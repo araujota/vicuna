@@ -30,6 +30,8 @@ if (MUSAToolkit_FOUND)
     list(APPEND GGML_HEADERS_MUSA "../ggml-musa/mudnn.cuh")
 
     file(GLOB   GGML_SOURCES_MUSA "../ggml-cuda/*.cu")
+    # Gated delta net is already disabled for MUSA at runtime in ggml-cuda.cu.
+    list(REMOVE_ITEM GGML_SOURCES_MUSA "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/gated_delta_net.cu")
     file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_MUSA ${SRCS})
     file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
