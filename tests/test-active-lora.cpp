@@ -64,6 +64,8 @@ int main(int argc, char ** argv) {
 
     llama_active_lora_params params = llama_active_lora_default_params();
     params.enabled = true;
+    params.host_memory_ratio = 1.0f;
+    params.device_memory_ratio = 1.0f;
     params.min_rank = 1;
     params.max_rank = 2;
     params.train_context_tokens = 8;
@@ -133,6 +135,8 @@ int main(int argc, char ** argv) {
 
     llama_active_lora_params pool_params = llama_active_lora_default_params();
     pool_params.enabled = true;
+    pool_params.host_memory_ratio = 1.0f;
+    pool_params.device_memory_ratio = 1.0f;
     pool_params.min_rank = 1;
     pool_params.max_rank = 2;
     pool_params.train_context_tokens = 8;
@@ -169,6 +173,8 @@ int main(int argc, char ** argv) {
 
     llama_active_lora_params custom_params = llama_active_lora_default_params();
     custom_params.enabled = true;
+    custom_params.host_memory_ratio = 1.0f;
+    custom_params.device_memory_ratio = 1.0f;
     custom_params.min_rank = 1;
     custom_params.max_rank = 2;
     custom_params.embedding_dim = 16;

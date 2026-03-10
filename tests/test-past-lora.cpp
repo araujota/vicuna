@@ -24,6 +24,8 @@ static void configure_small_buckets(llama_past_lora_params & params) {
     const std::array<float, LLAMA_MEMORY_LORA_BUCKET_COUNT> base_scales = { 0.90f, 0.70f, 0.50f, 0.30f, 0.10f };
 
     for (int i = 0; i < LLAMA_MEMORY_LORA_BUCKET_COUNT; ++i) {
+        params.host_memory_ratio[i] = 1.0f;
+        params.device_memory_ratio[i] = 1.0f;
         params.min_rank[i] = 1;
         params.max_rank[i] = 2;
         params.condensation_period_us[i] = periods[i];
@@ -59,6 +61,8 @@ int main(int argc, char ** argv) {
 
     llama_active_lora_params active = llama_active_lora_default_params();
     active.enabled = true;
+    active.host_memory_ratio = 1.0f;
+    active.device_memory_ratio = 1.0f;
     active.min_rank = 1;
     active.max_rank = 2;
     active.max_updates_before_rollover = 1;
