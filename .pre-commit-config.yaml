@@ -10,7 +10,7 @@ repos:
   - id: check-yaml
   - id: check-added-large-files
 - repo: https://github.com/PyCQA/flake8
-  rev: 7.0.0
+  rev: 4.0.1
   hooks:
   -   id: flake8
-      additional_dependencies: [flake8-no-print]
+      additional_dependencies: [flake8-no-print==0.1.1]

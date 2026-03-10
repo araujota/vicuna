@@ -432,6 +432,112 @@ llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * p
     return nullptr;
 }
 
+bool llama_adapter_lora_init_runtime(
+        llama_model & model,
+        llama_adapter_lora & adapter,
+        const std::vector<std::pair<ggml_tensor *, uint32_t>> & targets,
+        const std::string & name_prefix) {
+    if (targets.empty()) {
+        LLAMA_LOG_ERROR("%s: no runtime LoRA targets were provided\n", __func__);
+        return false;
+    }
+
+    adapter.is_runtime_mutable = true;
+    adapter.alpha = 0.0f;
+
+    std::vector<ggml_backend_buffer_type_t> buft_extra;
+    {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        GGML_ASSERT(cpu_dev != nullptr);
+        auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+        GGML_ASSERT(cpu_reg != nullptr);
+        auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+        if (ggml_backend_dev_get_extra_bufts_fn) {
+            ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(cpu_dev);
+            while (extra_bufts && *extra_bufts) {
+                buft_extra.push_back(*extra_bufts);
+                ++extra_bufts;
+            }
+        }
+    }
+
+    std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, size_t n_tensors) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it != ctx_map.end()) {
+            return it->second;
+        }
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ n_tensors*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * buft_ctx = ggml_init(params);
+        if (!buft_ctx) {
+            return nullptr;
+        }
+        ctx_map[buft] = buft_ctx;
+        adapter.ctxs.emplace_back(buft_ctx);
+        return buft_ctx;
+    };
+
+    const size_t n_tensors = targets.size() * 2;
+    for (const auto & target : targets) {
+        ggml_tensor * model_tensor = target.first;
+        const uint32_t rank = target.second;
+
+        if (!model_tensor || rank == 0 || model_tensor->ne[1] <= 1) {
+            LLAMA_LOG_ERROR("%s: invalid runtime LoRA target\n", __func__);
+            return false;
+        }
+
+        auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
+        for (auto & ex : buft_extra) {
+            if (ex == buft) {
+                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                GGML_ASSERT(cpu_dev != nullptr);
+                buft = ggml_backend_dev_buffer_type(cpu_dev);
+                break;
+            }
+        }
+
+        ggml_context * dev_ctx = ctx_for_buft(buft, n_tensors);
+        if (!dev_ctx) {
+            LLAMA_LOG_ERROR("%s: failed to allocate runtime LoRA context\n", __func__);
+            return false;
+        }
+
+        ggml_tensor * tensor_a = ggml_new_tensor_2d(dev_ctx, GGML_TYPE_F32, model_tensor->ne[0], rank);
+        ggml_tensor * tensor_b = ggml_new_tensor_2d(dev_ctx, GGML_TYPE_F32, rank, model_tensor->ne[1]);
+        if (!tensor_a || !tensor_b) {
+            LLAMA_LOG_ERROR("%s: failed to allocate runtime LoRA tensor pair for '%s'\n", __func__, model_tensor->name);
+            return false;
+        }
+
+        ggml_set_name(tensor_a, format("%s.%s.lora_a", name_prefix.c_str(), model_tensor->name).c_str());
+        ggml_set_name(tensor_b, format("%s.%s.lora_b", name_prefix.c_str(), model_tensor->name).c_str());
+
+        adapter.ab_map[model_tensor->name] = llama_adapter_lora_weight(tensor_a, tensor_b);
+    }
+
+    adapter.bufs.reserve(ctx_map.size());
+    for (auto & it : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(it.second, it.first);
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: failed to allocate runtime LoRA backend buffer\n", __func__);
+            return false;
+        }
+
+        ggml_backend_buffer_clear(buf, 0);
+        adapter.bufs.emplace_back(buf);
+    }
+
+    model.loras.insert(&adapter);
+    return true;
+}
+
 int32_t llama_adapter_meta_val_str(const llama_adapter_lora * adapter, const char * key, char * buf, size_t buf_size) {
     const auto & it = adapter->gguf_kv.find(key);
     if (it == adapter->gguf_kv.end()) {

@@ -48,16 +48,17 @@ using llama_adapter_cvec_ptr = std::shared_ptr<llama_adapter_cvec>;
 struct llama_adapter_lora_weight {
     ggml_tensor * a = nullptr;
     ggml_tensor * b = nullptr;
+    float gain = 1.0f;
 
     // get actual scale based on rank and alpha
     float get_scale(float alpha, float adapter_scale) const {
         const float rank  = (float) b->ne[0];
-        const float scale = alpha ? adapter_scale * alpha / rank : adapter_scale;
+        const float scale = (alpha ? adapter_scale * alpha / rank : adapter_scale) * gain;
         return scale;
     }
 
     llama_adapter_lora_weight() = default;
-    llama_adapter_lora_weight(ggml_tensor * a, ggml_tensor * b) : a(a), b(b) {}
+    llama_adapter_lora_weight(ggml_tensor * a, ggml_tensor * b, float gain = 1.0f) : a(a), b(b), gain(gain) {}
 };
 
 struct llama_adapter_lora {
@@ -75,6 +76,8 @@ struct llama_adapter_lora {
     // activated lora (aLoRA)
     std::vector<llama_token> alora_invocation_tokens;
 
+    bool is_runtime_mutable = false;
+
     llama_adapter_lora() = default;
     ~llama_adapter_lora() = default;
 
@@ -87,3 +90,9 @@ struct llama_adapter_lora {
 
 using llama_adapter_loras = std::unordered_map<llama_adapter_lora *, float>;
 using llama_adapter_loras_ptr = std::unique_ptr<llama_adapter_loras>;
+
+bool llama_adapter_lora_init_runtime(
+        llama_model & model,
+        llama_adapter_lora & adapter,
+        const std::vector<std::pair<ggml_tensor *, uint32_t>> & targets,
+        const std::string & name_prefix);
