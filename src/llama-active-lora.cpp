@@ -1,8 +1,13 @@
 #include "llama-active-lora.h"
 
+#include "llama.h"
 #include "llama-adapter.h"
 #include "llama-context.h"
+#include "llama-impl.h"
 #include "llama-model.h"
+
+#include "ggml-backend.h"
+#include "ggml.h"
 
 #include <algorithm>
 #include <array>
@@ -26,7 +31,7 @@ constexpr uint32_t YEAR_TO_ALL_TIME_JOB = 4;
 constexpr size_t PAST_BUCKET_COUNT = LLAMA_MEMORY_LORA_BUCKET_COUNT;
 constexpr float DIRECTION_EPS = 1.0e-8f;
 
-static const char * past_bucket_name(size_t bucket) {
+const char * past_bucket_name(size_t bucket) {
     switch (bucket) {
         case LLAMA_MEMORY_LORA_BUCKET_PAST_WEEK:    return "past_week";
         case LLAMA_MEMORY_LORA_BUCKET_PAST_MONTH:   return "past_month";
@@ -37,7 +42,7 @@ static const char * past_bucket_name(size_t bucket) {
     }
 }
 
-static uint64_t get_host_free_bytes() {
+uint64_t get_host_free_bytes() {
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
         return 0;
@@ -49,7 +54,7 @@ static uint64_t get_host_free_bytes() {
     return free ? free : total;
 }
 
-static uint64_t get_device_free_bytes(const llama_model & model) {
+uint64_t get_device_free_bytes(const llama_model & model) {
     uint64_t total_free = 0;
     for (auto * dev : model.devices) {
         size_t free = 0;
@@ -60,7 +65,7 @@ static uint64_t get_device_free_bytes(const llama_model & model) {
     return total_free;
 }
 
-static void maybe_add_target(std::vector<ggml_tensor *> & targets, ggml_tensor * tensor) {
+void maybe_add_target(std::vector<ggml_tensor *> & targets, ggml_tensor * tensor) {
     if (!tensor || tensor->ne[1] <= 1) {
         return;
     }
@@ -70,7 +75,7 @@ static void maybe_add_target(std::vector<ggml_tensor *> & targets, ggml_tensor *
     }
 }
 
-static std::vector<ggml_tensor *> collect_memory_targets(const llama_model & model) {
+std::vector<ggml_tensor *> collect_memory_targets(const llama_model & model) {
     std::vector<ggml_tensor *> targets;
     const int32_t n_layer = model.hparams.n_layer;
     const int32_t first_layer = std::max(0, n_layer - 4);
@@ -231,7 +236,7 @@ private:
     int32_t declared_type = LLAMA_ACTIVE_LORA_EMBEDDING_HASH;
 };
 
-static std::unique_ptr<active_lora_embedder> make_embedder(const llama_context & owner, const llama_active_lora_params & params) {
+std::unique_ptr<active_lora_embedder> make_embedder(const llama_context & owner, const llama_active_lora_params & params) {
     if (params.embedding_callback != nullptr) {
         return std::make_unique<active_lora_callback_embedder>(
                 owner,
@@ -250,7 +255,7 @@ static std::unique_ptr<active_lora_embedder> make_embedder(const llama_context &
     }
 }
 
-static float cosine_similarity(const active_lora_embedding & a, const active_lora_embedding & b) {
+float cosine_similarity(const active_lora_embedding & a, const active_lora_embedding & b) {
     if (a.values.empty() || b.values.empty() || a.values.size() != b.values.size() || a.norm == 0.0f || b.norm == 0.0f) {
         return -1.0f;
     }
@@ -263,7 +268,7 @@ static float cosine_similarity(const active_lora_embedding & a, const active_lor
     return dot / (a.norm * b.norm);
 }
 
-static float fro_norm(const std::vector<float> & data) {
+float fro_norm(const std::vector<float> & data) {
     double sum_sq = 0.0;
     for (float value : data) {
         sum_sq += (double) value * (double) value;
@@ -271,7 +276,7 @@ static float fro_norm(const std::vector<float> & data) {
     return std::sqrt((float) sum_sq);
 }
 
-static float compute_effective_scale(float base_scale, uint64_t created_at_us, uint64_t now_us, uint64_t half_life_us) {
+float compute_effective_scale(float base_scale, uint64_t created_at_us, uint64_t now_us, uint64_t half_life_us) {
     if (base_scale <= 0.0f) {
         return 0.0f;
     }
@@ -284,7 +289,7 @@ static float compute_effective_scale(float base_scale, uint64_t created_at_us, u
     return (float) (base_scale * std::pow(0.5, half_lives));
 }
 
-static std::pair<float, float> adapter_gain_stats(const llama_adapter_lora & adapter) {
+std::pair<float, float> adapter_gain_stats(const llama_adapter_lora & adapter) {
     float gain_sum = 0.0f;
     float gain_max = 0.0f;
     size_t count = 0;
@@ -301,7 +306,7 @@ static std::pair<float, float> adapter_gain_stats(const llama_adapter_lora & ada
     };
 }
 
-static void zero_weight(llama_adapter_lora_weight & weight) {
+void zero_weight(llama_adapter_lora_weight & weight) {
     std::vector<float> data_a(weight.a->ne[0] * weight.a->ne[1], 0.0f);
     std::vector<float> data_b(weight.b->ne[0] * weight.b->ne[1], 0.0f);
     ggml_backend_tensor_set(weight.a, data_a.data(), 0, data_a.size() * sizeof(float));
@@ -309,7 +314,7 @@ static void zero_weight(llama_adapter_lora_weight & weight) {
     weight.gain = 0.0f;
 }
 
-static void zero_adapter(llama_adapter_lora & adapter) {
+void zero_adapter(llama_adapter_lora & adapter) {
     for (auto & it : adapter.ab_map) {
         zero_weight(it.second);
     }
@@ -324,7 +329,7 @@ struct low_rank_direction {
     std::vector<float> right; // [in_dim, rank], row-major
 };
 
-static low_rank_direction read_direction(const llama_adapter_lora_weight & weight) {
+low_rank_direction read_direction(const llama_adapter_lora_weight & weight) {
     low_rank_direction result;
     result.in_dim = weight.a->ne[0];
     result.rank = weight.a->ne[1];
@@ -350,7 +355,7 @@ static low_rank_direction read_direction(const llama_adapter_lora_weight & weigh
     return result;
 }
 
-static void write_direction(llama_adapter_lora_weight & weight, const low_rank_direction & direction) {
+void write_direction(llama_adapter_lora_weight & weight, const low_rank_direction & direction) {
     const size_t alloc_rank = weight.a->ne[1];
     const size_t in_dim = weight.a->ne[0];
     const size_t out_dim = weight.b->ne[1];
@@ -372,7 +377,7 @@ static void write_direction(llama_adapter_lora_weight & weight, const low_rank_d
     weight.gain = direction.gain;
 }
 
-static float dot_columns(const std::vector<float> & mat, size_t rows, size_t cols, size_t col_a, size_t col_b) {
+float dot_columns(const std::vector<float> & mat, size_t rows, size_t cols, size_t col_a, size_t col_b) {
     float result = 0.0f;
     for (size_t r = 0; r < rows; ++r) {
         result += mat[r*cols + col_a] * mat[r*cols + col_b];
@@ -380,17 +385,17 @@ static float dot_columns(const std::vector<float> & mat, size_t rows, size_t col
     return result;
 }
 
-static float column_norm(const std::vector<float> & mat, size_t rows, size_t cols, size_t col) {
+float column_norm(const std::vector<float> & mat, size_t rows, size_t cols, size_t col) {
     return std::sqrt(std::max(0.0f, dot_columns(mat, rows, cols, col, col)));
 }
 
-static void scale_column(std::vector<float> & mat, size_t rows, size_t cols, size_t col, float scale) {
+void scale_column(std::vector<float> & mat, size_t rows, size_t cols, size_t col, float scale) {
     for (size_t r = 0; r < rows; ++r) {
         mat[r*cols + col] *= scale;
     }
 }
 
-static void subtract_column(std::vector<float> & mat, size_t rows, size_t cols, size_t dst_col, size_t src_col, float scale) {
+void subtract_column(std::vector<float> & mat, size_t rows, size_t cols, size_t dst_col, size_t src_col, float scale) {
     for (size_t r = 0; r < rows; ++r) {
         mat[r*cols + dst_col] -= scale * mat[r*cols + src_col];
     }
@@ -403,7 +408,7 @@ struct thin_qr_result {
     size_t cols = 0;
 };
 
-static thin_qr_result thin_qr(const std::vector<float> & mat, size_t rows, size_t cols) {
+thin_qr_result thin_qr(const std::vector<float> & mat, size_t rows, size_t cols) {
     thin_qr_result result;
     result.q = mat;
     result.r.assign(cols * cols, 0.0f);
@@ -431,7 +436,7 @@ static thin_qr_result thin_qr(const std::vector<float> & mat, size_t rows, size_
     return result;
 }
 
-static std::vector<float> small_mat_mul_r_rt(const std::vector<float> & lhs, const std::vector<float> & rhs, size_t n) {
+std::vector<float> small_mat_mul_r_rt(const std::vector<float> & lhs, const std::vector<float> & rhs, size_t n) {
     std::vector<float> out(n * n, 0.0f);
     for (size_t i = 0; i < n; ++i) {
         for (size_t j = 0; j < n; ++j) {
@@ -445,7 +450,7 @@ static std::vector<float> small_mat_mul_r_rt(const std::vector<float> & lhs, con
     return out;
 }
 
-static std::vector<float> small_mat_transpose_mul(const std::vector<float> & mat, size_t n) {
+std::vector<float> small_mat_transpose_mul(const std::vector<float> & mat, size_t n) {
     std::vector<float> out(n * n, 0.0f);
     for (size_t i = 0; i < n; ++i) {
         for (size_t j = 0; j < n; ++j) {
@@ -459,7 +464,7 @@ static std::vector<float> small_mat_transpose_mul(const std::vector<float> & mat
     return out;
 }
 
-static std::pair<std::vector<float>, std::vector<float>> jacobi_eigen(std::vector<float> mat, size_t n) {
+std::pair<std::vector<float>, std::vector<float>> jacobi_eigen(std::vector<float> mat, size_t n) {
     std::vector<float> eigenvectors(n * n, 0.0f);
     for (size_t i = 0; i < n; ++i) {
         eigenvectors[i*n + i] = 1.0f;
@@ -537,7 +542,7 @@ static std::pair<std::vector<float>, std::vector<float>> jacobi_eigen(std::vecto
     return { sorted_values, sorted_vectors };
 }
 
-static std::vector<float> multiply_small_matrix_vector(const std::vector<float> & mat, size_t n, const std::vector<float> & vec) {
+std::vector<float> multiply_small_matrix_vector(const std::vector<float> & mat, size_t n, const std::vector<float> & vec) {
     std::vector<float> out(n, 0.0f);
     for (size_t i = 0; i < n; ++i) {
         float sum = 0.0f;
@@ -549,7 +554,7 @@ static std::vector<float> multiply_small_matrix_vector(const std::vector<float> 
     return out;
 }
 
-static void normalize_vector(std::vector<float> & vec) {
+void normalize_vector(std::vector<float> & vec) {
     const float norm = fro_norm(vec);
     if (norm > DIRECTION_EPS) {
         for (float & value : vec) {
@@ -558,7 +563,7 @@ static void normalize_vector(std::vector<float> & vec) {
     }
 }
 
-static bool merge_directions(
+bool merge_directions(
         const low_rank_direction & target,
         float target_weight,
         const low_rank_direction & source,
@@ -688,7 +693,7 @@ static bool merge_directions(
     return true;
 }
 
-static void normalize_active_weight(
+void normalize_active_weight(
         llama_adapter_lora_weight & weight,
         float update_energy,
         float gain_decay,
@@ -815,7 +820,7 @@ struct llama_active_lora_manager::impl {
         (*owner.loras)[adapter_ptr] = scale;
     }
 
-    bool train_on_span(const active_lora_embedding & embedding, const llama_token * tokens, size_t n_tokens) {
+    bool train_on_span(const active_lora_embedding & embedding, const llama_token * tokens, size_t n_tokens) const {
         if (embedding.values.empty() || n_tokens == 0 || !adapter) {
             return false;
         }
@@ -929,7 +934,7 @@ struct llama_active_lora_manager::impl {
         bucket.stats.populated = true;
         bucket.stats.version += 1;
         bucket.stats.created_at_us = now_us;
-        if (bucket.stats.source_window_start_us == 0 || !bucket.stats.source_window_start_us || target_weight == 0.0f) {
+        if (bucket.stats.source_window_start_us == 0 || target_weight == 0.0f) {
             bucket.stats.source_window_start_us = source_window_start_us;
         } else {
             bucket.stats.source_window_start_us = std::min(bucket.stats.source_window_start_us, source_window_start_us);
@@ -1007,10 +1012,11 @@ struct llama_active_lora_manager::impl {
         }
 
         uint64_t mask = 0;
-        if (stats.rollover_ready) {
-            mask |= (1ull << ACTIVE_TO_WEEK_JOB);
-        } else if (stats.updates_applied > 0 && past_params.condensation_period_us[LLAMA_MEMORY_LORA_BUCKET_PAST_WEEK] > 0 &&
-                now_us >= active_started_at_us + past_params.condensation_period_us[LLAMA_MEMORY_LORA_BUCKET_PAST_WEEK]) {
+        const bool active_period_elapsed =
+                stats.updates_applied > 0 &&
+                past_params.condensation_period_us[LLAMA_MEMORY_LORA_BUCKET_PAST_WEEK] > 0 &&
+                now_us >= active_started_at_us + past_params.condensation_period_us[LLAMA_MEMORY_LORA_BUCKET_PAST_WEEK];
+        if (stats.rollover_ready || active_period_elapsed) {
             mask |= (1ull << ACTIVE_TO_WEEK_JOB);
         }
 
