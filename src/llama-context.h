@@ -14,6 +14,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+class llama_active_lora_manager;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -115,6 +116,16 @@ struct llama_context {
                 int32_t   n_embd,
                 int32_t   il_start,
                 int32_t   il_end);
+
+    bool active_lora_init(const llama_active_lora_params & params);
+    bool active_lora_ingest(const llama_token * tokens, size_t n_tokens);
+    bool active_lora_get_stats(llama_active_lora_stats * out_stats) const;
+    bool past_lora_init(const llama_past_lora_params & params);
+    bool past_lora_tick(uint64_t now_us);
+    bool past_lora_get_stats(llama_past_lora_stats * out_stats) const;
+
+    void attach_adapter_runtime(llama_adapter_lora * adapter, float scale);
+    void detach_adapter_runtime(llama_adapter_lora * adapter);
 
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
@@ -235,6 +246,8 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    friend class llama_active_lora_manager;
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -318,6 +331,8 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+
+    std::unique_ptr<llama_active_lora_manager> active_lora_manager;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

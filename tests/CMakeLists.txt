@@ -241,6 +241,10 @@ llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
+llama_build_and_test(test-active-lora.cpp       LABEL "model" ARGS "${MODEL_DEST}")
+set_tests_properties(test-active-lora PROPERTIES FIXTURES_REQUIRED test-download-model)
+llama_build_and_test(test-past-lora.cpp         LABEL "model" ARGS "${MODEL_DEST}")
+set_tests_properties(test-past-lora PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 # Test for state restore with fragmented KV cache
 # Requires a model, uses same args pattern as test-thread-safety
@@ -282,5 +286,3 @@ target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
 llama_build_and_test(test-alloc.cpp)
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
-
-

@@ -1,5 +1,6 @@
 #include "llama-context.h"
 
+#include "llama-active-lora.h"
 #include "llama-arch.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -1109,6 +1110,60 @@ bool llama_context::set_adapter_cvec(
     // TODO: should we reserve?
 
     return cvec->apply(model, data, len, n_embd, il_start, il_end);
+}
+
+bool llama_context::active_lora_init(const llama_active_lora_params & params) {
+    if (!active_lora_manager) {
+        active_lora_manager = std::make_unique<llama_active_lora_manager>(*this);
+    }
+    if (!active_lora_manager->init(params)) {
+        active_lora_manager.reset();
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_context::active_lora_ingest(const llama_token * tokens, size_t n_tokens) {
+    return active_lora_manager && active_lora_manager->ingest(tokens, n_tokens);
+}
+
+bool llama_context::active_lora_get_stats(llama_active_lora_stats * out_stats) const {
+    return active_lora_manager && active_lora_manager->get_stats(out_stats);
+}
+
+bool llama_context::past_lora_init(const llama_past_lora_params & params) {
+    if (!active_lora_manager) {
+        active_lora_manager = std::make_unique<llama_active_lora_manager>(*this);
+    }
+
+    return active_lora_manager->init_past(params);
+}
+
+bool llama_context::past_lora_tick(uint64_t now_us) {
+    return active_lora_manager && active_lora_manager->tick_past(now_us);
+}
+
+bool llama_context::past_lora_get_stats(llama_past_lora_stats * out_stats) const {
+    return active_lora_manager && active_lora_manager->get_past_stats(out_stats);
+}
+
+void llama_context::attach_adapter_runtime(llama_adapter_lora * adapter, float scale) {
+    if (!loras) {
+        loras = std::make_unique<llama_adapter_loras>();
+    }
+
+    (*loras)[adapter] = scale;
+    sched_need_reserve = true;
+}
+
+void llama_context::detach_adapter_runtime(llama_adapter_lora * adapter) {
+    if (!loras) {
+        return;
+    }
+
+    loras->erase(adapter);
+    sched_need_reserve = true;
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -3110,6 +3165,43 @@ int32_t llama_set_adapter_cvec(
     bool res = ctx->set_adapter_cvec(data, len, n_embd, il_start, il_end);
 
     return res ? 0 : -1;
+}
+
+int32_t llama_active_lora_init(
+        llama_context * ctx,
+        llama_active_lora_params params) {
+    return ctx && ctx->active_lora_init(params) ? 0 : -1;
+}
+
+int32_t llama_active_lora_ingest(
+        llama_context * ctx,
+        const llama_token * tokens,
+        size_t n_tokens) {
+    return ctx && ctx->active_lora_ingest(tokens, n_tokens) ? 0 : -1;
+}
+
+int32_t llama_active_lora_get_stats(
+        const llama_context * ctx,
+        llama_active_lora_stats * out_stats) {
+    return ctx && ctx->active_lora_get_stats(out_stats) ? 0 : -1;
+}
+
+int32_t llama_past_lora_init(
+        llama_context * ctx,
+        llama_past_lora_params params) {
+    return ctx && ctx->past_lora_init(params) ? 0 : -1;
+}
+
+int32_t llama_past_lora_tick(
+        llama_context * ctx,
+        uint64_t now_us) {
+    return ctx && ctx->past_lora_tick(now_us) ? 0 : -1;
+}
+
+int32_t llama_past_lora_get_stats(
+        const llama_context * ctx,
+        llama_past_lora_stats * out_stats) {
+    return ctx && ctx->past_lora_get_stats(out_stats) ? 0 : -1;
 }
 
 //

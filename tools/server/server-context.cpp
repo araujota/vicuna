@@ -729,6 +729,31 @@ private:
             }
         }
 
+        {
+            const char * vicuna_active_lora = getenv("VICUNA_ACTIVE_LORA");
+            const char * vicuna_past_lora = getenv("VICUNA_PAST_LORA");
+            const bool enable_active_lora = vicuna_active_lora && atoi(vicuna_active_lora) != 0;
+            const bool enable_past_lora = vicuna_past_lora && atoi(vicuna_past_lora) != 0;
+            if (enable_active_lora || enable_past_lora) {
+                llama_active_lora_params active_lora = llama_active_lora_default_params();
+                active_lora.enabled = true;
+                if (llama_active_lora_init(ctx, active_lora) == 0) {
+                    SRV_INF("%s\n", "Active LoRA memory enabled");
+                    if (enable_past_lora) {
+                        llama_past_lora_params past_lora = llama_past_lora_default_params();
+                        past_lora.enabled = true;
+                        if (llama_past_lora_init(ctx, past_lora) == 0) {
+                            SRV_INF("%s\n", "Past LoRA condensation stack enabled");
+                        } else {
+                            SRV_WRN("%s\n", "failed to initialize Past LoRA condensation stack");
+                        }
+                    }
+                } else {
+                    SRV_WRN("%s\n", "failed to initialize Active LoRA memory");
+                }
+            }
+        }
+
         if (llama_model_n_swa(model) == 0) {
             if (params_base.swa_full) {
                 params_base.swa_full = false;
@@ -1944,6 +1969,8 @@ private:
     }
 
     void update_slots() {
+        (void) llama_past_lora_tick(ctx, ggml_time_us());
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -2008,8 +2035,24 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
+                llama_tokens evicted_tokens;
+                {
+                    const llama_tokens & prompt_tokens = slot.prompt.tokens.get_text_tokens();
+                    if (n_discard > 0 && prompt_tokens.size() >= static_cast<size_t>(n_keep + n_discard)) {
+                        evicted_tokens.assign(
+                                prompt_tokens.begin() + n_keep,
+                                prompt_tokens.begin() + n_keep + n_discard);
+                    }
+                }
+
                 llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
                 llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+
+                if (!evicted_tokens.empty()) {
+                    if (llama_active_lora_ingest(ctx, evicted_tokens.data(), evicted_tokens.size()) != 0) {
+                        SLT_WRN(slot, "%s\n", "Active LoRA ingestion failed for evicted span");
+                    }
+                }
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481

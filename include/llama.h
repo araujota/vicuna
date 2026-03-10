@@ -415,12 +415,111 @@ extern "C" {
     // lora adapter
     struct llama_adapter_lora;
 
+    enum llama_active_lora_embedding_type {
+        LLAMA_ACTIVE_LORA_EMBEDDING_HASH       = 0,
+        LLAMA_ACTIVE_LORA_EMBEDDING_TOKEN_POOL = 1,
+    };
+
+    enum llama_memory_lora_bucket {
+        LLAMA_MEMORY_LORA_BUCKET_PAST_WEEK    = 0,
+        LLAMA_MEMORY_LORA_BUCKET_PAST_MONTH   = 1,
+        LLAMA_MEMORY_LORA_BUCKET_PAST_QUARTER = 2,
+        LLAMA_MEMORY_LORA_BUCKET_PAST_YEAR    = 3,
+        LLAMA_MEMORY_LORA_BUCKET_ALL_TIME     = 4,
+        LLAMA_MEMORY_LORA_BUCKET_COUNT        = 5,
+    };
+
+    typedef bool (*llama_active_lora_embedding_callback)(
+            const struct llama_context * ctx,
+            const llama_token * tokens,
+            size_t n_tokens,
+            float * out_embedding,
+            size_t n_embedding,
+            void * user_data);
+
+    struct llama_active_lora_params {
+        bool     enabled;
+        float    host_memory_ratio;
+        float    device_memory_ratio;
+        uint32_t min_rank;
+        uint32_t max_rank;
+        uint32_t train_context_tokens;
+        uint32_t train_stride_tokens;
+        uint32_t max_updates_before_rollover;
+        float    adapter_scale;
+        float    learning_rate;
+        float    weight_decay;
+        float    gain_max;
+        float    gain_decay;
+        uint32_t embedding_dim;
+        int32_t  embedding_type;
+        llama_active_lora_embedding_callback embedding_callback;
+        void *   embedding_callback_user_data;
+    };
+
+    struct llama_active_lora_stats {
+        bool     enabled;
+        bool     rollover_ready;
+        uint32_t selected_rank;
+        uint32_t updates_applied;
+        uint64_t tokens_ingested;
+        float    host_memory_ratio;
+        float    device_memory_ratio;
+        uint64_t host_budget_bytes;
+        uint64_t device_budget_bytes;
+        uint32_t embedding_dim;
+        bool     embedding_is_custom;
+        float    gain_mean;
+        float    gain_max;
+        int32_t  embedding_type;
+    };
+
+    struct llama_past_lora_params {
+        bool     enabled;
+        float    host_memory_ratio[LLAMA_MEMORY_LORA_BUCKET_COUNT];
+        float    device_memory_ratio[LLAMA_MEMORY_LORA_BUCKET_COUNT];
+        uint32_t min_rank[LLAMA_MEMORY_LORA_BUCKET_COUNT];
+        uint32_t max_rank[LLAMA_MEMORY_LORA_BUCKET_COUNT];
+        float    base_scale[LLAMA_MEMORY_LORA_BUCKET_COUNT];
+        uint64_t decay_half_life_us[LLAMA_MEMORY_LORA_BUCKET_COUNT];
+        uint64_t condensation_period_us[LLAMA_MEMORY_LORA_BUCKET_COUNT];
+        float    merge_source_weight[LLAMA_MEMORY_LORA_BUCKET_COUNT];
+        float    merge_target_retention[LLAMA_MEMORY_LORA_BUCKET_COUNT];
+        float    gain_max;
+        float    gain_decay;
+        float    singular_value_floor;
+    };
+
+    struct llama_past_lora_bucket_stats {
+        bool     populated;
+        uint32_t version;
+        uint32_t selected_rank;
+        uint64_t created_at_us;
+        uint64_t source_window_start_us;
+        uint64_t source_window_end_us;
+        uint64_t host_budget_bytes;
+        uint64_t device_budget_bytes;
+        float    base_scale;
+        float    effective_scale;
+        float    gain_mean;
+        float    gain_max;
+    };
+
+    struct llama_past_lora_stats {
+        bool     enabled;
+        uint64_t last_tick_us;
+        uint64_t pending_job_mask;
+        struct llama_past_lora_bucket_stats buckets[LLAMA_MEMORY_LORA_BUCKET_COUNT];
+    };
+
     // Helpers for getting default parameters
     // TODO: update API to start accepting pointers to params structs (https://github.com/ggml-org/llama.cpp/discussions/9172)
     LLAMA_API struct llama_model_params          llama_model_default_params(void);
     LLAMA_API struct llama_context_params        llama_context_default_params(void);
     LLAMA_API struct llama_sampler_chain_params  llama_sampler_chain_default_params(void);
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
+    LLAMA_API struct llama_active_lora_params    llama_active_lora_default_params(void);
+    LLAMA_API struct llama_past_lora_params      llama_past_lora_default_params(void);
 
     // Initialize the llama + ggml backend
     // If numa is true, use NUMA optimizations
@@ -689,6 +788,37 @@ extern "C" {
                          int32_t   n_embd,
                          int32_t   il_start,
                          int32_t   il_end);
+
+    // Initialize a runtime-generated Active LoRA memory stage on the context.
+    LLAMA_API int32_t llama_active_lora_init(
+            struct llama_context * ctx,
+            struct llama_active_lora_params params);
+
+    // Ingest an evicted token span into the Active LoRA memory stage.
+    LLAMA_API int32_t llama_active_lora_ingest(
+            struct llama_context * ctx,
+            const llama_token * tokens,
+            size_t n_tokens);
+
+    // Inspect Active LoRA state.
+    LLAMA_API int32_t llama_active_lora_get_stats(
+            const struct llama_context * ctx,
+            struct llama_active_lora_stats * out_stats);
+
+    // Initialize the frozen temporal past-LoRA stack on the context.
+    LLAMA_API int32_t llama_past_lora_init(
+            struct llama_context * ctx,
+            struct llama_past_lora_params params);
+
+    // Advance decay and condensation jobs for the frozen past-LoRA stack.
+    LLAMA_API int32_t llama_past_lora_tick(
+            struct llama_context * ctx,
+            uint64_t now_us);
+
+    // Inspect frozen past-LoRA stack state.
+    LLAMA_API int32_t llama_past_lora_get_stats(
+            const struct llama_context * ctx,
+            struct llama_past_lora_stats * out_stats);
 
     //
     // Memory
