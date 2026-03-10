@@ -12,9 +12,9 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstdint>
 #include <cmath>
 #include <cstring>
-#include <limits>
 #include <memory>
 #include <numeric>
 #include <string>
