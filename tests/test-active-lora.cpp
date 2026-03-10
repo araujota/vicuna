@@ -1,6 +1,7 @@
 #include "get-model.h"
 #include "llama.h"
 
+#include <cstdlib>
 #include <cstdio>
 #include <string>
 #include <vector>
