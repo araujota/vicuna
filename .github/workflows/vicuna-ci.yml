@@ -53,8 +53,8 @@ jobs:
           python -m pip install \
             ./gguf-py \
             -r requirements/requirements-all.txt \
-            flake8 \
-            flake8-no-print \
+            flake8==4.0.1 \
+            flake8-no-print==0.1.1 \
             lizard \
             pre-commit \
             pyright
