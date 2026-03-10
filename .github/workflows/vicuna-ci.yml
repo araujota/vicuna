@@ -1,4 +1,4 @@
-name: Vicuña CI
+name: Vicuna CI
 
 on:
   workflow_dispatch:
