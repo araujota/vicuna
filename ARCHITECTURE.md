@@ -251,6 +251,15 @@ on_user_message(msg)
 
 Tool returns follow the same pre-write, write, and post-write pattern and may justify follow-up output without a new user prompt.
 
+Current implementation slice:
+
+- the core runtime now exposes a typed active-loop trace with scored `answer`,
+  `ask`, `act`, and `wait` candidates,
+- foreground episodes run through shared self-state and memory surfaces instead
+  of bypassing them in host code,
+- and `llama-server` classifies foreground user versus tool episodes before
+  templating and records real outward emission back into the loop trace.
+
 ## DMN Background Loop
 
 The DMN is a default-mode-inspired background process. It is not literal biological terminology.
@@ -298,20 +307,65 @@ DMN invariants:
 - It may emit multiple user-facing messages in sequence if continuation remains high and inhibition remains below threshold.
 - It must respect channel state and anti-spam controls.
 
+Current implementation slice:
+
+- the core runtime now computes a typed DMN pressure vector from shared
+  registers, reactivation priorities, tool state, continuation pressure, and a
+  dedicated repair-pressure term derived from dissatisfaction, recent negative
+  user valence, trust/reciprocity deficits, failure signals, and social
+  relevance,
+- DMN admission is pressure-gated even when the host polls from an idle loop,
+- the first slice exposes typed `silent`, `internal_write`, `invoke_tool`, and
+  `emit` decisions plus burst-count and maintenance markers,
+- each admitted or deferred tick now snapshots a typed favorable-self-state
+  profile with per-dimension targets, tolerances, weights, and divergence
+  ordering for contradiction, uncertainty, tool readiness/backlog, reactivation,
+  continuation, broadcast pressure/inhibition, and social trust / reciprocity /
+  dissatisfaction,
+- the runtime now exposes Supermemory as a typed hard-memory second rail with
+  explicit endpoint/auth/container/runtime config, bounded query results, and
+  inspectable last-query / last-archive traces,
+- primary-channel events that produce above-threshold self-state deltas can now
+  be archived into hard memory with message context plus a bounded top-register
+  delta summary, while counterfactual-channel events remain excluded by default,
+- counterfactual search now follows a low-risk-first ladder across message
+  variants, tool-argument changes, hard-memory query variants, tool-choice
+  changes, timing shifts, and runtime-memory LoRA ablation before it considers
+  higher-risk sensitivity or updater-policy proposals,
+- LoRA ablation is treated as a first-class diagnostic over the serving runtime
+  memory stack in recency order (`active`, `past_week`, `past_month`,
+  `past_quarter`, `past_year`, `all_time`),
+- bounded remediation currently targets Active LoRA only, with tool-oriented
+  counterfactuals yielding `gather_info` plans that can now be typed as generic
+  tool work or hard-memory query work, and high-risk updater-policy proposals
+  denied or deferred,
+- repair urgency now contributes to the same DMN admission gate through
+  updater-program policy (`repair_admission_floor` and
+  `repair_admission_weight`) instead of bypassing the scheduler,
+- repair emission still uses an explicit second-stage evidence threshold from
+  the updater program (`repair_emit_threshold` plus floors / inhibition
+  ceiling), so the agent can reason about and propose threshold changes without
+  silently applying them,
+- governance traces now record proposal family, risk tier, evidence, user
+  dissatisfaction, recent negative valence, and optional repair messaging,
+- and `llama-server` polls the DMN only from idle states while recording
+  foreground deferral when user-facing work is still active.
+
 ## Counterfactual Self-Improvement
 
-The DMN should eventually support counterfactual simulation:
+The implemented DMN counterfactual path is:
 
 ```text
 reactivation / pressure spike
--> counterfactual candidate generation
--> evaluation against meta-registers
--> proposal selection
--> gated self-update recommendation
--> optional human approval or constrained automatic application
+-> favorable-self-state divergence ranking
+-> low-risk counterfactual ladder
+-> winner selection with risk-aware tie-breaking
+-> bounded remediation plan
+-> governance gate
+-> Active LoRA update, gather-info tool job, defer, deny, or repair emit
 ```
 
-Useful early meta-registers include:
+Useful meta-registers and governance inputs include:
 
 - `r_curiosity`
 - `r_performance_frustration`
@@ -322,18 +376,19 @@ Useful early meta-registers include:
 
 Safe initial improvement surfaces:
 
-- thresholds,
-- replay policy,
-- tool routing policy,
-- scoring coefficients,
-- new register activation,
-- memory compression schedules,
+- message-shaping biases captured in Active LoRA,
+- tool-argument and tool-choice heuristics,
+- timing / continuation policy,
+- bounded scoring coefficients,
+- replay ordering and reactivation refresh policy,
 - auxiliary learned probes.
 
 Unsafe early mutation targets:
 
 - base model weights,
 - frozen past LoRAs,
+- self-state updater formulas, repair-admission / repair-emission policy, and
+  consolidation policy without overwhelming counterfactual evidence,
 - global safety policy,
 - identity-critical priors.
 

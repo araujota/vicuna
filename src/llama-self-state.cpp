@@ -1,6 +1,7 @@
 #include "llama-self-state.h"
 
 #include "llama-context.h"
+#include "llama-hard-memory.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 
@@ -77,6 +78,71 @@ static float clamp_unit(float value) {
 
 static float clamp_range(float value, float lo, float hi) {
     return std::min(hi, std::max(lo, value));
+}
+
+static std::vector<float> capture_self_register_scalars(const llama_context & ctx) {
+    const int32_t count = ctx.self_state_register_count();
+    std::vector<float> values(std::max(0, count), 0.0f);
+    for (int32_t i = 0; i < count; ++i) {
+        llama_self_register_info info = {};
+        if (ctx.self_state_get_register(i, &info)) {
+            values[i] = info.scalar_value;
+        }
+    }
+    return values;
+}
+
+static llama_self_state_delta_summary summarize_self_state_delta(
+        const std::vector<float> & before,
+        const std::vector<float> & after,
+        const llama_self_state_event & event) {
+    llama_self_state_delta_summary summary = {};
+    summary.role = event.role;
+    summary.channel = event.channel;
+    summary.flags = event.flags;
+
+    struct delta_item {
+        int32_t register_id = -1;
+        float before_value = 0.0f;
+        float after_value = 0.0f;
+        float abs_delta = 0.0f;
+    };
+
+    std::vector<delta_item> deltas;
+    const int32_t count = std::min((int32_t) before.size(), (int32_t) after.size());
+    deltas.reserve(std::max(0, count));
+
+    for (int32_t i = 0; i < count; ++i) {
+        const float abs_delta = std::fabs(after[i] - before[i]);
+        if (abs_delta <= 1.0e-6f) {
+            continue;
+        }
+        summary.total_delta += abs_delta;
+        summary.max_delta = std::max(summary.max_delta, abs_delta);
+        deltas.push_back({
+            /*.register_id =*/ i,
+            /*.before_value =*/ before[i],
+            /*.after_value =*/ after[i],
+            /*.abs_delta =*/ abs_delta,
+        });
+    }
+
+    std::sort(deltas.begin(), deltas.end(), [](const delta_item & lhs, const delta_item & rhs) {
+        if (lhs.abs_delta == rhs.abs_delta) {
+            return lhs.register_id < rhs.register_id;
+        }
+        return lhs.abs_delta > rhs.abs_delta;
+    });
+
+    summary.dimension_count = std::min<int32_t>(deltas.size(), LLAMA_SELF_STATE_MAX_DELTA_DIMS);
+    for (int32_t i = 0; i < summary.dimension_count; ++i) {
+        summary.dimensions[i].register_id = deltas[i].register_id;
+        summary.dimensions[i].before_value = deltas[i].before_value;
+        summary.dimensions[i].after_value = deltas[i].after_value;
+        summary.dimensions[i].abs_delta = deltas[i].abs_delta;
+    }
+
+    return summary;
 }
 
 static float sigmoid_unit(float value) {
@@ -554,6 +620,34 @@ bool llama_self_state::validate_updater_program(const llama_self_updater_program
         return false;
     }
 
+    const float * scalar_fields[] = {
+        &program.memory_novelty_weight,
+        &program.memory_working_similarity_weight,
+        &program.memory_handle_similarity_weight,
+        &program.memory_uncertainty_weight,
+        &program.memory_contradiction_weight,
+        &program.memory_handle_variance_weight,
+        &program.broadcast_social_weight,
+        &program.broadcast_contradiction_weight,
+        &program.broadcast_uncertainty_weight,
+        &program.broadcast_tool_pending_weight,
+        &program.broadcast_tool_unready_weight,
+        &program.broadcast_failure_weight,
+        &program.broadcast_question_weight,
+        &program.broadcast_goal_weight,
+        &program.repair_emit_threshold,
+        &program.repair_dissatisfaction_floor,
+        &program.repair_recent_user_valence_floor,
+        &program.repair_inhibition_max,
+        &program.repair_admission_floor,
+        &program.repair_admission_weight,
+    };
+    for (const float * field : scalar_fields) {
+        if (!std::isfinite(*field)) {
+            return false;
+        }
+    }
+
     const uint32_t valid_phase_mask = LLAMA_SELF_UPDATER_PHASE_PREWRITE | LLAMA_SELF_UPDATER_PHASE_POSTWRITE;
 
     for (uint32_t i = 0; i < program.rule_count; ++i) {
@@ -1012,6 +1106,8 @@ bool llama_self_state::get_social_state(llama_self_social_state_info * out_info)
         /*.trust =*/ social_trust,
         /*.reciprocity =*/ social_reciprocity,
         /*.bond_strength =*/ bond_strength,
+        /*.recent_user_valence =*/ social_recent_user_valence,
+        /*.dissatisfaction =*/ social_dissatisfaction,
         /*.user_turn_count =*/ social_user_turn_count,
         /*.system_turn_count =*/ social_system_turn_count,
         /*.last_update_monotonic_ms =*/ social_last_update_monotonic_ms,
@@ -1185,6 +1281,7 @@ void llama_self_state::reset_dynamic_state_preserve_static() {
     }
 
     working_memory.clear();
+    tool_jobs.clear();
     reactivation_priorities.clear();
     next_working_memory_event_id = 1;
     has_previous_event_sketch = false;
@@ -1192,6 +1289,14 @@ void llama_self_state::reset_dynamic_state_preserve_static() {
     last_user_monotonic_ms = -1;
     last_tool_monotonic_ms = -1;
     last_emit_monotonic_ms = -1;
+    social_last_update_monotonic_ms = -1;
+    social_user_turn_count = 0;
+    social_system_turn_count = 0;
+    social_familiarity = 0.0f;
+    social_trust = 0.5f;
+    social_reciprocity = 0.5f;
+    social_recent_user_valence = 0.0f;
+    social_dissatisfaction = 0.0f;
     session_start_wall_ms = -1;
     session_start_monotonic_ms = -1;
     has_explicit_time = false;
@@ -1528,6 +1633,9 @@ bool llama_self_state::build_features(
     static const char * const uncertainty_terms[] = {"maybe", "perhaps", "uncertain", "unknown", "unsure", "likely", "possibly"};
     static const char * const self_terms[] = {"i", "me", "my", "myself", "vicuna"};
     static const char * const error_terms[] = {"error", "fail", "failed", "cannot", "can't", "invalid", "denied", "timeout"};
+    static const char * const negative_valence_terms[] = {
+            "bad", "worse", "wrong", "frustrat", "annoy", "disappoint", "hate", "awful", "terrible", "useless", "upset"
+    };
 
     const auto sketch = build_event_sketch(event);
     const float previous_similarity = has_previous_event_sketch ?
@@ -1548,6 +1656,7 @@ bool llama_self_state::build_features(
     float uncertainty_hits = 0.0f;
     float self_hits = 0.0f;
     float error_hits = 0.0f;
+    float negative_valence_hits = 0.0f;
     uint32_t question_hits = 0;
     std::unordered_set<llama_token> unique_tokens;
 
@@ -1566,6 +1675,9 @@ bool llama_self_state::build_features(
         }
         if (contains_any(piece, error_terms, sizeof(error_terms)/sizeof(error_terms[0]))) {
             error_hits += 1.0f;
+        }
+        if (contains_any(piece, negative_valence_terms, sizeof(negative_valence_terms)/sizeof(negative_valence_terms[0]))) {
+            negative_valence_hits += 1.0f;
         }
         if (piece.find('?') != std::string::npos) {
             ++question_hits;
@@ -1587,6 +1699,7 @@ bool llama_self_state::build_features(
     const float uncertainty_ratio = uncertainty_hits * inv_tokens;
     const float self_ratio = self_hits * inv_tokens;
     const float error_ratio = error_hits * inv_tokens;
+    const float negative_valence_ratio = negative_valence_hits * inv_tokens;
 
     const float contradiction_analytic = clamp_unit(
             0.35f * negation_ratio +
@@ -1676,6 +1789,7 @@ bool llama_self_state::build_features(
             0.30f * ((event.flags & LLAMA_SELF_STATE_EVENT_TOOL_FAILED) ? 1.0f : 0.0f) +
             0.15f * features.contradiction_score +
             0.10f * features.uncertainty_score) : 0.0f;
+    features.negative_user_valence = clamp_unit(negative_valence_ratio);
     if (postwrite) {
         features.broadcast_pressure_hint = run_broadcast_head(features.broadcast_pressure_hint, features);
     }
@@ -1839,6 +1953,9 @@ void llama_self_state::update_social_state(
     if (event.role == LLAMA_SELF_STATE_EVENT_USER) {
         ++social_user_turn_count;
         social_familiarity = clamp_unit(social_familiarity + 0.18f * (1.0f - social_familiarity));
+        social_recent_user_valence = clamp_unit(
+                0.65f * social_recent_user_valence +
+                0.35f * features.negative_user_valence);
 
         const float response_bonus = clamp_unit(0.45f * features.recency_emit + 0.55f * features.working_memory_top_similarity);
         social_reciprocity = clamp_unit(social_reciprocity + 0.15f * (response_bonus - social_reciprocity));
@@ -1864,6 +1981,11 @@ void llama_self_state::update_social_state(
                 0.20f * features.goal_top_similarity);
         social_reciprocity = clamp_unit(social_reciprocity + 0.08f * (reciprocity_target - social_reciprocity));
     }
+
+    social_dissatisfaction = clamp_unit(
+            0.50f * social_recent_user_valence +
+            0.30f * (1.0f - social_trust) +
+            0.20f * (1.0f - social_reciprocity));
 }
 
 bool llama_context::self_state_refresh_time() {
@@ -2049,7 +2171,58 @@ bool llama_context::self_state_build_postwrite_features(
 bool llama_context::self_state_apply_postwrite(
         const llama_self_state_event & event,
         const llama_self_state_feature_vector & features) {
-    return self_state && self_state->apply_postwrite(event, features);
+    if (!self_state) {
+        return false;
+    }
+
+    const std::vector<float> before = capture_self_register_scalars(*this);
+    if (!self_state->apply_postwrite(event, features)) {
+        return false;
+    }
+
+    if (!hard_memory) {
+        return true;
+    }
+
+    llama_hard_memory_config config = {};
+    if (!hard_memory->get_config(&config) || !config.enabled || !config.archive_enabled) {
+        return true;
+    }
+    if (event.channel == LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL && !config.archive_counterfactual_events) {
+        return true;
+    }
+    if (!event.tokens || event.n_tokens == 0) {
+        return true;
+    }
+
+    const std::vector<float> after = capture_self_register_scalars(*this);
+    const llama_self_state_delta_summary delta = summarize_self_state_delta(before, after, event);
+    if (delta.total_delta < config.archival_delta_threshold) {
+        return true;
+    }
+
+    (void) hard_memory->archive_event(&get_model().vocab, event, delta);
+    return true;
+}
+
+bool llama_context::hard_memory_configure(const llama_hard_memory_config & config) {
+    return hard_memory && hard_memory->configure(config);
+}
+
+bool llama_context::hard_memory_get_config(llama_hard_memory_config * out_config) const {
+    return hard_memory && hard_memory->get_config(out_config);
+}
+
+bool llama_context::hard_memory_query(const llama_hard_memory_query_request & query, llama_hard_memory_result * out_result) {
+    return hard_memory && hard_memory->query(query, out_result);
+}
+
+bool llama_context::hard_memory_get_last_result(llama_hard_memory_result * out_result) const {
+    return hard_memory && hard_memory->get_last_result(out_result);
+}
+
+bool llama_context::hard_memory_get_last_archive_trace(llama_hard_memory_archive_trace * out_trace) const {
+    return hard_memory && hard_memory->get_last_archive_trace(out_trace);
 }
 
 llama_self_state_params llama_self_state_default_params(void) {
@@ -2089,6 +2262,12 @@ llama_self_updater_program llama_self_state_default_updater_program(void) {
     program.broadcast_failure_weight = 0.15f;
     program.broadcast_question_weight = 0.08f;
     program.broadcast_goal_weight = 0.13f;
+    program.repair_emit_threshold = 0.72f;
+    program.repair_dissatisfaction_floor = 0.38f;
+    program.repair_recent_user_valence_floor = 0.20f;
+    program.repair_inhibition_max = 0.68f;
+    program.repair_admission_floor = 0.34f;
+    program.repair_admission_weight = 0.22f;
 
     program.rules[program.rule_count++] = make_rule(
             LLAMA_SELF_REGISTER_UNCERTAINTY,
@@ -2451,4 +2630,35 @@ int32_t llama_self_state_apply_postwrite(
         const struct llama_self_state_event * event,
         const struct llama_self_state_feature_vector * features) {
     return ctx && event && features && ctx->self_state_apply_postwrite(*event, *features) ? 0 : -1;
+}
+
+int32_t llama_hard_memory_configure(
+        struct llama_context * ctx,
+        struct llama_hard_memory_config config) {
+    return ctx && ctx->hard_memory_configure(config) ? 0 : -1;
+}
+
+int32_t llama_hard_memory_get_config(
+        const struct llama_context * ctx,
+        struct llama_hard_memory_config * out_config) {
+    return ctx && ctx->hard_memory_get_config(out_config) ? 0 : -1;
+}
+
+int32_t llama_hard_memory_query(
+        struct llama_context * ctx,
+        const struct llama_hard_memory_query_request * query,
+        struct llama_hard_memory_result * out_result) {
+    return ctx && query && out_result && ctx->hard_memory_query(*query, out_result) ? 0 : -1;
+}
+
+int32_t llama_hard_memory_get_last_result(
+        const struct llama_context * ctx,
+        struct llama_hard_memory_result * out_result) {
+    return ctx && out_result && ctx->hard_memory_get_last_result(out_result) ? 0 : -1;
+}
+
+int32_t llama_hard_memory_get_last_archive_trace(
+        const struct llama_context * ctx,
+        struct llama_hard_memory_archive_trace * out_trace) {
+    return ctx && out_trace && ctx->hard_memory_get_last_archive_trace(out_trace) ? 0 : -1;
 }

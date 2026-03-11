@@ -172,6 +172,8 @@ private:
     float social_familiarity = 0.0f;
     float social_trust = 0.5f;
     float social_reciprocity = 0.5f;
+    float social_recent_user_valence = 0.0f;
+    float social_dissatisfaction = 0.0f;
     std::vector<llama_self_sketch_surface> goals;
     std::vector<llama_self_sketch_surface> commitments;
     std::vector<llama_self_working_memory_item> working_memory;

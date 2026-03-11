@@ -260,6 +260,8 @@ llama_build_and_test(test-active-lora.cpp       LABEL "model" ARGS "${MODEL_DEST
 set_tests_properties(test-active-lora PROPERTIES FIXTURES_REQUIRED test-download-model)
 llama_build_and_test(test-self-state.cpp        LABEL "model" ARGS "${MODEL_DEST}")
 set_tests_properties(test-self-state PROPERTIES FIXTURES_REQUIRED test-download-model)
+llama_build_and_test(test-cognitive-loop.cpp    LABEL "model" ARGS "${MODEL_DEST}")
+set_tests_properties(test-cognitive-loop PROPERTIES FIXTURES_REQUIRED test-download-model)
 llama_build_and_test(test-serving-lora-stack.cpp LABEL "model" ARGS "${MODEL_DEST}")
 target_include_directories(test-serving-lora-stack PRIVATE ${PROJECT_SOURCE_DIR}/src)
 set_tests_properties(test-serving-lora-stack PROPERTIES FIXTURES_REQUIRED test-download-model)

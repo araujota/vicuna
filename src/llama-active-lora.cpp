@@ -32,6 +32,10 @@ constexpr uint32_t YEAR_TO_ALL_TIME_JOB = 4;
 constexpr size_t PAST_BUCKET_COUNT = LLAMA_MEMORY_LORA_BUCKET_COUNT;
 constexpr float DIRECTION_EPS = 1.0e-8f;
 
+static float clamp_unit(float value) {
+    return std::min(1.0f, std::max(0.0f, value));
+}
+
 const char * past_bucket_name(size_t bucket) {
     switch (bucket) {
         case LLAMA_MEMORY_LORA_BUCKET_PAST_WEEK:    return "past_week";
@@ -853,13 +857,21 @@ struct llama_active_lora_manager::impl {
         owner.attach_adapter_runtime(adapter_ptr, scale, role);
     }
 
-    bool train_on_span(const active_lora_embedding & embedding, const llama_token * tokens, size_t n_tokens) const {
+    bool train_on_span(
+            const active_lora_embedding & embedding,
+            const llama_token * tokens,
+            size_t n_tokens,
+            float budget_scale) const {
         if (embedding.values.empty() || n_tokens == 0 || !adapter) {
             return false;
         }
 
         const float token_scale = 1.0f / std::max<size_t>(1, n_tokens);
-        const float update_scale = params.learning_rate > 0.0f ? params.learning_rate : 1.0e-4f;
+        const float base_scale = params.learning_rate > 0.0f ? params.learning_rate : 1.0e-4f;
+        const float update_scale = base_scale * clamp_unit(budget_scale);
+        if (update_scale <= 0.0f) {
+            return false;
+        }
 
         for (auto & it : adapter->ab_map) {
             ggml_tensor * tensor_a = it.second.a;
@@ -1216,7 +1228,7 @@ bool llama_active_lora_manager::ingest(const llama_token * tokens, size_t n_toke
         return true;
     }
 
-    if (!pimpl->train_on_span(embedding, tokens, n_tokens)) {
+    if (!pimpl->train_on_span(embedding, tokens, n_tokens, 1.0f)) {
         return false;
     }
 
@@ -1230,6 +1242,30 @@ bool llama_active_lora_manager::ingest(const llama_token * tokens, size_t n_toke
 
     LLAMA_LOG_INFO("%s: Active LoRA write accepted (%zu tokens, update=%u, rollover_ready=%s)\n",
             __func__, n_tokens, pimpl->stats.updates_applied, pimpl->stats.rollover_ready ? "true" : "false");
+
+    return true;
+}
+
+bool llama_active_lora_manager::remediate(const llama_token * tokens, size_t n_tokens, float budget_scale) {
+    if (!pimpl->initialized || !tokens || n_tokens == 0) {
+        return false;
+    }
+
+    const active_lora_embedding embedding = pimpl->embedder->embed(tokens, n_tokens);
+    if (!pimpl->train_on_span(embedding, tokens, n_tokens, budget_scale)) {
+        return false;
+    }
+
+    pimpl->last_embedding = embedding;
+    pimpl->stats.updates_applied++;
+    pimpl->stats.tokens_ingested += n_tokens;
+    pimpl->updates_seen++;
+    pimpl->stats.rollover_ready = pimpl->updates_seen >= pimpl->params.max_updates_before_rollover;
+    pimpl->active_last_update_us = llama_time_us();
+    pimpl->update_active_gain_stats();
+
+    LLAMA_LOG_INFO("%s: Active LoRA remediation applied (%zu tokens, budget=%.3f, update=%u)\n",
+            __func__, n_tokens, budget_scale, pimpl->stats.updates_applied);
 
     return true;
 }

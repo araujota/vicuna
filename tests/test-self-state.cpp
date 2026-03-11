@@ -1,11 +1,19 @@
 #include "get-model.h"
 #include "llama.h"
 
+#include <cpp-httplib/httplib.h>
+#include <nlohmann/json.hpp>
+
+#include <atomic>
 #include <array>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
+
+using json = nlohmann::json;
 
 static std::vector<llama_token> tokenize_or_die(const llama_vocab * vocab, const std::string & text) {
     const int count = -llama_tokenize(vocab, text.c_str(), text.size(), nullptr, 0, true, true);
@@ -71,6 +79,86 @@ static void configure_small_buckets(llama_past_lora_params & params) {
     }
 }
 
+struct mock_supermemory_server {
+    httplib::Server server;
+    std::thread thread;
+    std::mutex mutex;
+    std::atomic<int> profile_calls = 0;
+    std::atomic<int> archive_calls = 0;
+    std::string last_profile_body;
+    std::string last_archive_body;
+    int port = -1;
+
+    bool start() {
+        server.Post("/v4/profile", [this](const httplib::Request & req, httplib::Response & res) {
+            ++profile_calls;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                last_profile_body = req.body;
+            }
+            res.status = 200;
+            res.set_content(json({
+                {"profile", {
+                    {"static", json::array({"Prefers explicit runtime policy", "Uses hard memory"})},
+                    {"dynamic", json::array({"Recently perturbed by contradiction-heavy prompts"})},
+                }},
+                {"searchResults", {
+                    {"results", json::array({
+                        {
+                            {"id", "mem_alpha"},
+                            {"memory", "Earlier repair attempt referenced the strict memory runtime."},
+                            {"similarity", 0.91},
+                            {"title", "repair-memory"},
+                        },
+                        {
+                            {"id", "chunk_beta"},
+                            {"chunk", "Older context from last week favored a narrower repository query."},
+                            {"similarity", 0.83},
+                            {"title", "last-week-query"},
+                        }
+                    })}
+                }}
+            }).dump(), "application/json");
+        });
+
+        server.Post("/v4/memories", [this](const httplib::Request & req, httplib::Response & res) {
+            ++archive_calls;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                last_archive_body = req.body;
+            }
+            res.status = 201;
+            res.set_content(json({
+                {"documentId", "doc_delta"},
+                {"memories", json::array({
+                    json({
+                        {"id", "mem_delta"},
+                        {"memory", "archived perturbation"},
+                        {"isStatic", false}
+                    })
+                })}
+            }).dump(), "application/json");
+        });
+
+        port = server.bind_to_any_port("127.0.0.1");
+        if (port <= 0) {
+            return false;
+        }
+
+        thread = std::thread([this]() {
+            server.listen_after_bind();
+        });
+        return true;
+    }
+
+    void stop() {
+        server.stop();
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+};
+
 int main(int argc, char ** argv) {
     char * model_path = get_model_or_exit(argc, argv);
 
@@ -97,7 +185,6 @@ int main(int argc, char ** argv) {
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
-
     if (llama_self_state_register_count(ctx) != LLAMA_SELF_REGISTER_COUNT) {
         std::fprintf(stderr, "unexpected self-state register count\n");
         llama_free(ctx);
@@ -472,6 +559,12 @@ int main(int argc, char ** argv) {
     program.broadcast_social_weight = 0.05f;
     program.broadcast_contradiction_weight = 0.45f;
     program.broadcast_goal_weight = 0.25f;
+    program.repair_emit_threshold = 0.58f;
+    program.repair_dissatisfaction_floor = 0.32f;
+    program.repair_recent_user_valence_floor = 0.18f;
+    program.repair_inhibition_max = 0.74f;
+    program.repair_admission_floor = 0.28f;
+    program.repair_admission_weight = 0.41f;
     if (program.rule_count == 0) {
         std::fprintf(stderr, "default updater program is missing register rules\n");
         llama_free(ctx);
@@ -509,6 +602,12 @@ int main(int argc, char ** argv) {
         program_roundtrip.version != 2 ||
         program_roundtrip.rule_count == 0 ||
         program_roundtrip.rules[0].phase_mask == 0 ||
+        program_roundtrip.repair_emit_threshold != program.repair_emit_threshold ||
+        program_roundtrip.repair_dissatisfaction_floor != program.repair_dissatisfaction_floor ||
+        program_roundtrip.repair_recent_user_valence_floor != program.repair_recent_user_valence_floor ||
+        program_roundtrip.repair_inhibition_max != program.repair_inhibition_max ||
+        program_roundtrip.repair_admission_floor != program.repair_admission_floor ||
+        program_roundtrip.repair_admission_weight != program.repair_admission_weight ||
         llama_self_state_evaluate_counterfactual(ctx, program, -1, &counterfactual) != 0 ||
         counterfactual.updater_version != 2 ||
         counterfactual.replay_channel != LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL ||
@@ -573,6 +672,169 @@ int main(int argc, char ** argv) {
     }
 
     llama_free(imported_ctx);
+
+    {
+        mock_supermemory_server mock_server;
+        if (!mock_server.start()) {
+            std::fprintf(stderr, "failed to start mock hard-memory server\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_context * hard_memory_ctx = llama_init_from_model(model, cparams);
+        if (!hard_memory_ctx) {
+            std::fprintf(stderr, "failed to create hard-memory context\n");
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_hard_memory_config hard_memory = llama_hard_memory_default_config();
+        hard_memory.enabled = true;
+        hard_memory.archive_enabled = true;
+        hard_memory.include_profile_by_default = true;
+        hard_memory.max_results = 2;
+        hard_memory.query_threshold = 0.33f;
+        hard_memory.archival_delta_threshold = 0.05f;
+        std::snprintf(hard_memory.base_url, sizeof(hard_memory.base_url), "http://127.0.0.1:%d", mock_server.port);
+        std::snprintf(hard_memory.auth_token, sizeof(hard_memory.auth_token), "%s", "sm_test_token");
+        std::snprintf(hard_memory.container_tag, sizeof(hard_memory.container_tag), "%s", "vicuna-self-state");
+        std::snprintf(hard_memory.runtime_identity, sizeof(hard_memory.runtime_identity), "%s", "vicuna-tests");
+
+        if (llama_hard_memory_configure(hard_memory_ctx, hard_memory) != 0) {
+            std::fprintf(stderr, "failed to configure hard memory\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_hard_memory_query_request hard_memory_query_req = {};
+        hard_memory_query_req.include_profile = true;
+        hard_memory_query_req.limit = 2;
+        hard_memory_query_req.threshold = 0.40f;
+        std::snprintf(hard_memory_query_req.query, sizeof(hard_memory_query_req.query), "%s", "strict memory runtime");
+
+        llama_hard_memory_result hard_memory_result = {};
+        if (llama_hard_memory_query(hard_memory_ctx, &hard_memory_query_req, &hard_memory_result) != 0 ||
+            !hard_memory_result.ok ||
+            hard_memory_result.result_count != 2 ||
+            std::string(hard_memory_result.results[0].id).empty() ||
+            std::string(hard_memory_result.profile_static).find("explicit runtime policy") == std::string::npos ||
+            std::string(hard_memory_result.effective_container_tag) != "vicuna-self-state" ||
+            hard_memory_result.tool_kind != LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
+            std::fprintf(stderr, "hard-memory query did not return bounded typed results\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_hard_memory_result last_result = {};
+        if (llama_hard_memory_get_last_result(hard_memory_ctx, &last_result) != 0 ||
+            last_result.result_count != hard_memory_result.result_count) {
+            std::fprintf(stderr, "hard-memory last-result surface was not preserved\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> delta_tokens = tokenize_or_die(vocab, "This was wrong, frustrating, and probably contradicted the earlier plan.");
+        llama_self_state_event delta_event = {
+            /*.tokens =*/ delta_tokens.data(),
+            /*.n_tokens =*/ delta_tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
+            /*.decoder_entropy =*/ 1.5f,
+            /*.decoder_top_margin =*/ 0.05f,
+        };
+        llama_self_state_feature_vector delta_pre = {};
+        llama_self_state_feature_vector delta_post = {};
+        if (llama_self_state_build_prewrite_features(hard_memory_ctx, &delta_event, &delta_pre) != 0 ||
+            llama_self_state_apply_prewrite(hard_memory_ctx, &delta_event, &delta_pre) != 0 ||
+            llama_self_state_build_postwrite_features(hard_memory_ctx, &delta_event, &delta_post) != 0 ||
+            llama_self_state_apply_postwrite(hard_memory_ctx, &delta_event, &delta_post) != 0) {
+            std::fprintf(stderr, "failed to drive hard-memory archival event\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_hard_memory_archive_trace archive_trace = {};
+        if (llama_hard_memory_get_last_archive_trace(hard_memory_ctx, &archive_trace) != 0 ||
+            !archive_trace.archived ||
+            archive_trace.delta.total_delta < hard_memory.archival_delta_threshold ||
+            archive_trace.delta.dimension_count <= 0 ||
+            std::string(archive_trace.container_tag) != "vicuna-self-state" ||
+            std::string(archive_trace.content_excerpt).find("frustrating") == std::string::npos ||
+            mock_server.archive_calls.load() != 1) {
+            std::fprintf(stderr, "hard-memory archival did not persist above-threshold delta context\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::string archive_body = [&]() {
+            std::lock_guard<std::mutex> lock(mock_server.mutex);
+            return mock_server.last_archive_body;
+        }();
+        if (archive_body.find("\"runtimeIdentity\":\"vicuna-tests\"") == std::string::npos ||
+            archive_body.find("\"containerTag\":\"vicuna-self-state\"") == std::string::npos) {
+            std::fprintf(stderr, "hard-memory archival did not preserve self-host routing metadata\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        hard_memory.archival_delta_threshold = 10.0f;
+        if (llama_hard_memory_configure(hard_memory_ctx, hard_memory) != 0) {
+            std::fprintf(stderr, "failed to raise hard-memory archival threshold\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> mild_tokens = tokenize_or_die(vocab, "A mild follow-up.");
+        llama_self_state_event mild_event = {
+            /*.tokens =*/ mild_tokens.data(),
+            /*.n_tokens =*/ mild_tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
+            /*.decoder_entropy =*/ 0.1f,
+            /*.decoder_top_margin =*/ 0.9f,
+        };
+        if (llama_self_state_build_prewrite_features(hard_memory_ctx, &mild_event, &delta_pre) != 0 ||
+            llama_self_state_apply_prewrite(hard_memory_ctx, &mild_event, &delta_pre) != 0 ||
+            llama_self_state_build_postwrite_features(hard_memory_ctx, &mild_event, &delta_post) != 0 ||
+            llama_self_state_apply_postwrite(hard_memory_ctx, &mild_event, &delta_post) != 0 ||
+            mock_server.archive_calls.load() != 1) {
+            std::fprintf(stderr, "hard-memory archival threshold did not suppress low-perturbation writes\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(hard_memory_ctx);
+        mock_server.stop();
+    }
 
     if (llama_self_state_clear_trace(ctx) != 0 ||
         llama_self_state_trace_count(ctx) != 0) {

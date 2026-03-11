@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <filesystem>
 
@@ -770,6 +772,53 @@ private:
             }
         }
 
+        {
+            const char * hard_memory_url = getenv("VICUNA_HARD_MEMORY_URL");
+            const char * hard_memory_token = getenv("VICUNA_HARD_MEMORY_TOKEN");
+            const char * hard_memory_tag = getenv("VICUNA_HARD_MEMORY_CONTAINER_TAG");
+            const char * hard_memory_runtime = getenv("VICUNA_HARD_MEMORY_RUNTIME_ID");
+            const char * hard_memory_threshold = getenv("VICUNA_HARD_MEMORY_ARCHIVAL_DELTA_THRESHOLD");
+            const char * hard_memory_query_threshold = getenv("VICUNA_HARD_MEMORY_QUERY_THRESHOLD");
+            const char * hard_memory_timeout = getenv("VICUNA_HARD_MEMORY_TIMEOUT_MS");
+            const char * hard_memory_results = getenv("VICUNA_HARD_MEMORY_MAX_RESULTS");
+
+            if (hard_memory_url && hard_memory_token) {
+                llama_hard_memory_config hard_memory = llama_hard_memory_default_config();
+                hard_memory.enabled = true;
+                std::snprintf(hard_memory.base_url, sizeof(hard_memory.base_url), "%s", hard_memory_url);
+                std::snprintf(hard_memory.auth_token, sizeof(hard_memory.auth_token), "%s", hard_memory_token);
+                if (hard_memory_tag) {
+                    std::snprintf(hard_memory.container_tag, sizeof(hard_memory.container_tag), "%s", hard_memory_tag);
+                }
+                if (hard_memory_runtime) {
+                    std::snprintf(hard_memory.runtime_identity, sizeof(hard_memory.runtime_identity), "%s", hard_memory_runtime);
+                } else {
+                    std::snprintf(hard_memory.runtime_identity, sizeof(hard_memory.runtime_identity), "%s", "vicuna-server");
+                }
+                if (hard_memory_threshold) {
+                    hard_memory.archival_delta_threshold = std::max(0.0f, (float) std::atof(hard_memory_threshold));
+                }
+                if (hard_memory_query_threshold) {
+                    hard_memory.query_threshold = std::max(0.0f, (float) std::atof(hard_memory_query_threshold));
+                }
+                if (hard_memory_timeout) {
+                    hard_memory.timeout_ms = std::max(100, std::atoi(hard_memory_timeout));
+                }
+                if (hard_memory_results) {
+                    hard_memory.max_results = std::max(1, std::atoi(hard_memory_results));
+                }
+
+                if (llama_hard_memory_configure(ctx, hard_memory) == 0) {
+                    SRV_INF("hard memory enabled: url=%s container=%s runtime=%s\n",
+                            hard_memory.base_url,
+                            hard_memory.container_tag,
+                            hard_memory.runtime_identity);
+                } else {
+                    SRV_WRN("%s\n", "failed to configure hard memory");
+                }
+            }
+        }
+
         if (llama_model_n_swa(model) == 0) {
             if (params_base.swa_full) {
                 params_base.swa_full = false;
@@ -1187,6 +1236,27 @@ private:
 
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
+        {
+            const llama_tokens & text_tokens = task.tokens.get_text_tokens();
+            const llama_self_state_event loop_event = {
+                /*.tokens =*/ text_tokens.empty() ? nullptr : text_tokens.data(),
+                /*.n_tokens =*/ text_tokens.size(),
+                /*.role =*/ task.foreground_role,
+                /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+                /*.flags =*/ task.foreground_flags,
+                /*.decoder_entropy =*/ 0.0f,
+                /*.decoder_top_margin =*/ 1.0f,
+            };
+            task.has_active_trace = llama_active_loop_process(ctx, &loop_event, &task.active_trace) == 0;
+            if (task.has_active_trace) {
+                SLT_INF(slot, "active loop episode %d winner=%d score=%.3f deferred_background=%d\n",
+                        task.active_trace.episode_id,
+                        task.active_trace.winner_action,
+                        task.active_trace.winner_score,
+                        task.active_trace.deferred_background ? 1 : 0);
+            }
+        }
+
         // initialize samplers
         if (task.need_sampling()) {
             slot.smpl.reset(common_sampler_init(model, task.params.sampling));
@@ -1545,6 +1615,10 @@ private:
         }
 
         res->generation_params = slot.task->params; // copy the parameters
+
+        if (slot.task->has_active_trace && slot.n_sent_text > 0) {
+            (void) llama_active_loop_note_emit(ctx, slot.task->active_trace.episode_id, slot.n_sent_text);
+        }
 
         queue_results.send(std::move(res));
     }
@@ -1999,11 +2073,21 @@ private:
             }
 
             if (all_idle) {
+                llama_dmn_tick_trace dmn_trace = {};
+                if (llama_dmn_tick(ctx, ggml_time_us(), &dmn_trace) == 0 && dmn_trace.admitted) {
+                    SRV_INF("dmn tick %d winner=%d score=%.3f burst=%d\n",
+                            dmn_trace.tick_id,
+                            dmn_trace.winner_action,
+                            dmn_trace.winner_score,
+                            dmn_trace.burst_count);
+                }
                 SRV_INF("%s", "all slots are idle\n");
 
                 return;
             }
         }
+
+        (void) llama_dmn_defer(ctx, ggml_time_us(), nullptr);
 
         {
             SRV_DBG("%s", "posting NEXT_RESPONSE\n");
@@ -3166,6 +3250,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->slot_n_ctx,
                     data);
+            task.foreground_role = classify_foreground_role(data);
+            if (task.foreground_role == LLAMA_SELF_STATE_EVENT_TOOL) {
+                task.foreground_flags |= LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED;
+            }
             task.id_slot = json_value(data, "id_slot", -1);
 
             // OAI-compat

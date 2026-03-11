@@ -4,6 +4,8 @@
 #include "llama-arch.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-cognitive-loop.h"
+#include "llama-hard-memory.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -36,6 +38,8 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
     self_state = std::make_unique<llama_self_state>();
+    cognitive_loop = std::make_unique<llama_cognitive_loop>(*this);
+    hard_memory = std::make_unique<llama_hard_memory>();
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -1175,6 +1179,10 @@ bool llama_context::active_lora_init(const llama_active_lora_params & params) {
 
 bool llama_context::active_lora_ingest(const llama_token * tokens, size_t n_tokens) {
     return active_lora_manager && active_lora_manager->ingest(tokens, n_tokens);
+}
+
+bool llama_context::active_lora_remediate(const llama_token * tokens, size_t n_tokens, float budget_scale) {
+    return active_lora_manager && active_lora_manager->remediate(tokens, n_tokens, budget_scale);
 }
 
 bool llama_context::active_lora_get_stats(llama_active_lora_stats * out_stats) const {

@@ -15,9 +15,11 @@ add_library(llama
             llama-batch.cpp
             llama-chat.cpp
             llama-context.cpp
+            llama-cognitive-loop.cpp
             llama-cparams.cpp
             llama-grammar.cpp
             llama-graph.cpp
+            llama-hard-memory.cpp
             llama-hparams.cpp
             llama-impl.cpp
             llama-io.cpp
@@ -158,11 +160,12 @@ set_target_properties(llama PROPERTIES
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
-target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE . ../vendor)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+target_link_libraries(llama PRIVATE cpp-httplib)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

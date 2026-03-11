@@ -16,6 +16,8 @@ struct llama_model;
 class llama_batch_allocr;
 class llama_active_lora_manager;
 class llama_self_state;
+class llama_cognitive_loop;
+class llama_hard_memory;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -120,6 +122,7 @@ struct llama_context {
 
     bool active_lora_init(const llama_active_lora_params & params);
     bool active_lora_ingest(const llama_token * tokens, size_t n_tokens);
+    bool active_lora_remediate(const llama_token * tokens, size_t n_tokens, float budget_scale);
     bool active_lora_get_stats(llama_active_lora_stats * out_stats) const;
     bool past_lora_init(const llama_past_lora_params & params);
     bool past_lora_tick(uint64_t now_us);
@@ -164,6 +167,22 @@ struct llama_context {
     bool self_state_apply_prewrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
     bool self_state_build_postwrite_features(const llama_self_state_event & event, llama_self_state_feature_vector * out_features) const;
     bool self_state_apply_postwrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
+    bool hard_memory_configure(const llama_hard_memory_config & config);
+    bool hard_memory_get_config(llama_hard_memory_config * out_config) const;
+    bool hard_memory_query(const llama_hard_memory_query_request & query, llama_hard_memory_result * out_result);
+    bool hard_memory_get_last_result(llama_hard_memory_result * out_result) const;
+    bool hard_memory_get_last_archive_trace(llama_hard_memory_archive_trace * out_trace) const;
+    bool active_loop_process(const llama_self_state_event & event, llama_active_loop_trace * out_trace);
+    bool active_loop_note_emit(int32_t episode_id, size_t emitted_text_bytes);
+    bool active_loop_get_last_trace(llama_active_loop_trace * out_trace) const;
+    bool dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_trace);
+    bool dmn_defer(uint64_t now_us, llama_dmn_tick_trace * out_trace);
+    bool dmn_get_last_trace(llama_dmn_tick_trace * out_trace) const;
+    bool cognitive_host_state(llama_cognitive_host_state * out_state) const;
+    bool favorable_state_get(llama_favorable_state_profile * out_profile) const;
+    bool counterfactual_get_last_trace(llama_counterfactual_trace * out_trace) const;
+    bool remediation_get_last_plan(llama_remediation_plan * out_plan) const;
+    bool governance_get_last_trace(llama_governance_trace * out_trace) const;
 
     void attach_adapter_runtime(llama_adapter_lora * adapter, float scale, llama_adapter_lora_layer_role role);
     void detach_adapter_runtime(llama_adapter_lora * adapter);
@@ -381,6 +400,8 @@ private:
 
     std::unique_ptr<llama_active_lora_manager> active_lora_manager;
     std::unique_ptr<llama_self_state> self_state;
+    std::unique_ptr<llama_cognitive_loop> cognitive_loop;
+    std::unique_ptr<llama_hard_memory> hard_memory;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

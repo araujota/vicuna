@@ -144,6 +144,10 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;
+    int32_t foreground_role = LLAMA_SELF_STATE_EVENT_USER;
+    uint32_t foreground_flags = 0;
+    llama_active_loop_trace active_trace = {};
+    bool has_active_trace = false;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -231,6 +235,8 @@ struct server_task {
         copy.params    = params;
         copy.type      = type;
         copy.tokens    = tokens.clone();
+        copy.foreground_role = foreground_role;
+        copy.foreground_flags = foreground_flags;
         copy.id_slot   = -1; // child tasks cannot specify slot
 
         // use different sampling seed for each child
