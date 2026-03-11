@@ -429,6 +429,16 @@ extern "C" {
         LLAMA_MEMORY_LORA_BUCKET_COUNT        = 5,
     };
 
+    enum llama_serving_lora_layer_role {
+        LLAMA_SERVING_LORA_LAYER_REQUEST      = 0,
+        LLAMA_SERVING_LORA_LAYER_ALL_TIME     = 1,
+        LLAMA_SERVING_LORA_LAYER_PAST_YEAR    = 2,
+        LLAMA_SERVING_LORA_LAYER_PAST_QUARTER = 3,
+        LLAMA_SERVING_LORA_LAYER_PAST_MONTH   = 4,
+        LLAMA_SERVING_LORA_LAYER_PAST_WEEK    = 5,
+        LLAMA_SERVING_LORA_LAYER_ACTIVE       = 6,
+    };
+
     typedef bool (*llama_active_lora_embedding_callback)(
             const struct llama_context * ctx,
             const llama_token * tokens,
@@ -512,6 +522,322 @@ extern "C" {
         struct llama_past_lora_bucket_stats buckets[LLAMA_MEMORY_LORA_BUCKET_COUNT];
     };
 
+    struct llama_serving_lora_layer_info {
+        float   scale;
+        int32_t precedence;
+        int32_t role;
+    };
+
+    enum llama_self_register_family {
+        LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR = 0,
+        LLAMA_SELF_REGISTER_FAMILY_SIGNED_SCALAR  = 1,
+        LLAMA_SELF_REGISTER_FAMILY_CATEGORICAL    = 2,
+    };
+
+    enum llama_self_register_id {
+        LLAMA_SELF_REGISTER_UNCERTAINTY = 0,
+        LLAMA_SELF_REGISTER_CONTRADICTION,
+        LLAMA_SELF_REGISTER_NOVELTY,
+        LLAMA_SELF_REGISTER_TOPIC_SHIFT,
+        LLAMA_SELF_REGISTER_GOAL_RELEVANCE,
+        LLAMA_SELF_REGISTER_SELF_RELEVANCE,
+        LLAMA_SELF_REGISTER_SOCIAL_RELEVANCE,
+        LLAMA_SELF_REGISTER_AFFORDANCE,
+        LLAMA_SELF_REGISTER_BROADCAST_PRESSURE,
+        LLAMA_SELF_REGISTER_BROADCAST_INHIBITION,
+        LLAMA_SELF_REGISTER_FOLLOWUP_CONTINUATION,
+        LLAMA_SELF_REGISTER_MEMORY_WRITE_PRIORITY,
+        LLAMA_SELF_REGISTER_TIME_PHASE,
+        LLAMA_SELF_REGISTER_TOOL_SALIENCE,
+        LLAMA_SELF_REGISTER_CHANNEL_STATE,
+        LLAMA_SELF_REGISTER_COUNT,
+    };
+
+    enum llama_self_state_channel_state {
+        LLAMA_SELF_STATE_CHANNEL_WAITING          = 0,
+        LLAMA_SELF_STATE_CHANNEL_ACTIVE           = 1,
+        LLAMA_SELF_STATE_CHANNEL_DO_NOT_INTERRUPT = 2,
+    };
+
+    enum llama_self_state_event_role {
+        LLAMA_SELF_STATE_EVENT_USER   = 0,
+        LLAMA_SELF_STATE_EVENT_TOOL   = 1,
+        LLAMA_SELF_STATE_EVENT_SYSTEM = 2,
+    };
+
+    enum llama_self_state_event_channel {
+        LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY        = 0,
+        LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL = 1,
+    };
+
+    enum llama_self_state_source_flags {
+        LLAMA_SELF_SOURCE_INIT          = 1u << 0,
+        LLAMA_SELF_SOURCE_TIME          = 1u << 1,
+        LLAMA_SELF_SOURCE_USER_EVENT    = 1u << 2,
+        LLAMA_SELF_SOURCE_TOOL_EVENT    = 1u << 3,
+        LLAMA_SELF_SOURCE_EMIT_EVENT    = 1u << 4,
+        LLAMA_SELF_SOURCE_CHANNEL       = 1u << 5,
+        LLAMA_SELF_SOURCE_EXTERNAL_TIME = 1u << 6,
+        LLAMA_SELF_SOURCE_COUNTERFACTUAL = 1u << 7,
+    };
+
+    enum llama_self_state_event_flags {
+        LLAMA_SELF_STATE_EVENT_ADMITTED       = 1u << 0,
+        LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED = 1u << 1,
+        LLAMA_SELF_STATE_EVENT_TOOL_FAILED    = 1u << 2,
+        LLAMA_SELF_STATE_EVENT_EMIT_FOLLOWUP  = 1u << 3,
+    };
+
+    enum llama_self_tool_job_status {
+        LLAMA_SELF_TOOL_JOB_IDLE      = 0,
+        LLAMA_SELF_TOOL_JOB_PENDING   = 1,
+        LLAMA_SELF_TOOL_JOB_RUNNING   = 2,
+        LLAMA_SELF_TOOL_JOB_COMPLETED = 3,
+        LLAMA_SELF_TOOL_JOB_FAILED    = 4,
+    };
+
+    enum llama_self_memory_handle_kind {
+        LLAMA_SELF_MEMORY_HANDLE_WORKING_MEMORY_CLUSTER = 0,
+        LLAMA_SELF_MEMORY_HANDLE_FROZEN_BUCKET          = 1,
+        LLAMA_SELF_MEMORY_HANDLE_ACTIVE_MEMORY          = 2,
+        LLAMA_SELF_MEMORY_HANDLE_EXTERNAL               = 3,
+    };
+
+    enum llama_self_updater_phase_mask {
+        LLAMA_SELF_UPDATER_PHASE_PREWRITE  = 1u << 0,
+        LLAMA_SELF_UPDATER_PHASE_POSTWRITE = 1u << 1,
+    };
+
+    enum llama_self_updater_feature_id {
+        LLAMA_SELF_UPDATER_FEATURE_NONE = -1,
+        LLAMA_SELF_UPDATER_FEATURE_NOVELTY = 0,
+        LLAMA_SELF_UPDATER_FEATURE_TOPIC_SHIFT = 1,
+        LLAMA_SELF_UPDATER_FEATURE_GOAL_SIMILARITY = 2,
+        LLAMA_SELF_UPDATER_FEATURE_COMMITMENT_SIMILARITY = 3,
+        LLAMA_SELF_UPDATER_FEATURE_IDENTITY_SIMILARITY = 4,
+        LLAMA_SELF_UPDATER_FEATURE_SELF_REFERENCE = 5,
+        LLAMA_SELF_UPDATER_FEATURE_NEGATION_RATIO = 6,
+        LLAMA_SELF_UPDATER_FEATURE_UNCERTAINTY_LEXICAL = 7,
+        LLAMA_SELF_UPDATER_FEATURE_ERROR_RATIO = 8,
+        LLAMA_SELF_UPDATER_FEATURE_RECENCY_USER = 9,
+        LLAMA_SELF_UPDATER_FEATURE_RECENCY_TOOL = 10,
+        LLAMA_SELF_UPDATER_FEATURE_RECENCY_EMIT = 11,
+        LLAMA_SELF_UPDATER_FEATURE_SOCIAL_FAMILIARITY = 12,
+        LLAMA_SELF_UPDATER_FEATURE_SOCIAL_TRUST = 13,
+        LLAMA_SELF_UPDATER_FEATURE_SOCIAL_RECIPROCITY = 14,
+        LLAMA_SELF_UPDATER_FEATURE_SOCIAL_BOND = 15,
+        LLAMA_SELF_UPDATER_FEATURE_TOOL_READINESS = 16,
+        LLAMA_SELF_UPDATER_FEATURE_TOOL_PENDING_PRESSURE = 17,
+        LLAMA_SELF_UPDATER_FEATURE_DECODER_ENTROPY = 18,
+        LLAMA_SELF_UPDATER_FEATURE_DECODER_TOP_MARGIN = 19,
+        LLAMA_SELF_UPDATER_FEATURE_CONTRADICTION = 20,
+        LLAMA_SELF_UPDATER_FEATURE_UNCERTAINTY = 21,
+        LLAMA_SELF_UPDATER_FEATURE_MEMORY_WRITE_PRESSURE = 22,
+        LLAMA_SELF_UPDATER_FEATURE_BROADCAST_PRESSURE_HINT = 23,
+        LLAMA_SELF_UPDATER_FEATURE_BROADCAST_INHIBITION_HINT = 24,
+        LLAMA_SELF_UPDATER_FEATURE_FOLLOWUP_HINT = 25,
+        LLAMA_SELF_UPDATER_FEATURE_EVENT_ROLE_USER = 26,
+        LLAMA_SELF_UPDATER_FEATURE_EVENT_ROLE_TOOL = 27,
+        LLAMA_SELF_UPDATER_FEATURE_EVENT_ROLE_SYSTEM = 28,
+        LLAMA_SELF_UPDATER_FEATURE_EVENT_CHANNEL_PRIMARY = 29,
+        LLAMA_SELF_UPDATER_FEATURE_EVENT_CHANNEL_COUNTERFACTUAL = 30,
+        LLAMA_SELF_UPDATER_FEATURE_EVENT_ADMITTED = 31,
+        LLAMA_SELF_UPDATER_FEATURE_EVENT_TOOL_FAILED = 32,
+        LLAMA_SELF_UPDATER_FEATURE_EVENT_TOOL_COMPLETED = 33,
+    };
+
+    enum {
+        LLAMA_SELF_MAX_UPDATER_RULE_TERMS = 8,
+        LLAMA_SELF_MAX_UPDATER_RULE_SOURCE_REGISTERS = 4,
+        LLAMA_SELF_MAX_UPDATER_RULES = 16,
+    };
+
+    struct llama_self_state_time_point {
+        int64_t wall_clock_ms;
+        int64_t monotonic_ms;
+        int32_t timezone_offset_minutes;
+    };
+
+    struct llama_self_state_datetime {
+        int64_t wall_clock_ms;
+        int64_t monotonic_ms;
+        int32_t timezone_offset_minutes;
+        int32_t local_year;
+        int32_t local_month;
+        int32_t local_day;
+        int32_t local_hour;
+        int32_t local_minute;
+        int32_t local_second;
+        int32_t day_of_week;
+        int32_t day_of_year;
+        float   hour_sin;
+        float   hour_cos;
+        float   weekday_sin;
+        float   weekday_cos;
+        float   year_day_sin;
+        float   year_day_cos;
+        int64_t delta_since_last_user_ms;
+        int64_t delta_since_last_tool_event_ms;
+        int64_t delta_since_last_emit_ms;
+        int64_t session_age_ms;
+    };
+
+    struct llama_self_register_info {
+        int32_t  register_id;
+        int32_t  family;
+        float    scalar_value;
+        int32_t  categorical_value;
+        float    value_min;
+        float    value_max;
+        float    confidence;
+        int64_t  last_update_wall_ms;
+        int64_t  last_update_monotonic_ms;
+        uint32_t source_mask;
+        uint32_t updater_version;
+        bool     dirty;
+    };
+
+    struct llama_self_state_event {
+        const llama_token * tokens;
+        size_t   n_tokens;
+        int32_t  role;
+        int32_t  channel;
+        uint32_t flags;
+        float    decoder_entropy;
+        float    decoder_top_margin;
+    };
+
+    struct llama_self_state_feature_vector {
+        float token_count_log;
+        float unique_token_ratio;
+        float novelty;
+        float topic_shift;
+        float working_memory_top_similarity;
+        float working_memory_similarity_variance;
+        float memory_handle_top_similarity;
+        float memory_handle_similarity_variance;
+        float goal_top_similarity;
+        float commitment_top_similarity;
+        float identity_similarity;
+        float self_reference_ratio;
+        float negation_ratio;
+        float uncertainty_lexical_ratio;
+        float error_ratio;
+        float recency_user;
+        float recency_tool;
+        float recency_emit;
+        float social_familiarity;
+        float social_trust;
+        float social_reciprocity;
+        float social_bond_strength;
+        float tool_readiness_score;
+        float tool_pending_pressure;
+        float decoder_entropy;
+        float decoder_top_margin;
+        float contradiction_score;
+        float uncertainty_score;
+        float memory_write_pressure;
+        float broadcast_pressure_hint;
+        float broadcast_inhibition_hint;
+        float followup_hint;
+    };
+
+    typedef bool (*llama_self_state_head_callback)(
+            const struct llama_self_state_feature_vector * features,
+            float * out_score,
+            void * user_data);
+
+    struct llama_self_state_params {
+        bool enable_learned_contradiction_head;
+        bool enable_learned_uncertainty_head;
+        bool enable_learned_broadcast_head;
+        bool enable_builtin_contradiction_probe;
+        bool enable_builtin_uncertainty_probe;
+        bool enable_builtin_broadcast_probe;
+        float tool_salience_half_life_ms;
+        float prewrite_gain;
+        float postwrite_gain;
+        llama_self_state_head_callback contradiction_head_callback;
+        void * contradiction_head_user_data;
+        llama_self_state_head_callback uncertainty_head_callback;
+        void * uncertainty_head_user_data;
+        llama_self_state_head_callback broadcast_head_callback;
+        void * broadcast_head_user_data;
+    };
+
+    struct llama_self_reactivation_info {
+        int32_t handle_id;
+        int32_t kind;
+        float priority;
+        float top_similarity;
+        int64_t last_update_monotonic_ms;
+    };
+
+    struct llama_self_tool_state_info {
+        int32_t active_status;
+        int32_t pending_jobs;
+        int32_t running_jobs;
+        int32_t completed_jobs;
+        int32_t failed_jobs;
+        float readiness;
+        int64_t last_update_monotonic_ms;
+    };
+
+    struct llama_self_social_state_info {
+        float familiarity;
+        float trust;
+        float reciprocity;
+        float bond_strength;
+        int32_t user_turn_count;
+        int32_t system_turn_count;
+        int64_t last_update_monotonic_ms;
+    };
+
+    struct llama_self_register_updater_rule {
+        int32_t register_id;
+        uint32_t phase_mask;
+        float baseline;
+        float rise_gain;
+        float fall_gain;
+        float baseline_pull;
+        int32_t feature_ids[LLAMA_SELF_MAX_UPDATER_RULE_TERMS];
+        float feature_weights[LLAMA_SELF_MAX_UPDATER_RULE_TERMS];
+        int32_t source_register_ids[LLAMA_SELF_MAX_UPDATER_RULE_SOURCE_REGISTERS];
+        float source_register_weights[LLAMA_SELF_MAX_UPDATER_RULE_SOURCE_REGISTERS];
+    };
+
+    struct llama_self_updater_program {
+        uint32_t version;
+        float memory_novelty_weight;
+        float memory_working_similarity_weight;
+        float memory_handle_similarity_weight;
+        float memory_uncertainty_weight;
+        float memory_contradiction_weight;
+        float memory_handle_variance_weight;
+        float broadcast_social_weight;
+        float broadcast_contradiction_weight;
+        float broadcast_uncertainty_weight;
+        float broadcast_tool_pending_weight;
+        float broadcast_tool_unready_weight;
+        float broadcast_failure_weight;
+        float broadcast_question_weight;
+        float broadcast_goal_weight;
+        uint32_t rule_count;
+        struct llama_self_register_updater_rule rules[LLAMA_SELF_MAX_UPDATER_RULES];
+    };
+
+    struct llama_self_counterfactual_result {
+        uint32_t updater_version;
+        int32_t replay_channel;
+        int32_t replayed_events;
+        int32_t working_memory_count;
+        int32_t reactivation_count;
+        float uncertainty;
+        float contradiction;
+        float memory_write_priority;
+        float broadcast_pressure;
+    };
+
     // Helpers for getting default parameters
     // TODO: update API to start accepting pointers to params structs (https://github.com/ggml-org/llama.cpp/discussions/9172)
     LLAMA_API struct llama_model_params          llama_model_default_params(void);
@@ -520,6 +846,8 @@ extern "C" {
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
     LLAMA_API struct llama_active_lora_params    llama_active_lora_default_params(void);
     LLAMA_API struct llama_past_lora_params      llama_past_lora_default_params(void);
+    LLAMA_API struct llama_self_state_params     llama_self_state_default_params(void);
+    LLAMA_API struct llama_self_updater_program  llama_self_state_default_updater_program(void);
 
     // Initialize the llama + ggml backend
     // If numa is true, use NUMA optimizations
@@ -819,6 +1147,142 @@ extern "C" {
     LLAMA_API int32_t llama_past_lora_get_stats(
             const struct llama_context * ctx,
             struct llama_past_lora_stats * out_stats);
+
+    // Inspect the effective live serving LoRA stack after request adapters and runtime memory layers
+    // have been composed for decode.
+    LLAMA_API int32_t llama_serving_lora_stack_count(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_serving_lora_stack_layer(
+            const struct llama_context * ctx,
+            int32_t i,
+            struct llama_serving_lora_layer_info * out_info);
+
+    // Refresh the self-state time surface from the local system clock.
+    LLAMA_API int32_t llama_self_state_refresh_time(struct llama_context * ctx);
+
+    // Apply a deterministic time point to the self-state for replay and testing.
+    LLAMA_API int32_t llama_self_state_set_time(
+            struct llama_context * ctx,
+            struct llama_self_state_time_point time_point);
+
+    // Inspect the expanded self-state datetime surface.
+    LLAMA_API int32_t llama_self_state_get_datetime(
+            const struct llama_context * ctx,
+            struct llama_self_state_datetime * out_info);
+
+    // Inspect the predefined self-state register bank.
+    LLAMA_API int32_t llama_self_state_register_count(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_get_register(
+            const struct llama_context * ctx,
+            int32_t register_id,
+            struct llama_self_register_info * out_info);
+    LLAMA_API const char * llama_self_state_register_name(int32_t register_id);
+    LLAMA_API int32_t llama_self_state_configure(
+            struct llama_context * ctx,
+            struct llama_self_state_params params);
+
+    // Update explicit self-state control surfaces and event anchors.
+    LLAMA_API int32_t llama_self_state_set_channel_state(
+            struct llama_context * ctx,
+            int32_t channel_state);
+    LLAMA_API int32_t llama_self_state_note_user_event(struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_note_tool_event(struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_note_emit_event(struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_set_identity(
+            struct llama_context * ctx,
+            const llama_token * tokens,
+            size_t n_tokens);
+    LLAMA_API int32_t llama_self_state_upsert_goal(
+            struct llama_context * ctx,
+            int32_t goal_id,
+            const llama_token * tokens,
+            size_t n_tokens,
+            float priority);
+    LLAMA_API int32_t llama_self_state_upsert_commitment(
+            struct llama_context * ctx,
+            int32_t commitment_id,
+            const llama_token * tokens,
+            size_t n_tokens,
+            float priority,
+            bool unresolved);
+    LLAMA_API int32_t llama_self_state_goal_count(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_commitment_count(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_working_memory_count(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_upsert_memory_handle(
+            struct llama_context * ctx,
+            int32_t handle_id,
+            int32_t kind,
+            const llama_token * tokens,
+            size_t n_tokens,
+            float priority);
+    LLAMA_API int32_t llama_self_state_memory_handle_count(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_reactivation_count(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_get_reactivation(
+            const struct llama_context * ctx,
+            int32_t index,
+            struct llama_self_reactivation_info * out_info);
+    LLAMA_API int32_t llama_self_state_upsert_tool_job(
+            struct llama_context * ctx,
+            int32_t job_id,
+            int32_t status,
+            float importance);
+    LLAMA_API int32_t llama_self_state_get_tool_state(
+            const struct llama_context * ctx,
+            struct llama_self_tool_state_info * out_info);
+    LLAMA_API int32_t llama_self_state_get_social_state(
+            const struct llama_context * ctx,
+            struct llama_self_social_state_info * out_info);
+    LLAMA_API int32_t llama_self_state_trace_count(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_clear_trace(struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_replay_trace(struct llama_context * ctx, int32_t upto_count);
+    LLAMA_API int32_t llama_self_state_replay_trace_on_channel(
+            struct llama_context * ctx,
+            int32_t upto_count,
+            int32_t replay_channel);
+    LLAMA_API int32_t llama_self_state_set_updater_program(
+            struct llama_context * ctx,
+            struct llama_self_updater_program program);
+    LLAMA_API int32_t llama_self_state_get_updater_program(
+            const struct llama_context * ctx,
+            struct llama_self_updater_program * out_program);
+    LLAMA_API size_t llama_self_state_trace_export_size(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_trace_export(
+            const struct llama_context * ctx,
+            void * dst,
+            size_t size);
+    LLAMA_API int32_t llama_self_state_trace_import(
+            struct llama_context * ctx,
+            const void * src,
+            size_t size,
+            bool replace_existing);
+    LLAMA_API int32_t llama_self_state_evaluate_counterfactual(
+            const struct llama_context * ctx,
+            struct llama_self_updater_program program,
+            int32_t upto_count,
+            struct llama_self_counterfactual_result * out_result);
+    LLAMA_API int32_t llama_self_state_evaluate_counterfactual_on_channel(
+            const struct llama_context * ctx,
+            struct llama_self_updater_program program,
+            int32_t upto_count,
+            int32_t replay_channel,
+            struct llama_self_counterfactual_result * out_result);
+
+    // Build and apply explicit feature vectors for register recomputation.
+    LLAMA_API int32_t llama_self_state_build_prewrite_features(
+            const struct llama_context * ctx,
+            const struct llama_self_state_event * event,
+            struct llama_self_state_feature_vector * out_features);
+    LLAMA_API int32_t llama_self_state_apply_prewrite(
+            struct llama_context * ctx,
+            const struct llama_self_state_event * event,
+            const struct llama_self_state_feature_vector * features);
+    LLAMA_API int32_t llama_self_state_build_postwrite_features(
+            const struct llama_context * ctx,
+            const struct llama_self_state_event * event,
+            struct llama_self_state_feature_vector * out_features);
+    LLAMA_API int32_t llama_self_state_apply_postwrite(
+            struct llama_context * ctx,
+            const struct llama_self_state_event * event,
+            const struct llama_self_state_feature_vector * features);
 
     //
     // Memory

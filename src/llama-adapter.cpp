@@ -9,6 +9,32 @@
 #include <sstream>
 #include <stdexcept>
 
+int32_t llama_adapter_lora_layer_precedence(llama_adapter_lora_layer_role role) {
+    switch (role) {
+        case LLAMA_ADAPTER_LORA_LAYER_REQUEST:      return 0;
+        case LLAMA_ADAPTER_LORA_LAYER_ALL_TIME:     return 100;
+        case LLAMA_ADAPTER_LORA_LAYER_PAST_YEAR:    return 110;
+        case LLAMA_ADAPTER_LORA_LAYER_PAST_QUARTER: return 120;
+        case LLAMA_ADAPTER_LORA_LAYER_PAST_MONTH:   return 130;
+        case LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK:    return 140;
+        case LLAMA_ADAPTER_LORA_LAYER_ACTIVE:       return 150;
+        default:                                    return 1000;
+    }
+}
+
+const char * llama_adapter_lora_layer_role_name(llama_adapter_lora_layer_role role) {
+    switch (role) {
+        case LLAMA_ADAPTER_LORA_LAYER_REQUEST:      return "request";
+        case LLAMA_ADAPTER_LORA_LAYER_ALL_TIME:     return "all_time";
+        case LLAMA_ADAPTER_LORA_LAYER_PAST_YEAR:    return "past_year";
+        case LLAMA_ADAPTER_LORA_LAYER_PAST_QUARTER: return "past_quarter";
+        case LLAMA_ADAPTER_LORA_LAYER_PAST_MONTH:   return "past_month";
+        case LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK:    return "past_week";
+        case LLAMA_ADAPTER_LORA_LAYER_ACTIVE:       return "active";
+        default:                                    return "unknown";
+    }
+}
+
 // vec
 
 ggml_tensor * llama_adapter_cvec::tensor_for(int il) const {

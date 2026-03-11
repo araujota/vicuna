@@ -220,6 +220,25 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const uint32_t updates_before_redundant = stats.updates_applied;
+    if (llama_active_lora_ingest(ctx, tokens.data(), tokens.size()) != 0) {
+        fprintf(stderr, "failed to ingest redundant Active LoRA span\n");
+        llama_free(ctx_custom);
+        llama_free(ctx_pool);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    if (llama_active_lora_get_stats(ctx, &stats) != 0 || stats.updates_applied != updates_before_redundant) {
+        fprintf(stderr, "redundant Active LoRA span unexpectedly changed weights\n");
+        llama_free(ctx_custom);
+        llama_free(ctx_pool);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
     llama_free(ctx_custom);
     llama_free(ctx_pool);
     llama_free(ctx);

@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <utility>
@@ -63,6 +64,25 @@ uint64_t get_device_free_bytes(const llama_model & model) {
         total_free += free ? free : total;
     }
     return total_free;
+}
+
+uint64_t scale_memory_budget(uint64_t free_bytes, float ratio) {
+    if (ratio <= 0.0f) {
+        return 0;
+    }
+
+    // Some backends do not report host/device memory. Treat that as "unknown"
+    // and avoid collapsing the planned rank to zero.
+    if (free_bytes == 0) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+
+    if (ratio >= 1.0f) {
+        return free_bytes;
+    }
+
+    const long double scaled = static_cast<long double>(free_bytes) * static_cast<long double>(ratio);
+    return std::max<uint64_t>(1, static_cast<uint64_t>(scaled));
 }
 
 void maybe_add_target(std::vector<ggml_tensor *> & targets, ggml_tensor * tensor) {
@@ -723,6 +743,17 @@ void normalize_active_weight(
     ggml_backend_tensor_set(weight.b, data_b.data(), 0, data_b.size() * sizeof(float));
 }
 
+llama_adapter_lora_layer_role past_bucket_role(size_t bucket) {
+    switch (bucket) {
+        case LLAMA_MEMORY_LORA_BUCKET_PAST_WEEK:    return LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK;
+        case LLAMA_MEMORY_LORA_BUCKET_PAST_MONTH:   return LLAMA_ADAPTER_LORA_LAYER_PAST_MONTH;
+        case LLAMA_MEMORY_LORA_BUCKET_PAST_QUARTER: return LLAMA_ADAPTER_LORA_LAYER_PAST_QUARTER;
+        case LLAMA_MEMORY_LORA_BUCKET_PAST_YEAR:    return LLAMA_ADAPTER_LORA_LAYER_PAST_YEAR;
+        case LLAMA_MEMORY_LORA_BUCKET_ALL_TIME:     return LLAMA_ADAPTER_LORA_LAYER_ALL_TIME;
+        default:                                    return LLAMA_ADAPTER_LORA_LAYER_ALL_TIME;
+    }
+}
+
 } // namespace
 
 struct llama_active_lora_manager::impl {
@@ -779,13 +810,17 @@ struct llama_active_lora_manager::impl {
             if (host_budget_bytes == 0) {
                 return 0;
             }
-            rank_limit = std::min<uint64_t>(rank_limit, host_budget_bytes / host_bytes_per_rank);
+            if (host_budget_bytes != std::numeric_limits<uint64_t>::max()) {
+                rank_limit = std::min<uint64_t>(rank_limit, host_budget_bytes / host_bytes_per_rank);
+            }
         }
         if (device_bytes_per_rank > 0) {
             if (device_budget_bytes == 0) {
                 return 0;
             }
-            rank_limit = std::min<uint64_t>(rank_limit, device_budget_bytes / device_bytes_per_rank);
+            if (device_budget_bytes != std::numeric_limits<uint64_t>::max()) {
+                rank_limit = std::min<uint64_t>(rank_limit, device_budget_bytes / device_bytes_per_rank);
+            }
         }
 
         return static_cast<uint32_t>(rank_limit);
@@ -795,7 +830,8 @@ struct llama_active_lora_manager::impl {
             std::unique_ptr<llama_adapter_lora> & out,
             uint32_t rank,
             const std::string & name_prefix,
-            float initial_scale) {
+            float initial_scale,
+            llama_adapter_lora_layer_role role) {
         out = std::make_unique<llama_adapter_lora>();
         std::vector<std::pair<ggml_tensor *, uint32_t>> runtime_targets;
         runtime_targets.reserve(targets.size());
@@ -809,15 +845,12 @@ struct llama_active_lora_manager::impl {
         }
 
         zero_adapter(*out);
-        owner.attach_adapter_runtime(out.get(), initial_scale);
+        owner.attach_adapter_runtime(out.get(), initial_scale, role);
         return true;
     }
 
-    void set_adapter_scale(llama_adapter_lora * adapter_ptr, float scale) {
-        if (!owner.loras) {
-            owner.loras = std::make_unique<llama_adapter_loras>();
-        }
-        (*owner.loras)[adapter_ptr] = scale;
+    void set_adapter_scale(llama_adapter_lora * adapter_ptr, float scale, llama_adapter_lora_layer_role role) {
+        owner.attach_adapter_runtime(adapter_ptr, scale, role);
     }
 
     bool train_on_span(const active_lora_embedding & embedding, const llama_token * tokens, size_t n_tokens) const {
@@ -1000,7 +1033,7 @@ struct llama_active_lora_manager::impl {
             buckets[bucket].stats.base_scale = past_params.base_scale[bucket];
             buckets[bucket].stats.effective_scale = scale;
             if (buckets[bucket].adapter) {
-                set_adapter_scale(buckets[bucket].adapter.get(), scale);
+                set_adapter_scale(buckets[bucket].adapter.get(), scale, past_bucket_role(bucket));
             }
             past_stats.buckets[bucket] = buckets[bucket].stats;
         }
@@ -1047,16 +1080,12 @@ llama_active_lora_manager::llama_active_lora_manager(llama_context & owner) :
 
 llama_active_lora_manager::~llama_active_lora_manager() {
     if (pimpl->adapter) {
-        if (pimpl->owner.loras) {
-            pimpl->owner.loras->erase(pimpl->adapter.get());
-        }
+        pimpl->owner.detach_adapter_runtime(pimpl->adapter.get());
         const_cast<llama_model &>(pimpl->owner.model).loras.erase(pimpl->adapter.get());
     }
     for (auto & bucket : pimpl->buckets) {
         if (bucket.adapter) {
-            if (pimpl->owner.loras) {
-                pimpl->owner.loras->erase(bucket.adapter.get());
-            }
+            pimpl->owner.detach_adapter_runtime(bucket.adapter.get());
             const_cast<llama_model &>(pimpl->owner.model).loras.erase(bucket.adapter.get());
         }
     }
@@ -1079,8 +1108,8 @@ bool llama_active_lora_manager::init(const llama_active_lora_params & params) {
 
     const uint64_t host_free_bytes = get_host_free_bytes();
     const uint64_t device_free_bytes = get_device_free_bytes(pimpl->owner.model);
-    const uint64_t host_budget_bytes = static_cast<uint64_t>(host_free_bytes * params.host_memory_ratio);
-    const uint64_t device_budget_bytes = static_cast<uint64_t>(device_free_bytes * params.device_memory_ratio);
+    const uint64_t host_budget_bytes = scale_memory_budget(host_free_bytes, params.host_memory_ratio);
+    const uint64_t device_budget_bytes = scale_memory_budget(device_free_bytes, params.device_memory_ratio);
     const uint32_t selected_rank = pimpl->compute_rank(host_budget_bytes, device_budget_bytes, params.max_rank);
     if (selected_rank < params.min_rank) {
         LLAMA_LOG_ERROR("%s: failed to plan Active LoRA rank (planned %u, min %u)\n",
@@ -1089,7 +1118,12 @@ bool llama_active_lora_manager::init(const llama_active_lora_params & params) {
     }
 
     if (!pimpl->adapter) {
-        if (!pimpl->create_runtime_adapter(pimpl->adapter, selected_rank, "memory.active", params.adapter_scale)) {
+        if (!pimpl->create_runtime_adapter(
+                    pimpl->adapter,
+                    selected_rank,
+                    "memory.active",
+                    params.adapter_scale,
+                    LLAMA_ADAPTER_LORA_LAYER_ACTIVE)) {
             return false;
         }
     }
@@ -1132,8 +1166,8 @@ bool llama_active_lora_manager::init_past(const llama_past_lora_params & params)
     const uint64_t device_free_bytes = get_device_free_bytes(pimpl->owner.model);
 
     for (size_t bucket = 0; bucket < PAST_BUCKET_COUNT; ++bucket) {
-        const uint64_t host_budget_bytes = static_cast<uint64_t>(host_free_bytes * params.host_memory_ratio[bucket]);
-        const uint64_t device_budget_bytes = static_cast<uint64_t>(device_free_bytes * params.device_memory_ratio[bucket]);
+        const uint64_t host_budget_bytes = scale_memory_budget(host_free_bytes, params.host_memory_ratio[bucket]);
+        const uint64_t device_budget_bytes = scale_memory_budget(device_free_bytes, params.device_memory_ratio[bucket]);
         const uint32_t selected_rank = pimpl->compute_rank(host_budget_bytes, device_budget_bytes, params.max_rank[bucket]);
         if (selected_rank < params.min_rank[bucket]) {
             LLAMA_LOG_ERROR("%s: failed to plan rank for %s (planned %u, min %u)\n",
@@ -1146,7 +1180,8 @@ bool llama_active_lora_manager::init_past(const llama_past_lora_params & params)
                         pimpl->buckets[bucket].adapter,
                         selected_rank,
                         std::string("memory.") + past_bucket_name(bucket),
-                        0.0f)) {
+                        0.0f,
+                        past_bucket_role(bucket))) {
                 return false;
             }
         }
@@ -1156,7 +1191,7 @@ bool llama_active_lora_manager::init_past(const llama_past_lora_params & params)
         pimpl->buckets[bucket].stats.host_budget_bytes = host_budget_bytes;
         pimpl->buckets[bucket].stats.device_budget_bytes = device_budget_bytes;
         pimpl->buckets[bucket].stats.base_scale = params.base_scale[bucket];
-        pimpl->set_adapter_scale(pimpl->buckets[bucket].adapter.get(), 0.0f);
+        pimpl->set_adapter_scale(pimpl->buckets[bucket].adapter.get(), 0.0f, past_bucket_role(bucket));
     }
 
     pimpl->past_stats = {};

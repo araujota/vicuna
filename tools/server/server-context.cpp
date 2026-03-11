@@ -37,6 +37,7 @@ enum slot_state {
     SLOT_STATE_WAIT_OTHER, // after assigning a task, but waiting for parent slot to process prompt
     SLOT_STATE_STARTED,    // after assigning a task and about to process prompt
     SLOT_STATE_PROCESSING_PROMPT,
+    SLOT_STATE_REPLAYING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
 };
@@ -100,6 +101,7 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+    std::unique_ptr<server_tokens> replay_tokens;
 
     void prompt_save(server_prompt_cache & prompt_cache) const {
         GGML_ASSERT(prompt.data.size() == 0);
@@ -135,6 +137,7 @@ struct server_slot {
 
         llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
         prompt.tokens.clear();
+        replay_tokens.reset();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -188,6 +191,7 @@ struct server_slot {
 
         task_prev = std::move(task);
         task.reset();
+        replay_tokens.reset();
 
         llama_set_sampler(ctx, id, nullptr);
 
@@ -217,6 +221,18 @@ struct server_slot {
 
         SLT_INF(*this, "init sampler, took %0.2f ms, tokens: text = %d, total = %d\n",
                 (ggml_time_us() - t_start) / 1000.0, n_text, (int) prompt.tokens.size());
+    }
+
+    bool is_replaying_prompt() const {
+        return replay_tokens != nullptr;
+    }
+
+    const server_tokens & input_tokens_ref() const {
+        return replay_tokens ? *replay_tokens : task->tokens;
+    }
+
+    int input_tokens_count() const {
+        return replay_tokens ? (int) replay_tokens->size() : task->n_tokens();
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
@@ -2036,6 +2052,7 @@ private:
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
                 llama_tokens evicted_tokens;
+                llama_tokens compacted_tokens;
                 {
                     const llama_tokens & prompt_tokens = slot.prompt.tokens.get_text_tokens();
                     if (n_discard > 0 && prompt_tokens.size() >= static_cast<size_t>(n_keep + n_discard)) {
@@ -2043,31 +2060,61 @@ private:
                                 prompt_tokens.begin() + n_keep,
                                 prompt_tokens.begin() + n_keep + n_discard);
                     }
+
+                    compacted_tokens = prompt_tokens;
+                    for (size_t i = n_keep + n_discard; i < compacted_tokens.size(); i++) {
+                        compacted_tokens[i - n_discard] = compacted_tokens[i];
+                    }
+                    compacted_tokens.resize(slot.prompt.tokens.size() - n_discard);
                 }
 
-                llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
-                llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+                llama_active_lora_stats active_before = {};
+                bool have_active_before = llama_active_lora_get_stats(ctx, &active_before) == 0;
+                bool active_weights_changed = false;
 
                 if (!evicted_tokens.empty()) {
                     if (llama_active_lora_ingest(ctx, evicted_tokens.data(), evicted_tokens.size()) != 0) {
                         SLT_WRN(slot, "%s\n", "Active LoRA ingestion failed for evicted span");
+                    } else if (have_active_before) {
+                        llama_active_lora_stats active_after = {};
+                        if (llama_active_lora_get_stats(ctx, &active_after) == 0) {
+                            active_weights_changed = active_after.updates_applied > active_before.updates_applied;
+                        }
                     }
                 }
 
-                // add generated tokens to cache
-                // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
-                {
-                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                const bool schedule_strict_replay = active_weights_changed && !compacted_tokens.empty();
 
-                    llama_tokens new_tokens = slot.prompt.tokens.get_text_tokens(); // copy
-                    for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
-                        new_tokens[i - n_discard] = new_tokens[i];
-                    }
+                if (schedule_strict_replay) {
+                    SLT_WRN(slot, "strict KV replay scheduled after Active LoRA update, replay_tokens = %zu\n", compacted_tokens.size());
 
-                    new_tokens.resize(slot.prompt.tokens.size() - n_discard);
-
+                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, -1, -1);
                     slot.prompt.tokens.clear();
-                    slot.prompt.tokens.insert(new_tokens);
+                    slot.prompt.checkpoints.clear();
+                    slot.replay_tokens = std::make_unique<server_tokens>(compacted_tokens, false);
+                    slot.state = SLOT_STATE_REPLAYING_PROMPT;
+                    slot.i_batch = -1;
+                    slot.i_batch_dft.clear();
+                    slot.drafted.clear();
+                    slot.n_prompt_tokens_cache = 0;
+                    slot.n_prompt_tokens_processed = 0;
+
+                    if (slot.can_speculate()) {
+                        common_speculative_begin(slot.spec, compacted_tokens);
+                    }
+                } else {
+                    llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
+                    llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+
+                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                    slot.prompt.tokens.clear();
+                    slot.prompt.tokens.insert(compacted_tokens);
+
+                    if (active_weights_changed && compacted_tokens.empty()) {
+                        SLT_WRN(slot, "%s\n", "strict KV replay skipped because no retained tokens remain");
+                    } else if (!active_weights_changed) {
+                        SLT_DBG(slot, "%s\n", "strict KV replay skipped because Active LoRA weights did not change");
+                    }
                 }
 
                 slot.truncated = true;
@@ -2181,21 +2228,30 @@ private:
                 }
 
                 // this slot still has a prompt to be processed
-                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
-                    const auto & input_tokens = slot.task->tokens;
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_REPLAYING_PROMPT) {
+                    const bool is_replay = slot.is_replaying_prompt();
+                    const auto & input_tokens = slot.input_tokens_ref();
+                    const int n_input_tokens = slot.input_tokens_count();
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.n_tokens;
 
                     // TODO: maybe move branch to outside of this loop in the future
-                    if (slot.state == SLOT_STATE_STARTED) {
-                        slot.t_start_process_prompt = ggml_time_us();
-                        slot.t_start_generation = 0;
-
+                    if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_REPLAYING_PROMPT) {
+                        int n_past = 0;
+                        if (slot.state == SLOT_STATE_STARTED) {
+                            slot.t_start_process_prompt = ggml_time_us();
+                            slot.t_start_generation = 0;
+                        }
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
-                        SLT_INF(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
-                                slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
+                        if (is_replay) {
+                            SLT_INF(slot, "strict KV replay started, n_ctx_slot = %d, replay_tokens = %d\n",
+                                    slot.n_ctx, n_input_tokens);
+                        } else {
+                            SLT_INF(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
+                                    slot.n_ctx, slot.task->params.n_keep, n_input_tokens);
+                        }
 
                         // print prompt tokens (for debugging)
                         /*if (1) {
@@ -2209,9 +2265,6 @@ private:
                                 SLT_DBG(slot, "prompt token %3d: %6d '%s'\n", i, input_tokens[i], common_token_to_piece(ctx, input_tokens[i]).c_str());
                             }
                         }*/
-
-                        // keep track how many tokens we can reuse from the previous state
-                        int n_past = 0;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -2232,39 +2285,39 @@ private:
                         }
 
                         if (!slot.can_split()) {
-                            if (slot.task->n_tokens() > n_ubatch) {
+                            if (n_input_tokens > n_ubatch) {
                                 send_error(slot,
                                            string_format(
                                                "input (%d tokens) is too large to process. increase the physical batch "
                                                "size (current batch size: %d)",
-                                               slot.task->n_tokens(), n_ubatch),
+                                               n_input_tokens, n_ubatch),
                                            ERROR_TYPE_SERVER);
                                 slot.release();
                                 continue;
                             }
 
-                            if (slot.task->n_tokens() > slot.n_ctx) {
+                            if (n_input_tokens > slot.n_ctx) {
                                 send_error(
                                     slot,
                                     string_format(
                                         "input (%d tokens) is larger than the max context size (%d tokens). skipping",
-                                        slot.task->n_tokens(), slot.n_ctx),
+                                        n_input_tokens, slot.n_ctx),
                                     ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 continue;
                             }
                         } else {
-                            if (slot.task->n_tokens() >= slot.n_ctx) {
+                            if (n_input_tokens >= slot.n_ctx) {
                                 send_error(slot,
                                            string_format("request (%d tokens) exceeds the available context size (%d "
                                                          "tokens), try increasing it",
-                                                         slot.task->n_tokens(), slot.n_ctx),
+                                                         n_input_tokens, slot.n_ctx),
                                            ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 continue;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            if (!is_replay && slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -2357,7 +2410,7 @@ private:
                                 // this is useful for debugging prompt caching
                                 if (slots_debug) {
                                     const int np0 = std::max<int>(n_past - 4, 0);
-                                    const int np1 = std::min<int>(n_past + 6, std::min(slot.prompt.tokens.size(), slot.task->tokens.size()));
+                                    const int np1 = std::min<int>(n_past + 6, std::min(slot.prompt.tokens.size(), input_tokens.size()));
 
                                     std::stringstream ss0;
                                     std::stringstream ss1;
@@ -2382,7 +2435,7 @@ private:
                                         }
 
                                         {
-                                            const auto token = slot.task->tokens[i];
+                                            const auto token = input_tokens[i];
                                             const auto piece = token != LLAMA_TOKEN_NULL ? common_token_to_piece(ctx, token) : "[mtmd]";
                                             ss1 << piece;
                                             st1 << std::setw(8) << token;
@@ -2453,8 +2506,8 @@ private:
                         }
 
                         // [TAG_PROMPT_LOGITS]
-                        if (n_past == slot.task->n_tokens() && n_past > 0) {
-                            SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
+                        if (n_past == n_input_tokens && n_past > 0) {
+                            SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, n_input_tokens);
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
@@ -2466,14 +2519,14 @@ private:
 
                         // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
-                        if (slot.task->params.stream && slot.task->params.return_progress) {
+                        if (!is_replay && slot.task->params.stream && slot.task->params.return_progress) {
                             send_partial_response(slot, {}, true);
                         }
                     }
 
                     if (!slot.can_split()) {
                         // cannot fit the prompt in the current batch - will try next iter
-                        if (batch.n_tokens + slot.task->n_tokens() > n_batch) {
+                        if (batch.n_tokens + n_input_tokens > n_batch) {
                             continue;
                         }
                     }
@@ -2495,7 +2548,7 @@ private:
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
 
                     // check if we should process the image
-                    if (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
+                    if (!is_replay && slot.prompt.n_tokens() < n_input_tokens && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
                         size_t n_tokens_out = 0;
                         int32_t res = input_tokens.process_chunk(ctx, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
@@ -2532,7 +2585,7 @@ private:
                     }
 
                     // make checkpoints only for completion tasks
-                    do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
+                    do_checkpoint = do_checkpoint && !is_replay && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
 
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
                     // checkpoints are created only if:
@@ -2547,7 +2600,7 @@ private:
                             );
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
+                    while (slot.prompt.n_tokens() < n_input_tokens && batch.n_tokens < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -2583,7 +2636,7 @@ private:
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
                                 const int n_last = std::min(n_batch, offset);
-                                if (do_checkpoint && slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                if (do_checkpoint && n_input_tokens == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
                                     break;
                                 }
@@ -2598,21 +2651,24 @@ private:
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
 
                     // entire prompt has been processed
-                    if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
-                        slot.state = SLOT_STATE_DONE_PROMPT;
-
+                    if (slot.prompt.n_tokens() == n_input_tokens) {
                         GGML_ASSERT(batch.n_tokens > 0);
-
-                        // extract the logits only for the last token
                         batch.logits[batch.n_tokens - 1] = true;
+                        slot.i_batch = batch.n_tokens - 1;
 
-                        slot.n_decoded = 0;
-                        slot.i_batch   = batch.n_tokens - 1;
-
-                        slot.init_sampler();
-                        SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
+                        if (is_replay) {
+                            slot.init_sampler();
+                            slot.replay_tokens.reset();
+                            slot.state = SLOT_STATE_GENERATING;
+                            SLT_INF(slot, "strict KV replay done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
+                        } else {
+                            slot.state = SLOT_STATE_DONE_PROMPT;
+                            slot.n_decoded = 0;
+                            slot.init_sampler();
+                            SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
+                        }
                     } else {
-                        if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
+                        if (n_input_tokens < slot.prompt.n_tokens() + n_ubatch) {
                             // near the end of the prompt
                             do_checkpoint = do_checkpoint && true;
                         } else {
@@ -2633,7 +2689,7 @@ private:
                             }
                         }
 
-                        SLT_INF(slot, "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f\n", slot.prompt.n_tokens(), batch.n_tokens, (float) slot.prompt.n_tokens() / slot.task->n_tokens());
+                        SLT_INF(slot, "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f\n", slot.prompt.n_tokens(), batch.n_tokens, (float) slot.prompt.n_tokens() / std::max(1, n_input_tokens));
                     }
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);

@@ -15,6 +15,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_active_lora_manager;
+class llama_self_state;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -123,8 +124,48 @@ struct llama_context {
     bool past_lora_init(const llama_past_lora_params & params);
     bool past_lora_tick(uint64_t now_us);
     bool past_lora_get_stats(llama_past_lora_stats * out_stats) const;
+    int32_t serving_lora_stack_count() const;
+    bool serving_lora_stack_layer(int32_t i, llama_serving_lora_layer_info * out_info) const;
+    bool self_state_refresh_time();
+    bool self_state_set_time(const llama_self_state_time_point & time_point);
+    bool self_state_get_datetime(llama_self_state_datetime * out_info) const;
+    bool self_state_configure(const llama_self_state_params & params);
+    int32_t self_state_register_count() const;
+    bool self_state_get_register(int32_t register_id, llama_self_register_info * out_info) const;
+    bool self_state_set_channel_state(int32_t channel_state);
+    bool self_state_note_user_event();
+    bool self_state_note_tool_event();
+    bool self_state_note_emit_event();
+    bool self_state_set_identity(const llama_token * tokens, size_t n_tokens);
+    bool self_state_upsert_goal(int32_t goal_id, const llama_token * tokens, size_t n_tokens, float priority);
+    bool self_state_upsert_commitment(int32_t commitment_id, const llama_token * tokens, size_t n_tokens, float priority, bool unresolved);
+    int32_t self_state_goal_count() const;
+    int32_t self_state_commitment_count() const;
+    int32_t self_state_working_memory_count() const;
+    bool self_state_upsert_memory_handle(int32_t handle_id, int32_t kind, const llama_token * tokens, size_t n_tokens, float priority);
+    int32_t self_state_memory_handle_count() const;
+    int32_t self_state_reactivation_count() const;
+    bool self_state_get_reactivation(int32_t index, llama_self_reactivation_info * out_info) const;
+    bool self_state_upsert_tool_job(int32_t job_id, int32_t status, float importance);
+    bool self_state_get_tool_state(llama_self_tool_state_info * out_info) const;
+    bool self_state_get_social_state(llama_self_social_state_info * out_info) const;
+    int32_t self_state_trace_count() const;
+    bool self_state_clear_trace();
+    bool self_state_replay_trace(int32_t upto_count);
+    bool self_state_replay_trace_on_channel(int32_t upto_count, int32_t replay_channel);
+    bool self_state_set_updater_program(const llama_self_updater_program & program);
+    bool self_state_get_updater_program(llama_self_updater_program * out_program) const;
+    size_t self_state_trace_export_size() const;
+    bool self_state_trace_export(void * dst, size_t size) const;
+    bool self_state_trace_import(const void * src, size_t size, bool replace_existing);
+    bool self_state_evaluate_counterfactual(const llama_self_updater_program & program, int32_t upto_count, llama_self_counterfactual_result * out_result) const;
+    bool self_state_evaluate_counterfactual_on_channel(const llama_self_updater_program & program, int32_t upto_count, int32_t replay_channel, llama_self_counterfactual_result * out_result) const;
+    bool self_state_build_prewrite_features(const llama_self_state_event & event, llama_self_state_feature_vector * out_features) const;
+    bool self_state_apply_prewrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
+    bool self_state_build_postwrite_features(const llama_self_state_event & event, llama_self_state_feature_vector * out_features) const;
+    bool self_state_apply_postwrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
 
-    void attach_adapter_runtime(llama_adapter_lora * adapter, float scale);
+    void attach_adapter_runtime(llama_adapter_lora * adapter, float scale, llama_adapter_lora_layer_role role);
     void detach_adapter_runtime(llama_adapter_lora * adapter);
 
     // process a single ubatch with a specific graph type
@@ -248,6 +289,9 @@ public:
 private:
     friend class llama_active_lora_manager;
 
+    void rebuild_lora_stack();
+    void log_lora_stack() const;
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -271,8 +315,11 @@ private:
 
     llama_cparams cparams;
 
-    llama_adapter_cvec_ptr  cvec;
-    llama_adapter_loras_ptr loras;
+    llama_adapter_cvec_ptr        cvec;
+    llama_adapter_lora_stack_ptr  request_loras;
+    llama_adapter_lora_stack_ptr  runtime_loras;
+    llama_adapter_lora_stack_ptr  loras;
+    uint64_t                      lora_stack_version = 0;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
@@ -333,6 +380,7 @@ private:
     ggml_opt_context_t opt_ctx = nullptr;
 
     std::unique_ptr<llama_active_lora_manager> active_lora_manager;
+    std::unique_ptr<llama_self_state> self_state;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

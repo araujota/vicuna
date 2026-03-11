@@ -8,7 +8,10 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-self-state.h"
 
+#include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -24,11 +27,15 @@ llama_context::llama_context(
               llama_context_params params) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
-    loras(std::make_unique<llama_adapter_loras>()),
+    request_loras(std::make_unique<llama_adapter_lora_stack>()),
+    runtime_loras(std::make_unique<llama_adapter_lora_stack>()),
+    loras(std::make_unique<llama_adapter_lora_stack>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    self_state = std::make_unique<llama_self_state>();
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -1062,41 +1069,83 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
         return;
     }
 
-    loras.reset(new llama_adapter_loras());
+    request_loras = std::make_unique<llama_adapter_lora_stack>();
 
     for (size_t i = 0; i < n_adapters; i ++) {
         if (scales[i] != 0.0f) {
-            loras->insert({adapters[i], scales[i]});
+            request_loras->push_back({
+                /*.adapter     =*/ adapters[i],
+                /*.scale       =*/ scales[i],
+                /*.precedence  =*/ llama_adapter_lora_layer_precedence(LLAMA_ADAPTER_LORA_LAYER_REQUEST) + (int32_t) request_loras->size(),
+                /*.role        =*/ LLAMA_ADAPTER_LORA_LAYER_REQUEST,
+            });
         }
     }
 
-    sched_need_reserve = true;
+    rebuild_lora_stack();
+    log_lora_stack();
 }
 
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
-    // Adapters with a zero scale are never added to `loras`, so also ignore them for the comparison.
-    size_t n_non_zero = 0;
+    size_t idx_non_zero = 0;
 
     for (size_t i = 0; i < n_adapters; i ++) {
         if (scales[i] == 0.0f) {
             continue;
         }
-        n_non_zero++;
 
-        auto it = loras->find(adapters[i]);
+        if (!request_loras || idx_non_zero >= request_loras->size()) {
+            return false;
+        }
 
-        if (it == loras->end() || it->second != scales[i]) {
+        const auto & cur = (*request_loras)[idx_non_zero++];
+        if (cur.adapter != adapters[i] || cur.scale != scales[i]) {
             return false;
         }
     }
 
-    if (n_non_zero != loras->size()) {
+    if (request_loras && idx_non_zero != request_loras->size()) {
         return false;
     }
 
     return true;
+}
+
+void llama_context::rebuild_lora_stack() {
+    if (!loras) {
+        loras = std::make_unique<llama_adapter_lora_stack>();
+    }
+
+    loras->clear();
+
+    if (request_loras) {
+        loras->insert(loras->end(), request_loras->begin(), request_loras->end());
+    }
+    if (runtime_loras) {
+        loras->insert(loras->end(), runtime_loras->begin(), runtime_loras->end());
+    }
+
+    std::stable_sort(loras->begin(), loras->end(), [](const auto & lhs, const auto & rhs) {
+        return lhs.precedence < rhs.precedence;
+    });
+
+    ++lora_stack_version;
+    sched_need_reserve = true;
+}
+
+void llama_context::log_lora_stack() const {
+    if (!loras || loras->empty()) {
+        LLAMA_LOG_DEBUG("%s: effective serving stack is empty\n", __func__);
+        return;
+    }
+
+    for (size_t i = 0; i < loras->size(); ++i) {
+        const auto & layer = (*loras)[i];
+        LLAMA_LOG_DEBUG("%s: layer[%zu] role=%s precedence=%d scale=%.4f adapter=%p\n",
+                __func__, i, llama_adapter_lora_layer_role_name(layer.role), layer.precedence, layer.scale, (void *) layer.adapter);
+    }
 }
 
 bool llama_context::set_adapter_cvec(
@@ -1141,29 +1190,120 @@ bool llama_context::past_lora_init(const llama_past_lora_params & params) {
 }
 
 bool llama_context::past_lora_tick(uint64_t now_us) {
-    return active_lora_manager && active_lora_manager->tick_past(now_us);
+    if (!active_lora_manager || !active_lora_manager->tick_past(now_us)) {
+        return false;
+    }
+
+    if (self_state) {
+        llama_past_lora_stats past_stats = {};
+        if (active_lora_manager->get_past_stats(&past_stats)) {
+            for (int bucket = 0; bucket < LLAMA_MEMORY_LORA_BUCKET_COUNT; ++bucket) {
+                const auto & stats = past_stats.buckets[bucket];
+                if (!stats.populated && stats.version == 0 && stats.effective_scale <= 0.0f) {
+                    continue;
+                }
+
+                std::array<float, 32> sketch = {};
+                const float values[] = {
+                    (float) bucket,
+                    (float) stats.version,
+                    stats.base_scale,
+                    stats.effective_scale,
+                    stats.gain_mean,
+                    stats.gain_max,
+                    stats.populated ? 1.0f : 0.0f,
+                };
+                for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+                    const size_t dim = ((size_t) bucket * 7 + i * 5) % sketch.size();
+                    sketch[dim] += values[i];
+                }
+
+                float norm = 0.0f;
+                for (float value : sketch) {
+                    norm += value * value;
+                }
+                norm = std::sqrt(norm);
+                if (norm > 0.0f) {
+                    for (float & value : sketch) {
+                        value /= norm;
+                    }
+                }
+
+                const float priority = std::min(1.0f, std::max(0.0f,
+                        0.60f * stats.effective_scale +
+                        0.20f * (stats.populated ? 1.0f : 0.0f) +
+                        0.20f * std::min(1.0f, stats.gain_max)));
+                (void) self_state->upsert_memory_handle_sketch(
+                        1000 + bucket,
+                        LLAMA_SELF_MEMORY_HANDLE_FROZEN_BUCKET,
+                        sketch,
+                        priority,
+                        std::max<uint32_t>(1, stats.version));
+            }
+        }
+    }
+
+    return true;
 }
 
 bool llama_context::past_lora_get_stats(llama_past_lora_stats * out_stats) const {
     return active_lora_manager && active_lora_manager->get_past_stats(out_stats);
 }
 
-void llama_context::attach_adapter_runtime(llama_adapter_lora * adapter, float scale) {
-    if (!loras) {
-        loras = std::make_unique<llama_adapter_loras>();
+int32_t llama_context::serving_lora_stack_count() const {
+    return loras ? (int32_t) loras->size() : 0;
+}
+
+bool llama_context::serving_lora_stack_layer(int32_t i, llama_serving_lora_layer_info * out_info) const {
+    if (!out_info || !loras || i < 0 || (size_t) i >= loras->size()) {
+        return false;
     }
 
-    (*loras)[adapter] = scale;
-    sched_need_reserve = true;
+    const auto & layer = (*loras)[i];
+    *out_info = {
+        /*.scale      =*/ layer.scale,
+        /*.precedence =*/ layer.precedence,
+        /*.role       =*/ (int32_t) layer.role,
+    };
+    return true;
+}
+
+void llama_context::attach_adapter_runtime(llama_adapter_lora * adapter, float scale, llama_adapter_lora_layer_role role) {
+    if (!runtime_loras) {
+        runtime_loras = std::make_unique<llama_adapter_lora_stack>();
+    }
+
+    auto it = std::find_if(runtime_loras->begin(), runtime_loras->end(), [&](const auto & layer) {
+        return layer.adapter == adapter;
+    });
+    if (it == runtime_loras->end()) {
+        runtime_loras->push_back({
+            /*.adapter     =*/ adapter,
+            /*.scale       =*/ scale,
+            /*.precedence  =*/ llama_adapter_lora_layer_precedence(role),
+            /*.role        =*/ role,
+        });
+    } else {
+        it->scale = scale;
+        it->precedence = llama_adapter_lora_layer_precedence(role);
+        it->role = role;
+    }
+
+    rebuild_lora_stack();
+    log_lora_stack();
 }
 
 void llama_context::detach_adapter_runtime(llama_adapter_lora * adapter) {
-    if (!loras) {
+    if (!runtime_loras) {
         return;
     }
 
-    loras->erase(adapter);
-    sched_need_reserve = true;
+    runtime_loras->erase(std::remove_if(runtime_loras->begin(), runtime_loras->end(), [&](const auto & layer) {
+        return layer.adapter == adapter;
+    }), runtime_loras->end());
+
+    rebuild_lora_stack();
+    log_lora_stack();
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -2145,6 +2285,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.lora_stack_version =*/ lora_stack_version,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3202,6 +3343,17 @@ int32_t llama_past_lora_get_stats(
         const llama_context * ctx,
         llama_past_lora_stats * out_stats) {
     return ctx && ctx->past_lora_get_stats(out_stats) ? 0 : -1;
+}
+
+int32_t llama_serving_lora_stack_count(const llama_context * ctx) {
+    return ctx ? ctx->serving_lora_stack_count() : -1;
+}
+
+int32_t llama_serving_lora_stack_layer(
+        const llama_context * ctx,
+        int32_t i,
+        llama_serving_lora_layer_info * out_info) {
+    return ctx && ctx->serving_lora_stack_layer(i, out_info) ? 0 : -1;
 }
 
 //
