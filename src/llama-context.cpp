@@ -1,24 +1,44 @@
 #include "llama-context.h"
 
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml-opt.h"
+#include "ggml.h"
+#include "llama.h"
 #include "llama-active-lora.h"
+#include "llama-adapter.h"
 #include "llama-arch.h"
-#include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-bash-tool.h"
 #include "llama-cognitive-loop.h"
+#include "llama-cparams.h"
+#include "llama-graph.h"
 #include "llama-hard-memory.h"
+#include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-sampler.h"
 #include "llama-self-state.h"
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cinttypes>
+#include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <limits>
+#include <map>
+#include <memory>
+#include <set>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 //
 // llama_context
@@ -40,6 +60,7 @@ llama_context::llama_context(
     self_state = std::make_unique<llama_self_state>();
     cognitive_loop = std::make_unique<llama_cognitive_loop>(*this);
     hard_memory = std::make_unique<llama_hard_memory>();
+    bash_tool = std::make_unique<llama_bash_tool>();
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -67,9 +88,13 @@ llama_context::llama_context(
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
 
-    cparams.n_ctx_orig_yarn  = params.yarn_orig_ctx    != 0 ? params.yarn_orig_ctx    :
-                               hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
-                                                              hparams.n_ctx_train;
+    if (params.yarn_orig_ctx != 0) {
+        cparams.n_ctx_orig_yarn = params.yarn_orig_ctx;
+    } else if (hparams.n_ctx_orig_yarn != 0) {
+        cparams.n_ctx_orig_yarn = hparams.n_ctx_orig_yarn;
+    } else {
+        cparams.n_ctx_orig_yarn = hparams.n_ctx_train;
+    }
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
@@ -1067,7 +1092,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 }
 
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
-    LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
+    LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, reinterpret_cast<const void *>(adapters));
 
     if (adapters_lora_are_same(adapters, n_adapters, scales)) {
         return;
@@ -1090,8 +1115,8 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
     log_lora_stack();
 }
 
-bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
-    LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
+bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, const float * scales) {
+    LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, reinterpret_cast<const void *>(adapters));
 
     size_t idx_non_zero = 0;
 
@@ -1284,6 +1309,74 @@ bool llama_context::serving_lora_stack_layer(int32_t i, llama_serving_lora_layer
     return true;
 }
 
+int32_t llama_context::functional_lora_family_count() const {
+    return active_lora_manager ? active_lora_manager->functional_family_count() : 0;
+}
+
+bool llama_context::functional_lora_family_config_get(int32_t family, llama_functional_lora_family_config * out_config) const {
+    return active_lora_manager && active_lora_manager->functional_family_config_get(family, out_config);
+}
+
+bool llama_context::functional_lora_family_state_get(int32_t family, llama_functional_lora_family_state * out_state) const {
+    return active_lora_manager && active_lora_manager->functional_family_state_get(family, out_state);
+}
+
+bool llama_context::functional_lora_get_last_trace(llama_functional_lora_trace * out_trace) const {
+    return active_lora_manager && active_lora_manager->functional_get_last_trace(out_trace);
+}
+
+bool llama_context::functional_lora_get_last_update(int32_t family, llama_functional_lora_update_info * out_update) const {
+    return active_lora_manager && active_lora_manager->functional_get_last_update(family, out_update);
+}
+
+bool llama_context::functional_lora_set_ablation(const llama_functional_lora_ablation_config & config) {
+    return active_lora_manager && active_lora_manager->functional_set_ablation(config);
+}
+
+bool llama_context::functional_lora_get_ablation(llama_functional_lora_ablation_config * out_config) const {
+    return active_lora_manager && active_lora_manager->functional_get_ablation(out_config);
+}
+
+bool llama_context::functional_lora_activate(const llama_functional_activation_decision & decision) {
+    return active_lora_manager && active_lora_manager->functional_activate(decision);
+}
+
+bool llama_context::functional_lora_note_command_complete(int32_t origin) {
+    return active_lora_manager && active_lora_manager->functional_note_command_complete(origin);
+}
+
+bool llama_context::functional_lora_apply_update(
+        int32_t family,
+        int32_t loop_origin,
+        int32_t start_microphase,
+        int32_t settle_microphase,
+        const llama_functional_outcome_snapshot & before,
+        const llama_functional_outcome_snapshot & after,
+        int32_t selected_tool_kind,
+        int32_t candidate_count,
+        const float * metrics,
+        size_t metric_count,
+        float signed_outcome,
+        float magnitude,
+        const llama_self_state_event & event,
+        const llama_self_state_feature_vector * features) {
+    return active_lora_manager && active_lora_manager->functional_apply_update(
+            family,
+            loop_origin,
+            start_microphase,
+            settle_microphase,
+            before,
+            after,
+            selected_tool_kind,
+            candidate_count,
+            metrics,
+            metric_count,
+            signed_outcome,
+            magnitude,
+            event,
+            features);
+}
+
 void llama_context::attach_adapter_runtime(llama_adapter_lora * adapter, float scale, llama_adapter_lora_layer_role role) {
     if (!runtime_loras) {
         runtime_loras = std::make_unique<llama_adapter_lora_stack>();
@@ -1330,7 +1423,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     auto * res = gf_res_prev.get();
-    auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
@@ -1348,7 +1440,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        auto * gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -2120,7 +2212,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         offset += sampling.sampled.size * sizeof(llama_token);
 
         sampling.candidates = {(llama_token *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
-        offset += sampling.candidates.size * sizeof(llama_token);
 
         // The count vectors keep track of the actual number of logits/probs/candidates
         // copied from the backend for each output row.
@@ -3372,6 +3463,49 @@ int32_t llama_serving_lora_stack_layer(
     return ctx && ctx->serving_lora_stack_layer(i, out_info) ? 0 : -1;
 }
 
+int32_t llama_functional_lora_family_count(const llama_context * ctx) {
+    return ctx ? ctx->functional_lora_family_count() : -1;
+}
+
+int32_t llama_functional_lora_family_config_get(
+        const llama_context * ctx,
+        int32_t family,
+        llama_functional_lora_family_config * out_config) {
+    return ctx && ctx->functional_lora_family_config_get(family, out_config) ? 0 : -1;
+}
+
+int32_t llama_functional_lora_family_state_get(
+        const llama_context * ctx,
+        int32_t family,
+        llama_functional_lora_family_state * out_state) {
+    return ctx && ctx->functional_lora_family_state_get(family, out_state) ? 0 : -1;
+}
+
+int32_t llama_functional_lora_get_last_trace(
+        const llama_context * ctx,
+        llama_functional_lora_trace * out_trace) {
+    return ctx && ctx->functional_lora_get_last_trace(out_trace) ? 0 : -1;
+}
+
+int32_t llama_functional_lora_get_last_update(
+        const llama_context * ctx,
+        int32_t family,
+        llama_functional_lora_update_info * out_update) {
+    return ctx && ctx->functional_lora_get_last_update(family, out_update) ? 0 : -1;
+}
+
+int32_t llama_functional_lora_set_ablation(
+        llama_context * ctx,
+        llama_functional_lora_ablation_config config) {
+    return ctx && ctx->functional_lora_set_ablation(config) ? 0 : -1;
+}
+
+int32_t llama_functional_lora_get_ablation(
+        const llama_context * ctx,
+        llama_functional_lora_ablation_config * out_config) {
+    return ctx && ctx->functional_lora_get_ablation(out_config) ? 0 : -1;
+}
+
 //
 // memory
 //
@@ -3718,15 +3852,22 @@ void llama_memory_breakdown_print(const struct llama_context * ctx) {
             }
         }
 
-        size_t free, total;
+        size_t free = 0;
+        size_t total = 0;
         ggml_backend_dev_memory(dev, &free, &total);
 
         const size_t self = mb.model + mb.context + mb.compute;
         const size_t unaccounted = total - self - free;
 
+        std::string device_label = "  - ";
+        device_label += name;
+        device_label += " (";
+        device_label += desc;
+        device_label += ")";
+
         table_data.push_back({
             template_gpu,
-            "  - " + name + " (" + desc + ")",
+            device_label,
             std::to_string(total / MiB),
             std::to_string(free / MiB),
             std::to_string(self / MiB),

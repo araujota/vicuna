@@ -18,6 +18,7 @@ class llama_active_lora_manager;
 class llama_self_state;
 class llama_cognitive_loop;
 class llama_hard_memory;
+class llama_bash_tool;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -111,7 +112,7 @@ struct llama_context {
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
-    bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+    bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, const float * scales);
 
     bool set_adapter_cvec(
             const float * data,
@@ -131,6 +132,30 @@ struct llama_context {
     bool past_lora_get_stats(llama_past_lora_stats * out_stats) const;
     int32_t serving_lora_stack_count() const;
     bool serving_lora_stack_layer(int32_t i, llama_serving_lora_layer_info * out_info) const;
+    int32_t functional_lora_family_count() const;
+    bool functional_lora_family_config_get(int32_t family, llama_functional_lora_family_config * out_config) const;
+    bool functional_lora_family_state_get(int32_t family, llama_functional_lora_family_state * out_state) const;
+    bool functional_lora_get_last_trace(llama_functional_lora_trace * out_trace) const;
+    bool functional_lora_get_last_update(int32_t family, llama_functional_lora_update_info * out_update) const;
+    bool functional_lora_set_ablation(const llama_functional_lora_ablation_config & config);
+    bool functional_lora_get_ablation(llama_functional_lora_ablation_config * out_config) const;
+    bool functional_lora_activate(const llama_functional_activation_decision & decision);
+    bool functional_lora_note_command_complete(int32_t origin);
+    bool functional_lora_apply_update(
+            int32_t family,
+            int32_t loop_origin,
+            int32_t start_microphase,
+            int32_t settle_microphase,
+            const llama_functional_outcome_snapshot & before,
+            const llama_functional_outcome_snapshot & after,
+            int32_t selected_tool_kind,
+            int32_t candidate_count,
+            const float * metrics,
+            size_t metric_count,
+            float signed_outcome,
+            float magnitude,
+            const llama_self_state_event & event,
+            const llama_self_state_feature_vector * features);
     bool self_state_refresh_time();
     bool self_state_set_time(const llama_self_state_time_point & time_point);
     bool self_state_get_datetime(llama_self_state_datetime * out_info) const;
@@ -175,6 +200,14 @@ struct llama_context {
     bool hard_memory_query(const llama_hard_memory_query_request & query, llama_hard_memory_result * out_result);
     bool hard_memory_get_last_result(llama_hard_memory_result * out_result) const;
     bool hard_memory_get_last_archive_trace(llama_hard_memory_archive_trace * out_trace) const;
+    bool bash_tool_configure(const llama_bash_tool_config & config);
+    bool bash_tool_get_config(llama_bash_tool_config * out_config) const;
+    bool bash_tool_set_request(const llama_bash_tool_request & request);
+    bool bash_tool_clear_request(int32_t command_id);
+    bool bash_tool_submit_result(const llama_bash_tool_result & result);
+    bool bash_tool_get_last_result(llama_bash_tool_result * out_result) const;
+    bool cognitive_bash_tool_get_request(int32_t command_id, llama_bash_tool_request * out_request) const;
+    bool cognitive_bash_tool_submit_result(const llama_bash_tool_result & result, llama_active_loop_trace * out_active_trace);
     int32_t cognitive_tool_spec_count() const;
     bool cognitive_tool_spec_get(int32_t index, llama_cognitive_tool_spec * out_spec) const;
     bool cognitive_tool_spec_set(const llama_cognitive_tool_spec * specs, int32_t count);
@@ -414,6 +447,7 @@ private:
     std::unique_ptr<llama_self_state> self_state;
     std::unique_ptr<llama_cognitive_loop> cognitive_loop;
     std::unique_ptr<llama_hard_memory> hard_memory;
+    std::unique_ptr<llama_bash_tool> bash_tool;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

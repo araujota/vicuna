@@ -2,6 +2,8 @@
 #include "llama.h"
 
 #include <array>
+#include <cstring>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -203,6 +205,81 @@ static bool expect_single_command(
     return true;
 }
 
+static bool expect_bash_request(
+        const char * label,
+        llama_context * ctx,
+        const llama_cognitive_command & command,
+        const char * expected_command_fragment,
+        llama_bash_tool_request * out_request = nullptr) {
+    llama_bash_tool_request request = {};
+    if (llama_cognitive_bash_tool_get_request(ctx, command.command_id, &request) != 0) {
+        std::fprintf(stderr, "%s: failed to retrieve bash request\n", label);
+        return false;
+    }
+    if (request.command_id != command.command_id ||
+        request.tool_job_id != command.tool_job_id ||
+        request.origin != command.origin ||
+        !request.command_ready ||
+        request.command_text[0] == '\0') {
+        std::fprintf(stderr, "%s: invalid bash request metadata\n", label);
+        return false;
+    }
+    if (expected_command_fragment && std::strstr(request.command_text, expected_command_fragment) == nullptr) {
+        std::fprintf(stderr, "%s: unexpected bash request command text: %s\n", label, request.command_text);
+        return false;
+    }
+    if (out_request) {
+        *out_request = request;
+    }
+    return true;
+}
+
+static bool expect_functional_family_state(
+        const char * label,
+        llama_context * ctx,
+        int32_t family,
+        bool expected_active,
+        int32_t expected_microphase = -1,
+        float min_gain = -1.0f) {
+    llama_functional_lora_family_state state = {};
+    if (llama_functional_lora_family_state_get(ctx, family, &state) != 0) {
+        std::fprintf(stderr, "%s: failed to query functional family state\n", label);
+        return false;
+    }
+    if (state.active_now != expected_active) {
+        std::fprintf(stderr, "%s: unexpected active state for family %d\n", label, family);
+        return false;
+    }
+    if (expected_microphase >= 0 && state.current_microphase != expected_microphase) {
+        std::fprintf(stderr, "%s: unexpected microphase for family %d: got %d expected %d\n",
+                label, family, state.current_microphase, expected_microphase);
+        return false;
+    }
+    if (min_gain >= 0.0f && state.current_gain < min_gain) {
+        std::fprintf(stderr, "%s: unexpected gain for family %d: got %f expected >= %f\n",
+                label, family, state.current_gain, min_gain);
+        return false;
+    }
+    return true;
+}
+
+static bool expect_functional_last_update(
+        const char * label,
+        llama_context * ctx,
+        int32_t family,
+        int32_t expected_settle_microphase) {
+    llama_functional_lora_update_info update = {};
+    if (llama_functional_lora_get_last_update(ctx, family, &update) != 0 || !update.valid) {
+        std::fprintf(stderr, "%s: missing functional update for family %d\n", label, family);
+        return false;
+    }
+    if (update.family != family || update.settle_microphase != expected_settle_microphase) {
+        std::fprintf(stderr, "%s: unexpected functional update metadata for family %d\n", label, family);
+        return false;
+    }
+    return true;
+}
+
 static bool settle_active_runner(const char * label, llama_context * ctx) {
     while (llama_cognitive_command_count(ctx) > 0) {
         llama_cognitive_command command = {};
@@ -321,11 +398,19 @@ int main(int argc, char ** argv) {
         }
 
         llama_cognitive_tool_spec spec = {};
-        if (llama_cognitive_tool_spec_count(ctx) < 3 ||
+        if (llama_cognitive_tool_spec_count(ctx) < 4 ||
             llama_cognitive_tool_spec_get(ctx, 0, &spec) != 0 ||
             spec.tool_kind != LLAMA_TOOL_KIND_GENERIC ||
             spec.name[0] == '\0') {
             std::fprintf(stderr, "default cognitive tool registry was not populated\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (llama_cognitive_tool_spec_get(ctx, 1, &spec) != 0 ||
+            spec.tool_kind != LLAMA_TOOL_KIND_BASH_CLI ||
+            spec.name[0] == '\0') {
+            std::fprintf(stderr, "bash cognitive tool registry entry was not populated\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -350,9 +435,11 @@ int main(int argc, char ** argv) {
         }
         if (trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_FINISH ||
             trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_ANSWER_READY ||
-            trace.loop_state.tool_registry_count < 3 ||
+            trace.loop_state.tool_registry_count < 4 ||
             trace.tool_proposal.valid ||
             !trace.observation.valid ||
+            trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ||
+            trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION ||
             trace.observation.status != LLAMA_SELF_TOOL_JOB_COMPLETED) {
             std::fprintf(stderr, "active answer trace did not expose bounded loop scaffolding\n");
             llama_free(ctx);
@@ -365,7 +452,9 @@ int main(int argc, char ** argv) {
             llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
             !runner.active ||
             runner.completed ||
-            runner.pending_command_id != command.command_id) {
+            runner.pending_command_id != command.command_id ||
+            runner.functional_microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION ||
+            !expect_functional_family_state("active-answer-functional", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, true, LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION, 0.10f)) {
             std::fprintf(stderr, "active answer runner did not retain pending emit command\n");
             llama_free(ctx);
             llama_model_free(model);
@@ -383,6 +472,11 @@ int main(int argc, char ** argv) {
             runner.active ||
             !runner.completed) {
             std::fprintf(stderr, "active answer runner did not clear after emit\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (!expect_functional_family_state("active-answer-functional-cleared", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, false)) {
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -487,7 +581,9 @@ int main(int argc, char ** argv) {
             !trace.loop_state.continuation_allowed ||
             !trace.loop_state.waiting_on_tool ||
             !trace.tool_proposal.valid ||
-            trace.tool_proposal.tool_kind != LLAMA_TOOL_KIND_GENERIC ||
+            trace.tool_proposal.tool_kind != LLAMA_TOOL_KIND_BASH_CLI ||
+            trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ||
+            trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP ||
             trace.tool_proposal.expected_steps <= 0) {
             std::fprintf(stderr, "active act trace did not expose tool preparation scaffolding\n");
             llama_free(ctx);
@@ -501,18 +597,16 @@ int main(int argc, char ** argv) {
             llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
             !runner.active ||
             !runner.waiting_on_tool ||
-            runner.pending_command_id != command.command_id) {
+            runner.pending_command_id != command.command_id ||
+            runner.functional_microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP ||
+            !expect_functional_family_state("active-act-functional", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, true, LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, 0.10f)) {
             std::fprintf(stderr, "active act runner did not retain waiting tool command\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
         }
-        if (llama_cognitive_command_complete(ctx, command.command_id, false) != 0 ||
-            llama_cognitive_command_count(ctx) != 0 ||
-            llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
-            !runner.active ||
-            !runner.waiting_on_tool) {
-            std::fprintf(stderr, "active act runner did not remain waiting after host completion\n");
+        llama_bash_tool_request request = {};
+        if (!expect_bash_request("active-act-request", ctx, command, "find build .", &request)) {
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -526,24 +620,27 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        const std::vector<llama_token> tool_tokens = tokenize_or_die(vocab, "Tool completed with repository results.");
-        const llama_self_state_event tool_event = {
-            /*.tokens =*/ tool_tokens.data(),
-            /*.n_tokens =*/ tool_tokens.size(),
-            /*.role =*/ LLAMA_SELF_STATE_EVENT_TOOL,
-            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
-            /*.flags =*/ LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED,
-            /*.decoder_entropy =*/ 0.0f,
-            /*.decoder_top_margin =*/ 1.0f,
-        };
+        llama_bash_tool_result result = {};
+        result.command_id = request.command_id;
+        result.tool_job_id = request.tool_job_id;
+        result.exit_code = 0;
+        result.runtime_ms = 12;
+        std::snprintf(result.stdout_text, sizeof(result.stdout_text), "%s", "build/logs/unit.log");
+
         const int32_t original_episode = trace.episode_id;
-        if (!expect_active_action("active-tool-followup", ctx, tool_event, LLAMA_ACTIVE_LOOP_ACTION_ANSWER, &trace)) {
+        if (llama_cognitive_bash_tool_submit_result(ctx, &result, &trace) != 0) {
+            std::fprintf(stderr, "failed to submit active bash tool result\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
         }
-        if (!trace.observation.valid ||
+        if (trace.winner_action != LLAMA_ACTIVE_LOOP_ACTION_ANSWER ||
+            !trace.observation.valid ||
+            trace.observation.tool_kind != LLAMA_TOOL_KIND_BASH_CLI ||
+            trace.observation.job_id != command.tool_job_id ||
             trace.observation.status != LLAMA_SELF_TOOL_JOB_COMPLETED ||
+            trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ||
+            trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION ||
             trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_ANSWER_READY ||
             trace.episode_id != original_episode) {
             std::fprintf(stderr, "tool followup did not surface tool observation scaffolding\n");
@@ -551,11 +648,37 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
+        if (!expect_functional_last_update(
+                    "active-tool-selection-update",
+                    ctx,
+                    LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION,
+                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        llama_bash_tool_result last_result = {};
+        if (llama_bash_tool_get_last_result(ctx, &last_result) != 0 ||
+            last_result.command_id != command.command_id ||
+            last_result.tool_job_id != command.tool_job_id ||
+            last_result.exit_code != 0) {
+            std::fprintf(stderr, "active bash result was not retained for observation\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
         if (!expect_single_command("active-tool-followup-command", ctx, LLAMA_COG_COMMAND_ORIGIN_ACTIVE, LLAMA_COG_COMMAND_EMIT_ANSWER, &command) ||
             llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
             !runner.active ||
-            runner.waiting_on_tool) {
+            runner.waiting_on_tool ||
+            !expect_functional_family_state("active-tool-followup-functional", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, true, LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION, 0.10f)) {
             std::fprintf(stderr, "active tool followup did not schedule final emit command\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (llama_cognitive_get_host_state(ctx, &host) != 0 || host.pending_tool_followup_count != 0) {
+            std::fprintf(stderr, "tool followup count did not settle after bash result submission\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -567,9 +690,7 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
-
-        if (llama_cognitive_get_host_state(ctx, &host) != 0 || host.pending_tool_followup_count != 0) {
-            std::fprintf(stderr, "tool followup count did not settle\n");
+        if (!expect_functional_family_state("active-tool-followup-functional-cleared", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, false)) {
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -618,6 +739,66 @@ int main(int argc, char ** argv) {
     }
 
     {
+        g_contradiction_score = 0.10f;
+        g_uncertainty_score = 0.10f;
+        g_broadcast_score = 0.05f;
+
+        llama_context * ctx = create_context(model);
+        if (!ctx) {
+            std::fprintf(stderr, "failed to create functional ablation context\n");
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_functional_lora_ablation_config ablation = {};
+        ablation.disabled_family_mask = (1ull << LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION);
+        if (llama_functional_lora_set_ablation(ctx, ablation) != 0) {
+            std::fprintf(stderr, "failed to configure functional family ablation\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> goal_tokens = tokenize_or_die(vocab, "Inspect the repository and run the appropriate tools.");
+        if (llama_self_state_upsert_goal(ctx, 101, goal_tokens.data(), goal_tokens.size(), 1.0f) != 0 ||
+            llama_self_state_upsert_tool_job(ctx, 107, LLAMA_SELF_TOOL_JOB_PENDING, 1.0f) != 0) {
+            std::fprintf(stderr, "failed to seed functional ablation active state\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> tokens = tokenize_or_die(vocab, "Please search the repository and inspect the build logs.");
+        const llama_self_state_event event = {
+            /*.tokens =*/ tokens.data(),
+            /*.n_tokens =*/ tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.1f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+
+        llama_active_loop_trace trace = {};
+        if (!expect_active_action("functional-ablation-active-act", ctx, event, LLAMA_ACTIVE_LOOP_ACTION_ACT, &trace) ||
+            trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ||
+            !expect_functional_family_state("functional-ablation-family-state", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, false)) {
+            std::fprintf(stderr, "functional family ablation did not suppress live activation while preserving route intent\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        if (!settle_active_runner("functional-ablation-settle", ctx)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(ctx);
+    }
+
+    {
         g_contradiction_score = 0.0f;
         g_uncertainty_score = 0.0f;
         g_broadcast_score = 0.0f;
@@ -655,6 +836,13 @@ int main(int argc, char ** argv) {
             runner.active ||
             !runner.completed) {
             std::fprintf(stderr, "low-pressure DMN runner state was not terminal\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_NONE ||
+            !expect_functional_family_state("low-pressure-dmn-functional", ctx, LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION, false)) {
+            std::fprintf(stderr, "low-pressure DMN did not clear functional state\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -728,6 +916,8 @@ int main(int argc, char ** argv) {
         if (trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_FINISH ||
             trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_INTERNAL_WRITE_READY ||
             !trace.observation.valid ||
+            trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION ||
+            trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION ||
             trace.observation.status != LLAMA_SELF_TOOL_JOB_COMPLETED) {
             std::fprintf(stderr, "internal-write DMN trace did not expose bounded loop observation state\n");
             llama_free(ctx);
@@ -739,6 +929,13 @@ int main(int argc, char ** argv) {
             runner.steps_taken < 2 ||
             runner.active) {
             std::fprintf(stderr, "internal-write DMN runner did not finish bounded local execution\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (!expect_functional_last_update("dmn-self-observation-update", ctx, LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION, LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION) ||
+            !expect_functional_last_update("dmn-counterfactual-update", ctx, LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL, LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE) ||
+            !expect_functional_family_state("dmn-internal-write-functional-cleared", ctx, LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION, false)) {
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -876,6 +1073,9 @@ int main(int argc, char ** argv) {
             trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_TOOL_REQUIRED ||
             !trace.loop_state.waiting_on_tool ||
             !trace.tool_proposal.valid ||
+            trace.tool_proposal.tool_kind != LLAMA_TOOL_KIND_BASH_CLI ||
+            trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ||
+            trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP ||
             trace.tool_proposal.job_id <= 0) {
             std::fprintf(stderr, "tool-focused DMN trace did not expose tool proposal scaffolding\n");
             llama_free(ctx);
@@ -889,8 +1089,15 @@ int main(int argc, char ** argv) {
             llama_cognitive_dmn_runner_get(ctx, &runner) != 0 ||
             !runner.active ||
             !runner.waiting_on_tool ||
-            runner.pending_command_id != command.command_id) {
+            runner.pending_command_id != command.command_id ||
+            runner.functional_microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP ||
+            !expect_functional_family_state("dmn-invoke-tool-functional", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, true, LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, 0.10f)) {
             std::fprintf(stderr, "tool-focused DMN runner did not retain pending tool command\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (!expect_bash_request("dmn-invoke-tool-request", ctx, command, "find . -maxdepth 3")) {
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -901,6 +1108,55 @@ int main(int argc, char ** argv) {
             remediation.action != LLAMA_REMEDIATION_ACTION_GATHER_INFO ||
             remediation.tool_job_id <= 0) {
             std::fprintf(stderr, "tool-focused DMN tick did not request bounded information gathering\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(ctx);
+    }
+
+    {
+        g_contradiction_score = 0.88f;
+        g_uncertainty_score = 0.72f;
+        g_broadcast_score = 0.04f;
+
+        llama_context * ctx = create_context(model);
+        if (!ctx) {
+            std::fprintf(stderr, "failed to create compression DMN context\n");
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> tokens = tokenize_or_die(vocab, "There are unresolved commitments, causal links, and social details to preserve.");
+        const llama_self_state_event event = {
+            /*.tokens =*/ tokens.data(),
+            /*.n_tokens =*/ tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.9f,
+            /*.decoder_top_margin =*/ 0.0f,
+        };
+        for (int32_t i = 0; i < 4; ++i) {
+            if (!ingest_event_without_runner("seed-compression-dmn", ctx, event)) {
+                std::fprintf(stderr, "failed to seed compression DMN pressure\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+        }
+
+        llama_dmn_tick_trace trace = {};
+        if (llama_dmn_tick(ctx, 6500, &trace) != 0 || !trace.admitted) {
+            std::fprintf(stderr, "compression DMN tick failed\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if ((trace.maintenance_mask & LLAMA_DMN_MAINTENANCE_COMPRESS_WORKING_MEMORY) == 0 ||
+            !expect_functional_last_update("dmn-memory-compression-update", ctx, LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION, LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT)) {
+            std::fprintf(stderr, "compression DMN tick did not settle memory-compression update\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;

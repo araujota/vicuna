@@ -2,6 +2,7 @@
 #include "llama.h"
 
 #include <cstdlib>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -92,6 +93,36 @@ int main(int argc, char ** argv) {
         stats.embedding_type != LLAMA_ACTIVE_LORA_EMBEDDING_HIDDEN_STATE ||
         stats.embedding_is_custom || stats.embedding_dim != (uint32_t) llama_model_n_embd_out(model)) {
         fprintf(stderr, "unexpected Active LoRA init stats\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    if (llama_functional_lora_family_count(ctx) != LLAMA_FUNCTIONAL_LORA_COUNT) {
+        fprintf(stderr, "unexpected functional LoRA family count\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+    for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+        llama_functional_lora_family_config config = {};
+        llama_functional_lora_family_state state = {};
+        if (llama_functional_lora_family_config_get(ctx, family, &config) != 0 ||
+            llama_functional_lora_family_state_get(ctx, family, &state) != 0 ||
+            !config.enabled ||
+            !state.compatible ||
+            state.active_now ||
+            state.current_gain != 0.0f) {
+            fprintf(stderr, "unexpected functional LoRA registry state for family %d\n", family);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+    }
+    llama_functional_lora_trace functional_trace = {};
+    if (llama_functional_lora_get_last_trace(ctx, &functional_trace) != 0 ||
+        functional_trace.last_activation.microphase != 0) {
+        fprintf(stderr, "unexpected default functional LoRA trace\n");
         llama_free(ctx);
         llama_model_free(model);
         return 1;

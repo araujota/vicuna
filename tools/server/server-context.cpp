@@ -1,11 +1,15 @@
 #include "server-context.h"
+#include "server-bash-tool.h"
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
 
+#include "chat.h"
 #include "common.h"
+#include "ggml.h"
 #include "llama.h"
+#include "llama-cpp.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -15,10 +19,24 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <memory>
+#include <ctime>
+#include <exception>
 #include <filesystem>
+#include <functional>
+#include <iomanip>
+#include <map>
+#include <memory>
+#include <set>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -106,7 +124,7 @@ struct server_slot {
     std::unique_ptr<server_tokens> replay_tokens;
 
     void prompt_save(server_prompt_cache & prompt_cache) const {
-        GGML_ASSERT(prompt.data.size() == 0);
+        GGML_ASSERT(prompt.data.empty());
 
         const size_t cur_size = llama_state_seq_get_size_ext(ctx, id, 0);
 
@@ -636,6 +654,110 @@ private:
         sleeping = new_state;
     }
 
+    bool process_bash_tool_commands(
+            int32_t origin_filter,
+            llama_active_loop_trace * out_active_trace = nullptr) {
+        if (!ctx) {
+            return false;
+        }
+
+        constexpr int32_t max_iterations = LLAMA_COGNITIVE_MAX_PENDING_COMMANDS;
+        int32_t iterations = 0;
+        bool had_match = false;
+
+        while (iterations < max_iterations) {
+            bool processed_command = false;
+            const int32_t command_count = llama_cognitive_command_count(ctx);
+
+            for (int32_t i = 0; i < command_count; ++i) {
+                llama_cognitive_command command = {};
+                if (llama_cognitive_command_get(ctx, i, &command) != 0) {
+                    continue;
+                }
+                if (command.kind != LLAMA_COG_COMMAND_INVOKE_TOOL ||
+                    command.tool_kind != LLAMA_TOOL_KIND_BASH_CLI ||
+                    command.status != LLAMA_COG_COMMAND_STATUS_PENDING) {
+                    continue;
+                }
+                if (origin_filter >= 0 && command.origin != origin_filter) {
+                    continue;
+                }
+
+                had_match = true;
+                processed_command = true;
+                ++iterations;
+
+                if (llama_cognitive_command_ack(ctx, command.command_id) != 0) {
+                    SRV_WRN("failed to ack bash tool command %d\n", command.command_id);
+                    break;
+                }
+
+                llama_bash_tool_request request = {};
+                if (llama_cognitive_bash_tool_get_request(ctx, command.command_id, &request) != 0) {
+                    SRV_WRN("bash tool command %d did not have a pending request\n", command.command_id);
+                    (void) llama_cognitive_command_complete(ctx, command.command_id, true);
+                    break;
+                }
+
+                llama_bash_tool_result result = {};
+                result.command_id = request.command_id;
+                result.tool_job_id = request.tool_job_id;
+
+                llama_bash_tool_config config = llama_bash_tool_default_config();
+                (void) llama_bash_tool_get_config(ctx, &config);
+                if (!config.enabled) {
+                    result.launch_failed = true;
+                    result.exit_code = 127;
+                    std::snprintf(result.error_text, sizeof(result.error_text), "%s", "bash tool is disabled");
+                } else if (!request.command_ready || request.command_text[0] == '\0') {
+                    result.launch_failed = true;
+                    result.exit_code = 127;
+                    std::snprintf(result.error_text, sizeof(result.error_text), "%s", "bash tool request did not include a command");
+                } else if (!server_bash_tool_execute(request, &result)) {
+                    result = {};
+                    result.command_id = request.command_id;
+                    result.tool_job_id = request.tool_job_id;
+                    result.launch_failed = true;
+                    result.exit_code = 127;
+                    std::snprintf(result.error_text, sizeof(result.error_text), "%s", "bash tool host execution failed");
+                }
+
+                llama_active_loop_trace active_trace = {};
+                if (llama_cognitive_bash_tool_submit_result(
+                            ctx,
+                            &result,
+                            command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE ? &active_trace : nullptr) != 0) {
+                    SRV_WRN("failed to submit bash tool result for command %d\n", command.command_id);
+                    break;
+                }
+
+                SRV_INF("bash tool command %d origin=%d exit=%d signal=%d timeout=%d launch_failed=%d\n",
+                        command.command_id,
+                        command.origin,
+                        result.exit_code,
+                        result.term_signal,
+                        result.timed_out ? 1 : 0,
+                        result.launch_failed ? 1 : 0);
+
+                if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE && out_active_trace) {
+                    *out_active_trace = active_trace;
+                }
+
+                break;
+            }
+
+            if (!processed_command) {
+                break;
+            }
+        }
+
+        if (iterations >= max_iterations) {
+            SRV_WRN("%s", "stopped draining bash tool commands after reaching the iteration cap\n");
+        }
+
+        return !had_match || iterations > 0;
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(const common_params & params) {
@@ -816,6 +938,58 @@ private:
                 } else {
                     SRV_WRN("%s\n", "failed to configure hard memory");
                 }
+            }
+        }
+
+        {
+            llama_bash_tool_config bash_tool = llama_bash_tool_default_config();
+            const char * bash_enabled = getenv("VICUNA_BASH_TOOL_ENABLED");
+            const char * bash_path = getenv("VICUNA_BASH_TOOL_PATH");
+            const char * bash_workdir = getenv("VICUNA_BASH_TOOL_WORKDIR");
+            const char * bash_timeout = getenv("VICUNA_BASH_TOOL_TIMEOUT_MS");
+            const char * bash_stdout = getenv("VICUNA_BASH_TOOL_MAX_STDOUT_BYTES");
+            const char * bash_stderr = getenv("VICUNA_BASH_TOOL_MAX_STDERR_BYTES");
+            const char * bash_login = getenv("VICUNA_BASH_TOOL_LOGIN_SHELL");
+            const char * bash_inherit_env = getenv("VICUNA_BASH_TOOL_INHERIT_ENV");
+
+            if (bash_enabled) {
+                bash_tool.enabled = atoi(bash_enabled) != 0;
+            }
+            if (bash_path) {
+                std::snprintf(bash_tool.bash_path, sizeof(bash_tool.bash_path), "%s", bash_path);
+            }
+            if (bash_workdir) {
+                std::snprintf(bash_tool.working_directory, sizeof(bash_tool.working_directory), "%s", bash_workdir);
+            }
+            if (bash_timeout) {
+                bash_tool.timeout_ms = std::max(100, atoi(bash_timeout));
+            }
+            if (bash_stdout) {
+                bash_tool.max_stdout_bytes = std::max(1, atoi(bash_stdout));
+            }
+            if (bash_stderr) {
+                bash_tool.max_stderr_bytes = std::max(1, atoi(bash_stderr));
+            }
+            if (bash_login) {
+                bash_tool.login_shell = atoi(bash_login) != 0;
+            }
+            if (bash_inherit_env) {
+                bash_tool.inherit_env = atoi(bash_inherit_env) != 0;
+            }
+
+            if (llama_bash_tool_configure(ctx, bash_tool) == 0) {
+                if (bash_tool.enabled) {
+                    SRV_INF("bash tool enabled: bash=%s cwd=%s timeout_ms=%d stdout=%d stderr=%d login=%d inherit_env=%d\n",
+                            bash_tool.bash_path,
+                            bash_tool.working_directory[0] ? bash_tool.working_directory : ".",
+                            bash_tool.timeout_ms,
+                            bash_tool.max_stdout_bytes,
+                            bash_tool.max_stderr_bytes,
+                            bash_tool.login_shell ? 1 : 0,
+                            bash_tool.inherit_env ? 1 : 0);
+                }
+            } else {
+                SRV_WRN("%s\n", "failed to configure bash tool");
             }
         }
 
@@ -1096,7 +1270,7 @@ private:
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
             // don't update the cache if the slot's context is empty
-            update_cache = update_cache && tokens.size() > 0;
+            update_cache = update_cache && !tokens.empty();
 
             if (update_cache) {
                 SRV_WRN("%s", "updating prompt cache\n");
@@ -1249,6 +1423,7 @@ private:
             };
             task.has_active_trace = llama_active_loop_process(ctx, &loop_event, &task.active_trace) == 0;
             if (task.has_active_trace) {
+                (void) process_bash_tool_commands(LLAMA_COG_COMMAND_ORIGIN_ACTIVE, &task.active_trace);
                 SLT_INF(slot, "active loop episode %d winner=%d score=%.3f deferred_background=%d\n",
                         task.active_trace.episode_id,
                         task.active_trace.winner_action,
@@ -1595,7 +1770,7 @@ private:
         }
         res->timings         = slot.get_timings();
         res->prompt          = slot.task->tokens.detokenize(ctx, true);
-        res->response_fields = std::move(slot.task->params.response_fields);
+        res->response_fields = slot.task->params.response_fields;
 
         res->truncated           = slot.truncated;
         res->n_decoded           = slot.n_decoded;
@@ -1957,7 +2132,9 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (!check_no_mtmd(task.id)) break;
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -2039,7 +2216,7 @@ private:
                     res->id = task.id;
                     for (size_t i = 0; i < loras.size(); ++i) {
                         auto & lora = loras[i];
-                        std::string alora_invocation_string = "";
+                        std::string alora_invocation_string;
                         const uint64_t n_alora_tokens = llama_adapter_get_alora_n_invocation_tokens(lora.ptr);
                         llama_tokens alora_invocation_tokens;
                         if (n_alora_tokens) {
@@ -2073,6 +2250,8 @@ private:
         }
     }
 
+    // Legacy dispatcher remains monolithic while server task semantics are being untangled.
+    // NOLINTNEXTLINE(readability-function-size)
     void update_slots() {
         (void) llama_past_lora_tick(ctx, ggml_time_us());
 
@@ -2111,6 +2290,7 @@ private:
                         }
                     }
                 }
+                (void) process_bash_tool_commands(-1);
                 SRV_INF("%s", "all slots are idle\n");
 
                 return;
@@ -2570,7 +2750,7 @@ private:
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
-                                        [&, func_name = __func__](const auto & cur) {
+                                        [&, func_name = "update_slots"](const auto & cur) {
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
@@ -2599,7 +2779,6 @@ private:
                                     if (do_reset) {
                                         SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                        pos_next = 0;
                                         n_past = 0;
                                     }
                                 }
@@ -3025,7 +3204,7 @@ private:
                     continue; // continue loop of slots
                 }
 
-                if (slot.i_batch_dft.size() > 0) {
+                if (!slot.i_batch_dft.empty()) {
                     continue; // sample using speculative decoding
                 }
 
@@ -3146,15 +3325,18 @@ private:
 server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 bool server_context::load_model(const common_params & params) {
     return impl->load_model(params);
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 void server_context::terminate() {
     impl->queue_tasks.terminate();
 }
@@ -3163,6 +3345,7 @@ llama_context * server_context::get_llama_context() const {
     return impl->ctx;
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 server_response_reader server_context::get_response_reader() {
     return impl->get_response_reader();
 }
@@ -3315,30 +3498,31 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         auto all_results = rd.wait_for_all(req.should_stop);
         if (all_results.is_terminated) {
             return res; // connection is closed
-        } else if (all_results.error) {
+        }
+        if (all_results.error) {
             res->error(all_results.error->to_json());
             return res;
+        }
+
+        json arr = json::array();
+        for (auto & res : all_results.results) {
+            GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
+            arr.push_back(res->to_json());
+        }
+        GGML_ASSERT(!arr.empty() && "empty results");
+        if (arr.size() == 1) {
+            // if single request, return single object instead of array
+            res->ok(arr[0]);
+        } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
+            // if multiple results in OAI format, we need to re-format them
+            json & choices = arr[0]["choices"];
+            for (size_t i = 1; i < arr.size(); i++) {
+                choices.push_back(std::move(arr[i]["choices"][0]));
+            }
+            res->ok(arr[0]);
         } else {
-            json arr = json::array();
-            for (auto & res : all_results.results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
-                arr.push_back(res->to_json());
-            }
-            GGML_ASSERT(!arr.empty() && "empty results");
-            if (arr.size() == 1) {
-                // if single request, return single object instead of array
-                res->ok(arr[0]);
-            } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
-                // if multiple results in OAI format, we need to re-format them
-                json & choices = arr[0]["choices"];
-                for (size_t i = 1; i < arr.size(); i++) {
-                    choices.push_back(std::move(arr[i]["choices"][0]));
-                }
-                res->ok(arr[0]);
-            } else {
-                // multi-results, non-OAI compat
-                res->ok(arr);
-            }
+            // multi-results, non-OAI compat
+            res->ok(arr);
         }
     } else {
         // in streaming mode, the first error must be treated as non-stream response
@@ -3379,14 +3563,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         {"event", "error"},
                         {"data", res_json},
                     });
-                } else {
-                    return format_oai_sse(json {{ "error", res_json }});
                 }
+                return format_oai_sse(json {{ "error", res_json }});
             };
 
             try {
                 if (req.should_stop()) {
-                    SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
+                    LOG_DBG("srv  %12.*s: %s", 12, "stream_next", "stopping streaming due to should_stop condition\n");
                     return false; // should_stop condition met
                 }
 
@@ -3412,14 +3595,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             output = "data: [DONE]\n\n";
                             break;
                     }
-                    SRV_DBG("%s", "all results received, terminating stream\n");
+                    LOG_DBG("srv  %12.*s: %s", 12, "stream_next", "all results received, terminating stream\n");
                     return false; // no more data, terminate
                 }
 
                 // receive subsequent results
                 auto result = rd.next(req.should_stop);
                 if (result == nullptr) {
-                    SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
+                    LOG_DBG("srv  %12.*s: %s", 12, "stream_next", "stopping streaming due to should_stop condition\n");
                     GGML_ASSERT(req.should_stop());
                     return false; // should_stop condition met
                 }
@@ -3428,21 +3611,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 if (result->is_error()) {
                     json res_json = result->to_json();
                     output = format_error(res_type, res_json);
-                    SRV_DBG("%s", "error received during streaming, terminating stream\n");
+                    LOG_DBG("srv  %12.*s: %s", 12, "stream_next", "error received during streaming, terminating stream\n");
                     return false; // terminate on error
+                }
+                GGML_ASSERT(
+                    dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
+                    || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
+                );
+                json res_json = result->to_json();
+                if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                    output = format_anthropic_sse(res_json);
+                } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                    output = format_oai_resp_sse(res_json);
                 } else {
-                    GGML_ASSERT(
-                        dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
-                        || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
-                    );
-                    json res_json = result->to_json();
-                    if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-                        output = format_anthropic_sse(res_json);
-                    } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-                        output = format_oai_resp_sse(res_json);
-                    } else {
-                        output = format_oai_sse(res_json);
-                    }
+                    output = format_oai_sse(res_json);
                 }
 
                 // has next data, continue
@@ -3518,7 +3700,7 @@ void server_routes::init_routes() {
         }
 
         // TODO: get rid of this dynamic_cast
-        auto res_task = dynamic_cast<server_task_result_metrics*>(result.get());
+        auto * res_task = dynamic_cast<server_task_result_metrics*>(result.get());
         GGML_ASSERT(res_task != nullptr);
 
         // metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
@@ -3526,19 +3708,19 @@ void server_routes::init_routes() {
             {"counter", {{
                     {"name",  "prompt_tokens_total"},
                     {"help",  "Number of prompt tokens processed."},
-                    {"value",  (uint64_t) res_task->n_prompt_tokens_processed_total}
+                    {"value",  res_task->n_prompt_tokens_processed_total}
             }, {
                     {"name",  "prompt_seconds_total"},
                     {"help",  "Prompt process time"},
-                    {"value",  (uint64_t) res_task->t_prompt_processing_total / 1.e3}
+                    {"value",  res_task->t_prompt_processing_total / 1.e3}
             }, {
                     {"name",  "tokens_predicted_total"},
                     {"help",  "Number of generation tokens processed."},
-                    {"value",  (uint64_t) res_task->n_tokens_predicted_total}
+                    {"value",  res_task->n_tokens_predicted_total}
             }, {
                     {"name",  "tokens_predicted_seconds_total"},
                     {"help",  "Predict process time"},
-                    {"value",  (uint64_t) res_task->t_tokens_generation_total / 1.e3}
+                    {"value",  res_task->t_tokens_generation_total / 1.e3}
             }, {
                     {"name",  "n_decode_total"},
                     {"help",  "Total number of llama_decode() calls"},
@@ -3563,11 +3745,11 @@ void server_routes::init_routes() {
             },{
                     {"name",  "requests_processing"},
                     {"help",  "Number of requests processing."},
-                    {"value",  (uint64_t) res_task->n_processing_slots}
+                    {"value",  res_task->n_processing_slots}
             },{
                     {"name",  "requests_deferred"},
                     {"help",  "Number of requests deferred."},
-                    {"value",  (uint64_t) res_task->n_tasks_deferred}
+                    {"value",  res_task->n_tasks_deferred}
             }}}
         };
 
@@ -3815,7 +3997,7 @@ void server_routes::init_routes() {
 
         std::string prompt = json_value(data, "prompt", std::string());
         std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, false, true);
-        SRV_DBG("creating infill tasks, n_prompts = %d\n", (int) tokenized_prompts.size());
+        LOG_DBG("srv  %12.*s: creating infill tasks, n_prompts = %d\n", 12, "post_infill", (int) tokenized_prompts.size());
         data["prompt"] = format_prompt_infill(
             ctx_server.vocab,
             data.at("input_prefix"),
@@ -3881,8 +4063,8 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = convert_responses_to_chatcmpl(json::parse(req.body));
-        SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
+        LOG_DBG("srv  %12.*s: %s\n", 12, "post_responses", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
+        LOG_DBG("srv  %12.*s: converted request: %s\n", 12, "post_responses", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -3899,8 +4081,8 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = convert_anthropic_to_oai(json::parse(req.body));
-        SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
+        LOG_DBG("srv  %12.*s: %s\n", 12, "anth_messages", "Request converted: Anthropic -> OpenAI Chat Completions");
+        LOG_DBG("srv  %12.*s: converted request: %s\n", 12, "anth_messages", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -3917,8 +4099,8 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = convert_anthropic_to_oai(json::parse(req.body));
-        SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
+        LOG_DBG("srv  %12.*s: %s\n", 12, "anth_count", "Request converted: Anthropic -> OpenAI Chat Completions");
+        LOG_DBG("srv  %12.*s: converted request: %s\n", 12, "anth_count", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -4119,14 +4301,14 @@ void server_routes::init_routes() {
         // collect results
         if (all_results.is_terminated) {
             return res; // connection is closed
-        } else if (all_results.error) {
+        }
+        if (all_results.error) {
             res->error(all_results.error->to_json());
             return res;
-        } else {
-            for (auto & res : all_results.results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr);
-                responses.push_back(res->to_json());
-            }
+        }
+        for (auto & res : all_results.results) {
+            GGML_ASSERT(dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr);
+            responses.push_back(res->to_json());
         }
 
         // write JSON response
@@ -4385,14 +4567,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
     // collect results
     if (all_results.is_terminated) {
         return res; // connection is closed
-    } else if (all_results.error) {
+    }
+    if (all_results.error) {
         res->error(all_results.error->to_json());
         return res;
-    } else {
-        for (auto & res : all_results.results) {
-            GGML_ASSERT(dynamic_cast<server_task_result_embd*>(res.get()) != nullptr);
-            responses.push_back(res->to_json());
-        }
+    }
+    for (auto & res : all_results.results) {
+        GGML_ASSERT(dynamic_cast<server_task_result_embd*>(res.get()) != nullptr);
+        responses.push_back(res->to_json());
     }
 
     // write JSON response

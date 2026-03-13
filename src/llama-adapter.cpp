@@ -1,13 +1,28 @@
 #include "llama-adapter.h"
 
+#include "ggml-alloc.h"
+#include "ggml-cpp.h"
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "gguf.h"
+#include "llama.h"
+#include "llama-arch.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 
-#include <map>
+#include <algorithm>
 #include <cassert>
-#include <sstream>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <exception>
+#include <iterator>
+#include <map>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 int32_t llama_adapter_lora_layer_precedence(llama_adapter_lora_layer_role role) {
     switch (role) {
@@ -18,6 +33,10 @@ int32_t llama_adapter_lora_layer_precedence(llama_adapter_lora_layer_role role) 
         case LLAMA_ADAPTER_LORA_LAYER_PAST_MONTH:   return 130;
         case LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK:    return 140;
         case LLAMA_ADAPTER_LORA_LAYER_ACTIVE:       return 150;
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_TOOL_SELECTION:   return 160;
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_COUNTERFACTUAL:   return 170;
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_MEMORY_COMPRESSION:return 180;
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_SELF_OBSERVATION: return 190;
         default:                                    return 1000;
     }
 }
@@ -31,6 +50,10 @@ const char * llama_adapter_lora_layer_role_name(llama_adapter_lora_layer_role ro
         case LLAMA_ADAPTER_LORA_LAYER_PAST_MONTH:   return "past_month";
         case LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK:    return "past_week";
         case LLAMA_ADAPTER_LORA_LAYER_ACTIVE:       return "active";
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_TOOL_SELECTION:   return "functional_tool_selection";
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_COUNTERFACTUAL:   return "functional_counterfactual";
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_MEMORY_COMPRESSION:return "functional_memory_compression";
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_SELF_OBSERVATION: return "functional_self_observation";
         default:                                    return "unknown";
     }
 }
@@ -101,20 +124,20 @@ bool llama_adapter_cvec::init(const llama_model & model) {
     }
 
     // allocate tensors / buffers and zero
+    const char * fn = __func__;
     bufs.reserve(ctx_map.size());
-    for (auto it : ctx_map) {
-        ggml_backend_buffer_type_t buft = it.first;
-        ggml_context * ctx = it.second;
+    return std::all_of(ctx_map.begin(), ctx_map.end(), [&](const auto & entry) {
+        ggml_backend_buffer_type_t buft = entry.first;
+        ggml_context * ctx = entry.second;
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
         if (!buf) {
-            LLAMA_LOG_ERROR("%s: failed to allocate buffer for control vector\n", __func__);
+            LLAMA_LOG_ERROR("%s: failed to allocate buffer for control vector\n", fn);
             return false;
         }
         ggml_backend_buffer_clear(buf, 0);
         bufs.emplace_back(buf);
-    }
-
-    return true;
+        return true;
+    });
 }
 
 bool llama_adapter_cvec::apply(
@@ -603,7 +626,8 @@ int32_t llama_adapter_meta_val_str_by_index(const llama_adapter_lora * adapter, 
     return snprintf(buf, buf_size, "%s", it->second.c_str());
 }
 
-void llama_adapter_lora_free(llama_adapter_lora *) {
+void llama_adapter_lora_free(llama_adapter_lora * adapter) {
+    (void) adapter;
     // deprecated: adapters are freed by llama_model's destructor
 }
 

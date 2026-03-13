@@ -1,9 +1,11 @@
 #include "get-model.h"
+#include "ggml.h"
 #include "llama.h"
 #include "llama-adapter.h"
 #include "llama-model.h"
 
 #include <cstdio>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -96,13 +98,17 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (llama_serving_lora_stack_count(ctx.get()) != 6 ||
+    if (llama_serving_lora_stack_count(ctx.get()) != 10 ||
         !expect_layer(ctx.get(), 0, LLAMA_SERVING_LORA_LAYER_ALL_TIME) ||
         !expect_layer(ctx.get(), 1, LLAMA_SERVING_LORA_LAYER_PAST_YEAR) ||
         !expect_layer(ctx.get(), 2, LLAMA_SERVING_LORA_LAYER_PAST_QUARTER) ||
         !expect_layer(ctx.get(), 3, LLAMA_SERVING_LORA_LAYER_PAST_MONTH) ||
         !expect_layer(ctx.get(), 4, LLAMA_SERVING_LORA_LAYER_PAST_WEEK) ||
-        !expect_layer(ctx.get(), 5, LLAMA_SERVING_LORA_LAYER_ACTIVE, 0.0f)) {
+        !expect_layer(ctx.get(), 5, LLAMA_SERVING_LORA_LAYER_ACTIVE, 0.0f) ||
+        !expect_layer(ctx.get(), 6, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_TOOL_SELECTION, 0.0f) ||
+        !expect_layer(ctx.get(), 7, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_COUNTERFACTUAL, 0.0f) ||
+        !expect_layer(ctx.get(), 8, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_MEMORY_COMPRESS, 0.0f) ||
+        !expect_layer(ctx.get(), 9, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_SELF_OBSERVE, 0.0f)) {
         fprintf(stderr, "unexpected runtime-only serving stack\n");
         return 1;
     }
@@ -127,10 +133,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (llama_serving_lora_stack_count(ctx.get()) != 7 ||
+    if (llama_serving_lora_stack_count(ctx.get()) != 11 ||
         !expect_layer(ctx.get(), 0, LLAMA_SERVING_LORA_LAYER_REQUEST, 0.5f) ||
         !expect_layer(ctx.get(), 1, LLAMA_SERVING_LORA_LAYER_ALL_TIME) ||
-        !expect_layer(ctx.get(), 6, LLAMA_SERVING_LORA_LAYER_ACTIVE, 0.0f)) {
+        !expect_layer(ctx.get(), 6, LLAMA_SERVING_LORA_LAYER_ACTIVE, 0.0f) ||
+        !expect_layer(ctx.get(), 10, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_SELF_OBSERVE, 0.0f)) {
         fprintf(stderr, "request adapter replaced runtime memory layers\n");
         model->loras.erase(request_adapter.get());
         return 1;
@@ -138,10 +145,11 @@ int main(int argc, char ** argv) {
 
     request_scales[0] = 0.25f;
     if (llama_set_adapters_lora(ctx.get(), request_adapters, 1, request_scales) != 0 ||
-        llama_serving_lora_stack_count(ctx.get()) != 7 ||
+        llama_serving_lora_stack_count(ctx.get()) != 11 ||
         !expect_layer(ctx.get(), 0, LLAMA_SERVING_LORA_LAYER_REQUEST, 0.25f) ||
         !expect_layer(ctx.get(), 1, LLAMA_SERVING_LORA_LAYER_ALL_TIME) ||
-        !expect_layer(ctx.get(), 6, LLAMA_SERVING_LORA_LAYER_ACTIVE, 0.0f)) {
+        !expect_layer(ctx.get(), 6, LLAMA_SERVING_LORA_LAYER_ACTIVE, 0.0f) ||
+        !expect_layer(ctx.get(), 10, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_SELF_OBSERVE, 0.0f)) {
         fprintf(stderr, "request adapter update broke serving stack preservation\n");
         model->loras.erase(request_adapter.get());
         return 1;
@@ -149,9 +157,10 @@ int main(int argc, char ** argv) {
 
     request_scales[0] = 0.0f;
     if (llama_set_adapters_lora(ctx.get(), request_adapters, 1, request_scales) != 0 ||
-        llama_serving_lora_stack_count(ctx.get()) != 6 ||
+        llama_serving_lora_stack_count(ctx.get()) != 10 ||
         !expect_layer(ctx.get(), 0, LLAMA_SERVING_LORA_LAYER_ALL_TIME) ||
-        !expect_layer(ctx.get(), 5, LLAMA_SERVING_LORA_LAYER_ACTIVE, 0.0f)) {
+        !expect_layer(ctx.get(), 5, LLAMA_SERVING_LORA_LAYER_ACTIVE, 0.0f) ||
+        !expect_layer(ctx.get(), 9, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_SELF_OBSERVE, 0.0f)) {
         fprintf(stderr, "clearing request adapter removed runtime memory layers\n");
         model->loras.erase(request_adapter.get());
         return 1;

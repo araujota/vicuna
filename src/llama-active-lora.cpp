@@ -32,7 +32,7 @@ constexpr uint32_t YEAR_TO_ALL_TIME_JOB = 4;
 constexpr size_t PAST_BUCKET_COUNT = LLAMA_MEMORY_LORA_BUCKET_COUNT;
 constexpr float DIRECTION_EPS = 1.0e-8f;
 
-static float clamp_unit(float value) {
+float clamp_unit(float value) {
     return std::min(1.0f, std::max(0.0f, value));
 }
 
@@ -148,7 +148,7 @@ struct active_lora_write_features {
 
 void normalize_vector(std::vector<float> & vec);
 
-static uint64_t mix_seed(uint64_t value) {
+uint64_t mix_seed(uint64_t value) {
     value ^= value >> 33;
     value *= 0xff51afd7ed558ccdULL;
     value ^= value >> 33;
@@ -157,14 +157,14 @@ static uint64_t mix_seed(uint64_t value) {
     return value;
 }
 
-static float decoder_entropy_feature(float entropy) {
+float decoder_entropy_feature(float entropy) {
     if (entropy <= 0.0f) {
         return 0.0f;
     }
     return entropy / (entropy + 1.0f);
 }
 
-static float sample_signal(const std::vector<float> & signal, size_t index, uint64_t seed) {
+float sample_signal(const std::vector<float> & signal, size_t index, uint64_t seed) {
     if (signal.empty()) {
         return 0.0f;
     }
@@ -183,7 +183,7 @@ static float sample_signal(const std::vector<float> & signal, size_t index, uint
     return 0.60f * first + 0.30f * second + 0.10f * third * sign;
 }
 
-static std::vector<float> project_signal(const std::vector<float> & src, size_t out_dim, uint64_t seed) {
+std::vector<float> project_signal(const std::vector<float> & src, size_t out_dim, uint64_t seed) {
     std::vector<float> out(out_dim, 0.0f);
     if (src.empty() || out_dim == 0) {
         return out;
@@ -201,7 +201,7 @@ static std::vector<float> project_signal(const std::vector<float> & src, size_t 
     return out;
 }
 
-static uint64_t hash_signal_prefix(const std::vector<float> & signal, size_t limit, uint64_t seed) {
+uint64_t hash_signal_prefix(const std::vector<float> & signal, size_t limit, uint64_t seed) {
     uint64_t hash = mix_seed(seed ^ 1469598103934665603ULL);
     for (size_t i = 0; i < std::min(limit, signal.size()); ++i) {
         const int32_t quantized = static_cast<int32_t>(std::lrint(signal[i] * 4096.0f));
@@ -212,7 +212,7 @@ static uint64_t hash_signal_prefix(const std::vector<float> & signal, size_t lim
     return hash;
 }
 
-static size_t parse_layer_index(const std::string & tensor_name) {
+size_t parse_layer_index(const std::string & tensor_name) {
     const std::string marker = "blk.";
     const size_t pos = tensor_name.find(marker);
     if (pos == std::string::npos) {
@@ -231,6 +231,47 @@ static size_t parse_layer_index(const std::string & tensor_name) {
     }
 
     return saw_digit ? value : std::numeric_limits<size_t>::max();
+}
+
+float functional_default_gain(int32_t family) {
+    switch (family) {
+        case LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION:
+            return 0.38f;
+        case LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL:
+            return 0.42f;
+        case LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION:
+            return 0.34f;
+        case LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION:
+        default:
+            return 0.36f;
+    }
+}
+
+uint32_t functional_top_k_priority(int32_t family) {
+    switch (family) {
+        case LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL:
+            return 4;
+        case LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION:
+            return 3;
+        case LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION:
+            return 2;
+        case LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION:
+        default:
+            return 1;
+    }
+}
+
+uint32_t functional_update_horizon_steps(int32_t family) {
+    switch (family) {
+        case LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL:
+            return 3;
+        case LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION:
+            return 2;
+        case LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION:
+        case LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION:
+        default:
+            return 1;
+    }
 }
 
 class active_lora_embedder {
@@ -371,8 +412,7 @@ private:
 
 class active_lora_hidden_state_embedder final : public active_lora_embedder {
 public:
-    active_lora_hidden_state_embedder(const llama_context & owner, const llama_active_lora_params & params) :
-        owner(owner) {
+    active_lora_hidden_state_embedder(const llama_context & owner, const llama_active_lora_params & params) {
         const auto & cparams = owner.get_cparams();
         llama_context_params aux_params = llama_context_default_params();
         const uint32_t planned_tokens = std::max<uint32_t>(8, params.train_context_tokens);
@@ -512,7 +552,6 @@ public:
     }
 
 private:
-    const llama_context & owner;
     llama_context_ptr aux_ctx;
     uint32_t source_dim = 0;
     uint32_t embedding_dim = 0;
@@ -1023,8 +1062,28 @@ llama_adapter_lora_layer_role past_bucket_role(size_t bucket) {
         case LLAMA_MEMORY_LORA_BUCKET_PAST_MONTH:   return LLAMA_ADAPTER_LORA_LAYER_PAST_MONTH;
         case LLAMA_MEMORY_LORA_BUCKET_PAST_QUARTER: return LLAMA_ADAPTER_LORA_LAYER_PAST_QUARTER;
         case LLAMA_MEMORY_LORA_BUCKET_PAST_YEAR:    return LLAMA_ADAPTER_LORA_LAYER_PAST_YEAR;
-        case LLAMA_MEMORY_LORA_BUCKET_ALL_TIME:     return LLAMA_ADAPTER_LORA_LAYER_ALL_TIME;
+        case LLAMA_MEMORY_LORA_BUCKET_ALL_TIME:
         default:                                    return LLAMA_ADAPTER_LORA_LAYER_ALL_TIME;
+    }
+}
+
+llama_adapter_lora_layer_role functional_family_role(int32_t family) {
+    switch (family) {
+        case LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION:    return LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_TOOL_SELECTION;
+        case LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL:    return LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_COUNTERFACTUAL;
+        case LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION:return LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_MEMORY_COMPRESSION;
+        case LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION: return LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_SELF_OBSERVATION;
+        default:                                      return LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_TOOL_SELECTION;
+    }
+}
+
+const char * functional_family_name(int32_t family) {
+    switch (family) {
+        case LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION:     return "tool_selection";
+        case LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL:     return "counterfactual";
+        case LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION: return "memory_compression";
+        case LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION:   return "self_observation";
+        default:                                       return "unknown";
     }
 }
 
@@ -1052,6 +1111,12 @@ struct llama_active_lora_manager::impl {
     std::unique_ptr<active_lora_embedder> embedder;
     std::array<bucket_runtime, PAST_BUCKET_COUNT> buckets = {};
     std::array<job_runtime, PAST_BUCKET_COUNT> jobs = {};
+    std::array<std::unique_ptr<llama_adapter_lora>, LLAMA_FUNCTIONAL_LORA_COUNT> functional_adapters = {};
+    std::array<llama_functional_lora_family_config, LLAMA_FUNCTIONAL_LORA_COUNT> functional_configs = {};
+    std::array<llama_functional_lora_family_state, LLAMA_FUNCTIONAL_LORA_COUNT> functional_states = {};
+    std::array<llama_functional_lora_update_info, LLAMA_FUNCTIONAL_LORA_COUNT> functional_updates = {};
+    llama_functional_lora_trace functional_trace = {};
+    llama_functional_lora_ablation_config functional_ablation = {};
     std::vector<ggml_tensor *> targets;
     active_lora_embedding last_embedding;
     uint64_t updates_seen = 0;
@@ -1061,10 +1126,44 @@ struct llama_active_lora_manager::impl {
     bool initialized = false;
     bool past_initialized = false;
 
-    llama_self_state_event default_event(
+    void initialize_functional_defaults(uint32_t selected_rank) {
+        functional_ablation = {};
+        functional_trace = {};
+        for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+            auto & cfg = functional_configs[family];
+            cfg.enabled = true;
+            cfg.rank_min = std::max<uint32_t>(1, std::min<uint32_t>(selected_rank, params.min_rank));
+            cfg.rank_max = std::max<uint32_t>(cfg.rank_min, selected_rank);
+            cfg.gain_min = 0.0f;
+            cfg.gain_max = params.gain_max;
+            cfg.default_gain = functional_default_gain(family);
+            cfg.negative_update_scale = 0.65f;
+            cfg.positive_update_scale = 1.0f;
+            cfg.top_k_priority = functional_top_k_priority(family);
+            cfg.update_horizon_steps = functional_update_horizon_steps(family);
+            cfg.update_horizon_commands =
+                    family == LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ? 1 : 0;
+            cfg.allow_active_loop = family != LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL;
+            cfg.allow_dmn_loop = true;
+
+            auto & state = functional_states[family];
+            state = {};
+            state.family = family;
+            state.enabled = true;
+            state.compatible = true;
+
+            functional_trace.holds[family] = {};
+            functional_trace.holds[family].family = family;
+            functional_trace.family_state[family] = state;
+            functional_updates[family] = {};
+            functional_updates[family].family = family;
+        }
+    }
+
+    static llama_self_state_event default_event(
             const llama_token * tokens,
             size_t n_tokens,
-            bool remediation) const {
+            bool remediation) {
         return {
             /*.tokens =*/ tokens,
             /*.n_tokens =*/ n_tokens,
@@ -1175,7 +1274,7 @@ struct llama_active_lora_manager::impl {
         return result;
     }
 
-    size_t select_slot(const active_lora_write_features & features, size_t rank) const {
+    static size_t select_slot(const active_lora_write_features & features, size_t rank) {
         if (rank == 0) {
             return 0;
         }
@@ -1283,22 +1382,56 @@ struct llama_active_lora_manager::impl {
         owner.attach_adapter_runtime(adapter_ptr, scale, role);
     }
 
-    bool train_on_span(
+    static active_lora_write_features augment_functional_write_features(
+            active_lora_write_features base,
+            int32_t family,
+            int32_t loop_origin,
+            const float * metrics,
+            size_t metric_count,
+            float signed_outcome,
+            float magnitude) {
+        if (base.content_signal.empty()) {
+            return base;
+        }
+
+        base.state_signal.push_back(family == LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ? 1.0f : 0.0f);
+        base.state_signal.push_back(family == LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL ? 1.0f : 0.0f);
+        base.state_signal.push_back(family == LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION ? 1.0f : 0.0f);
+        base.state_signal.push_back(family == LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION ? 1.0f : 0.0f);
+        base.state_signal.push_back(loop_origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE ? 1.0f : 0.0f);
+        base.state_signal.push_back(loop_origin == LLAMA_COG_COMMAND_ORIGIN_DMN ? 1.0f : 0.0f);
+        base.state_signal.push_back(clamp_unit(0.5f + 0.5f * signed_outcome));
+        base.state_signal.push_back(clamp_unit(0.5f - 0.5f * signed_outcome));
+        base.state_signal.push_back(clamp_unit(magnitude));
+        for (size_t i = 0; i < metric_count; ++i) {
+            base.state_signal.push_back(clamp_unit(metrics[i]));
+        }
+
+        base.update_emphasis = clamp_unit(std::max(base.update_emphasis, 0.15f + 0.85f * magnitude));
+        base.goal_alignment = clamp_unit(std::max(base.goal_alignment, 0.5f + 0.5f * std::max(0.0f, signed_outcome)));
+        base.repair_pressure = clamp_unit(std::max(base.repair_pressure, 0.5f + 0.5f * std::max(0.0f, -signed_outcome)));
+        normalize_vector(base.state_signal);
+        return base;
+    }
+
+    bool train_on_adapter(
+            llama_adapter_lora & target_adapter,
             const active_lora_embedding & embedding,
             const active_lora_write_features & write_features,
-            float budget_scale,
+            float signed_budget_scale,
             bool remediation) const {
-        if (embedding.values.empty() || !adapter) {
+        if (embedding.values.empty()) {
             return false;
         }
 
+        const float sign = signed_budget_scale >= 0.0f ? 1.0f : -1.0f;
         const float base_scale = params.learning_rate > 0.0f ? params.learning_rate : 1.0e-4f;
-        const float update_scale = base_scale * clamp_unit(budget_scale) * std::max(0.15f, write_features.update_emphasis);
+        const float update_scale = base_scale * clamp_unit(std::fabs(signed_budget_scale)) * std::max(0.15f, write_features.update_emphasis);
         if (update_scale <= 0.0f) {
             return false;
         }
 
-        for (auto & it : adapter->ab_map) {
+        for (auto & it : target_adapter.ab_map) {
             ggml_tensor * tensor_a = it.second.a;
             ggml_tensor * tensor_b = it.second.b;
             const size_t ne0_a = tensor_a->ne[0];
@@ -1316,8 +1449,8 @@ struct llama_active_lora_manager::impl {
             ggml_backend_tensor_get(tensor_b, data_b.data(), 0, data_b.size() * sizeof(float));
 
             const size_t slot = select_slot(write_features, ne1_a);
-            const float tensor_scale = update_scale * tensor_update_scale(it.first, write_features, remediation);
-            if (tensor_scale <= 0.0f) {
+            const float tensor_scale = sign * update_scale * tensor_update_scale(it.first, write_features, remediation);
+            if (tensor_scale == 0.0f) {
                 continue;
             }
 
@@ -1347,10 +1480,21 @@ struct llama_active_lora_manager::impl {
 
             ggml_backend_tensor_set(tensor_a, data_a.data(), 0, data_a.size() * sizeof(float));
             ggml_backend_tensor_set(tensor_b, data_b.data(), 0, data_b.size() * sizeof(float));
-            normalize_active_weight(it.second, tensor_scale, params.gain_decay, params.gain_max);
+            normalize_active_weight(it.second, std::fabs(tensor_scale), params.gain_decay, params.gain_max);
         }
 
         return true;
+    }
+
+    bool train_on_span(
+            const active_lora_embedding & embedding,
+            const active_lora_write_features & write_features,
+            float budget_scale,
+            bool remediation) const {
+        if (embedding.values.empty() || !adapter) {
+            return false;
+        }
+        return train_on_adapter(*adapter, embedding, write_features, budget_scale, remediation);
     }
 
     bool apply_write(
@@ -1585,6 +1729,12 @@ llama_active_lora_manager::~llama_active_lora_manager() {
         pimpl->owner.detach_adapter_runtime(pimpl->adapter.get());
         const_cast<llama_model &>(pimpl->owner.model).loras.erase(pimpl->adapter.get());
     }
+    for (auto & adapter : pimpl->functional_adapters) {
+        if (adapter) {
+            pimpl->owner.detach_adapter_runtime(adapter.get());
+            const_cast<llama_model &>(pimpl->owner.model).loras.erase(adapter.get());
+        }
+    }
     for (auto & bucket : pimpl->buckets) {
         if (bucket.adapter) {
             pimpl->owner.detach_adapter_runtime(bucket.adapter.get());
@@ -1646,6 +1796,22 @@ bool llama_active_lora_manager::init(const llama_active_lora_params & params) {
     pimpl->stats.gain_max = 0.0f;
     pimpl->initialized = true;
     pimpl->reset_active_stage(llama_time_us());
+    pimpl->initialize_functional_defaults(selected_rank);
+
+    for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+        if (!pimpl->functional_adapters[family]) {
+            if (!pimpl->create_runtime_adapter(
+                        pimpl->functional_adapters[family],
+                        selected_rank,
+                        std::string("functional.") + functional_family_name(family),
+                        0.0f,
+                        functional_family_role(family))) {
+                return false;
+            }
+        }
+        pimpl->functional_states[family].compatible = pimpl->functional_adapters[family] != nullptr;
+        pimpl->functional_trace.family_state[family] = pimpl->functional_states[family];
+    }
 
     LLAMA_LOG_INFO("%s: initialized Active LoRA (rank=%u, host_budget=%" PRIu64 ", device_budget=%" PRIu64 ", embedder=%d)\n",
             __func__, selected_rank, host_budget_bytes, device_budget_bytes, pimpl->stats.embedding_type);
@@ -1770,5 +1936,223 @@ bool llama_active_lora_manager::get_past_stats(llama_past_lora_stats * out_stats
     }
 
     *out_stats = pimpl->past_stats;
+    return true;
+}
+
+int32_t llama_active_lora_manager::functional_family_count() {
+    return LLAMA_FUNCTIONAL_LORA_COUNT;
+}
+
+bool llama_active_lora_manager::functional_family_config_get(int32_t family, llama_functional_lora_family_config * out_config) const {
+    if (!out_config || family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+        return false;
+    }
+    *out_config = pimpl->functional_configs[family];
+    return true;
+}
+
+bool llama_active_lora_manager::functional_family_state_get(int32_t family, llama_functional_lora_family_state * out_state) const {
+    if (!out_state || family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+        return false;
+    }
+    *out_state = pimpl->functional_states[family];
+    return true;
+}
+
+bool llama_active_lora_manager::functional_get_last_trace(llama_functional_lora_trace * out_trace) const {
+    if (!out_trace) {
+        return false;
+    }
+    *out_trace = pimpl->functional_trace;
+    return true;
+}
+
+bool llama_active_lora_manager::functional_get_last_update(int32_t family, llama_functional_lora_update_info * out_update) const {
+    if (!out_update || family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+        return false;
+    }
+    *out_update = pimpl->functional_updates[family];
+    return true;
+}
+
+bool llama_active_lora_manager::functional_set_ablation(const llama_functional_lora_ablation_config & config) {
+    pimpl->functional_ablation = config;
+    return true;
+}
+
+bool llama_active_lora_manager::functional_get_ablation(llama_functional_lora_ablation_config * out_config) const {
+    if (!out_config) {
+        return false;
+    }
+    *out_config = pimpl->functional_ablation;
+    return true;
+}
+
+bool llama_active_lora_manager::functional_activate(const llama_functional_activation_decision & decision) {
+    if (!pimpl->initialized) {
+        return false;
+    }
+
+    const bool disable_stack = pimpl->functional_ablation.disable_functional_stack;
+    const bool disable_holds = pimpl->functional_ablation.disable_hold_windows;
+    pimpl->functional_trace.last_activation = decision;
+
+    for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+        auto & hold = pimpl->functional_trace.holds[family];
+        auto & state = pimpl->functional_states[family];
+        hold.family = family;
+
+        if (hold.active && hold.loop_origin == decision.loop_origin) {
+            if (hold.hold_unit == LLAMA_FUNCTIONAL_HOLD_LOOP_STEPS && hold.hold_remaining > 0) {
+                --hold.hold_remaining;
+            } else if (hold.hold_unit == LLAMA_FUNCTIONAL_HOLD_PHASE_EXIT && hold.microphase_current != decision.microphase) {
+                hold.hold_remaining = 0;
+            }
+            if (hold.hold_remaining == 0) {
+                hold.active = false;
+                hold.gain = 0.0f;
+            }
+        }
+
+        const bool family_disabled = (pimpl->functional_ablation.disabled_family_mask & (1ull << family)) != 0;
+        const bool microphase_disabled =
+                decision.microphase >= 0 &&
+                decision.microphase < 63 &&
+                (pimpl->functional_ablation.disabled_microphase_mask & (1ull << decision.microphase)) != 0;
+        const bool activate_now =
+                !disable_stack &&
+                !family_disabled &&
+                !microphase_disabled &&
+                (decision.activated_mask & (1ull << family)) != 0 &&
+                decision.gains[family] > 0.0f;
+
+        if (activate_now) {
+            hold.active = true;
+            hold.loop_origin = decision.loop_origin;
+            hold.microphase_started = decision.microphase;
+            hold.microphase_current = decision.microphase;
+            hold.hold_unit = disable_holds ? LLAMA_FUNCTIONAL_HOLD_LOOP_STEPS : decision.hold_unit[family];
+            hold.hold_budget = disable_holds ? 1u : std::max<uint32_t>(1u, decision.hold_value[family]);
+            hold.hold_remaining = hold.hold_budget;
+            hold.gain = std::min(pimpl->functional_configs[family].gain_max, std::max(0.0f, decision.gains[family]));
+        } else if (hold.active) {
+            hold.microphase_current = decision.microphase;
+        }
+
+        const float gain = hold.active ? hold.gain : 0.0f;
+        if (pimpl->functional_adapters[family]) {
+            pimpl->set_adapter_scale(pimpl->functional_adapters[family].get(), gain, functional_family_role(family));
+        }
+
+        state.family = family;
+        state.enabled = pimpl->functional_configs[family].enabled && !family_disabled;
+        state.compatible = pimpl->functional_adapters[family] != nullptr;
+        state.active_now = gain > 0.0f;
+        state.current_gain = gain;
+        state.current_microphase = hold.active ? decision.microphase : LLAMA_FUNCTIONAL_MICROPHASE_NONE;
+        state.current_hold_unit = hold.active ? hold.hold_unit : LLAMA_FUNCTIONAL_HOLD_LOOP_STEPS;
+        state.current_hold_remaining = hold.active ? hold.hold_remaining : 0;
+        pimpl->functional_trace.family_state[family] = state;
+    }
+
+    return true;
+}
+
+bool llama_active_lora_manager::functional_note_command_complete(int32_t origin) {
+    if (!pimpl->initialized) {
+        return false;
+    }
+
+    for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+        auto & hold = pimpl->functional_trace.holds[family];
+        if (!hold.active || hold.loop_origin != origin) {
+            continue;
+        }
+        if (hold.hold_unit == LLAMA_FUNCTIONAL_HOLD_COMMANDS && hold.hold_remaining > 0) {
+            --hold.hold_remaining;
+            if (hold.hold_remaining == 0) {
+                hold.active = false;
+                hold.gain = 0.0f;
+                if (pimpl->functional_adapters[family]) {
+                    pimpl->set_adapter_scale(pimpl->functional_adapters[family].get(), 0.0f, functional_family_role(family));
+                }
+                pimpl->functional_states[family].active_now = false;
+                pimpl->functional_states[family].current_gain = 0.0f;
+                pimpl->functional_states[family].current_hold_remaining = 0;
+                pimpl->functional_trace.family_state[family] = pimpl->functional_states[family];
+            }
+        }
+    }
+    return true;
+}
+
+bool llama_active_lora_manager::functional_apply_update(
+        int32_t family,
+        int32_t loop_origin,
+        int32_t start_microphase,
+        int32_t settle_microphase,
+        const llama_functional_outcome_snapshot & before,
+        const llama_functional_outcome_snapshot & after,
+        int32_t selected_tool_kind,
+        int32_t candidate_count,
+        const float * metrics,
+        size_t metric_count,
+        float signed_outcome,
+        float magnitude,
+        const llama_self_state_event & event,
+        const llama_self_state_feature_vector * features) {
+    if (!pimpl->initialized ||
+            family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT ||
+            !event.tokens || event.n_tokens == 0 ||
+            pimpl->functional_ablation.disable_update_writes ||
+            (pimpl->functional_ablation.disabled_family_mask & (1ull << family)) != 0 ||
+            !pimpl->functional_adapters[family]) {
+        return false;
+    }
+
+    const active_lora_embedding embedding = pimpl->embedder->embed(event.tokens, event.n_tokens);
+    if (embedding.values.empty()) {
+        return false;
+    }
+
+    active_lora_write_features write_features = pimpl->build_write_features(embedding, event, features, false);
+    write_features = pimpl->augment_functional_write_features(
+            write_features,
+            family,
+            loop_origin,
+            metrics,
+            metric_count,
+            signed_outcome,
+            magnitude);
+
+    const float direction_scale =
+            std::max(0.05f, std::min(1.0f, magnitude)) *
+            (signed_outcome >= 0.0f ?
+                pimpl->functional_configs[family].positive_update_scale :
+                pimpl->functional_configs[family].negative_update_scale);
+    if (!pimpl->train_on_adapter(*pimpl->functional_adapters[family], embedding, write_features, signed_outcome >= 0.0f ? direction_scale : -direction_scale, false)) {
+        return false;
+    }
+
+    auto & update = pimpl->functional_updates[family];
+    update = {};
+    update.valid = true;
+    update.family = family;
+    update.loop_origin = loop_origin;
+    update.start_microphase = start_microphase;
+    update.settle_microphase = settle_microphase;
+    update.selected_tool_kind = selected_tool_kind;
+    update.candidate_count = candidate_count;
+    update.signed_outcome = signed_outcome;
+    update.magnitude = magnitude;
+    update.before_snapshot = before;
+    update.after_snapshot = after;
+    for (size_t i = 0; i < std::min(metric_count, sizeof(update.metrics)/sizeof(update.metrics[0])); ++i) {
+        update.metrics[i] = metrics[i];
+    }
+
+    pimpl->functional_states[family].update_count += 1;
+    pimpl->functional_states[family].last_signed_outcome = signed_outcome;
+    pimpl->functional_trace.family_state[family] = pimpl->functional_states[family];
     return true;
 }

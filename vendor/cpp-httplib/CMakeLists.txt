@@ -7,6 +7,10 @@ llama_add_compile_flags()
 
 add_library(${TARGET} STATIC httplib.cpp httplib.h)
 
+if (BUILD_SHARED_LIBS)
+    set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # disable warnings in 3rd party code
 if (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     target_compile_options(${TARGET} PRIVATE /w)
