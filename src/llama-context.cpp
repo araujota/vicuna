@@ -1337,6 +1337,20 @@ bool llama_context::functional_lora_get_ablation(llama_functional_lora_ablation_
     return active_lora_manager && active_lora_manager->functional_get_ablation(out_config);
 }
 
+bool llama_context::active_temporal_encoding_bias_get(llama_active_temporal_encoding_bias * out_bias) const {
+    return active_lora_manager && active_lora_manager->temporal_encoding_bias_get(out_bias);
+}
+
+bool llama_context::active_temporal_encoding_bias_apply(
+        float signed_advantage,
+        float efficiency_advantage,
+        int64_t monotonic_ms) {
+    return active_lora_manager && active_lora_manager->temporal_encoding_bias_apply(
+            signed_advantage,
+            efficiency_advantage,
+            monotonic_ms);
+}
+
 bool llama_context::functional_lora_activate(const llama_functional_activation_decision & decision) {
     return active_lora_manager && active_lora_manager->functional_activate(decision);
 }
@@ -3504,6 +3518,12 @@ int32_t llama_functional_lora_get_ablation(
         const llama_context * ctx,
         llama_functional_lora_ablation_config * out_config) {
     return ctx && ctx->functional_lora_get_ablation(out_config) ? 0 : -1;
+}
+
+int32_t llama_active_temporal_encoding_bias_get(
+        const llama_context * ctx,
+        llama_active_temporal_encoding_bias * out_bias) {
+    return ctx && ctx->active_temporal_encoding_bias_get(out_bias) ? 0 : -1;
 }
 
 //

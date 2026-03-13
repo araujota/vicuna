@@ -127,6 +127,19 @@ int main(int argc, char ** argv) {
         llama_model_free(model);
         return 1;
     }
+    llama_active_temporal_encoding_bias temporal_bias = {};
+    if (llama_active_temporal_encoding_bias_get(ctx, &temporal_bias) != 0 ||
+        temporal_bias.reward_bias != 0.0f ||
+        temporal_bias.dampening_bias != 0.0f ||
+        temporal_bias.effective_write_scale < 0.999f ||
+        temporal_bias.effective_write_scale > 1.001f ||
+        temporal_bias.applied_update_count != 0 ||
+        temporal_bias.last_update_monotonic_ms != 0) {
+        fprintf(stderr, "unexpected default temporal encoding bias\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     std::string prompt;

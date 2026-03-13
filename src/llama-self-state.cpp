@@ -19,6 +19,8 @@ namespace {
 
 static constexpr uint32_t LLAMA_SELF_UPDATER_VERSION = 2;
 static constexpr float    LLAMA_SELF_DEFAULT_TOOL_SALIENCE_HALF_LIFE_MS = 300000.0f;
+static constexpr float    LLAMA_SELF_EVOLUTION_PROGRESS_HORIZON_MS = 45.0f * 60.0f * 1000.0f;
+static constexpr float    LLAMA_SELF_EVOLUTION_UPDATE_HORIZON_MS = 5.0f * 60.0f * 1000.0f;
 static constexpr float    LLAMA_SELF_TWO_PI = 6.28318530717958647692f;
 static constexpr size_t   LLAMA_SELF_MAX_WORKING_MEMORY_ITEMS = 32;
 static constexpr size_t   LLAMA_SELF_MAX_GOALS = 16;
@@ -78,6 +80,10 @@ static float clamp_unit(float value) {
 
 static float clamp_range(float value, float lo, float hi) {
     return std::min(hi, std::max(lo, value));
+}
+
+static float clamp_signed_unit(float value) {
+    return clamp_range(value, -1.0f, 1.0f);
 }
 
 static float blend_value(float current, float target, float gain) {
@@ -446,6 +452,7 @@ std::array<llama_self_register_definition, LLAMA_SELF_REGISTER_COUNT> llama_self
         { LLAMA_SELF_REGISTER_RECOVERY_URGENCY,      "r_recovery_urgency",       LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
         { LLAMA_SELF_REGISTER_ANSWERABILITY,         "r_answerability",          LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
         { LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY,"r_preference_uncertainty", LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
+        { LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY, "r_evolution_uncertainty",  LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
         { LLAMA_SELF_REGISTER_CHANNEL_STATE,         "r_channel_state",          LLAMA_SELF_REGISTER_FAMILY_CATEGORICAL,    0.0f, 2.0f, 0.0f, LLAMA_SELF_STATE_CHANNEL_WAITING },
     }};
 }
@@ -552,6 +559,9 @@ bool llama_self_state::apply_time_point(const llama_self_state_time_point & time
     if (session_start_monotonic_ms < 0) {
         session_start_monotonic_ms = time_point.monotonic_ms;
     }
+    if (last_validated_progress_monotonic_ms < 0) {
+        last_validated_progress_monotonic_ms = time_point.monotonic_ms;
+    }
 
     recompute_time_surface(source_mask);
     return true;
@@ -598,6 +608,7 @@ void llama_self_state::recompute_time_surface(uint32_t source_mask) {
 
     const float tool_salience = decay_to_unit(datetime.delta_since_last_tool_event_ms, params.tool_salience_half_life_ms);
     update_scalar_register(LLAMA_SELF_REGISTER_TOOL_SALIENCE, tool_salience, source_mask | (tool_salience > 0.0f ? LLAMA_SELF_SOURCE_TOOL_EVENT : 0));
+    update_evolution_uncertainty(source_mask, 0.0f, 0.0f);
 }
 
 float llama_self_state::current_scalar_register(int32_t register_id) const {
@@ -1888,6 +1899,18 @@ bool llama_self_state::apply_postwrite(const llama_self_state_event & event, con
     return true;
 }
 
+bool llama_self_state::note_validated_progress(float signed_progress, float efficiency_advantage) {
+    if (!ensure_time_initialized()) {
+        return false;
+    }
+
+    update_evolution_uncertainty(
+            LLAMA_SELF_SOURCE_COUNTERFACTUAL,
+            clamp_signed_unit(signed_progress),
+            clamp_signed_unit(efficiency_advantage));
+    return true;
+}
+
 void llama_self_state::update_reactivation_priorities(
         const std::array<float, 32> & sketch,
         float memory_write_pressure) {
@@ -2032,6 +2055,11 @@ void llama_self_state::initialize_model_state() {
 
 void llama_self_state::update_summary_registers(uint32_t source_mask) {
     const auto & instant = model_horizons[(size_t) LLAMA_SELF_HORIZON_INSTANT];
+    const float previous_satisfaction_risk = current_scalar_register(LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK);
+    const float previous_loop_inefficiency = current_scalar_register(LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY);
+    const float previous_recovery_urgency = current_scalar_register(LLAMA_SELF_REGISTER_RECOVERY_URGENCY);
+    const float previous_answerability = current_scalar_register(LLAMA_SELF_REGISTER_ANSWERABILITY);
+    const float previous_preference_uncertainty = current_scalar_register(LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY);
     const float satisfaction_risk = clamp_unit(
             0.55f * instant.user_outcome.frustration_risk +
             0.25f * instant.user_outcome.misunderstanding_risk +
@@ -2056,6 +2084,67 @@ void llama_self_state::update_summary_registers(uint32_t source_mask) {
     blend_scalar_register(LLAMA_SELF_REGISTER_RECOVERY_URGENCY, recovery_urgency, params.postwrite_gain, source_mask);
     blend_scalar_register(LLAMA_SELF_REGISTER_ANSWERABILITY, instant.epistemic.answerability, params.postwrite_gain, source_mask);
     blend_scalar_register(LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY, instant.user_outcome.preference_uncertainty, params.postwrite_gain, source_mask);
+
+    const float signed_progress = clamp_signed_unit(
+            0.28f * (previous_recovery_urgency - current_scalar_register(LLAMA_SELF_REGISTER_RECOVERY_URGENCY)) +
+            0.24f * (previous_loop_inefficiency - current_scalar_register(LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY)) +
+            0.18f * (current_scalar_register(LLAMA_SELF_REGISTER_ANSWERABILITY) - previous_answerability) +
+            0.15f * (previous_preference_uncertainty - current_scalar_register(LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY)) +
+            0.15f * (previous_satisfaction_risk - current_scalar_register(LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK)));
+    const float efficiency_advantage = clamp_signed_unit(
+            0.60f * (previous_loop_inefficiency - current_scalar_register(LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY)) +
+            0.40f * (previous_recovery_urgency - current_scalar_register(LLAMA_SELF_REGISTER_RECOVERY_URGENCY)));
+    update_evolution_uncertainty(source_mask, signed_progress, efficiency_advantage);
+}
+
+void llama_self_state::update_evolution_uncertainty(
+        uint32_t source_mask,
+        float signed_progress,
+        float efficiency_advantage) {
+    if (datetime.monotonic_ms < 0) {
+        return;
+    }
+
+    if (last_validated_progress_monotonic_ms < 0) {
+        last_validated_progress_monotonic_ms =
+                session_start_monotonic_ms >= 0 ? session_start_monotonic_ms : datetime.monotonic_ms;
+    }
+
+    const int64_t now_ms = datetime.monotonic_ms;
+    const int64_t since_progress_ms = elapsed_or_unset(now_ms, last_validated_progress_monotonic_ms);
+    const int64_t since_update_ms = elapsed_or_unset(
+            now_ms,
+            registers[(size_t) LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY].last_update_monotonic_ms);
+    const float time_pressure = clamp_unit((float) since_progress_ms / LLAMA_SELF_EVOLUTION_PROGRESS_HORIZON_MS);
+    const float drift_pressure = clamp_unit(
+            0.35f * current_scalar_register(LLAMA_SELF_REGISTER_RECOVERY_URGENCY) +
+            0.25f * current_scalar_register(LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY) +
+            0.20f * current_scalar_register(LLAMA_SELF_REGISTER_UNCERTAINTY) +
+            0.20f * current_scalar_register(LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY));
+    const float target = clamp_unit(0.58f * time_pressure + 0.42f * drift_pressure);
+    const float current = current_scalar_register(LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY);
+
+    float next = current;
+    if (signed_progress > 0.05f || efficiency_advantage > 0.05f) {
+        const float credit = clamp_unit(
+                0.65f * std::max(0.0f, signed_progress) +
+                0.35f * std::max(0.0f, efficiency_advantage));
+        last_validated_progress_monotonic_ms = now_ms;
+        last_validated_progress_score = credit;
+        next = clamp_unit(current * (1.0f - 0.55f * credit));
+    } else {
+        const float update_gain = clamp_unit((float) since_update_ms / LLAMA_SELF_EVOLUTION_UPDATE_HORIZON_MS);
+        const float growth_gain = clamp_unit((0.20f + 0.80f * drift_pressure) * update_gain);
+        next = clamp_unit(current + growth_gain * (target - current));
+        if (signed_progress < -0.05f || efficiency_advantage < -0.05f) {
+            const float penalty = clamp_unit(
+                    0.65f * std::max(0.0f, -signed_progress) +
+                    0.35f * std::max(0.0f, -efficiency_advantage));
+            next = clamp_unit(std::max(next, current + 0.12f * penalty));
+        }
+    }
+
+    update_scalar_register(LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY, next, source_mask);
 }
 
 void llama_self_state::update_expanded_model(
@@ -2764,6 +2853,10 @@ bool llama_context::self_state_apply_postwrite(
 
     (void) hard_memory->archive_event(&get_model().vocab, event, delta);
     return true;
+}
+
+bool llama_context::self_state_note_validated_progress(float signed_progress, float efficiency_advantage) {
+    return self_state && self_state->note_validated_progress(signed_progress, efficiency_advantage);
 }
 
 bool llama_context::hard_memory_configure(const llama_hard_memory_config & config) {

@@ -139,6 +139,8 @@ struct llama_context {
     bool functional_lora_get_last_update(int32_t family, llama_functional_lora_update_info * out_update) const;
     bool functional_lora_set_ablation(const llama_functional_lora_ablation_config & config);
     bool functional_lora_get_ablation(llama_functional_lora_ablation_config * out_config) const;
+    bool active_temporal_encoding_bias_get(llama_active_temporal_encoding_bias * out_bias) const;
+    bool active_temporal_encoding_bias_apply(float signed_advantage, float efficiency_advantage, int64_t monotonic_ms);
     bool functional_lora_activate(const llama_functional_activation_decision & decision);
     bool functional_lora_note_command_complete(int32_t origin);
     bool functional_lora_apply_update(
@@ -195,6 +197,7 @@ struct llama_context {
     bool self_state_apply_prewrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
     bool self_state_build_postwrite_features(const llama_self_state_event & event, llama_self_state_feature_vector * out_features) const;
     bool self_state_apply_postwrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
+    bool self_state_note_validated_progress(float signed_progress, float efficiency_advantage);
     bool hard_memory_configure(const llama_hard_memory_config & config);
     bool hard_memory_get_config(llama_hard_memory_config * out_config) const;
     bool hard_memory_query(const llama_hard_memory_query_request & query, llama_hard_memory_result * out_result);
@@ -228,6 +231,7 @@ struct llama_context {
     bool counterfactual_get_last_trace(llama_counterfactual_trace * out_trace) const;
     bool remediation_get_last_plan(llama_remediation_plan * out_plan) const;
     bool governance_get_last_trace(llama_governance_trace * out_trace) const;
+    bool temporal_self_improvement_get_last(llama_temporal_self_improvement_trace * out_trace) const;
 
     void attach_adapter_runtime(llama_adapter_lora * adapter, float scale, llama_adapter_lora_layer_role role);
     void detach_adapter_runtime(llama_adapter_lora * adapter);

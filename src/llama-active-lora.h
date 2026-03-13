@@ -25,6 +25,8 @@ public:
     bool functional_get_last_update(int32_t family, llama_functional_lora_update_info * out_update) const;
     bool functional_set_ablation(const llama_functional_lora_ablation_config & config);
     bool functional_get_ablation(llama_functional_lora_ablation_config * out_config) const;
+    bool temporal_encoding_bias_get(llama_active_temporal_encoding_bias * out_bias) const;
+    bool temporal_encoding_bias_apply(float signed_advantage, float efficiency_advantage, int64_t monotonic_ms);
     bool functional_activate(const llama_functional_activation_decision & decision);
     bool functional_note_command_complete(int32_t origin);
     bool functional_apply_update(

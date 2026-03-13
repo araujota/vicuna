@@ -1,10 +1,13 @@
 #include "llama-cognitive-loop.h"
 
+#include "llama.h"
+#include "llama-adapter.h"
 #include "llama-context.h"
 #include "llama-vocab.h"
 
 #include <algorithm>
-#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <cmath>
 #include <cctype>
 #include <cstring>
@@ -14,13 +17,19 @@
 
 namespace {
 
-static constexpr float LLAMA_DMN_PRESSURE_THRESHOLD = 0.24f;
+constexpr float LLAMA_DMN_PRESSURE_THRESHOLD = 0.24f;
+constexpr float LLAMA_TEMPORAL_SELF_TRIGGER_THRESHOLD = 0.58f;
+constexpr uint64_t LLAMA_TEMPORAL_SELF_TRIGGER_COOLDOWN_US = 2ULL * 60ULL * 1000000ULL;
 
-static float clamp_unit(float value) {
+float clamp_unit(float value) {
     return std::min(1.0f, std::max(0.0f, value));
 }
 
-static std::string normalize_piece(const std::string & piece) {
+float clamp_signed_unit(float value) {
+    return std::min(1.0f, std::max(-1.0f, value));
+}
+
+std::string normalize_piece(const std::string & piece) {
     std::string out;
     out.reserve(piece.size());
 
@@ -34,7 +43,7 @@ static std::string normalize_piece(const std::string & piece) {
     return out;
 }
 
-static bool contains_any(const std::string & piece, const char * const * patterns, size_t n_patterns) {
+bool contains_any(const std::string & piece, const char * const * patterns, size_t n_patterns) {
     for (size_t i = 0; i < n_patterns; ++i) {
         if (piece.find(patterns[i]) != std::string::npos) {
             return true;
@@ -50,7 +59,9 @@ struct lexical_signals {
     float uncertainty = 0.0f;
 };
 
-static lexical_signals analyze_event_lexicon(const llama_vocab * vocab, const llama_self_state_event & event) {
+std::vector<llama_token> tokenize_text(const llama_vocab * vocab, const std::string & text);
+
+lexical_signals analyze_event_lexicon(const llama_vocab * vocab, const llama_self_state_event & event) {
     lexical_signals out = {};
     if (!vocab || !event.tokens) {
         return out;
@@ -92,7 +103,7 @@ static lexical_signals analyze_event_lexicon(const llama_vocab * vocab, const ll
     return out;
 }
 
-static float get_scalar_register(const llama_context & ctx, int32_t register_id) {
+float get_scalar_register(const llama_context & ctx, int32_t register_id) {
     llama_self_register_info info = {};
     if (!ctx.self_state_get_register(register_id, &info)) {
         return 0.0f;
@@ -100,7 +111,7 @@ static float get_scalar_register(const llama_context & ctx, int32_t register_id)
     return clamp_unit(info.scalar_value);
 }
 
-static void fill_active_candidate(
+void fill_active_candidate(
         llama_active_loop_candidate & candidate,
         int32_t action,
         float score,
@@ -118,7 +129,7 @@ static void fill_active_candidate(
     candidate.reason_mask = reason_mask;
 }
 
-static void fill_dmn_candidate(
+void fill_dmn_candidate(
         llama_dmn_candidate & candidate,
         int32_t action,
         float score,
@@ -137,7 +148,7 @@ static void fill_dmn_candidate(
 }
 
 template<typename T>
-static void pick_top_two(const T * candidates, int32_t candidate_count, int32_t * out_best, int32_t * out_second) {
+void pick_top_two(const T * candidates, int32_t candidate_count, int32_t * out_best, int32_t * out_second) {
     int32_t best = -1;
     int32_t second = -1;
     for (int32_t i = 0; i < candidate_count; ++i) {
@@ -152,7 +163,7 @@ static void pick_top_two(const T * candidates, int32_t candidate_count, int32_t 
     *out_second = second;
 }
 
-static bool pressure_crossed(const llama_dmn_pressure_vector & pressure) {
+bool pressure_crossed(const llama_dmn_pressure_vector & pressure) {
     return pressure.total >= LLAMA_DMN_PRESSURE_THRESHOLD;
 }
 
@@ -166,7 +177,7 @@ struct repair_signal_state {
     float evidence = 0.0f;
 };
 
-static llama_self_updater_program load_updater_program(const llama_context & ctx) {
+llama_self_updater_program load_updater_program(const llama_context & ctx) {
     llama_self_updater_program program = {};
     if (!ctx.self_state_get_updater_program(&program)) {
         program = llama_self_state_default_updater_program();
@@ -174,7 +185,7 @@ static llama_self_updater_program load_updater_program(const llama_context & ctx
     return program;
 }
 
-static repair_signal_state compute_repair_signal(
+repair_signal_state compute_repair_signal(
         const llama_context & ctx,
         const llama_self_social_state_info & social,
         const llama_self_tool_state_info & tool_state,
@@ -196,7 +207,7 @@ static repair_signal_state compute_repair_signal(
     return signal;
 }
 
-static uint32_t build_active_reason_mask(
+uint32_t build_active_reason_mask(
         const llama_self_state_event & event,
         const lexical_signals & lex,
         float uncertainty,
@@ -224,7 +235,7 @@ static uint32_t build_active_reason_mask(
     return mask;
 }
 
-static uint32_t build_dmn_reason_mask(
+uint32_t build_dmn_reason_mask(
         const llama_dmn_pressure_vector & pressure,
         float inhibition,
         float social_relevance,
@@ -248,12 +259,230 @@ static uint32_t build_dmn_reason_mask(
     return mask;
 }
 
-static float normalized_divergence(float current, float target, float tolerance) {
+float prediction_error_signal(const llama_self_prediction_error_trace & trace) {
+    if (!trace.valid) {
+        return 0.0f;
+    }
+    return clamp_unit(
+            0.25f * std::fabs(trace.steps_error) +
+            0.25f * std::fabs(trace.inference_cost_error) +
+            0.20f * std::fabs(trace.satisfaction_error) +
+            0.15f * std::fabs(trace.recovery_error) +
+            0.15f * std::fabs(trace.goal_progress_error));
+}
+
+llama_functional_outcome_snapshot capture_functional_snapshot(
+        const llama_context & ctx,
+        const llama_favorable_state_profile & favorable) {
+    llama_functional_outcome_snapshot out = {};
+    out.favorable_divergence = clamp_unit(favorable.aggregate_divergence);
+    out.user_satisfaction_risk = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK));
+    out.goal_progress_pressure = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_GOAL_PROGRESS_PRESSURE));
+    out.loop_inefficiency = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY));
+    out.recovery_urgency = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_RECOVERY_URGENCY));
+    out.answerability = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_ANSWERABILITY));
+    out.preference_uncertainty = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY));
+
+    llama_self_model_state_info model_state = {};
+    if (ctx.self_state_get_model_state(&model_state)) {
+        out.expected_steps_remaining = clamp_unit(model_state.horizons[LLAMA_SELF_HORIZON_SHORT].efficiency.expected_steps_remaining);
+        out.expected_inference_cost_remaining = clamp_unit(model_state.horizons[LLAMA_SELF_HORIZON_SHORT].efficiency.expected_inference_cost_remaining);
+    }
+
+    return out;
+}
+
+llama_functional_activation_decision route_functional_activation(
+        const llama_context & ctx,
+        int32_t loop_origin,
+        int32_t microphase,
+        float uncertainty,
+        float answerability,
+        float tool_affinity,
+        float favorable_divergence,
+        float continuation,
+        float memory_pressure,
+        float recovery_urgency) {
+    llama_functional_activation_decision decision = {};
+    decision.loop_origin = loop_origin;
+    decision.microphase = microphase;
+    decision.top_family = -1;
+    decision.family_count = LLAMA_FUNCTIONAL_LORA_COUNT;
+
+    llama_self_model_state_info model_state = {};
+    const bool have_model_state = ctx.self_state_get_model_state(&model_state);
+    const float pred_error = have_model_state ? prediction_error_signal(model_state.prediction_error) : 0.0f;
+
+    auto set_family = [&](int32_t family, float gain, int32_t hold_unit, uint32_t hold_value, uint32_t reason_mask) {
+        decision.eligible_mask |= (1ull << family);
+        decision.gains[family] = clamp_unit(gain);
+        decision.hold_unit[family] = hold_unit;
+        decision.hold_value[family] = hold_value;
+        decision.priority[family] = decision.gains[family];
+        decision.reason_mask[family] = reason_mask;
+    };
+
+    switch (microphase) {
+        case LLAMA_FUNCTIONAL_MICROPHASE_TOOL_CLASS_SELECTION:
+        case LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP:
+        case LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION:
+            set_family(
+                    LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION,
+                    0.32f + 0.38f * uncertainty + 0.24f * tool_affinity + 0.18f * (1.0f - answerability),
+                    LLAMA_FUNCTIONAL_HOLD_COMMANDS,
+                    1,
+                    LLAMA_FUNCTIONAL_ROUTE_REASON_UNCERTAINTY | LLAMA_FUNCTIONAL_ROUTE_REASON_TOOL_AFFINITY);
+            break;
+        case LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_GENERATE:
+        case LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE:
+            set_family(
+                    LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL,
+                    0.34f + 0.42f * favorable_divergence + 0.24f * continuation + 0.18f * recovery_urgency,
+                    LLAMA_FUNCTIONAL_HOLD_LOOP_STEPS,
+                    2,
+                    LLAMA_FUNCTIONAL_ROUTE_REASON_FAVORABLE_DIVERGENCE);
+            break;
+        case LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION:
+        case LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT:
+            set_family(
+                    LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION,
+                    0.28f + 0.48f * memory_pressure + 0.14f * favorable_divergence + 0.10f * recovery_urgency,
+                    LLAMA_FUNCTIONAL_HOLD_PHASE_EXIT,
+                    1,
+                    LLAMA_FUNCTIONAL_ROUTE_REASON_MEMORY_PRESSURE);
+            break;
+        case LLAMA_FUNCTIONAL_MICROPHASE_STATE_INTERPRET:
+        case LLAMA_FUNCTIONAL_MICROPHASE_SELF_OBSERVE:
+        case LLAMA_FUNCTIONAL_MICROPHASE_SELF_FORECAST:
+        case LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION:
+        default:
+            set_family(
+                    LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION,
+                    0.30f + 0.32f * uncertainty + 0.24f * pred_error + 0.14f * recovery_urgency + 0.10f * (1.0f - answerability),
+                    LLAMA_FUNCTIONAL_HOLD_PHASE_EXIT,
+                    1,
+                    LLAMA_FUNCTIONAL_ROUTE_REASON_UNCERTAINTY | LLAMA_FUNCTIONAL_ROUTE_REASON_PREDICTION_ERROR);
+            break;
+    }
+
+    for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+        if ((decision.eligible_mask & (1ull << family)) == 0) {
+            continue;
+        }
+        if (decision.top_family < 0 || decision.gains[family] > decision.gains[decision.top_family]) {
+            decision.top_family = family;
+        }
+    }
+    if (decision.top_family >= 0) {
+        decision.activated_mask = (1ull << decision.top_family);
+    }
+
+    return decision;
+}
+
+struct functional_delta_summary {
+    float delta_favorable = 0.0f;
+    float delta_user = 0.0f;
+    float delta_goal = 0.0f;
+    float delta_efficiency = 0.0f;
+    float delta_recovery = 0.0f;
+    float delta_answerability = 0.0f;
+    float delta_preference = 0.0f;
+};
+
+functional_delta_summary compute_functional_deltas(
+        const llama_functional_outcome_snapshot & before,
+        const llama_functional_outcome_snapshot & after) {
+    functional_delta_summary deltas = {};
+    deltas.delta_favorable = clamp_signed_unit(before.favorable_divergence - after.favorable_divergence);
+    deltas.delta_user = clamp_signed_unit(before.user_satisfaction_risk - after.user_satisfaction_risk);
+    deltas.delta_goal = clamp_signed_unit(before.goal_progress_pressure - after.goal_progress_pressure);
+    deltas.delta_efficiency = clamp_signed_unit(before.loop_inefficiency - after.loop_inefficiency);
+    deltas.delta_recovery = clamp_signed_unit(before.recovery_urgency - after.recovery_urgency);
+    deltas.delta_answerability = clamp_signed_unit(after.answerability - before.answerability);
+    deltas.delta_preference = clamp_signed_unit(before.preference_uncertainty - after.preference_uncertainty);
+    return deltas;
+}
+
+const llama_counterfactual_candidate * best_temporal_ablation_candidate(
+        const llama_counterfactual_trace & trace) {
+    const llama_counterfactual_candidate * best = nullptr;
+    for (int32_t i = 0; i < trace.candidate_count; ++i) {
+        const auto & candidate = trace.candidates[i];
+        if (candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_LORA_ABLATION) {
+            continue;
+        }
+        if (!best) {
+            best = &candidate;
+            continue;
+        }
+        const float lhs = candidate.expected_improvement * candidate.confidence;
+        const float rhs = best->expected_improvement * best->confidence;
+        if (lhs > rhs + 1.0e-6f) {
+            best = &candidate;
+        }
+    }
+    return best;
+}
+
+llama_functional_activation_decision make_inactive_functional_decision(int32_t loop_origin) {
+    llama_functional_activation_decision decision = {};
+    decision.loop_origin = loop_origin;
+    decision.microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
+    decision.top_family = -1;
+    decision.family_count = LLAMA_FUNCTIONAL_LORA_COUNT;
+    return decision;
+}
+
+std::string functional_family_name(int32_t family) {
+    switch (family) {
+        case LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION: return "tool_selection";
+        case LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL: return "counterfactual";
+        case LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION: return "memory_compression";
+        case LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION: return "self_observation";
+        default: return "unknown";
+    }
+}
+
+std::string functional_microphase_name(int32_t microphase) {
+    switch (microphase) {
+        case LLAMA_FUNCTIONAL_MICROPHASE_STATE_INTERPRET: return "state_interpret";
+        case LLAMA_FUNCTIONAL_MICROPHASE_TOOL_CLASS_SELECTION: return "tool_class_selection";
+        case LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP: return "tool_argument_prep";
+        case LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION: return "tool_result_integration";
+        case LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_GENERATE: return "counterfactual_generate";
+        case LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE: return "counterfactual_compare";
+        case LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION: return "memory_compression";
+        case LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT: return "memory_audit";
+        case LLAMA_FUNCTIONAL_MICROPHASE_SELF_OBSERVE: return "self_observe";
+        case LLAMA_FUNCTIONAL_MICROPHASE_SELF_FORECAST: return "self_forecast";
+        case LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION: return "post_action_reflection";
+        default: return "none";
+    }
+}
+
+std::vector<llama_token> functional_update_tokens(
+        const llama_vocab * vocab,
+        int32_t family,
+        int32_t microphase,
+        const std::string & details) {
+    std::string summary = "functional family ";
+    summary += functional_family_name(family);
+    summary += " microphase ";
+    summary += functional_microphase_name(microphase);
+    if (!details.empty()) {
+        summary += " ";
+        summary += details;
+    }
+    return tokenize_text(vocab, summary);
+}
+
+float normalized_divergence(float current, float target, float tolerance) {
     const float slack = std::max(0.0f, std::fabs(current - target) - tolerance);
     return clamp_unit(slack / std::max(0.05f, 1.0f - tolerance));
 }
 
-static int32_t role_recency_rank(int32_t role) {
+int32_t role_recency_rank(int32_t role) {
     switch (role) {
         case LLAMA_ADAPTER_LORA_LAYER_ACTIVE:       return 0;
         case LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK:    return 1;
@@ -265,7 +494,7 @@ static int32_t role_recency_rank(int32_t role) {
     }
 }
 
-static bool is_runtime_memory_role(int32_t role) {
+bool is_runtime_memory_role(int32_t role) {
     switch (role) {
         case LLAMA_ADAPTER_LORA_LAYER_ACTIVE:
         case LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK:
@@ -279,14 +508,14 @@ static bool is_runtime_memory_role(int32_t role) {
     }
 }
 
-static void set_repair_message(llama_governance_trace & trace, const std::string & message) {
+void set_repair_message(llama_governance_trace & trace, const std::string & message) {
     std::memset(trace.repair_message, 0, sizeof(trace.repair_message));
     const size_t copy_len = std::min(message.size(), sizeof(trace.repair_message) - 1);
     std::memcpy(trace.repair_message, message.data(), copy_len);
     trace.repair_message_length = (int32_t) copy_len;
 }
 
-static void set_bounded_cstr(char * dst, size_t dst_size, const char * src) {
+void set_bounded_cstr(char * dst, size_t dst_size, const char * src) {
     if (!dst || dst_size == 0) {
         return;
     }
@@ -296,9 +525,10 @@ static void set_bounded_cstr(char * dst, size_t dst_size, const char * src) {
     }
     const size_t copy_len = std::min(std::strlen(src), dst_size - 1);
     std::memcpy(dst, src, copy_len);
+    dst[copy_len] = '\0';
 }
 
-static llama_cognitive_tool_spec make_tool_spec(
+llama_cognitive_tool_spec make_tool_spec(
         int32_t tool_kind,
         uint32_t flags,
         int32_t latency_class,
@@ -313,7 +543,7 @@ static llama_cognitive_tool_spec make_tool_spec(
     return spec;
 }
 
-static int32_t find_tool_spec_index(
+int32_t find_tool_spec_index(
         const llama_cognitive_tool_spec * specs,
         int32_t spec_count,
         int32_t tool_kind) {
@@ -325,7 +555,7 @@ static int32_t find_tool_spec_index(
     return -1;
 }
 
-static const llama_cognitive_tool_spec * find_tool_spec(
+const llama_cognitive_tool_spec * find_tool_spec(
         const llama_cognitive_tool_spec * specs,
         int32_t spec_count,
         int32_t tool_kind,
@@ -337,7 +567,7 @@ static const llama_cognitive_tool_spec * find_tool_spec(
     return index >= 0 ? &specs[index] : nullptr;
 }
 
-static void set_loop_state(
+void set_loop_state(
         llama_cognitive_loop_state & state,
         int32_t phase,
         int32_t terminal_reason,
@@ -355,7 +585,7 @@ static void set_loop_state(
     state.tool_registry_count = tool_registry_count;
 }
 
-static void set_tool_proposal(
+void set_tool_proposal(
         llama_cognitive_tool_proposal & proposal,
         const llama_cognitive_tool_spec * spec,
         int32_t spec_index,
@@ -376,7 +606,7 @@ static void set_tool_proposal(
     proposal.job_id = job_id;
 }
 
-static void set_observation(
+void set_observation(
         llama_cognitive_observation & observation,
         bool valid,
         int32_t tool_kind,
@@ -392,7 +622,7 @@ static void set_observation(
     observation.followup_affinity = clamp_unit(followup_affinity);
 }
 
-static int32_t find_command_index(
+int32_t find_command_index(
         const llama_cognitive_command * queue,
         int32_t count,
         int32_t command_id) {
@@ -404,7 +634,7 @@ static int32_t find_command_index(
     return -1;
 }
 
-static bool has_command_origin(
+bool has_command_origin(
         const llama_cognitive_command * queue,
         int32_t count,
         int32_t origin) {
@@ -418,7 +648,7 @@ static bool has_command_origin(
     return false;
 }
 
-static void compact_command_queue(
+void compact_command_queue(
         llama_cognitive_command * queue,
         int32_t * count) {
     if (!queue || !count) {
@@ -444,7 +674,7 @@ static void compact_command_queue(
     *count = write;
 }
 
-static void init_command(
+void init_command(
         llama_cognitive_command & command,
         int32_t command_id,
         int32_t origin,
@@ -471,7 +701,7 @@ static void init_command(
     command.loop_phase = loop_phase;
 }
 
-static std::vector<llama_token> tokenize_text(const llama_vocab * vocab, const std::string & text) {
+std::vector<llama_token> tokenize_text(const llama_vocab * vocab, const std::string & text) {
     if (!vocab || text.empty()) {
         return {};
     }
@@ -488,7 +718,231 @@ static std::vector<llama_token> tokenize_text(const llama_vocab * vocab, const s
     return tokens;
 }
 
-static std::string remediation_prompt_for_family(int32_t family) {
+std::string trim_ascii(const std::string & text) {
+    size_t start = 0;
+    while (start < text.size() && std::isspace((unsigned char) text[start])) {
+        ++start;
+    }
+
+    size_t end = text.size();
+    while (end > start && std::isspace((unsigned char) text[end - 1])) {
+        --end;
+    }
+
+    return text.substr(start, end - start);
+}
+
+std::string lower_ascii(std::string text) {
+    for (char & ch : text) {
+        ch = (char) std::tolower((unsigned char) ch);
+    }
+    return text;
+}
+
+std::string event_text(const llama_vocab * vocab, const llama_self_state_event & event) {
+    if (!vocab || !event.tokens || event.n_tokens == 0) {
+        return "";
+    }
+
+    std::string out;
+    for (size_t i = 0; i < event.n_tokens; ++i) {
+        if (event.tokens[i] < 0) {
+            continue;
+        }
+        out += vocab->token_to_piece(event.tokens[i]);
+    }
+    return trim_ascii(out);
+}
+
+bool starts_with_ascii(const std::string & text, const char * prefix) {
+    const size_t prefix_len = std::strlen(prefix);
+    return text.size() >= prefix_len && text.compare(0, prefix_len, prefix) == 0;
+}
+
+std::string extract_backtick_command(const std::string & text) {
+    const size_t start = text.find('`');
+    if (start == std::string::npos) {
+        return "";
+    }
+
+    const size_t end = text.find('`', start + 1);
+    if (end == std::string::npos || end <= start + 1) {
+        return "";
+    }
+
+    return trim_ascii(text.substr(start + 1, end - start - 1));
+}
+
+std::string strip_command_prefix(const std::string & text) {
+    const std::string lower = lower_ascii(text);
+    static const char * const prefixes[] = {
+        "please run ",
+        "run ",
+        "please execute ",
+        "execute ",
+        "use bash to ",
+        "bash -c ",
+        "bash ",
+    };
+
+    for (size_t i = 0; i < sizeof(prefixes)/sizeof(prefixes[0]); ++i) {
+        if (starts_with_ascii(lower, prefixes[i])) {
+            return trim_ascii(text.substr(std::strlen(prefixes[i])));
+        }
+    }
+
+    return trim_ascii(text);
+}
+
+bool looks_shell_command(const std::string & text) {
+    if (text.empty()) {
+        return false;
+    }
+
+    if (text.find('\n') != std::string::npos || text.find("&&") != std::string::npos || text.find('|') != std::string::npos ||
+            text.find(';') != std::string::npos || text.find("./") != std::string::npos) {
+        return true;
+    }
+
+    const std::string lower = lower_ascii(text);
+    static const char * const commands[] = {
+        "ls", "pwd", "cd", "cat", "rg", "grep", "find", "git", "cmake", "ctest",
+        "make", "ninja", "head", "tail", "sed", "awk", "printf", "echo", "python",
+        "python3", "bash", "sh"
+    };
+
+    for (size_t i = 0; i < sizeof(commands)/sizeof(commands[0]); ++i) {
+        if (lower == commands[i] || starts_with_ascii(lower, (std::string(commands[i]) + " ").c_str())) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::string infer_bash_command(const std::string & intent_text) {
+    const std::string trimmed = trim_ascii(intent_text);
+    if (trimmed.empty()) {
+        return "";
+    }
+
+    std::string extracted = extract_backtick_command(trimmed);
+    if (!extracted.empty()) {
+        return extracted;
+    }
+
+    std::string stripped = strip_command_prefix(trimmed);
+    if (looks_shell_command(stripped)) {
+        return stripped;
+    }
+
+    const std::string lower = lower_ascii(trimmed);
+    if (lower.find("build") != std::string::npos && lower.find("log") != std::string::npos) {
+        return "pwd && find build . -maxdepth 4 -type f 2>/dev/null | sort | head -n 200";
+    }
+    if (lower.find("repo") != std::string::npos || lower.find("repository") != std::string::npos ||
+            lower.find("file") != std::string::npos || lower.find("inspect") != std::string::npos ||
+            lower.find("search") != std::string::npos) {
+        return "pwd && find . -maxdepth 3 -type f | sort | head -n 200";
+    }
+
+    return "";
+}
+
+void init_bash_request(
+        llama_bash_tool_request & request,
+        const llama_bash_tool_config & config,
+        int32_t command_id,
+        int32_t origin,
+        int32_t tool_job_id,
+        const std::string & intent_text,
+        const std::string & command_text) {
+    request = {};
+    request.command_id = command_id;
+    request.origin = origin;
+    request.tool_job_id = tool_job_id;
+    request.timeout_ms = std::max(100, config.timeout_ms);
+    request.max_stdout_bytes = std::max(1, std::min(config.max_stdout_bytes, LLAMA_BASH_TOOL_STDOUT_MAX_CHARS - 1));
+    request.max_stderr_bytes = std::max(1, std::min(config.max_stderr_bytes, LLAMA_BASH_TOOL_STDERR_MAX_CHARS - 1));
+    request.inherit_env = config.inherit_env;
+    request.login_shell = config.login_shell;
+    request.command_ready = !command_text.empty();
+    set_bounded_cstr(request.bash_path, sizeof(request.bash_path), config.bash_path);
+    set_bounded_cstr(request.working_directory, sizeof(request.working_directory), config.working_directory);
+    set_bounded_cstr(request.intent_text, sizeof(request.intent_text), intent_text.c_str());
+    set_bounded_cstr(request.command_text, sizeof(request.command_text), command_text.c_str());
+}
+
+std::string summarize_bash_result(const llama_bash_tool_result & result) {
+    auto summarize_channel = [](const char * text, size_t max_len) {
+        std::string out = trim_ascii(text ? text : "");
+        if (out.size() > max_len) {
+            out.resize(max_len);
+        }
+        return out;
+    };
+
+    std::string summary;
+    if (result.launch_failed) {
+        summary = "bash command launch failed.";
+    } else if (result.timed_out) {
+        summary = "bash command timed out.";
+    } else if (result.exit_code == 0) {
+        summary = "bash command completed successfully.";
+    } else {
+        summary = "bash command failed.";
+    }
+
+    if (result.exit_code != 0) {
+        summary += " exit_code=" + std::to_string(result.exit_code) + ".";
+    }
+    if (result.term_signal > 0) {
+        summary += " signal=" + std::to_string(result.term_signal) + ".";
+    }
+
+    const std::string stdout_text = summarize_channel(result.stdout_text, 160);
+    const std::string stderr_text = summarize_channel(result.stderr_text, 160);
+    const std::string error_text = summarize_channel(result.error_text, 160);
+
+    if (!stdout_text.empty()) {
+        summary += " stdout: " + stdout_text;
+    }
+    if (!stderr_text.empty()) {
+        summary += " stderr: " + stderr_text;
+    }
+    if (!error_text.empty()) {
+        summary += " error: " + error_text;
+    }
+    if (result.truncated_stdout || result.truncated_stderr) {
+        summary += " output_truncated=true.";
+    }
+
+    return summary;
+}
+
+bool apply_tool_event_only(llama_context & ctx, const llama_self_state_event & event) {
+    (void) ctx.self_state_set_channel_state(LLAMA_SELF_STATE_CHANNEL_ACTIVE);
+    (void) ctx.self_state_note_tool_event();
+
+    llama_self_state_feature_vector pre = {};
+    llama_self_state_feature_vector post = {};
+    if (!ctx.self_state_build_prewrite_features(event, &pre)) {
+        return false;
+    }
+    if (!ctx.self_state_apply_prewrite(event, pre)) {
+        return false;
+    }
+    if (!ctx.self_state_build_postwrite_features(event, &post)) {
+        return false;
+    }
+    if (!ctx.self_state_apply_postwrite(event, post)) {
+        return false;
+    }
+
+    return true;
+}
+
+std::string remediation_prompt_for_family(int32_t family) {
     switch (family) {
         case LLAMA_COUNTERFACTUAL_FAMILY_MESSAGE_VARIANT:
             return "Prefer response variants that reduce contradiction, uncertainty, and user dissatisfaction while preserving commitments.";
@@ -513,9 +967,9 @@ class llama_cognitive_runtime_impl {
 public:
     explicit llama_cognitive_runtime_impl(llama_context & ctx) : ctx(ctx) {}
 
-    const llama_favorable_dimension_target * find_dimension(
+    static const llama_favorable_dimension_target * find_dimension(
             const llama_favorable_state_profile & profile,
-            int32_t dimension_id) const {
+            int32_t dimension_id) {
         for (int32_t i = 0; i < profile.dimension_count; ++i) {
             if (profile.dimensions[i].dimension_id == dimension_id) {
                 return &profile.dimensions[i];
@@ -524,14 +978,14 @@ public:
         return nullptr;
     }
 
-    void add_dimension(
+    static void add_dimension(
             llama_favorable_state_profile & profile,
             int32_t dimension_id,
             float current_value,
             float target_value,
             float tolerance,
             float weight,
-            bool stable) const {
+            bool stable) {
         if (profile.dimension_count >= LLAMA_FAVORABLE_MAX_DIMS) {
             return;
         }
@@ -846,7 +1300,7 @@ public:
             plan.budget = 0.0f;
             plan.tool_kind = winner.family == LLAMA_COUNTERFACTUAL_FAMILY_HARD_MEMORY_QUERY ?
                     LLAMA_TOOL_KIND_HARD_MEMORY_QUERY :
-                    LLAMA_TOOL_KIND_GENERIC;
+                    LLAMA_TOOL_KIND_BASH_CLI;
             return plan;
         }
 
@@ -891,17 +1345,20 @@ public:
                 0.35f * plan.expected_improvement +
                 0.20f * plan.confidence +
                 0.10f * trace.dissatisfaction);
-        trace.threshold =
-                risk_tier == LLAMA_COUNTERFACTUAL_RISK_LOW ? 0.18f :
-                risk_tier == LLAMA_COUNTERFACTUAL_RISK_MEDIUM ? 0.80f : 0.92f;
+        if (risk_tier == LLAMA_COUNTERFACTUAL_RISK_LOW) {
+            trace.threshold = 0.18f;
+        } else if (risk_tier == LLAMA_COUNTERFACTUAL_RISK_MEDIUM) {
+            trace.threshold = 0.80f;
+        } else {
+            trace.threshold = 0.92f;
+        }
 
         if (plan.action == LLAMA_REMEDIATION_ACTION_NONE) {
             trace.outcome = risk_tier >= LLAMA_COUNTERFACTUAL_RISK_MEDIUM ?
                     LLAMA_GOVERNANCE_OUTCOME_DENY :
                     LLAMA_GOVERNANCE_OUTCOME_DEFER;
-        } else if (risk_tier >= LLAMA_COUNTERFACTUAL_RISK_HIGH) {
-            trace.outcome = LLAMA_GOVERNANCE_OUTCOME_DENY;
-        } else if (risk_tier == LLAMA_COUNTERFACTUAL_RISK_MEDIUM && trace.evidence < trace.threshold) {
+        } else if (risk_tier >= LLAMA_COUNTERFACTUAL_RISK_HIGH ||
+                (risk_tier == LLAMA_COUNTERFACTUAL_RISK_MEDIUM && trace.evidence < trace.threshold)) {
             trace.outcome = LLAMA_GOVERNANCE_OUTCOME_DENY;
         } else if (trace.evidence < trace.threshold) {
             trace.outcome = LLAMA_GOVERNANCE_OUTCOME_DEFER;
@@ -1038,6 +1495,15 @@ llama_cognitive_loop::llama_cognitive_loop(llama_context & ctx) : ctx(ctx) {
                 2,
                 "generic"),
         make_tool_spec(
+                LLAMA_TOOL_KIND_BASH_CLI,
+                LLAMA_COG_TOOL_ACTIVE_ELIGIBLE |
+                        LLAMA_COG_TOOL_DMN_ELIGIBLE |
+                        LLAMA_COG_TOOL_REMEDIATION_SAFE |
+                        LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT,
+                LLAMA_COG_TOOL_LATENCY_MEDIUM,
+                2,
+                "bash"),
+        make_tool_spec(
                 LLAMA_TOOL_KIND_HARD_MEMORY_QUERY,
                 LLAMA_COG_TOOL_ACTIVE_ELIGIBLE |
                         LLAMA_COG_TOOL_DMN_ELIGIBLE |
@@ -1150,6 +1616,27 @@ bool llama_cognitive_loop::cognitive_command_complete(int32_t command_id, bool c
         }
     }
 
+    (void) ctx.functional_lora_note_command_complete(command.origin);
+
+    if (cancelled &&
+            command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE &&
+            command.kind == LLAMA_COG_COMMAND_INVOKE_TOOL) {
+        tool_selection_episode_open = false;
+        tool_selection_before = {};
+        tool_selection_tool_kind = LLAMA_TOOL_KIND_NONE;
+        tool_selection_candidate_count = 0;
+        tool_selection_uncertainty = 0.0f;
+    }
+
+    if (cancelled || command.kind != LLAMA_COG_COMMAND_INVOKE_TOOL) {
+        (void) ctx.functional_lora_activate(make_inactive_functional_decision(command.origin));
+        if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+            active_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
+        } else if (command.origin == LLAMA_COG_COMMAND_ORIGIN_DMN) {
+            dmn_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
+        }
+    }
+
     compact_command_queue(command_queue, &command_count);
     return true;
 }
@@ -1226,6 +1713,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
         active_runner.max_steps = 3;
         active_runner.pending_command_id = -1;
         active_runner.last_command_id = -1;
+        active_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
     }
 
     (void) ctx.self_state_set_channel_state(LLAMA_SELF_STATE_CHANNEL_ACTIVE);
@@ -1273,6 +1761,39 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     const float recovery_urgency = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_RECOVERY_URGENCY));
     const float preference_uncertainty = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY));
     const bool tool_completed = (mutable_event.flags & LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED) != 0;
+
+    auto activate_microphase = [&](int32_t microphase, float tool_affinity_seed, float favorable_divergence_seed) {
+        const float memory_pressure_seed = clamp_unit(std::max(
+                trace.prewrite_features.memory_write_pressure,
+                trace.postwrite_features.memory_write_pressure));
+        const float continuation_seed = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_FOLLOWUP_CONTINUATION));
+        const llama_functional_activation_decision decision = route_functional_activation(
+                ctx,
+                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                microphase,
+                uncertainty,
+                answerability,
+                tool_affinity_seed,
+                favorable_divergence_seed,
+                continuation_seed,
+                memory_pressure_seed,
+                recovery_urgency);
+        (void) ctx.functional_lora_activate(decision);
+        trace.functional_activation = decision;
+        active_runner.functional_microphase = microphase;
+    };
+
+    const llama_favorable_state_profile pre_active_profile =
+            llama_cognitive_runtime_impl(ctx).compute_favorable_profile();
+    const llama_functional_outcome_snapshot active_before_snapshot =
+            capture_functional_snapshot(ctx, pre_active_profile);
+
+    activate_microphase(
+            mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL ?
+                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION :
+                    LLAMA_FUNCTIONAL_MICROPHASE_STATE_INTERPRET,
+            0.0f,
+            active_before_snapshot.favorable_divergence);
 
     llama_self_social_state_info social = {};
     llama_self_tool_state_info tool_state = {};
@@ -1362,12 +1883,29 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     const bool waiting_on_tool =
             trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT ||
             (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_WAIT && tool_state.running_jobs > 0);
-    const int32_t proposed_tool_kind =
-            trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT ? LLAMA_TOOL_KIND_GENERIC :
-            (mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL ? LLAMA_TOOL_KIND_GENERIC : LLAMA_TOOL_KIND_NONE);
+    int32_t proposed_tool_kind = LLAMA_TOOL_KIND_NONE;
+    if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT ||
+            mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
+        proposed_tool_kind = LLAMA_TOOL_KIND_BASH_CLI;
+    }
     int32_t proposed_spec_index = -1;
     const llama_cognitive_tool_spec * proposed_spec =
             find_tool_spec(tool_specs, tool_spec_count, proposed_tool_kind, &proposed_spec_index);
+
+    int32_t final_microphase =
+            mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL ?
+                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION :
+                    LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION;
+    if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
+        final_microphase = LLAMA_FUNCTIONAL_MICROPHASE_TOOL_CLASS_SELECTION;
+    } else if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_WAIT &&
+            trace.prewrite_features.memory_write_pressure > 0.45f) {
+        final_microphase = LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION;
+    } else if (uncertainty > 0.55f || preference_uncertainty > 0.55f || recovery_urgency > 0.50f) {
+        final_microphase = LLAMA_FUNCTIONAL_MICROPHASE_SELF_OBSERVE;
+    }
+
+    activate_microphase(final_microphase, tool_affinity, active_before_snapshot.favorable_divergence);
 
     if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
         const int32_t tool_job_id = next_tool_job_id++;
@@ -1382,16 +1920,18 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 true,
                 true,
                 tool_spec_count);
+        const int32_t proposal_tool_kind = proposed_tool_kind;
+        const int32_t proposal_job_id = tool_job_id;
         set_tool_proposal(
                 trace.tool_proposal,
                 proposed_spec,
                 proposed_spec_index,
-                proposed_tool_kind,
+                proposal_tool_kind,
                 trace.reason_mask,
                 -1,
                 proposed_spec ? std::max(1, proposed_spec->max_steps_reserved) : 1,
                 0.55f * tool_affinity + 0.25f * uncertainty + 0.20f * goal_relevance,
-                tool_job_id);
+                proposal_job_id);
         active_runner.steps_taken = trace.loop_state.steps_taken;
         active_runner.waiting_on_tool = true;
         active_runner.pending_command_id = enqueue_command(
@@ -1404,11 +1944,39 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 -1,
                 trace.loop_state.phase);
         active_runner.last_command_id = active_runner.pending_command_id > 0 ? active_runner.pending_command_id : active_runner.last_command_id;
+        llama_bash_tool_config bash_config = {};
+            if (proposed_tool_kind == LLAMA_TOOL_KIND_BASH_CLI &&
+                    active_runner.pending_command_id > 0 &&
+                    ctx.bash_tool_get_config(&bash_config)) {
+                const std::string intent = event_text(vocab, mutable_event);
+                activate_microphase(LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, tool_affinity, active_before_snapshot.favorable_divergence);
+                const std::string command_text = infer_bash_command(intent);
+                llama_bash_tool_request request = {};
+                init_bash_request(
+                        request,
+                        bash_config,
+                    active_runner.pending_command_id,
+                    LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                    tool_job_id,
+                    intent,
+                    command_text);
+            (void) ctx.bash_tool_set_request(request);
+        }
+
+        if (!tool_selection_episode_open) {
+            tool_selection_episode_open = true;
+            tool_selection_before = active_before_snapshot;
+            tool_selection_tool_kind = proposed_tool_kind;
+            tool_selection_candidate_count = std::max(1, tool_spec_count);
+            tool_selection_uncertainty = uncertainty;
+        }
     } else {
-        const int32_t terminal_reason =
-                trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ANSWER ? LLAMA_COG_TERMINAL_ANSWER_READY :
-                trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ASK    ? LLAMA_COG_TERMINAL_ASK_USER :
-                                                                         LLAMA_COG_TERMINAL_WAITING_ON_TOOL;
+        int32_t terminal_reason = LLAMA_COG_TERMINAL_WAITING_ON_TOOL;
+        if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ANSWER) {
+            terminal_reason = LLAMA_COG_TERMINAL_ANSWER_READY;
+        } else if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ASK) {
+            terminal_reason = LLAMA_COG_TERMINAL_ASK_USER;
+        }
         set_loop_state(
                 trace.loop_state,
                 LLAMA_COG_LOOP_PHASE_FINISH,
@@ -1440,18 +2008,231 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     }
 
     if (mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
-        const int32_t observation_status =
-                (mutable_event.flags & LLAMA_SELF_STATE_EVENT_TOOL_FAILED) ? LLAMA_SELF_TOOL_JOB_FAILED :
-                (mutable_event.flags & LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED) ? LLAMA_SELF_TOOL_JOB_COMPLETED :
-                                                                                LLAMA_SELF_TOOL_JOB_RUNNING;
+        llama_bash_tool_result last_bash_result = {};
+        const bool have_bash_result =
+                ctx.bash_tool_get_last_result(&last_bash_result) &&
+                last_bash_result.tool_job_id > 0;
+        int32_t observation_status = LLAMA_SELF_TOOL_JOB_RUNNING;
+        if ((mutable_event.flags & LLAMA_SELF_STATE_EVENT_TOOL_FAILED) != 0) {
+            observation_status = LLAMA_SELF_TOOL_JOB_FAILED;
+        } else if ((mutable_event.flags & LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED) != 0) {
+            observation_status = LLAMA_SELF_TOOL_JOB_COMPLETED;
+        }
         set_observation(
                 trace.observation,
                 true,
-                LLAMA_TOOL_KIND_GENERIC,
-                -1,
+                have_bash_result ? LLAMA_TOOL_KIND_BASH_CLI : LLAMA_TOOL_KIND_GENERIC,
+                have_bash_result ? last_bash_result.tool_job_id : -1,
                 observation_status,
                 0.55f * trace.winner_score + 0.45f * answerability,
                 0.50f * lex.followup + 0.30f * goal_relevance + 0.20f * recovery_urgency);
+    }
+
+    const llama_favorable_state_profile post_active_profile =
+            llama_cognitive_runtime_impl(ctx).compute_favorable_profile();
+    const llama_functional_outcome_snapshot active_after_snapshot =
+            capture_functional_snapshot(ctx, post_active_profile);
+    const functional_delta_summary active_deltas =
+            compute_functional_deltas(active_before_snapshot, active_after_snapshot);
+
+    auto apply_family_update = [&](int32_t family,
+                                   int32_t start_microphase,
+                                   int32_t settle_microphase,
+                                   int32_t selected_tool_kind,
+                                   int32_t candidate_count,
+                                   const float * metrics,
+                                   size_t metric_count,
+                                   float signed_outcome,
+                                   float magnitude,
+                                   const std::vector<llama_token> & update_tokens) {
+        if (update_tokens.empty()) {
+            return;
+        }
+        const llama_self_state_event update_event = {
+            /*.tokens =*/ update_tokens.data(),
+            /*.n_tokens =*/ update_tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
+            /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
+            /*.decoder_entropy =*/ 0.0f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+        llama_self_state_feature_vector update_features = {};
+        const llama_self_state_feature_vector * feature_ptr =
+                ctx.self_state_build_postwrite_features(update_event, &update_features) ? &update_features : nullptr;
+        (void) ctx.functional_lora_apply_update(
+                family,
+                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                start_microphase,
+                settle_microphase,
+                active_before_snapshot,
+                active_after_snapshot,
+                selected_tool_kind,
+                candidate_count,
+                metrics,
+                metric_count,
+                clamp_signed_unit(signed_outcome),
+                clamp_unit(magnitude),
+                update_event,
+                feature_ptr);
+    };
+
+    if (tool_selection_episode_open && mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
+        const functional_delta_summary tool_deltas =
+                compute_functional_deltas(tool_selection_before, active_after_snapshot);
+        const float signed_outcome = clamp_signed_unit(
+                0.30f * tool_deltas.delta_favorable +
+                0.20f * tool_deltas.delta_answerability +
+                0.20f * tool_deltas.delta_user +
+                0.15f * tool_deltas.delta_preference +
+                0.15f * tool_deltas.delta_efficiency);
+        const float magnitude = clamp_unit(
+                0.45f * std::fabs(signed_outcome) +
+                0.25f * tool_selection_uncertainty +
+                0.20f * clamp_unit((float) tool_selection_candidate_count / 3.0f) +
+                0.10f * (tool_selection_tool_kind != LLAMA_TOOL_KIND_NONE ? 1.0f : 0.0f));
+        const float metrics[] = {
+            tool_deltas.delta_favorable,
+            tool_deltas.delta_answerability,
+            tool_deltas.delta_user,
+            tool_deltas.delta_preference,
+            tool_deltas.delta_efficiency,
+            tool_selection_uncertainty,
+        };
+        const std::vector<llama_token> update_tokens = functional_update_tokens(
+                vocab,
+                LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION,
+                LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION,
+                "tool_kind " + std::to_string(tool_selection_tool_kind) +
+                        " candidate_count " + std::to_string(tool_selection_candidate_count) +
+                        " signed_outcome " + std::to_string(signed_outcome));
+        const llama_self_state_event_flags update_flags = update_tokens.empty() ?
+                (llama_self_state_event_flags) mutable_event.flags :
+                (llama_self_state_event_flags) LLAMA_SELF_STATE_EVENT_ADMITTED;
+        const llama_self_state_event update_event = {
+            /*.tokens =*/ update_tokens.empty() ? mutable_event.tokens : update_tokens.data(),
+            /*.n_tokens =*/ update_tokens.empty() ? mutable_event.n_tokens : update_tokens.size(),
+            /*.role =*/ update_tokens.empty() ? mutable_event.role : LLAMA_SELF_STATE_EVENT_SYSTEM,
+            /*.channel =*/ update_tokens.empty() ? mutable_event.channel : LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
+            /*.flags =*/ update_flags,
+            /*.decoder_entropy =*/ update_tokens.empty() ? mutable_event.decoder_entropy : 0.0f,
+            /*.decoder_top_margin =*/ update_tokens.empty() ? mutable_event.decoder_top_margin : 1.0f,
+        };
+        llama_self_state_feature_vector update_features = {};
+        const llama_self_state_feature_vector * feature_ptr = &trace.postwrite_features;
+        if (!update_tokens.empty()) {
+            feature_ptr = ctx.self_state_build_postwrite_features(update_event, &update_features) ? &update_features : nullptr;
+        }
+        (void) ctx.functional_lora_apply_update(
+                LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION,
+                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                LLAMA_FUNCTIONAL_MICROPHASE_TOOL_CLASS_SELECTION,
+                LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION,
+                tool_selection_before,
+                active_after_snapshot,
+                tool_selection_tool_kind,
+                tool_selection_candidate_count,
+                metrics,
+                sizeof(metrics)/sizeof(metrics[0]),
+                signed_outcome,
+                magnitude,
+                update_event,
+                feature_ptr);
+        tool_selection_episode_open = false;
+        tool_selection_before = {};
+        tool_selection_tool_kind = LLAMA_TOOL_KIND_NONE;
+        tool_selection_candidate_count = 0;
+        tool_selection_uncertainty = 0.0f;
+    }
+
+    if (final_microphase == LLAMA_FUNCTIONAL_MICROPHASE_SELF_OBSERVE ||
+            final_microphase == LLAMA_FUNCTIONAL_MICROPHASE_STATE_INTERPRET ||
+            final_microphase == LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION ||
+            final_microphase == LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION) {
+        llama_self_model_state_info model_state = {};
+        const float pred_error = ctx.self_state_get_model_state(&model_state) ?
+                prediction_error_signal(model_state.prediction_error) :
+                0.0f;
+        const float signed_outcome = clamp_signed_unit(
+                0.22f * active_deltas.delta_favorable +
+                0.18f * active_deltas.delta_recovery +
+                0.18f * active_deltas.delta_answerability +
+                0.16f * active_deltas.delta_preference +
+                0.14f * active_deltas.delta_user +
+                0.12f * active_deltas.delta_efficiency);
+        const float magnitude = clamp_unit(
+                0.35f * std::fabs(signed_outcome) +
+                0.25f * uncertainty +
+                0.20f * pred_error +
+                0.20f * recovery_urgency);
+        const float metrics[] = {
+            active_deltas.delta_favorable,
+            active_deltas.delta_recovery,
+            active_deltas.delta_answerability,
+            active_deltas.delta_preference,
+            active_deltas.delta_user,
+            pred_error,
+        };
+        apply_family_update(
+                LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION,
+                LLAMA_FUNCTIONAL_MICROPHASE_STATE_INTERPRET,
+                final_microphase,
+                LLAMA_TOOL_KIND_NONE,
+                trace.candidate_count,
+                metrics,
+                sizeof(metrics)/sizeof(metrics[0]),
+                signed_outcome,
+                magnitude,
+                functional_update_tokens(
+                        vocab,
+                        LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION,
+                        final_microphase,
+                        "uncertainty " + std::to_string(uncertainty) +
+                                " answerability " + std::to_string(answerability)));
+    }
+
+    if (final_microphase == LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION ||
+            trace.prewrite_features.memory_write_pressure > 0.55f) {
+        const float compression_pressure =
+                clamp_unit(std::max(trace.prewrite_features.memory_write_pressure, trace.postwrite_features.memory_write_pressure));
+        const float signed_outcome = clamp_signed_unit(
+                0.24f * active_deltas.delta_favorable +
+                0.18f * active_deltas.delta_goal +
+                0.18f * active_deltas.delta_recovery +
+                0.16f * active_deltas.delta_user +
+                0.12f * active_deltas.delta_preference +
+                0.12f * active_deltas.delta_efficiency);
+        const float magnitude = clamp_unit(
+                0.35f * std::fabs(signed_outcome) +
+                0.35f * compression_pressure +
+                0.15f * clamp_unit((float) ctx.self_state_working_memory_count() / 8.0f) +
+                0.15f * goal_relevance);
+        const float metrics[] = {
+            active_deltas.delta_favorable,
+            active_deltas.delta_goal,
+            active_deltas.delta_recovery,
+            active_deltas.delta_user,
+            compression_pressure,
+            goal_relevance,
+        };
+        apply_family_update(
+                LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION,
+                LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION,
+                final_microphase == LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION ?
+                        LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT :
+                        final_microphase,
+                LLAMA_TOOL_KIND_NONE,
+                trace.candidate_count,
+                metrics,
+                sizeof(metrics)/sizeof(metrics[0]),
+                signed_outcome,
+                magnitude,
+                functional_update_tokens(
+                        vocab,
+                        LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION,
+                        LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION,
+                        "memory_pressure " + std::to_string(compression_pressure) +
+                                " working_memory_count " + std::to_string(ctx.self_state_working_memory_count())));
     }
 
     trace.completed_time_us = llama_time_us();
@@ -1504,6 +2285,7 @@ bool llama_cognitive_loop::dmn_defer(uint64_t now_us, llama_dmn_tick_trace * out
     last_remediation_plan.tool_job_id = -1;
     last_governance_trace = {};
     last_governance_trace.proposal_family = -1;
+    last_temporal_self_trace = {};
 
     trace.deferred_for_foreground = true;
     trace.admitted = false;
@@ -1525,6 +2307,9 @@ bool llama_cognitive_loop::dmn_defer(uint64_t now_us, llama_dmn_tick_trace * out
     dmn_runner.tick_id = next_tick_id;
     dmn_runner.completed = true;
     dmn_runner.max_steps = 1;
+    dmn_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
+    trace.functional_activation = make_inactive_functional_decision(LLAMA_COG_COMMAND_ORIGIN_DMN);
+    (void) ctx.functional_lora_activate(trace.functional_activation);
     ++host_state.background_deferred_count;
     trace.tick_id = next_tick_id;
     host_state.last_dmn_time_us = now_us;
@@ -1583,14 +2368,18 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     last_remediation_plan.tool_job_id = -1;
     last_governance_trace = {};
     last_governance_trace.proposal_family = -1;
+    last_temporal_self_trace = {};
     dmn_runner = {};
     dmn_runner.max_steps = 3;
     dmn_runner.pending_command_id = -1;
     dmn_runner.last_command_id = -1;
+    dmn_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
 
     if (!pressure_crossed(trace.pressure)) {
         trace.admitted = false;
         trace.burst_count = 0;
+        trace.functional_activation = make_inactive_functional_decision(LLAMA_COG_COMMAND_ORIGIN_DMN);
+        (void) ctx.functional_lora_activate(trace.functional_activation);
         set_loop_state(
                 trace.loop_state,
                 LLAMA_COG_LOOP_PHASE_FINISH,
@@ -1615,9 +2404,47 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     dmn_runner.tick_id = trace.tick_id;
     dmn_runner.active = true;
     (void) ctx.self_state_set_channel_state(LLAMA_SELF_STATE_CHANNEL_WAITING);
+    const llama_functional_outcome_snapshot dmn_before_snapshot =
+            capture_functional_snapshot(ctx, last_favorable_profile);
+    auto activate_microphase = [&](int32_t microphase, float tool_affinity_seed, float memory_pressure_seed) {
+        const llama_functional_activation_decision decision = route_functional_activation(
+                ctx,
+                LLAMA_COG_COMMAND_ORIGIN_DMN,
+                microphase,
+                clamp_unit(trace.pressure.uncertainty),
+                clamp_unit(1.0f - trace.pressure.contradiction),
+                tool_affinity_seed,
+                dmn_before_snapshot.favorable_divergence,
+                clamp_unit(trace.pressure.continuation),
+                memory_pressure_seed,
+                dmn_before_snapshot.recovery_urgency);
+        (void) ctx.functional_lora_activate(decision);
+        trace.functional_activation = decision;
+        dmn_runner.functional_microphase = microphase;
+    };
+    activate_microphase(
+            LLAMA_FUNCTIONAL_MICROPHASE_SELF_OBSERVE,
+            clamp_unit(trace.pressure.tool_delta),
+            clamp_unit((float) ctx.self_state_working_memory_count() / 8.0f));
     runtime.select_reactivation_targets(trace);
     runtime.assemble_seed(trace.pressure, trace);
+    activate_microphase(
+            LLAMA_FUNCTIONAL_MICROPHASE_SELF_FORECAST,
+            clamp_unit(trace.pressure.tool_delta),
+            clamp_unit((float) ctx.self_state_working_memory_count() / 8.0f));
     last_counterfactual_trace = runtime.compute_counterfactual_trace(last_favorable_profile);
+    const float evolution_uncertainty_before = clamp_unit(
+            get_scalar_register(ctx, LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY));
+    const llama_counterfactual_candidate * temporal_ablation_candidate =
+            best_temporal_ablation_candidate(last_counterfactual_trace);
+    const bool temporal_self_triggered =
+            evolution_uncertainty_before >= LLAMA_TEMPORAL_SELF_TRIGGER_THRESHOLD &&
+            temporal_ablation_candidate != nullptr &&
+            now_us >= temporal_self_next_trigger_us;
+    activate_microphase(
+            LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_GENERATE,
+            clamp_unit(trace.pressure.tool_delta),
+            clamp_unit((float) ctx.self_state_working_memory_count() / 8.0f));
     last_remediation_plan = runtime.plan_remediation(last_favorable_profile, last_counterfactual_trace);
     last_governance_trace = runtime.evaluate_governance(last_favorable_profile, last_counterfactual_trace, last_remediation_plan);
 
@@ -1718,6 +2545,20 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         trace.maintenance_mask |= LLAMA_DMN_MAINTENANCE_REFRESH_REACTIVATION;
     }
 
+    const bool compression_eligible =
+            (trace.maintenance_mask & LLAMA_DMN_MAINTENANCE_COMPRESS_WORKING_MEMORY) != 0;
+    if (compression_eligible) {
+        activate_microphase(
+                LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION,
+                tool_affinity,
+                clamp_unit((float) working_memory_count / 8.0f));
+    } else {
+        activate_microphase(
+                LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE,
+                tool_affinity,
+                clamp_unit((float) working_memory_count / 8.0f));
+    }
+
     if (last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_ACTIVE_LORA_UPDATE &&
             last_governance_trace.outcome != LLAMA_GOVERNANCE_OUTCOME_DENY &&
             last_governance_trace.outcome != LLAMA_GOVERNANCE_OUTCOME_DEFER) {
@@ -1761,6 +2602,10 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         if (ctx.self_state_build_postwrite_features(internal_event, &post)) {
             (void) ctx.self_state_apply_postwrite(internal_event, post);
         }
+        activate_microphase(
+                compression_eligible ? LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT : LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION,
+                tool_affinity,
+                clamp_unit((float) working_memory_count / 8.0f));
         set_loop_state(
                 trace.loop_state,
                 LLAMA_COG_LOOP_PHASE_FINISH,
@@ -1828,11 +2673,29 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                     last_remediation_plan.source_family,
                     trace.loop_state.phase);
             dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
+            llama_bash_tool_config bash_config = {};
+            if (trace.tool_kind == LLAMA_TOOL_KIND_BASH_CLI &&
+                    dmn_runner.pending_command_id > 0 &&
+                    ctx.bash_tool_get_config(&bash_config)) {
+                llama_bash_tool_request request = {};
+                init_bash_request(
+                        request,
+                        bash_config,
+                        dmn_runner.pending_command_id,
+                        LLAMA_COG_COMMAND_ORIGIN_DMN,
+                        trace.tool_job_id,
+                        "inspect repository and runtime state",
+                        "pwd && find . -maxdepth 3 -type f | sort | head -n 200");
+                (void) ctx.bash_tool_set_request(request);
+            }
         } else if (should_emit_followup && dmn_runner.steps_taken < dmn_runner.max_steps) {
             trace.winner_action = LLAMA_DMN_ACTION_EMIT;
-            trace.burst_count =
-                    last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR ? 1 :
-                    (continuation > 0.0f && inhibition < 0.60f ? 2 : 1);
+            trace.burst_count = 1;
+            if (last_governance_trace.outcome != LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR &&
+                    continuation > 0.0f &&
+                    inhibition < 0.60f) {
+                trace.burst_count = 2;
+            }
             host_state.pending_dmn_emits += trace.burst_count;
             set_loop_state(
                     trace.loop_state,
@@ -1859,6 +2722,10 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
             dmn_runner.active = false;
         }
     } else if (trace.winner_action == LLAMA_DMN_ACTION_INVOKE_TOOL) {
+        activate_microphase(
+                LLAMA_FUNCTIONAL_MICROPHASE_TOOL_CLASS_SELECTION,
+                tool_affinity,
+                clamp_unit((float) working_memory_count / 8.0f));
         trace.tool_job_id = next_tool_job_id++;
         trace.tool_kind = last_remediation_plan.tool_kind;
         (void) ctx.self_state_upsert_tool_job(trace.tool_job_id, LLAMA_SELF_TOOL_JOB_PENDING, clamp_unit(trace.winner_score));
@@ -1900,10 +2767,36 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 last_remediation_plan.source_family,
                 trace.loop_state.phase);
         dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
+        llama_bash_tool_config bash_config = {};
+        if (trace.tool_kind == LLAMA_TOOL_KIND_BASH_CLI &&
+                dmn_runner.pending_command_id > 0 &&
+                ctx.bash_tool_get_config(&bash_config)) {
+            activate_microphase(
+                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP,
+                    tool_affinity,
+                    clamp_unit((float) working_memory_count / 8.0f));
+            llama_bash_tool_request request = {};
+            init_bash_request(
+                    request,
+                    bash_config,
+                    dmn_runner.pending_command_id,
+                    LLAMA_COG_COMMAND_ORIGIN_DMN,
+                    trace.tool_job_id,
+                    "inspect repository and runtime state",
+                    "pwd && find . -maxdepth 3 -type f | sort | head -n 200");
+            (void) ctx.bash_tool_set_request(request);
+        }
     } else if (trace.winner_action == LLAMA_DMN_ACTION_EMIT) {
-        trace.burst_count =
-                last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR ? 1 :
-                (continuation > 0.0f && inhibition < 0.60f ? 2 : 1);
+        activate_microphase(
+                LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION,
+                tool_affinity,
+                clamp_unit((float) working_memory_count / 8.0f));
+        trace.burst_count = 1;
+        if (last_governance_trace.outcome != LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR &&
+                continuation > 0.0f &&
+                inhibition < 0.60f) {
+            trace.burst_count = 2;
+        }
         host_state.pending_dmn_emits += trace.burst_count;
         set_loop_state(
                 trace.loop_state,
@@ -1951,10 +2844,211 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     }
 
     llama_favorable_state_profile post_profile = runtime.compute_favorable_profile();
+    const llama_functional_outcome_snapshot dmn_after_snapshot =
+            capture_functional_snapshot(ctx, post_profile);
+    const functional_delta_summary dmn_deltas =
+            compute_functional_deltas(dmn_before_snapshot, dmn_after_snapshot);
     if (last_remediation_plan.applied) {
         last_remediation_plan.post_divergence = post_profile.aggregate_divergence;
     } else {
         last_remediation_plan.post_divergence = last_remediation_plan.pre_divergence;
+    }
+
+    if (temporal_self_triggered) {
+        const float temporal_reference_score = clamp_unit(
+                temporal_ablation_candidate->expected_improvement *
+                (0.65f + 0.35f * temporal_ablation_candidate->confidence));
+        const float active_path_score = clamp_unit(
+                0.42f * std::max(0.0f, dmn_deltas.delta_favorable) +
+                0.28f * std::max(0.0f, dmn_deltas.delta_efficiency) +
+                0.18f * std::max(0.0f, dmn_deltas.delta_recovery) +
+                0.12f * std::max(0.0f, dmn_deltas.delta_answerability));
+        const float signed_advantage = clamp_signed_unit(active_path_score - temporal_reference_score);
+        const float efficiency_advantage = clamp_signed_unit(
+                dmn_deltas.delta_efficiency -
+                0.50f * temporal_ablation_candidate->expected_improvement);
+        int32_t outcome = LLAMA_TEMPORAL_SELF_IMPROVEMENT_TIE;
+        if (signed_advantage > 0.08f && efficiency_advantage > -0.05f) {
+            outcome = LLAMA_TEMPORAL_SELF_IMPROVEMENT_REWARD;
+        } else if (signed_advantage < -0.08f && efficiency_advantage < 0.05f) {
+            outcome = LLAMA_TEMPORAL_SELF_IMPROVEMENT_DAMPEN;
+        }
+
+        llama_self_state_datetime time_info = {};
+        const int64_t monotonic_ms = ctx.self_state_get_datetime(&time_info) ?
+                time_info.monotonic_ms :
+                (int64_t) (now_us / 1000);
+        (void) ctx.active_temporal_encoding_bias_apply(signed_advantage, efficiency_advantage, monotonic_ms);
+        (void) ctx.self_state_note_validated_progress(signed_advantage, efficiency_advantage);
+
+        llama_active_temporal_encoding_bias bias = {};
+        (void) ctx.active_temporal_encoding_bias_get(&bias);
+        last_temporal_self_trace.valid = true;
+        last_temporal_self_trace.loop_origin = LLAMA_COG_COMMAND_ORIGIN_DMN;
+        last_temporal_self_trace.selected_temporal_role = temporal_ablation_candidate->subject_id;
+        last_temporal_self_trace.counterfactual_family = temporal_ablation_candidate->family;
+        last_temporal_self_trace.outcome = outcome;
+        last_temporal_self_trace.evolution_uncertainty_before = evolution_uncertainty_before;
+        last_temporal_self_trace.evolution_uncertainty_after = clamp_unit(
+                get_scalar_register(ctx, LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY));
+        last_temporal_self_trace.signed_advantage = signed_advantage;
+        last_temporal_self_trace.efficiency_advantage = efficiency_advantage;
+        last_temporal_self_trace.active_reward_bias = bias.reward_bias;
+        last_temporal_self_trace.active_dampening_bias = bias.dampening_bias;
+        last_temporal_self_trace.active_effective_write_scale = bias.effective_write_scale;
+        temporal_self_next_trigger_us = now_us + LLAMA_TEMPORAL_SELF_TRIGGER_COOLDOWN_US;
+    }
+
+    auto apply_family_update = [&](int32_t family,
+                                   int32_t start_microphase,
+                                   int32_t settle_microphase,
+                                   int32_t selected_tool_kind,
+                                   int32_t candidate_count,
+                                   const float * metrics,
+                                   size_t metric_count,
+                                   float signed_outcome,
+                                   float magnitude,
+                                   const std::string & details) {
+        const std::vector<llama_token> update_tokens =
+                functional_update_tokens(llama_model_get_vocab(&ctx.get_model()), family, settle_microphase, details);
+        if (update_tokens.empty()) {
+            return;
+        }
+        const llama_self_state_event update_event = {
+            /*.tokens =*/ update_tokens.data(),
+            /*.n_tokens =*/ update_tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
+            /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
+            /*.decoder_entropy =*/ 0.0f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+        llama_self_state_feature_vector update_features = {};
+        const llama_self_state_feature_vector * feature_ptr =
+                ctx.self_state_build_postwrite_features(update_event, &update_features) ? &update_features : nullptr;
+        (void) ctx.functional_lora_apply_update(
+                family,
+                LLAMA_COG_COMMAND_ORIGIN_DMN,
+                start_microphase,
+                settle_microphase,
+                dmn_before_snapshot,
+                dmn_after_snapshot,
+                selected_tool_kind,
+                candidate_count,
+                metrics,
+                metric_count,
+                clamp_signed_unit(signed_outcome),
+                clamp_unit(magnitude),
+                update_event,
+                feature_ptr);
+    };
+
+    {
+        const float pred_error = clamp_unit(trace.pressure.uncertainty + trace.pressure.contradiction);
+        const float signed_outcome = clamp_signed_unit(
+                0.24f * dmn_deltas.delta_favorable +
+                0.18f * dmn_deltas.delta_recovery +
+                0.18f * dmn_deltas.delta_preference +
+                0.16f * dmn_deltas.delta_answerability +
+                0.12f * dmn_deltas.delta_efficiency +
+                0.12f * dmn_deltas.delta_user);
+        const float magnitude = clamp_unit(
+                0.30f * std::fabs(signed_outcome) +
+                0.25f * trace.pressure.uncertainty +
+                0.25f * trace.pressure.contradiction +
+                0.20f * pred_error);
+        const float metrics[] = {
+            dmn_deltas.delta_favorable,
+            dmn_deltas.delta_recovery,
+            dmn_deltas.delta_preference,
+            dmn_deltas.delta_answerability,
+            dmn_deltas.delta_efficiency,
+            pred_error,
+        };
+        apply_family_update(
+                LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION,
+                LLAMA_FUNCTIONAL_MICROPHASE_SELF_OBSERVE,
+                dmn_runner.functional_microphase > LLAMA_FUNCTIONAL_MICROPHASE_NONE ?
+                        dmn_runner.functional_microphase :
+                        LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION,
+                LLAMA_TOOL_KIND_NONE,
+                trace.candidate_count,
+                metrics,
+                sizeof(metrics)/sizeof(metrics[0]),
+                signed_outcome,
+                magnitude,
+                "pressure uncertainty " + std::to_string(trace.pressure.uncertainty) +
+                        " contradiction " + std::to_string(trace.pressure.contradiction));
+    }
+
+    if (last_counterfactual_trace.candidate_count > 0) {
+        const float signed_outcome = clamp_signed_unit(
+                0.35f * dmn_deltas.delta_favorable +
+                0.25f * dmn_deltas.delta_efficiency +
+                0.20f * dmn_deltas.delta_recovery +
+                0.20f * dmn_deltas.delta_goal);
+        const float magnitude = clamp_unit(
+                0.35f * std::fabs(signed_outcome) +
+                0.25f * dmn_before_snapshot.favorable_divergence +
+                0.20f * trace.pressure.continuation +
+                0.20f * clamp_unit((float) last_counterfactual_trace.candidate_count / 4.0f));
+        const float metrics[] = {
+            dmn_deltas.delta_favorable,
+            dmn_deltas.delta_efficiency,
+            dmn_deltas.delta_recovery,
+            dmn_deltas.delta_goal,
+            clamp_unit((float) last_counterfactual_trace.candidate_count / 4.0f),
+            trace.pressure.continuation,
+        };
+        apply_family_update(
+                LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL,
+                LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_GENERATE,
+                compression_eligible ? LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION :
+                        LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE,
+                trace.tool_kind,
+                last_counterfactual_trace.candidate_count,
+                metrics,
+                sizeof(metrics)/sizeof(metrics[0]),
+                signed_outcome,
+                magnitude,
+                "winner_index " + std::to_string(last_counterfactual_trace.winner_index) +
+                        " candidates " + std::to_string(last_counterfactual_trace.candidate_count));
+    }
+
+    if (compression_eligible) {
+        const float memory_pressure = clamp_unit((float) working_memory_count / 8.0f);
+        const float signed_outcome = clamp_signed_unit(
+                0.24f * dmn_deltas.delta_favorable +
+                0.20f * dmn_deltas.delta_goal +
+                0.18f * dmn_deltas.delta_recovery +
+                0.14f * dmn_deltas.delta_user +
+                0.12f * dmn_deltas.delta_preference +
+                0.12f * dmn_deltas.delta_efficiency);
+        const float magnitude = clamp_unit(
+                0.35f * std::fabs(signed_outcome) +
+                0.35f * memory_pressure +
+                0.15f * trace.pressure.reactivation +
+                0.15f * trace.pressure.continuation);
+        const float metrics[] = {
+            dmn_deltas.delta_favorable,
+            dmn_deltas.delta_goal,
+            dmn_deltas.delta_recovery,
+            dmn_deltas.delta_user,
+            memory_pressure,
+            trace.pressure.reactivation,
+        };
+        apply_family_update(
+                LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION,
+                LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION,
+                LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT,
+                LLAMA_TOOL_KIND_NONE,
+                working_memory_count,
+                metrics,
+                sizeof(metrics)/sizeof(metrics[0]),
+                signed_outcome,
+                magnitude,
+                "working_memory_count " + std::to_string(working_memory_count) +
+                        " continuation " + std::to_string(trace.pressure.continuation));
     }
 
     if (dmn_runner.pending_command_id > 0) {
@@ -1963,6 +3057,8 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     } else if (!dmn_runner.waiting_on_tool) {
         dmn_runner.active = false;
         dmn_runner.completed = true;
+        (void) ctx.functional_lora_activate(make_inactive_functional_decision(LLAMA_COG_COMMAND_ORIGIN_DMN));
+        dmn_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
     }
 
     host_state.shared_state_version += 1;
@@ -2024,6 +3120,58 @@ bool llama_cognitive_loop::governance_get_last_trace(llama_governance_trace * ou
     return true;
 }
 
+bool llama_cognitive_loop::temporal_self_improvement_get_last(
+        llama_temporal_self_improvement_trace * out_trace) const {
+    if (!out_trace) {
+        return false;
+    }
+    *out_trace = last_temporal_self_trace;
+    return true;
+}
+
+bool llama_cognitive_loop::cognitive_bash_tool_submit_result(
+        const llama_bash_tool_result & result,
+        llama_active_loop_trace * out_active_trace) {
+    llama_bash_tool_request request = {};
+    if (!ctx.cognitive_bash_tool_get_request(result.command_id, &request)) {
+        return false;
+    }
+
+    const int32_t tool_status =
+            (!result.launch_failed && !result.timed_out && result.exit_code == 0) ?
+                    LLAMA_SELF_TOOL_JOB_COMPLETED :
+                    LLAMA_SELF_TOOL_JOB_FAILED;
+    (void) ctx.self_state_upsert_tool_job(result.tool_job_id, tool_status, 1.0f);
+
+    if (!ctx.bash_tool_submit_result(result)) {
+        return false;
+    }
+    if (!ctx.cognitive_command_complete(result.command_id, false)) {
+        return false;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(&ctx.get_model());
+    const std::string summary = summarize_bash_result(result);
+    const std::vector<llama_token> tokens = tokenize_text(vocab, summary);
+    const llama_self_state_event tool_event = {
+        /*.tokens =*/ tokens.empty() ? nullptr : tokens.data(),
+        /*.n_tokens =*/ tokens.size(),
+        /*.role =*/ LLAMA_SELF_STATE_EVENT_TOOL,
+        /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+        /*.flags =*/ tool_status == LLAMA_SELF_TOOL_JOB_COMPLETED ?
+                LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED :
+                LLAMA_SELF_STATE_EVENT_TOOL_FAILED,
+        /*.decoder_entropy =*/ 0.0f,
+        /*.decoder_top_margin =*/ 1.0f,
+    };
+
+    if (request.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+        return active_loop_process(tool_event, out_active_trace);
+    }
+
+    return apply_tool_event_only(ctx, tool_event);
+}
+
 int32_t llama_context::cognitive_tool_spec_count() const {
     return cognitive_loop ? cognitive_loop->cognitive_tool_spec_count() : 0;
 }
@@ -2050,6 +3198,10 @@ bool llama_context::cognitive_command_ack(int32_t command_id) {
 
 bool llama_context::cognitive_command_complete(int32_t command_id, bool cancelled) {
     return cognitive_loop && cognitive_loop->cognitive_command_complete(command_id, cancelled);
+}
+
+bool llama_context::cognitive_bash_tool_submit_result(const llama_bash_tool_result & result, llama_active_loop_trace * out_active_trace) {
+    return cognitive_loop && cognitive_loop->cognitive_bash_tool_submit_result(result, out_active_trace);
 }
 
 bool llama_context::cognitive_active_runner_get(llama_cognitive_active_runner_status * out_status) const {
@@ -2104,6 +3256,10 @@ bool llama_context::governance_get_last_trace(llama_governance_trace * out_trace
     return cognitive_loop && cognitive_loop->governance_get_last_trace(out_trace);
 }
 
+bool llama_context::temporal_self_improvement_get_last(llama_temporal_self_improvement_trace * out_trace) const {
+    return cognitive_loop && cognitive_loop->temporal_self_improvement_get_last(out_trace);
+}
+
 int32_t llama_cognitive_tool_spec_count(const struct llama_context * ctx) {
     return ctx ? ctx->cognitive_tool_spec_count() : 0;
 }
@@ -2144,6 +3300,13 @@ int32_t llama_cognitive_command_complete(
         int32_t command_id,
         bool cancelled) {
     return ctx && ctx->cognitive_command_complete(command_id, cancelled) ? 0 : -1;
+}
+
+int32_t llama_cognitive_bash_tool_submit_result(
+        struct llama_context * ctx,
+        const struct llama_bash_tool_result * result,
+        struct llama_active_loop_trace * out_active_trace) {
+    return ctx && result && ctx->cognitive_bash_tool_submit_result(*result, out_active_trace) ? 0 : -1;
 }
 
 int32_t llama_cognitive_active_runner_get(
@@ -2226,4 +3389,10 @@ int32_t llama_governance_get_last_trace(
         const struct llama_context * ctx,
         struct llama_governance_trace * out_trace) {
     return ctx && ctx->governance_get_last_trace(out_trace) ? 0 : -1;
+}
+
+int32_t llama_temporal_self_improvement_get_last(
+        const struct llama_context * ctx,
+        struct llama_temporal_self_improvement_trace * out_trace) {
+    return ctx && ctx->temporal_self_improvement_get_last(out_trace) ? 0 : -1;
 }

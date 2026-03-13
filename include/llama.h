@@ -438,6 +438,49 @@ extern "C" {
         LLAMA_SERVING_LORA_LAYER_PAST_MONTH   = 4,
         LLAMA_SERVING_LORA_LAYER_PAST_WEEK    = 5,
         LLAMA_SERVING_LORA_LAYER_ACTIVE       = 6,
+        LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_TOOL_SELECTION  = 7,
+        LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_COUNTERFACTUAL  = 8,
+        LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_MEMORY_COMPRESS = 9,
+        LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_SELF_OBSERVE    = 10,
+    };
+
+    enum llama_functional_lora_family {
+        LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION = 0,
+        LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL = 1,
+        LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION = 2,
+        LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION = 3,
+        LLAMA_FUNCTIONAL_LORA_COUNT = 4,
+    };
+
+    enum llama_functional_microphase {
+        LLAMA_FUNCTIONAL_MICROPHASE_NONE = 0,
+        LLAMA_FUNCTIONAL_MICROPHASE_STATE_INTERPRET = 1,
+        LLAMA_FUNCTIONAL_MICROPHASE_TOOL_CLASS_SELECTION = 2,
+        LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP = 3,
+        LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION = 4,
+        LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_GENERATE = 5,
+        LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE = 6,
+        LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION = 7,
+        LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT = 8,
+        LLAMA_FUNCTIONAL_MICROPHASE_SELF_OBSERVE = 9,
+        LLAMA_FUNCTIONAL_MICROPHASE_SELF_FORECAST = 10,
+        LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION = 11,
+    };
+
+    enum llama_functional_hold_unit {
+        LLAMA_FUNCTIONAL_HOLD_PHASE_EXIT = 0,
+        LLAMA_FUNCTIONAL_HOLD_LOOP_STEPS = 1,
+        LLAMA_FUNCTIONAL_HOLD_COMMANDS = 2,
+        LLAMA_FUNCTIONAL_HOLD_TOKENS = 3,
+    };
+
+    enum llama_functional_route_reason_flags {
+        LLAMA_FUNCTIONAL_ROUTE_REASON_UNCERTAINTY = 1u << 0,
+        LLAMA_FUNCTIONAL_ROUTE_REASON_TOOL_AFFINITY = 1u << 1,
+        LLAMA_FUNCTIONAL_ROUTE_REASON_FAVORABLE_DIVERGENCE = 1u << 2,
+        LLAMA_FUNCTIONAL_ROUTE_REASON_MEMORY_PRESSURE = 1u << 3,
+        LLAMA_FUNCTIONAL_ROUTE_REASON_PREDICTION_ERROR = 1u << 4,
+        LLAMA_FUNCTIONAL_ROUTE_REASON_HOLD_CONTINUITY = 1u << 5,
     };
 
     typedef bool (*llama_active_lora_embedding_callback)(
@@ -529,6 +572,134 @@ extern "C" {
         int32_t role;
     };
 
+    struct llama_functional_lora_family_config {
+        bool enabled;
+        uint32_t rank_min;
+        uint32_t rank_max;
+        float gain_min;
+        float gain_max;
+        float default_gain;
+        float negative_update_scale;
+        float positive_update_scale;
+        uint32_t top_k_priority;
+        uint32_t update_horizon_steps;
+        uint32_t update_horizon_commands;
+        bool allow_active_loop;
+        bool allow_dmn_loop;
+    };
+
+    struct llama_functional_outcome_snapshot {
+        float favorable_divergence;
+        float user_satisfaction_risk;
+        float goal_progress_pressure;
+        float loop_inefficiency;
+        float recovery_urgency;
+        float answerability;
+        float preference_uncertainty;
+        float expected_steps_remaining;
+        float expected_inference_cost_remaining;
+    };
+
+    struct llama_functional_lora_update_info {
+        bool valid;
+        int32_t family;
+        int32_t loop_origin;
+        int32_t start_microphase;
+        int32_t settle_microphase;
+        int32_t selected_tool_kind;
+        int32_t candidate_count;
+        float signed_outcome;
+        float magnitude;
+        float metrics[6];
+        struct llama_functional_outcome_snapshot before_snapshot;
+        struct llama_functional_outcome_snapshot after_snapshot;
+    };
+
+    struct llama_functional_hold_state {
+        bool active;
+        int32_t family;
+        int32_t loop_origin;
+        int32_t microphase_started;
+        int32_t microphase_current;
+        int32_t hold_unit;
+        uint32_t hold_budget;
+        uint32_t hold_remaining;
+        float gain;
+        bool replay_boundary_required;
+    };
+
+    struct llama_functional_activation_decision {
+        int32_t loop_origin;
+        int32_t microphase;
+        uint64_t activated_mask;
+        uint64_t eligible_mask;
+        int32_t top_family;
+        int32_t family_count;
+        float gains[LLAMA_FUNCTIONAL_LORA_COUNT];
+        int32_t hold_unit[LLAMA_FUNCTIONAL_LORA_COUNT];
+        uint32_t hold_value[LLAMA_FUNCTIONAL_LORA_COUNT];
+        float priority[LLAMA_FUNCTIONAL_LORA_COUNT];
+        uint32_t reason_mask[LLAMA_FUNCTIONAL_LORA_COUNT];
+    };
+
+    struct llama_functional_lora_family_state {
+        int32_t family;
+        bool enabled;
+        bool compatible;
+        bool active_now;
+        float current_gain;
+        int32_t current_microphase;
+        int32_t current_hold_unit;
+        uint32_t current_hold_remaining;
+        uint64_t update_count;
+        float last_signed_outcome;
+    };
+
+    struct llama_functional_lora_trace {
+        struct llama_functional_activation_decision last_activation;
+        struct llama_functional_hold_state holds[LLAMA_FUNCTIONAL_LORA_COUNT];
+        struct llama_functional_lora_family_state family_state[LLAMA_FUNCTIONAL_LORA_COUNT];
+    };
+
+    struct llama_functional_lora_ablation_config {
+        uint64_t disabled_family_mask;
+        uint64_t disabled_microphase_mask;
+        bool disable_functional_stack;
+        bool disable_update_writes;
+        bool disable_hold_windows;
+    };
+
+    enum llama_temporal_self_improvement_outcome {
+        LLAMA_TEMPORAL_SELF_IMPROVEMENT_NONE    = 0,
+        LLAMA_TEMPORAL_SELF_IMPROVEMENT_REWARD  = 1,
+        LLAMA_TEMPORAL_SELF_IMPROVEMENT_DAMPEN  = 2,
+        LLAMA_TEMPORAL_SELF_IMPROVEMENT_TIE     = 3,
+        LLAMA_TEMPORAL_SELF_IMPROVEMENT_SKIPPED = 4,
+    };
+
+    struct llama_active_temporal_encoding_bias {
+        float reward_bias;
+        float dampening_bias;
+        float effective_write_scale;
+        uint64_t applied_update_count;
+        int64_t last_update_monotonic_ms;
+    };
+
+    struct llama_temporal_self_improvement_trace {
+        bool valid;
+        int32_t loop_origin;
+        int32_t selected_temporal_role;
+        int32_t counterfactual_family;
+        int32_t outcome;
+        float evolution_uncertainty_before;
+        float evolution_uncertainty_after;
+        float signed_advantage;
+        float efficiency_advantage;
+        float active_reward_bias;
+        float active_dampening_bias;
+        float active_effective_write_scale;
+    };
+
     enum llama_self_register_family {
         LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR = 0,
         LLAMA_SELF_REGISTER_FAMILY_SIGNED_SCALAR  = 1,
@@ -556,6 +727,7 @@ extern "C" {
         LLAMA_SELF_REGISTER_RECOVERY_URGENCY,
         LLAMA_SELF_REGISTER_ANSWERABILITY,
         LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY,
+        LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY,
         LLAMA_SELF_REGISTER_CHANNEL_STATE,
         LLAMA_SELF_REGISTER_COUNT,
     };
@@ -608,6 +780,7 @@ extern "C" {
         LLAMA_TOOL_KIND_GENERIC           = 1,
         LLAMA_TOOL_KIND_HARD_MEMORY_QUERY = 2,
         LLAMA_TOOL_KIND_HARD_MEMORY_WRITE = 3,
+        LLAMA_TOOL_KIND_BASH_CLI          = 4,
     };
 
     enum llama_self_memory_handle_kind {
@@ -1153,6 +1326,13 @@ extern "C" {
         LLAMA_HARD_MEMORY_MAX_ERROR_CHARS = 256,
         LLAMA_HARD_MEMORY_MAX_PROFILE_CHARS = 512,
         LLAMA_HARD_MEMORY_QUERY_MAX_CHARS = 256,
+        LLAMA_BASH_TOOL_PATH_MAX_CHARS = 256,
+        LLAMA_BASH_TOOL_CWD_MAX_CHARS = 256,
+        LLAMA_BASH_TOOL_COMMAND_MAX_CHARS = 512,
+        LLAMA_BASH_TOOL_INTENT_MAX_CHARS = 512,
+        LLAMA_BASH_TOOL_STDOUT_MAX_CHARS = 4096,
+        LLAMA_BASH_TOOL_STDERR_MAX_CHARS = 4096,
+        LLAMA_BASH_TOOL_ERROR_MAX_CHARS = 256,
         LLAMA_SELF_STATE_MAX_DELTA_DIMS = 8,
         LLAMA_COGNITIVE_MAX_TOOL_SPECS = 8,
         LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS = 48,
@@ -1236,6 +1416,48 @@ extern "C" {
         char content_excerpt[LLAMA_HARD_MEMORY_MAX_TEXT_CHARS];
         char error[LLAMA_HARD_MEMORY_MAX_ERROR_CHARS];
         struct llama_self_state_delta_summary delta;
+    };
+
+    struct llama_bash_tool_config {
+        bool enabled;
+        bool inherit_env;
+        bool login_shell;
+        int32_t timeout_ms;
+        int32_t max_stdout_bytes;
+        int32_t max_stderr_bytes;
+        char bash_path[LLAMA_BASH_TOOL_PATH_MAX_CHARS];
+        char working_directory[LLAMA_BASH_TOOL_CWD_MAX_CHARS];
+    };
+
+    struct llama_bash_tool_request {
+        int32_t command_id;
+        int32_t origin;
+        int32_t tool_job_id;
+        int32_t timeout_ms;
+        int32_t max_stdout_bytes;
+        int32_t max_stderr_bytes;
+        bool inherit_env;
+        bool login_shell;
+        bool command_ready;
+        char bash_path[LLAMA_BASH_TOOL_PATH_MAX_CHARS];
+        char working_directory[LLAMA_BASH_TOOL_CWD_MAX_CHARS];
+        char intent_text[LLAMA_BASH_TOOL_INTENT_MAX_CHARS];
+        char command_text[LLAMA_BASH_TOOL_COMMAND_MAX_CHARS];
+    };
+
+    struct llama_bash_tool_result {
+        int32_t command_id;
+        int32_t tool_job_id;
+        int32_t exit_code;
+        int32_t term_signal;
+        int32_t runtime_ms;
+        bool timed_out;
+        bool launch_failed;
+        bool truncated_stdout;
+        bool truncated_stderr;
+        char stdout_text[LLAMA_BASH_TOOL_STDOUT_MAX_CHARS];
+        char stderr_text[LLAMA_BASH_TOOL_STDERR_MAX_CHARS];
+        char error_text[LLAMA_BASH_TOOL_ERROR_MAX_CHARS];
     };
 
     struct llama_favorable_dimension_target {
@@ -1362,6 +1584,7 @@ extern "C" {
         int32_t max_steps;
         int32_t pending_command_id;
         int32_t last_command_id;
+        int32_t functional_microphase;
     };
 
     struct llama_cognitive_dmn_runner_status {
@@ -1373,6 +1596,7 @@ extern "C" {
         int32_t max_steps;
         int32_t pending_command_id;
         int32_t last_command_id;
+        int32_t functional_microphase;
     };
 
     struct llama_active_loop_candidate {
@@ -1409,6 +1633,7 @@ extern "C" {
         int32_t runner_up_action;
         float runner_up_score;
         uint32_t reason_mask;
+        struct llama_functional_activation_decision functional_activation;
     };
 
     struct llama_cognitive_host_state {
@@ -1464,6 +1689,7 @@ extern "C" {
         int32_t tool_kind;
         int32_t tool_job_id;
         float favorable_divergence;
+        struct llama_functional_activation_decision functional_activation;
         struct llama_cognitive_loop_state loop_state;
         struct llama_cognitive_tool_proposal tool_proposal;
         struct llama_cognitive_observation observation;
@@ -1480,6 +1706,7 @@ extern "C" {
     LLAMA_API struct llama_self_state_params     llama_self_state_default_params(void);
     LLAMA_API struct llama_self_updater_program  llama_self_state_default_updater_program(void);
     LLAMA_API struct llama_hard_memory_config    llama_hard_memory_default_config(void);
+    LLAMA_API struct llama_bash_tool_config      llama_bash_tool_default_config(void);
 
     // Initialize the llama + ggml backend
     // If numa is true, use NUMA optimizations
@@ -1787,6 +2014,34 @@ extern "C" {
             const struct llama_context * ctx,
             int32_t i,
             struct llama_serving_lora_layer_info * out_info);
+    LLAMA_API int32_t llama_functional_lora_family_count(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_functional_lora_family_config_get(
+            const struct llama_context * ctx,
+            int32_t family,
+            struct llama_functional_lora_family_config * out_config);
+    LLAMA_API int32_t llama_functional_lora_family_state_get(
+            const struct llama_context * ctx,
+            int32_t family,
+            struct llama_functional_lora_family_state * out_state);
+    LLAMA_API int32_t llama_functional_lora_get_last_trace(
+            const struct llama_context * ctx,
+            struct llama_functional_lora_trace * out_trace);
+    LLAMA_API int32_t llama_functional_lora_get_last_update(
+            const struct llama_context * ctx,
+            int32_t family,
+            struct llama_functional_lora_update_info * out_update);
+    LLAMA_API int32_t llama_functional_lora_set_ablation(
+            struct llama_context * ctx,
+            struct llama_functional_lora_ablation_config config);
+    LLAMA_API int32_t llama_functional_lora_get_ablation(
+            const struct llama_context * ctx,
+            struct llama_functional_lora_ablation_config * out_config);
+    LLAMA_API int32_t llama_active_temporal_encoding_bias_get(
+            const struct llama_context * ctx,
+            struct llama_active_temporal_encoding_bias * out_bias);
+    LLAMA_API int32_t llama_temporal_self_improvement_get_last(
+            const struct llama_context * ctx,
+            struct llama_temporal_self_improvement_trace * out_trace);
 
     // Refresh the self-state time surface from the local system clock.
     LLAMA_API int32_t llama_self_state_refresh_time(struct llama_context * ctx);
@@ -1934,6 +2189,15 @@ extern "C" {
     LLAMA_API int32_t llama_hard_memory_get_last_archive_trace(
             const struct llama_context * ctx,
             struct llama_hard_memory_archive_trace * out_trace);
+    LLAMA_API int32_t llama_bash_tool_configure(
+            struct llama_context * ctx,
+            struct llama_bash_tool_config config);
+    LLAMA_API int32_t llama_bash_tool_get_config(
+            const struct llama_context * ctx,
+            struct llama_bash_tool_config * out_config);
+    LLAMA_API int32_t llama_bash_tool_get_last_result(
+            const struct llama_context * ctx,
+            struct llama_bash_tool_result * out_result);
 
     LLAMA_API int32_t llama_cognitive_tool_spec_count(
             const struct llama_context * ctx);
@@ -1958,6 +2222,14 @@ extern "C" {
             struct llama_context * ctx,
             int32_t command_id,
             bool cancelled);
+    LLAMA_API int32_t llama_cognitive_bash_tool_get_request(
+            const struct llama_context * ctx,
+            int32_t command_id,
+            struct llama_bash_tool_request * out_request);
+    LLAMA_API int32_t llama_cognitive_bash_tool_submit_result(
+            struct llama_context * ctx,
+            const struct llama_bash_tool_result * result,
+            struct llama_active_loop_trace * out_active_trace);
     LLAMA_API int32_t llama_cognitive_active_runner_get(
             const struct llama_context * ctx,
             struct llama_cognitive_active_runner_status * out_status);

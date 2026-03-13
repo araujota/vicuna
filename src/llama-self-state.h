@@ -112,6 +112,7 @@ public:
     bool apply_prewrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
     bool build_postwrite_features(const llama_vocab * vocab, const llama_self_state_event & event, llama_self_state_feature_vector * out_features) const;
     bool apply_postwrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
+    bool note_validated_progress(float signed_progress, float efficiency_advantage);
 
     static const char * register_name(int32_t register_id);
 
@@ -137,6 +138,7 @@ private:
     void initialize_model_state();
     void update_expanded_model(const llama_self_state_event & event, const llama_self_state_feature_vector & features, uint32_t source_mask);
     void update_summary_registers(uint32_t source_mask);
+    void update_evolution_uncertainty(uint32_t source_mask, float signed_progress, float efficiency_advantage);
 
     void recompute_time_surface(uint32_t source_mask);
     void update_scalar_register(int32_t register_id, float value, uint32_t source_mask);
@@ -164,6 +166,7 @@ private:
     int64_t last_user_monotonic_ms = -1;
     int64_t last_tool_monotonic_ms = -1;
     int64_t last_emit_monotonic_ms = -1;
+    int64_t last_validated_progress_monotonic_ms = -1;
     int64_t social_last_update_monotonic_ms = -1;
     int32_t next_working_memory_event_id = 1;
     int32_t social_user_turn_count = 0;
@@ -173,6 +176,7 @@ private:
     std::array<float, 32> previous_event_sketch = {};
     std::array<float, 32> identity_sketch = {};
     bool has_identity_sketch = false;
+    float last_validated_progress_score = 0.0f;
     float social_familiarity = 0.0f;
     float social_trust = 0.5f;
     float social_reciprocity = 0.5f;

@@ -36,6 +36,10 @@ float clamp_unit(float value) {
     return std::min(1.0f, std::max(0.0f, value));
 }
 
+float clamp_range(float value, float lo, float hi) {
+    return std::min(hi, std::max(lo, value));
+}
+
 const char * past_bucket_name(size_t bucket) {
     switch (bucket) {
         case LLAMA_MEMORY_LORA_BUCKET_PAST_WEEK:    return "past_week";
@@ -1123,6 +1127,7 @@ struct llama_active_lora_manager::impl {
     uint64_t active_started_at_us = 0;
     uint64_t active_last_update_us = 0;
     uint32_t active_rollover_version = 0;
+    llama_active_temporal_encoding_bias temporal_encoding_bias = {};
     bool initialized = false;
     bool past_initialized = false;
 
@@ -1519,8 +1524,17 @@ struct llama_active_lora_manager::impl {
             }
         }
 
+        float effective_budget_scale = budget_scale;
+        if (!remediation) {
+            const float write_scale =
+                    std::max(0.20f, temporal_encoding_bias.effective_write_scale > 0.0f ?
+                            temporal_encoding_bias.effective_write_scale :
+                            1.0f);
+            effective_budget_scale *= write_scale;
+        }
+
         const active_lora_write_features write_features = build_write_features(embedding, event, features, remediation);
-        if (!train_on_span(embedding, write_features, budget_scale, remediation)) {
+        if (!train_on_span(embedding, write_features, effective_budget_scale, remediation)) {
             return false;
         }
 
@@ -1563,6 +1577,8 @@ struct llama_active_lora_manager::impl {
         stats.gain_max = 0.0f;
         active_started_at_us = now_us;
         active_last_update_us = now_us;
+        temporal_encoding_bias.effective_write_scale =
+                clamp_range(1.0f + temporal_encoding_bias.reward_bias - temporal_encoding_bias.dampening_bias, 0.20f, 1.80f);
     }
 
     bool merge_source_into_bucket(
@@ -1985,6 +2001,45 @@ bool llama_active_lora_manager::functional_get_ablation(llama_functional_lora_ab
         return false;
     }
     *out_config = pimpl->functional_ablation;
+    return true;
+}
+
+bool llama_active_lora_manager::temporal_encoding_bias_get(llama_active_temporal_encoding_bias * out_bias) const {
+    if (!out_bias) {
+        return false;
+    }
+    *out_bias = pimpl->temporal_encoding_bias;
+    return true;
+}
+
+bool llama_active_lora_manager::temporal_encoding_bias_apply(
+        float signed_advantage,
+        float efficiency_advantage,
+        int64_t monotonic_ms) {
+    if (!pimpl->initialized) {
+        return false;
+    }
+
+    auto & bias = pimpl->temporal_encoding_bias;
+    const float magnitude = clamp_unit(
+            0.65f * std::fabs(clamp_range(signed_advantage, -1.0f, 1.0f)) +
+            0.35f * std::fabs(clamp_range(efficiency_advantage, -1.0f, 1.0f)));
+    const float step = 0.02f + 0.08f * magnitude;
+
+    if (signed_advantage > 0.08f && efficiency_advantage > -0.05f) {
+        bias.reward_bias = clamp_range(bias.reward_bias + step, 0.0f, 0.35f);
+        bias.dampening_bias = clamp_range(bias.dampening_bias * (1.0f - 0.35f * step), 0.0f, 0.35f);
+    } else if (signed_advantage < -0.08f && efficiency_advantage < 0.05f) {
+        bias.dampening_bias = clamp_range(bias.dampening_bias + step, 0.0f, 0.35f);
+        bias.reward_bias = clamp_range(bias.reward_bias * (1.0f - 0.35f * step), 0.0f, 0.35f);
+    } else {
+        bias.reward_bias = clamp_range(bias.reward_bias * 0.995f, 0.0f, 0.35f);
+        bias.dampening_bias = clamp_range(bias.dampening_bias * 0.995f, 0.0f, 0.35f);
+    }
+
+    bias.effective_write_scale = clamp_range(1.0f + bias.reward_bias - bias.dampening_bias, 0.20f, 1.80f);
+    bias.applied_update_count += 1;
+    bias.last_update_monotonic_ms = monotonic_ms;
     return true;
 }
 

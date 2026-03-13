@@ -874,6 +874,36 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
+        llama_self_updater_program temporal_policy = {};
+        if (llama_self_state_get_updater_program(ctx, &temporal_policy) != 0 ||
+            temporal_policy.rule_count >= LLAMA_SELF_MAX_UPDATER_RULES) {
+            std::fprintf(stderr, "failed to load updater program for temporal evaluation test\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        llama_self_register_updater_rule temporal_rule = {};
+        temporal_rule.register_id = LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY;
+        temporal_rule.phase_mask = LLAMA_SELF_UPDATER_PHASE_PREWRITE;
+        temporal_rule.baseline = 0.62f;
+        temporal_rule.rise_gain = 1.0f;
+        temporal_rule.fall_gain = 0.25f;
+        temporal_rule.baseline_pull = 0.0f;
+        temporal_rule.feature_ids[0] = LLAMA_SELF_UPDATER_FEATURE_UNCERTAINTY;
+        temporal_rule.feature_weights[0] = 0.50f;
+        temporal_rule.feature_ids[1] = LLAMA_SELF_UPDATER_FEATURE_CONTRADICTION;
+        temporal_rule.feature_weights[1] = 0.40f;
+        for (size_t i = 0; i < LLAMA_SELF_MAX_UPDATER_RULE_SOURCE_REGISTERS; ++i) {
+            temporal_rule.source_register_ids[i] = -1;
+        }
+        temporal_policy.version += 1;
+        temporal_policy.rules[temporal_policy.rule_count++] = temporal_rule;
+        if (llama_self_state_set_updater_program(ctx, temporal_policy) != 0) {
+            std::fprintf(stderr, "failed to install temporal evaluation updater rule\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
 
         const std::vector<llama_token> handle_tokens = tokenize_or_die(vocab, "important contradiction memory cluster");
         if (llama_self_state_upsert_memory_handle(ctx, 5, LLAMA_SELF_MEMORY_HANDLE_WORKING_MEMORY_CLUSTER, handle_tokens.data(), handle_tokens.size(), 1.0f) != 0) {
@@ -895,6 +925,27 @@ int main(int argc, char ** argv) {
         };
         if (!ingest_event_without_runner("seed-internal-dmn", ctx, event)) {
             std::fprintf(stderr, "failed to seed internal-write pressure\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        llama_self_state_time_point future_time = {
+            /*.wall_clock_ms =*/ 1700003600000,
+            /*.monotonic_ms =*/ 3601000,
+            /*.timezone_offset_minutes =*/ -360,
+        };
+        if (llama_self_state_set_time(ctx, future_time) != 0) {
+            std::fprintf(stderr, "failed to advance self-state time for temporal evaluation\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        llama_self_register_info evolution_register = {};
+        if (llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY, &evolution_register) != 0 ||
+            evolution_register.scalar_value < 0.58f) {
+            std::fprintf(stderr,
+                    "evolution uncertainty did not accumulate before DMN temporal evaluation (value=%.3f)\n",
+                    evolution_register.scalar_value);
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -1005,6 +1056,35 @@ int main(int argc, char ** argv) {
         llama_active_lora_stats active_stats = {};
         if (llama_active_lora_get_stats(ctx, &active_stats) != 0 || active_stats.updates_applied < 2) {
             std::fprintf(stderr, "Active LoRA remediation did not advance runtime updates\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        llama_temporal_self_improvement_trace temporal_trace = {};
+        llama_active_temporal_encoding_bias temporal_bias = {};
+        if (llama_temporal_self_improvement_get_last(ctx, &temporal_trace) != 0 ||
+            !temporal_trace.valid ||
+            temporal_trace.loop_origin != LLAMA_COG_COMMAND_ORIGIN_DMN ||
+            temporal_trace.selected_temporal_role < 0 ||
+            temporal_trace.counterfactual_family != LLAMA_COUNTERFACTUAL_FAMILY_LORA_ABLATION ||
+            temporal_trace.outcome == LLAMA_TEMPORAL_SELF_IMPROVEMENT_NONE ||
+            temporal_trace.outcome == LLAMA_TEMPORAL_SELF_IMPROVEMENT_SKIPPED ||
+            temporal_trace.evolution_uncertainty_before < 0.58f ||
+            temporal_trace.evolution_uncertainty_after < 0.0f ||
+            temporal_trace.evolution_uncertainty_after > 1.0f ||
+            llama_active_temporal_encoding_bias_get(ctx, &temporal_bias) != 0 ||
+            temporal_bias.applied_update_count < 1 ||
+            temporal_bias.effective_write_scale <= 0.0f ||
+            temporal_bias.last_update_monotonic_ms < future_time.monotonic_ms) {
+            std::fprintf(stderr, "DMN temporal self-improvement trace or active LoRA bias was not retained\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (std::fabs(temporal_trace.active_reward_bias - temporal_bias.reward_bias) > 1.0e-6f ||
+            std::fabs(temporal_trace.active_dampening_bias - temporal_bias.dampening_bias) > 1.0e-6f ||
+            std::fabs(temporal_trace.active_effective_write_scale - temporal_bias.effective_write_scale) > 1.0e-6f) {
+            std::fprintf(stderr, "temporal self-improvement trace did not mirror retained active LoRA bias state\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
