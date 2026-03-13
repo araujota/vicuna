@@ -267,7 +267,8 @@ static bool expect_functional_last_update(
         const char * label,
         llama_context * ctx,
         int32_t family,
-        int32_t expected_settle_microphase) {
+        int32_t expected_settle_microphase,
+        bool require_meta_update = false) {
     llama_functional_lora_update_info update = {};
     if (llama_functional_lora_get_last_update(ctx, family, &update) != 0 || !update.valid) {
         std::fprintf(stderr, "%s: missing functional update for family %d\n", label, family);
@@ -276,6 +277,24 @@ static bool expect_functional_last_update(
     if (update.family != family || update.settle_microphase != expected_settle_microphase) {
         std::fprintf(stderr, "%s: unexpected functional update metadata for family %d\n", label, family);
         return false;
+    }
+    if (update.adapter_optimizer_step == 0 || update.adapter_update_norm <= 0.0f) {
+        std::fprintf(stderr, "%s: missing runtime adapter Adam fields for family %d\n", label, family);
+        return false;
+    }
+    if (require_meta_update) {
+        if (update.adam_step == 0 ||
+            update.allostatic_distance_before < 0.0f ||
+            update.allostatic_distance_after < 0.0f ||
+            update.exploration_std <= 0.0f) {
+            std::fprintf(stderr, "%s: missing gating meta-update fields for family %d\n", label, family);
+            return false;
+        }
+        const float expected_meta_loss = update.allostatic_distance_after - update.allostatic_distance_before;
+        if (std::fabs(update.meta_loss - expected_meta_loss) > 1.0e-5f) {
+            std::fprintf(stderr, "%s: meta-loss does not match allostatic delta for family %d\n", label, family);
+            return false;
+        }
     }
     return true;
 }
@@ -440,8 +459,30 @@ int main(int argc, char ** argv) {
             !trace.observation.valid ||
             trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ||
             trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION ||
+            trace.functional_activation.exploration_std <= 0.0f ||
+            trace.functional_activation.gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] < 0.0f ||
+            trace.functional_activation.gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] > 2.0f ||
+            trace.functional_activation.predicted_gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] <= 0.0f ||
+            trace.functional_activation.allostatic_distance < 0.0f ||
+            trace.functional_activation.allostatic_gradient_norm < 0.0f ||
             trace.observation.status != LLAMA_SELF_TOOL_JOB_COMPLETED) {
-            std::fprintf(stderr, "active answer trace did not expose bounded loop scaffolding\n");
+            std::fprintf(stderr,
+                    "active answer trace did not expose bounded loop scaffolding "
+                    "(phase=%d terminal=%d tool_count=%d proposal=%d obs=%d top_family=%d microphase=%d "
+                    "exploration=%.4f gain=%.4f predicted=%.4f distance=%.4f grad=%.4f status=%d)\n",
+                    trace.loop_state.phase,
+                    trace.loop_state.terminal_reason,
+                    trace.loop_state.tool_registry_count,
+                    trace.tool_proposal.valid ? 1 : 0,
+                    trace.observation.valid ? 1 : 0,
+                    trace.functional_activation.top_family,
+                    trace.functional_activation.microphase,
+                    trace.functional_activation.exploration_std,
+                    trace.functional_activation.gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION],
+                    trace.functional_activation.predicted_gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION],
+                    trace.functional_activation.allostatic_distance,
+                    trace.functional_activation.allostatic_gradient_norm,
+                    trace.observation.status);
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -641,6 +682,10 @@ int main(int argc, char ** argv) {
             trace.observation.status != LLAMA_SELF_TOOL_JOB_COMPLETED ||
             trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ||
             trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION ||
+            trace.functional_activation.exploration_std <= 0.0f ||
+            trace.functional_activation.gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] < 0.0f ||
+            trace.functional_activation.gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] > 2.0f ||
+            trace.functional_activation.predicted_gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] <= 0.0f ||
             trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_ANSWER_READY ||
             trace.episode_id != original_episode) {
             std::fprintf(stderr, "tool followup did not surface tool observation scaffolding\n");
@@ -652,7 +697,8 @@ int main(int argc, char ** argv) {
                     "active-tool-selection-update",
                     ctx,
                     LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION,
-                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION)) {
+                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION,
+                    true)) {
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -969,6 +1015,11 @@ int main(int argc, char ** argv) {
             !trace.observation.valid ||
             trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION ||
             trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION ||
+            trace.functional_activation.exploration_std <= 0.0f ||
+            trace.functional_activation.gains[LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION] < 0.0f ||
+            trace.functional_activation.gains[LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION] > 2.0f ||
+            trace.functional_activation.predicted_gains[LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION] <= 0.0f ||
+            trace.functional_activation.allostatic_distance < 0.0f ||
             trace.observation.status != LLAMA_SELF_TOOL_JOB_COMPLETED) {
             std::fprintf(stderr, "internal-write DMN trace did not expose bounded loop observation state\n");
             llama_free(ctx);
@@ -984,7 +1035,7 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
-        if (!expect_functional_last_update("dmn-self-observation-update", ctx, LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION, LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION) ||
+        if (!expect_functional_last_update("dmn-self-observation-update", ctx, LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION, LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION, true) ||
             !expect_functional_last_update("dmn-counterfactual-update", ctx, LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL, LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE) ||
             !expect_functional_family_state("dmn-internal-write-functional-cleared", ctx, LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION, false)) {
             llama_free(ctx);
@@ -1054,7 +1105,10 @@ int main(int argc, char ** argv) {
         }
 
         llama_active_lora_stats active_stats = {};
-        if (llama_active_lora_get_stats(ctx, &active_stats) != 0 || active_stats.updates_applied < 2) {
+        if (llama_active_lora_get_stats(ctx, &active_stats) != 0 ||
+            active_stats.updates_applied < 2 ||
+            active_stats.optimizer_step_count == 0 ||
+            active_stats.optimizer_last_update_norm <= 0.0f) {
             std::fprintf(stderr, "Active LoRA remediation did not advance runtime updates\n");
             llama_free(ctx);
             llama_model_free(model);
@@ -1074,7 +1128,9 @@ int main(int argc, char ** argv) {
             temporal_trace.evolution_uncertainty_after > 1.0f ||
             llama_active_temporal_encoding_bias_get(ctx, &temporal_bias) != 0 ||
             temporal_bias.applied_update_count < 1 ||
+            temporal_bias.adam_step == 0 ||
             temporal_bias.effective_write_scale <= 0.0f ||
+            temporal_bias.last_update_norm <= 0.0f ||
             temporal_bias.last_update_monotonic_ms < future_time.monotonic_ms) {
             std::fprintf(stderr, "DMN temporal self-improvement trace or active LoRA bias was not retained\n");
             llama_free(ctx);
@@ -1156,6 +1212,10 @@ int main(int argc, char ** argv) {
             trace.tool_proposal.tool_kind != LLAMA_TOOL_KIND_BASH_CLI ||
             trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ||
             trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP ||
+            trace.functional_activation.exploration_std <= 0.0f ||
+            trace.functional_activation.gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] < 0.0f ||
+            trace.functional_activation.gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] > 2.0f ||
+            trace.functional_activation.predicted_gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] <= 0.0f ||
             trace.tool_proposal.job_id <= 0) {
             std::fprintf(stderr, "tool-focused DMN trace did not expose tool proposal scaffolding\n");
             llama_free(ctx);

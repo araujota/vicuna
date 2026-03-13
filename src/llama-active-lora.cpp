@@ -18,6 +18,7 @@
 #include <memory>
 #include <limits>
 #include <numeric>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,6 +32,11 @@ constexpr uint32_t QUARTER_TO_YEAR_JOB = 3;
 constexpr uint32_t YEAR_TO_ALL_TIME_JOB = 4;
 constexpr size_t PAST_BUCKET_COUNT = LLAMA_MEMORY_LORA_BUCKET_COUNT;
 constexpr float DIRECTION_EPS = 1.0e-8f;
+constexpr float FUNCTIONAL_GAIN_CLIP_MIN = 0.0f;
+constexpr float FUNCTIONAL_GAIN_CLIP_MAX = 2.0f;
+constexpr size_t FUNCTIONAL_GATING_INPUT_DIM = 21;
+constexpr size_t FUNCTIONAL_GATING_HIDDEN_DIM = 16;
+constexpr uint64_t FUNCTIONAL_GATING_INIT_SEED = 0x6d6574616c6f7373ULL;
 
 float clamp_unit(float value) {
     return std::min(1.0f, std::max(0.0f, value));
@@ -238,17 +244,8 @@ size_t parse_layer_index(const std::string & tensor_name) {
 }
 
 float functional_default_gain(int32_t family) {
-    switch (family) {
-        case LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION:
-            return 0.38f;
-        case LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL:
-            return 0.42f;
-        case LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION:
-            return 0.34f;
-        case LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION:
-        default:
-            return 0.36f;
-    }
+    (void) family;
+    return 1.0f;
 }
 
 uint32_t functional_top_k_priority(int32_t family) {
@@ -276,6 +273,119 @@ uint32_t functional_update_horizon_steps(int32_t family) {
         default:
             return 1;
     }
+}
+
+float functional_target_value(size_t index) {
+    switch (index) {
+        case 5: return 1.0f; // answerability
+        default: return 0.0f;
+    }
+}
+
+float functional_snapshot_component(const llama_functional_outcome_snapshot & snapshot, size_t index) {
+    switch (index) {
+        case 0: return clamp_unit(snapshot.favorable_divergence);
+        case 1: return clamp_unit(snapshot.user_satisfaction_risk);
+        case 2: return clamp_unit(snapshot.goal_progress_pressure);
+        case 3: return clamp_unit(snapshot.loop_inefficiency);
+        case 4: return clamp_unit(snapshot.recovery_urgency);
+        case 5: return clamp_unit(snapshot.answerability);
+        case 6: return clamp_unit(snapshot.preference_uncertainty);
+        case 7: return clamp_unit(snapshot.expected_steps_remaining);
+        case 8: return clamp_unit(snapshot.expected_inference_cost_remaining);
+        default: return 0.0f;
+    }
+}
+
+float functional_allostatic_distance(const llama_functional_outcome_snapshot & snapshot) {
+    static const float weights[] = { 0.25f, 0.12f, 0.12f, 0.10f, 0.10f, 0.10f, 0.08f, 0.08f, 0.05f };
+    float accum = 0.0f;
+    float weight_sum = 0.0f;
+    for (size_t i = 0; i < sizeof(weights)/sizeof(weights[0]); ++i) {
+        const float error = functional_target_value(i) - functional_snapshot_component(snapshot, i);
+        accum += weights[i] * error * error;
+        weight_sum += weights[i];
+    }
+    return weight_sum > 0.0f ? std::sqrt(accum / weight_sum) : 0.0f;
+}
+
+struct functional_gating_training_tuple {
+    bool valid = false;
+    int32_t family = -1;
+    int32_t loop_origin = 0;
+    int32_t microphase = 0;
+    uint64_t eligible_mask = 0;
+    uint64_t activated_mask = 0;
+    uint64_t invocation_count = 0;
+    float allostatic_distance_before = 0.0f;
+    float exploration_std = 0.0f;
+    std::array<float, FUNCTIONAL_GATING_INPUT_DIM> input = {};
+    std::array<float, FUNCTIONAL_GATING_HIDDEN_DIM> hidden = {};
+    std::array<float, LLAMA_FUNCTIONAL_LORA_COUNT> predicted_gains = {};
+    std::array<float, LLAMA_FUNCTIONAL_LORA_COUNT> sampled_noise = {};
+    std::array<float, LLAMA_FUNCTIONAL_LORA_COUNT> applied_gains = {};
+};
+
+struct functional_gating_network {
+    std::array<float, FUNCTIONAL_GATING_HIDDEN_DIM * FUNCTIONAL_GATING_INPUT_DIM> w1 = {};
+    std::array<float, FUNCTIONAL_GATING_HIDDEN_DIM> b1 = {};
+    std::array<float, LLAMA_FUNCTIONAL_LORA_COUNT * FUNCTIONAL_GATING_HIDDEN_DIM> w2 = {};
+    std::array<float, LLAMA_FUNCTIONAL_LORA_COUNT> b2 = {};
+};
+
+struct functional_gating_adam_state {
+    std::array<float, FUNCTIONAL_GATING_HIDDEN_DIM * FUNCTIONAL_GATING_INPUT_DIM> m_w1 = {};
+    std::array<float, FUNCTIONAL_GATING_HIDDEN_DIM * FUNCTIONAL_GATING_INPUT_DIM> v_w1 = {};
+    std::array<float, FUNCTIONAL_GATING_HIDDEN_DIM> m_b1 = {};
+    std::array<float, FUNCTIONAL_GATING_HIDDEN_DIM> v_b1 = {};
+    std::array<float, LLAMA_FUNCTIONAL_LORA_COUNT * FUNCTIONAL_GATING_HIDDEN_DIM> m_w2 = {};
+    std::array<float, LLAMA_FUNCTIONAL_LORA_COUNT * FUNCTIONAL_GATING_HIDDEN_DIM> v_w2 = {};
+    std::array<float, LLAMA_FUNCTIONAL_LORA_COUNT> m_b2 = {};
+    std::array<float, LLAMA_FUNCTIONAL_LORA_COUNT> v_b2 = {};
+    uint64_t step = 0;
+    float learning_rate = 3.0e-3f;
+    float beta1 = 0.9f;
+    float beta2 = 0.999f;
+    float epsilon = 1.0e-8f;
+};
+
+struct runtime_lora_adam_state {
+    std::vector<float> m_a;
+    std::vector<float> v_a;
+    std::vector<float> m_b;
+    std::vector<float> v_b;
+    uint64_t step = 0;
+    float learning_rate = 1.0e-4f;
+    float beta1 = 0.9f;
+    float beta2 = 0.999f;
+    float epsilon = 1.0e-8f;
+    float last_update_norm = 0.0f;
+};
+
+struct temporal_bias_adam_state {
+    uint64_t step = 0;
+    float learning_rate = 1.5e-2f;
+    float beta1 = 0.9f;
+    float beta2 = 0.999f;
+    float epsilon = 1.0e-8f;
+    float m_reward = 0.0f;
+    float v_reward = 0.0f;
+    float m_dampening = 0.0f;
+    float v_dampening = 0.0f;
+};
+
+struct runtime_lora_write_result {
+    bool updated = false;
+    uint64_t transaction_step = 0;
+    float update_norm = 0.0f;
+};
+
+float gating_noise_std(const llama_functional_lora_family_config & config, uint64_t invocation_count) {
+    const float init = std::max(0.0f, config.exploration_noise_initial_std);
+    const float min_std = std::max(0.0f, std::min(init, config.exploration_noise_min_std));
+    const float decay = std::max<uint32_t>(1u, config.exploration_noise_decay_invocations);
+    const float scaled = std::sqrt(1.0f + static_cast<float>(invocation_count) / static_cast<float>(decay));
+    return min_std + (init - min_std) / scaled;
 }
 
 class active_lora_embedder {
@@ -1128,20 +1238,34 @@ struct llama_active_lora_manager::impl {
     uint64_t active_last_update_us = 0;
     uint32_t active_rollover_version = 0;
     llama_active_temporal_encoding_bias temporal_encoding_bias = {};
+    temporal_bias_adam_state temporal_bias_adam = {};
+    functional_gating_network gating_network = {};
+    functional_gating_adam_state gating_adam = {};
+    std::array<functional_gating_training_tuple, LLAMA_FUNCTIONAL_LORA_COUNT> gating_training = {};
+    std::unordered_map<const ggml_tensor *, runtime_lora_adam_state> runtime_lora_adam = {};
+    std::unordered_map<const llama_adapter_lora *, uint64_t> runtime_lora_write_count = {};
+    std::mt19937_64 gating_rng { FUNCTIONAL_GATING_INIT_SEED };
+    uint64_t gating_invocation_count = 0;
     bool initialized = false;
     bool past_initialized = false;
 
     void initialize_functional_defaults(uint32_t selected_rank) {
         functional_ablation = {};
         functional_trace = {};
+        initialize_gating_network();
         for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
             auto & cfg = functional_configs[family];
             cfg.enabled = true;
             cfg.rank_min = std::max<uint32_t>(1, std::min<uint32_t>(selected_rank, params.min_rank));
             cfg.rank_max = std::max<uint32_t>(cfg.rank_min, selected_rank);
-            cfg.gain_min = 0.0f;
-            cfg.gain_max = params.gain_max;
+            cfg.gain_min = FUNCTIONAL_GAIN_CLIP_MIN;
+            cfg.gain_max = FUNCTIONAL_GAIN_CLIP_MAX;
+            cfg.gain_clip_min = FUNCTIONAL_GAIN_CLIP_MIN;
+            cfg.gain_clip_max = FUNCTIONAL_GAIN_CLIP_MAX;
             cfg.default_gain = functional_default_gain(family);
+            cfg.exploration_noise_initial_std = 0.08f;
+            cfg.exploration_noise_min_std = 0.01f;
+            cfg.exploration_noise_decay_invocations = 512;
             cfg.negative_update_scale = 0.65f;
             cfg.positive_update_scale = 1.0f;
             cfg.top_k_priority = functional_top_k_priority(family);
@@ -1156,13 +1280,305 @@ struct llama_active_lora_manager::impl {
             state.family = family;
             state.enabled = true;
             state.compatible = true;
+            state.predicted_gain = cfg.default_gain;
 
             functional_trace.holds[family] = {};
             functional_trace.holds[family].family = family;
             functional_trace.family_state[family] = state;
             functional_updates[family] = {};
             functional_updates[family].family = family;
+            gating_training[family] = {};
         }
+    }
+
+    void initialize_gating_network() {
+        std::normal_distribution<float> dist(0.0f, 0.05f);
+        for (float & value : gating_network.w1) {
+            value = dist(gating_rng);
+        }
+        for (float & value : gating_network.w2) {
+            value = dist(gating_rng);
+        }
+        for (float & value : gating_network.b1) {
+            value = 0.0f;
+        }
+        for (float & value : gating_network.b2) {
+            value = 1.0f;
+        }
+        gating_adam = {};
+        gating_invocation_count = 0;
+    }
+
+    void clear_runtime_optimizer(llama_adapter_lora & target_adapter) {
+        runtime_lora_write_count.erase(&target_adapter);
+        for (const auto & it : target_adapter.ab_map) {
+            runtime_lora_adam.erase(it.second.a);
+        }
+    }
+
+    runtime_lora_adam_state & ensure_runtime_adam_state(
+            const llama_adapter_lora_weight & weight,
+            size_t size_a,
+            size_t size_b) {
+        auto & state = runtime_lora_adam[weight.a];
+        if (state.m_a.size() != size_a) {
+            state.m_a.assign(size_a, 0.0f);
+            state.v_a.assign(size_a, 0.0f);
+        }
+        if (state.m_b.size() != size_b) {
+            state.m_b.assign(size_b, 0.0f);
+            state.v_b.assign(size_b, 0.0f);
+        }
+        return state;
+    }
+
+    std::array<float, FUNCTIONAL_GATING_INPUT_DIM> build_gating_input(
+            const llama_functional_gating_observation & observation,
+            float * out_gradient_norm = nullptr) const {
+        std::array<float, FUNCTIONAL_GATING_INPUT_DIM> input = {};
+        float norm_sq = 0.0f;
+        for (size_t i = 0; i < 9; ++i) {
+            const float error = functional_target_value(i) - functional_snapshot_component(observation.snapshot, i);
+            input[i] = error;
+            norm_sq += error * error;
+        }
+
+        input[9]  = -clamp_unit(observation.uncertainty);
+        input[10] = clamp_unit(observation.tool_affinity);
+        input[11] = clamp_unit(observation.continuation);
+        input[12] = clamp_unit(observation.memory_pressure);
+        input[13] = clamp_unit(observation.recovery_urgency);
+        input[14] = -clamp_unit(observation.prediction_error);
+        input[15] = observation.loop_origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE ? 1.0f : 0.0f;
+        input[16] = observation.loop_origin == LLAMA_COG_COMMAND_ORIGIN_DMN ? 1.0f : 0.0f;
+        input[17] = (observation.eligible_mask & (1ull << LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION)) != 0 ? 1.0f : 0.0f;
+        input[18] = (observation.eligible_mask & (1ull << LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL)) != 0 ? 1.0f : 0.0f;
+        input[19] = (observation.eligible_mask & (1ull << LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION)) != 0 ? 1.0f : 0.0f;
+        input[20] = (observation.eligible_mask & (1ull << LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION)) != 0 ? 1.0f : 0.0f;
+
+        if (out_gradient_norm) {
+            *out_gradient_norm = std::sqrt(norm_sq);
+        }
+        return input;
+    }
+
+    void forward_gating(
+            const std::array<float, FUNCTIONAL_GATING_INPUT_DIM> & input,
+            std::array<float, FUNCTIONAL_GATING_HIDDEN_DIM> * out_hidden,
+            std::array<float, LLAMA_FUNCTIONAL_LORA_COUNT> * out_means) const {
+        for (size_t h = 0; h < FUNCTIONAL_GATING_HIDDEN_DIM; ++h) {
+            float sum = gating_network.b1[h];
+            for (size_t i = 0; i < FUNCTIONAL_GATING_INPUT_DIM; ++i) {
+                sum += gating_network.w1[h * FUNCTIONAL_GATING_INPUT_DIM + i] * input[i];
+            }
+            (*out_hidden)[h] = std::tanh(sum);
+        }
+
+        for (size_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+            float sum = gating_network.b2[family];
+            for (size_t h = 0; h < FUNCTIONAL_GATING_HIDDEN_DIM; ++h) {
+                sum += gating_network.w2[family * FUNCTIONAL_GATING_HIDDEN_DIM + h] * (*out_hidden)[h];
+            }
+            (*out_means)[family] = sum;
+        }
+    }
+
+    bool predict_activation(
+            const llama_functional_gating_observation & observation,
+            const llama_functional_activation_decision & policy_seed,
+            llama_functional_activation_decision * out_decision) {
+        if (!out_decision) {
+            return false;
+        }
+
+        llama_functional_activation_decision decision = policy_seed;
+        decision.loop_origin = observation.loop_origin;
+        decision.microphase = observation.microphase;
+        decision.family_count = LLAMA_FUNCTIONAL_LORA_COUNT;
+        decision.eligible_mask = policy_seed.eligible_mask;
+        decision.activated_mask = 0;
+        decision.top_family = -1;
+
+        float gradient_norm = 0.0f;
+        const auto input = build_gating_input(observation, &gradient_norm);
+        std::array<float, FUNCTIONAL_GATING_HIDDEN_DIM> hidden = {};
+        std::array<float, LLAMA_FUNCTIONAL_LORA_COUNT> means = {};
+        forward_gating(input, &hidden, &means);
+
+        const float exploration_std = gating_noise_std(functional_configs[0], gating_invocation_count);
+        std::normal_distribution<float> noise_dist(0.0f, exploration_std);
+
+        for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+            const bool eligible = (decision.eligible_mask & (1ull << family)) != 0;
+            const float sampled_noise = eligible ? noise_dist(gating_rng) : 0.0f;
+            const float unclipped = means[family] + sampled_noise;
+            const float gain = eligible ?
+                    clamp_range(unclipped, functional_configs[family].gain_clip_min, functional_configs[family].gain_clip_max) :
+                    0.0f;
+            decision.predicted_gains[family] = means[family];
+            decision.sampled_noise[family] = sampled_noise;
+            decision.gains[family] = gain;
+            decision.priority[family] = gain;
+
+            if (eligible && gain > 0.0f) {
+                decision.activated_mask |= (1ull << family);
+                if (decision.top_family < 0 || gain > decision.gains[decision.top_family]) {
+                    decision.top_family = family;
+                }
+
+                auto & tuple = gating_training[family];
+                tuple = {};
+                tuple.valid = true;
+                tuple.family = family;
+                tuple.loop_origin = observation.loop_origin;
+                tuple.microphase = observation.microphase;
+                tuple.eligible_mask = decision.eligible_mask;
+                tuple.activated_mask = decision.activated_mask;
+                tuple.invocation_count = gating_invocation_count;
+                tuple.allostatic_distance_before = functional_allostatic_distance(observation.snapshot);
+                tuple.exploration_std = exploration_std;
+                tuple.input = input;
+                tuple.hidden = hidden;
+                for (int32_t i = 0; i < LLAMA_FUNCTIONAL_LORA_COUNT; ++i) {
+                    tuple.predicted_gains[i] = means[i];
+                    tuple.sampled_noise[i] = decision.sampled_noise[i];
+                    tuple.applied_gains[i] = decision.gains[i];
+                }
+            } else {
+                gating_training[family].valid = false;
+            }
+        }
+
+        decision.exploration_std = exploration_std;
+        decision.allostatic_distance = functional_allostatic_distance(observation.snapshot);
+        decision.allostatic_gradient_norm = gradient_norm;
+        decision.gating_invocation_count = gating_invocation_count;
+        gating_invocation_count += 1;
+        *out_decision = decision;
+        return true;
+    }
+
+    template<size_t N>
+    static float adam_update_array(
+            std::array<float, N> & params,
+            std::array<float, N> & m,
+            std::array<float, N> & v,
+            const std::array<float, N> & grad,
+            const functional_gating_adam_state & adam) {
+        float update_norm = 0.0f;
+        const float step_f = static_cast<float>(adam.step);
+        const float beta1h = 1.0f - std::pow(adam.beta1, step_f);
+        const float beta2h = 1.0f - std::pow(adam.beta2, step_f);
+        for (size_t i = 0; i < N; ++i) {
+            m[i] = adam.beta1 * m[i] + (1.0f - adam.beta1) * grad[i];
+            v[i] = adam.beta2 * v[i] + (1.0f - adam.beta2) * grad[i] * grad[i];
+            const float m_hat = beta1h > 0.0f ? m[i] / beta1h : m[i];
+            const float v_hat = beta2h > 0.0f ? v[i] / beta2h : v[i];
+            const float delta = adam.learning_rate * m_hat / (std::sqrt(v_hat) + adam.epsilon);
+            params[i] -= delta;
+            update_norm += delta * delta;
+        }
+        return update_norm;
+    }
+
+    static float adam_update_vector(
+            std::vector<float> & params,
+            std::vector<float> & m,
+            std::vector<float> & v,
+            const std::vector<float> & grad,
+            const runtime_lora_adam_state & adam) {
+        float update_norm = 0.0f;
+        const float step_f = static_cast<float>(adam.step);
+        const float beta1h = 1.0f - std::pow(adam.beta1, step_f);
+        const float beta2h = 1.0f - std::pow(adam.beta2, step_f);
+        for (size_t i = 0; i < params.size(); ++i) {
+            m[i] = adam.beta1 * m[i] + (1.0f - adam.beta1) * grad[i];
+            v[i] = adam.beta2 * v[i] + (1.0f - adam.beta2) * grad[i] * grad[i];
+            const float m_hat = beta1h > 0.0f ? m[i] / beta1h : m[i];
+            const float v_hat = beta2h > 0.0f ? v[i] / beta2h : v[i];
+            const float delta = adam.learning_rate * m_hat / (std::sqrt(v_hat) + adam.epsilon);
+            params[i] -= delta;
+            update_norm += delta * delta;
+        }
+        return update_norm;
+    }
+
+    static float adam_update_scalar(
+            float & param,
+            float & m,
+            float & v,
+            float grad,
+            const temporal_bias_adam_state & adam) {
+        const float step_f = static_cast<float>(adam.step);
+        const float beta1h = 1.0f - std::pow(adam.beta1, step_f);
+        const float beta2h = 1.0f - std::pow(adam.beta2, step_f);
+        m = adam.beta1 * m + (1.0f - adam.beta1) * grad;
+        v = adam.beta2 * v + (1.0f - adam.beta2) * grad * grad;
+        const float m_hat = beta1h > 0.0f ? m / beta1h : m;
+        const float v_hat = beta2h > 0.0f ? v / beta2h : v;
+        const float delta = adam.learning_rate * m_hat / (std::sqrt(v_hat) + adam.epsilon);
+        param -= delta;
+        return std::fabs(delta);
+    }
+
+    float apply_meta_update(
+            int32_t family,
+            const llama_functional_outcome_snapshot & before,
+            const llama_functional_outcome_snapshot & after,
+            llama_functional_lora_update_info * out_update) {
+        if (family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+            return 0.0f;
+        }
+        (void) before;
+        auto & tuple = gating_training[family];
+        if (!tuple.valid) {
+            return 0.0f;
+        }
+
+        const float before_distance = tuple.allostatic_distance_before;
+        const float after_distance = functional_allostatic_distance(after);
+        const float meta_loss = after_distance - before_distance;
+        const float std = std::max(1.0e-4f, tuple.exploration_std);
+        const float effective_noise = tuple.applied_gains[family] - tuple.predicted_gains[family];
+        const float grad_output = meta_loss * effective_noise / (std * std);
+
+        std::array<float, LLAMA_FUNCTIONAL_LORA_COUNT * FUNCTIONAL_GATING_HIDDEN_DIM> grad_w2 = {};
+        std::array<float, LLAMA_FUNCTIONAL_LORA_COUNT> grad_b2 = {};
+        std::array<float, FUNCTIONAL_GATING_HIDDEN_DIM> grad_hidden = {};
+        std::array<float, FUNCTIONAL_GATING_HIDDEN_DIM> grad_b1 = {};
+        std::array<float, FUNCTIONAL_GATING_HIDDEN_DIM * FUNCTIONAL_GATING_INPUT_DIM> grad_w1 = {};
+
+        grad_b2[family] = grad_output;
+        for (size_t h = 0; h < FUNCTIONAL_GATING_HIDDEN_DIM; ++h) {
+            grad_w2[family * FUNCTIONAL_GATING_HIDDEN_DIM + h] = grad_output * tuple.hidden[h];
+            grad_hidden[h] = grad_output * gating_network.w2[family * FUNCTIONAL_GATING_HIDDEN_DIM + h];
+        }
+        for (size_t h = 0; h < FUNCTIONAL_GATING_HIDDEN_DIM; ++h) {
+            const float local = grad_hidden[h] * (1.0f - tuple.hidden[h] * tuple.hidden[h]);
+            grad_b1[h] = local;
+            for (size_t i = 0; i < FUNCTIONAL_GATING_INPUT_DIM; ++i) {
+                grad_w1[h * FUNCTIONAL_GATING_INPUT_DIM + i] = local * tuple.input[i];
+            }
+        }
+
+        gating_adam.step += 1;
+        float update_norm_sq = 0.0f;
+        update_norm_sq += adam_update_array(gating_network.w2, gating_adam.m_w2, gating_adam.v_w2, grad_w2, gating_adam);
+        update_norm_sq += adam_update_array(gating_network.b2, gating_adam.m_b2, gating_adam.v_b2, grad_b2, gating_adam);
+        update_norm_sq += adam_update_array(gating_network.w1, gating_adam.m_w1, gating_adam.v_w1, grad_w1, gating_adam);
+        update_norm_sq += adam_update_array(gating_network.b1, gating_adam.m_b1, gating_adam.v_b1, grad_b1, gating_adam);
+
+        if (out_update) {
+            out_update->meta_loss = meta_loss;
+            out_update->allostatic_distance_before = before_distance;
+            out_update->allostatic_distance_after = after_distance;
+            out_update->exploration_std = tuple.exploration_std;
+            out_update->parameter_update_norm = std::sqrt(update_norm_sq);
+            out_update->adam_step = gating_adam.step;
+        }
+
+        tuple.valid = false;
+        return meta_loss;
     }
 
     static llama_self_state_event default_event(
@@ -1424,7 +1840,11 @@ struct llama_active_lora_manager::impl {
             const active_lora_embedding & embedding,
             const active_lora_write_features & write_features,
             float signed_budget_scale,
-            bool remediation) const {
+            bool remediation,
+            runtime_lora_write_result * out_result = nullptr) {
+        if (out_result) {
+            *out_result = {};
+        }
         if (embedding.values.empty()) {
             return false;
         }
@@ -1436,6 +1856,8 @@ struct llama_active_lora_manager::impl {
             return false;
         }
 
+        bool any_written = false;
+        float total_update_norm_sq = 0.0f;
         for (auto & it : target_adapter.ab_map) {
             ggml_tensor * tensor_a = it.second.a;
             ggml_tensor * tensor_b = it.second.b;
@@ -1450,6 +1872,8 @@ struct llama_active_lora_manager::impl {
 
             std::vector<float> data_a(ne0_a * ne1_a);
             std::vector<float> data_b(ne0_b * ne1_b);
+            std::vector<float> grad_a(data_a.size(), 0.0f);
+            std::vector<float> grad_b(data_b.size(), 0.0f);
             ggml_backend_tensor_get(tensor_a, data_a.data(), 0, data_a.size() * sizeof(float));
             ggml_backend_tensor_get(tensor_b, data_b.data(), 0, data_b.size() * sizeof(float));
 
@@ -1474,20 +1898,40 @@ struct llama_active_lora_manager::impl {
             for (size_t i = 0; i < ne0_a; ++i) {
                 const float content = sample_signal(write_features.content_signal, i, right_seed);
                 const float state = sample_signal(write_features.state_signal, i, right_seed ^ 0x94d049bb133111ebULL);
-                data_a[slot*ne0_a + i] += tensor_scale * (0.78f * content + 0.22f * state);
+                grad_a[slot*ne0_a + i] = -sign * (0.78f * content + 0.22f * state);
             }
 
             for (size_t j = 0; j < ne1_b; ++j) {
                 const float steer = sample_signal(write_features.state_signal, j, left_seed);
                 const float content = sample_signal(write_features.content_signal, j, left_seed ^ 0xd6e8feb86659fd93ULL);
-                data_b[j*ne0_b + slot] += tensor_scale * (0.65f * steer + 0.35f * content);
+                grad_b[j*ne0_b + slot] = -sign * (0.65f * steer + 0.35f * content);
             }
+
+            auto & adam = ensure_runtime_adam_state(it.second, data_a.size(), data_b.size());
+            adam.learning_rate = std::fabs(tensor_scale);
+            adam.step += 1;
+            float update_norm_sq = 0.0f;
+            update_norm_sq += adam_update_vector(data_a, adam.m_a, adam.v_a, grad_a, adam);
+            update_norm_sq += adam_update_vector(data_b, adam.m_b, adam.v_b, grad_b, adam);
+            adam.last_update_norm = std::sqrt(update_norm_sq);
 
             ggml_backend_tensor_set(tensor_a, data_a.data(), 0, data_a.size() * sizeof(float));
             ggml_backend_tensor_set(tensor_b, data_b.data(), 0, data_b.size() * sizeof(float));
             normalize_active_weight(it.second, std::fabs(tensor_scale), params.gain_decay, params.gain_max);
+            total_update_norm_sq += update_norm_sq;
+            any_written = true;
         }
 
+        if (!any_written) {
+            return false;
+        }
+
+        const uint64_t transaction_step = ++runtime_lora_write_count[&target_adapter];
+        if (out_result) {
+            out_result->updated = true;
+            out_result->transaction_step = transaction_step;
+            out_result->update_norm = std::sqrt(total_update_norm_sq);
+        }
         return true;
     }
 
@@ -1495,11 +1939,12 @@ struct llama_active_lora_manager::impl {
             const active_lora_embedding & embedding,
             const active_lora_write_features & write_features,
             float budget_scale,
-            bool remediation) const {
+            bool remediation,
+            runtime_lora_write_result * out_result = nullptr) {
         if (embedding.values.empty() || !adapter) {
             return false;
         }
-        return train_on_adapter(*adapter, embedding, write_features, budget_scale, remediation);
+        return train_on_adapter(*adapter, embedding, write_features, budget_scale, remediation, out_result);
     }
 
     bool apply_write(
@@ -1534,17 +1979,20 @@ struct llama_active_lora_manager::impl {
         }
 
         const active_lora_write_features write_features = build_write_features(embedding, event, features, remediation);
-        if (!train_on_span(embedding, write_features, effective_budget_scale, remediation)) {
+        runtime_lora_write_result write_result = {};
+        if (!train_on_span(embedding, write_features, effective_budget_scale, remediation, &write_result)) {
             return false;
         }
 
         last_embedding = embedding;
         stats.updates_applied++;
+        stats.optimizer_step_count = write_result.transaction_step;
         stats.tokens_ingested += event.n_tokens;
         updates_seen++;
         stats.rollover_ready = updates_seen >= params.max_updates_before_rollover;
         active_last_update_us = llama_time_us();
         update_active_gain_stats();
+        stats.optimizer_last_update_norm = write_result.update_norm;
 
         if (remediation) {
             LLAMA_LOG_INFO("%s: Active LoRA remediation applied (%zu tokens, budget=%.3f, update=%u)\n",
@@ -1565,6 +2013,7 @@ struct llama_active_lora_manager::impl {
 
     void reset_active_stage(uint64_t now_us) {
         if (adapter) {
+            clear_runtime_optimizer(*adapter);
             zero_adapter(*adapter);
         }
 
@@ -1572,9 +2021,11 @@ struct llama_active_lora_manager::impl {
         updates_seen = 0;
         stats.rollover_ready = false;
         stats.updates_applied = 0;
+        stats.optimizer_step_count = 0;
         stats.tokens_ingested = 0;
         stats.gain_mean = 0.0f;
         stats.gain_max = 0.0f;
+        stats.optimizer_last_update_norm = 0.0f;
         active_started_at_us = now_us;
         active_last_update_us = now_us;
         temporal_encoding_bias.effective_write_scale =
@@ -1800,6 +2251,7 @@ bool llama_active_lora_manager::init(const llama_active_lora_params & params) {
     pimpl->stats.rollover_ready = false;
     pimpl->stats.selected_rank = selected_rank;
     pimpl->stats.updates_applied = 0;
+    pimpl->stats.optimizer_step_count = 0;
     pimpl->stats.tokens_ingested = 0;
     pimpl->stats.host_memory_ratio = params.host_memory_ratio;
     pimpl->stats.device_memory_ratio = params.device_memory_ratio;
@@ -1810,6 +2262,12 @@ bool llama_active_lora_manager::init(const llama_active_lora_params & params) {
     pimpl->stats.embedding_type = pimpl->embedder->type();
     pimpl->stats.gain_mean = 0.0f;
     pimpl->stats.gain_max = 0.0f;
+    pimpl->stats.optimizer_last_update_norm = 0.0f;
+    pimpl->runtime_lora_adam.clear();
+    pimpl->runtime_lora_write_count.clear();
+    pimpl->temporal_bias_adam = {};
+    pimpl->temporal_encoding_bias.adam_step = 0;
+    pimpl->temporal_encoding_bias.last_update_norm = 0.0f;
     pimpl->initialized = true;
     pimpl->reset_active_stage(llama_time_us());
     pimpl->initialize_functional_defaults(selected_rank);
@@ -2024,23 +2482,55 @@ bool llama_active_lora_manager::temporal_encoding_bias_apply(
     const float magnitude = clamp_unit(
             0.65f * std::fabs(clamp_range(signed_advantage, -1.0f, 1.0f)) +
             0.35f * std::fabs(clamp_range(efficiency_advantage, -1.0f, 1.0f)));
-    const float step = 0.02f + 0.08f * magnitude;
+    const float reward_signal = clamp_unit(
+            0.75f * std::max(0.0f, signed_advantage) +
+            0.25f * std::max(0.0f, efficiency_advantage));
+    const float dampening_signal = clamp_unit(
+            0.75f * std::max(0.0f, -signed_advantage) +
+            0.25f * std::max(0.0f, -efficiency_advantage));
+    auto & adam = pimpl->temporal_bias_adam;
+    adam.learning_rate = 0.01f + 0.04f * magnitude;
+    adam.step += 1;
 
-    if (signed_advantage > 0.08f && efficiency_advantage > -0.05f) {
-        bias.reward_bias = clamp_range(bias.reward_bias + step, 0.0f, 0.35f);
-        bias.dampening_bias = clamp_range(bias.dampening_bias * (1.0f - 0.35f * step), 0.0f, 0.35f);
-    } else if (signed_advantage < -0.08f && efficiency_advantage < 0.05f) {
-        bias.dampening_bias = clamp_range(bias.dampening_bias + step, 0.0f, 0.35f);
-        bias.reward_bias = clamp_range(bias.reward_bias * (1.0f - 0.35f * step), 0.0f, 0.35f);
-    } else {
-        bias.reward_bias = clamp_range(bias.reward_bias * 0.995f, 0.0f, 0.35f);
-        bias.dampening_bias = clamp_range(bias.dampening_bias * 0.995f, 0.0f, 0.35f);
-    }
+    const float reward_grad =
+            reward_signal > 0.0f ?
+            -(reward_signal - 0.10f * bias.reward_bias) :
+            0.10f * bias.reward_bias;
+    const float dampening_grad =
+            dampening_signal > 0.0f ?
+            -(dampening_signal - 0.10f * bias.dampening_bias) :
+            0.10f * bias.dampening_bias;
+    const float reward_delta = llama_active_lora_manager::impl::adam_update_scalar(
+            bias.reward_bias,
+            adam.m_reward,
+            adam.v_reward,
+            reward_grad,
+            adam);
+    const float dampening_delta = llama_active_lora_manager::impl::adam_update_scalar(
+            bias.dampening_bias,
+            adam.m_dampening,
+            adam.v_dampening,
+            dampening_grad,
+            adam);
+    bias.reward_bias = clamp_range(bias.reward_bias, 0.0f, 0.35f);
+    bias.dampening_bias = clamp_range(bias.dampening_bias, 0.0f, 0.35f);
 
     bias.effective_write_scale = clamp_range(1.0f + bias.reward_bias - bias.dampening_bias, 0.20f, 1.80f);
+    bias.last_update_norm = std::sqrt(reward_delta * reward_delta + dampening_delta * dampening_delta);
+    bias.adam_step = adam.step;
     bias.applied_update_count += 1;
     bias.last_update_monotonic_ms = monotonic_ms;
     return true;
+}
+
+bool llama_active_lora_manager::functional_predict_activation(
+        const llama_functional_gating_observation & observation,
+        const llama_functional_activation_decision & policy_seed,
+        llama_functional_activation_decision * out_decision) {
+    if (!pimpl->initialized) {
+        return false;
+    }
+    return pimpl->predict_activation(observation, policy_seed, out_decision);
 }
 
 bool llama_active_lora_manager::functional_activate(const llama_functional_activation_decision & decision) {
@@ -2089,7 +2579,10 @@ bool llama_active_lora_manager::functional_activate(const llama_functional_activ
             hold.hold_unit = disable_holds ? LLAMA_FUNCTIONAL_HOLD_LOOP_STEPS : decision.hold_unit[family];
             hold.hold_budget = disable_holds ? 1u : std::max<uint32_t>(1u, decision.hold_value[family]);
             hold.hold_remaining = hold.hold_budget;
-            hold.gain = std::min(pimpl->functional_configs[family].gain_max, std::max(0.0f, decision.gains[family]));
+            hold.gain = clamp_range(
+                    decision.gains[family],
+                    pimpl->functional_configs[family].gain_clip_min,
+                    pimpl->functional_configs[family].gain_clip_max);
         } else if (hold.active) {
             hold.microphase_current = decision.microphase;
         }
@@ -2104,6 +2597,8 @@ bool llama_active_lora_manager::functional_activate(const llama_functional_activ
         state.compatible = pimpl->functional_adapters[family] != nullptr;
         state.active_now = gain > 0.0f;
         state.current_gain = gain;
+        state.predicted_gain = decision.predicted_gains[family];
+        state.last_noise = decision.sampled_noise[family];
         state.current_microphase = hold.active ? decision.microphase : LLAMA_FUNCTIONAL_MICROPHASE_NONE;
         state.current_hold_unit = hold.active ? hold.hold_unit : LLAMA_FUNCTIONAL_HOLD_LOOP_STEPS;
         state.current_hold_remaining = hold.active ? hold.hold_remaining : 0;
@@ -2185,7 +2680,14 @@ bool llama_active_lora_manager::functional_apply_update(
             (signed_outcome >= 0.0f ?
                 pimpl->functional_configs[family].positive_update_scale :
                 pimpl->functional_configs[family].negative_update_scale);
-    if (!pimpl->train_on_adapter(*pimpl->functional_adapters[family], embedding, write_features, signed_outcome >= 0.0f ? direction_scale : -direction_scale, false)) {
+    runtime_lora_write_result write_result = {};
+    if (!pimpl->train_on_adapter(
+                *pimpl->functional_adapters[family],
+                embedding,
+                write_features,
+                signed_outcome >= 0.0f ? direction_scale : -direction_scale,
+                false,
+                &write_result)) {
         return false;
     }
 
@@ -2205,9 +2707,13 @@ bool llama_active_lora_manager::functional_apply_update(
     for (size_t i = 0; i < std::min(metric_count, sizeof(update.metrics)/sizeof(update.metrics[0])); ++i) {
         update.metrics[i] = metrics[i];
     }
+    (void) pimpl->apply_meta_update(family, before, after, &update);
+    update.adapter_update_norm = write_result.update_norm;
+    update.adapter_optimizer_step = write_result.transaction_step;
 
     pimpl->functional_states[family].update_count += 1;
     pimpl->functional_states[family].last_signed_outcome = signed_outcome;
+    pimpl->functional_states[family].last_meta_loss = update.meta_loss;
     pimpl->functional_trace.family_state[family] = pimpl->functional_states[family];
     return true;
 }

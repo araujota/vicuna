@@ -49,7 +49,16 @@ The memory cascade is:
 sliding attention window
 -> active LoRA (editable, fixed-size, current compressed memory)
 -> past LoRA stack (fixed-size units, frozen, time-decayed influence)
+-> functional LoRA bank (operation-local procedural bias above temporal memory)
 ```
+
+The functional bank is not routed by a persistent prompt artifact. Its gains
+are now driven by a typed self-state gradient toward favorable self-state, with
+explicit online meta-updates after settled loop transactions. More broadly,
+Adam is now used only where the runtime is actually updating weights or biases
+from self-state deltas: the functional gate, the runtime LoRA writer, and the
+temporal write-bias controller. The counterfactual ladder remains an explicit
+ranking process.
 
 ### 3.2 Loop split
 
@@ -63,6 +72,25 @@ internal-pressure loop (DMN)
 
 Both loops read and update shared state, but they do not have the same trigger conditions and they do not share the same broadcast policy.
 
+Both loops also now share a typed functional-microphase vocabulary used to
+route a separate bank of functional LoRAs, while a small gating MLP predicts
+the gain applied to the eligible family or families from self-state gradient
+features:
+
+- `TOOL_CLASS_SELECTION`
+- `TOOL_ARGUMENT_PREP`
+- `TOOL_RESULT_INTEGRATION`
+- `COUNTERFACTUAL_GENERATE`
+- `COUNTERFACTUAL_COMPARE`
+- `MEMORY_COMPRESSION`
+- `MEMORY_AUDIT`
+- `SELF_OBSERVE`
+- `SELF_FORECAST`
+- `POST_ACTION_REFLECTION`
+
+These microphases do not replace the temporal memory stack. They sit above it
+as an explicit procedural-bias layer.
+
 ### 3.3 Persistent self-core
 
 The system must maintain a mathematical self-state that persists even when the token-level context changes. The self is not just the current prompt and not just the latest summary. It is a structured core made of:
@@ -73,6 +101,41 @@ The system must maintain a mathematical self-state that persists even when the t
 - time-state encodings,
 - unresolved commitments,
 - and long-horizon memory bias.
+
+### 3.3.1 Functional LoRA bank
+
+The current runtime adds a second runtime-adapter family separate from temporal
+memory:
+
+```text
+request adapters
+-> all_time
+-> past_year
+-> past_quarter
+-> past_month
+-> past_week
+-> active
+-> functional_tool_selection
+-> functional_counterfactual
+-> functional_memory_compression
+-> functional_self_observation
+```
+
+This bank is meant to accumulate durable procedural/style biases rather than
+episodic recall. The first four families are:
+
+- a tool-selection bias LoRA
+- a counterfactual-simulation LoRA
+- a memory-compression bias LoRA
+- a self-observation/state-interpretation LoRA
+
+These adapters stay loaded continuously. Explicit CPU-side microphase policy
+still owns eligibility and hold semantics, but the applied gain now comes from
+a shared gating MLP that reads a typed self-state gradient, applies bounded
+Gaussian exploration, clips gains into `[0, 2]`, and is updated online with
+Adam after settled transactions. The same optimizer also conditions the
+underlying self-state-driven runtime LoRA writes, while discrete
+counterfactual-ablation proposals remain non-optimizer policy.
 
 ### 3.4 Extensibility
 

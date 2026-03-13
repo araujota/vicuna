@@ -65,9 +65,30 @@ request adapters (if any)
 -> past_month
 -> past_week
 -> active
+-> functional_tool_selection
+-> functional_counterfactual
+-> functional_memory_compression
+-> functional_self_observation
 ```
 
 This ordering is a control-policy ordering, not a serial neural pipeline. The graph still applies LoRA deltas additively on top of base weights, but the runtime now keeps the effective stack deterministic and inspectable.
+
+The functional bank is intentionally separate from the temporal cascade:
+
+- temporal LoRAs encode time-sliced behavioral residue from lived history
+- functional LoRAs encode reusable operation-local bias for tool choice,
+  counterfactual comparison, memory compression, and self-observation
+- all four functional adapters stay attached at stable zero-or-gain scale rather
+  than being created and destroyed per phase
+- routing still keeps eligibility, hold windows, and ablations in explicit
+  CPU-side policy, but the applied gain now comes from a small shared gating
+  MLP driven by a typed self-state gradient toward favorable allostasis
+- the gating controller is updated online after settled transactions with an
+  explicit meta-loss that minimizes post-action distance to ideal self-state,
+  using Adam over bounded perturbation-derived credit signals
+- the same Adam family is also used for self-state-driven runtime LoRA tensor
+  writes and temporal write-bias updates, while discrete counterfactual
+  intervention ranking remains explicit CPU policy rather than an optimizer path
 
 The current request/response cycle is:
 
@@ -104,6 +125,53 @@ Both loops share state, but they do not share identical triggers or output polic
   metadata are public trace surfaces.
 - This is intentionally not "generic ReAct everywhere." The active loop and DMN
   use different policies on top of the same bounded scaffold.
+- Both loops now also assign explicit functional microphases and route the
+  functional LoRA bank through the same public activation substrate.
+
+The shared functional microphase vocabulary currently includes:
+
+- `STATE_INTERPRET`
+- `TOOL_CLASS_SELECTION`
+- `TOOL_ARGUMENT_PREP`
+- `TOOL_RESULT_INTEGRATION`
+- `COUNTERFACTUAL_GENERATE`
+- `COUNTERFACTUAL_COMPARE`
+- `MEMORY_COMPRESSION`
+- `MEMORY_AUDIT`
+- `SELF_OBSERVE`
+- `SELF_FORECAST`
+- `POST_ACTION_REFLECTION`
+
+The intended bias families are:
+
+- `functional_tool_selection`: active and DMN tool-class bias under uncertainty
+- `functional_counterfactual`: comparative simulation and alternative ranking
+- `functional_memory_compression`: preservation bias for salient evicted spans
+- `functional_self_observation`: "what changed in me" interpretation and forecast
+
+Family updates are outcome-weighted rather than generic:
+
+- tool-selection opens on tool commitment and settles only after tool output has
+  actually been integrated into the active loop
+- counterfactual settles against favorable-state and efficiency deltas after DMN
+  comparison and remediation choice
+- memory-compression settles when compression pressure and later audit signals
+  indicate whether salient structure was preserved usefully
+- self-observation settles against interpretation and recovery deltas after
+  reflection-oriented active or DMN phases
+
+Functional gain control now follows a bounded loop:
+
+1. observe the current self-state gradient and allostatic distance,
+2. predict per-family gains with the gating MLP,
+3. apply bounded Gaussian exploration and clip gains into `[0, 2]`,
+4. execute the functional-biased loop step and let registers shift,
+5. settle a bounded training tuple and update the gate with Adam.
+
+Outside that gate, runtime LoRA tensor mutation and temporal write-bias control
+also use Adam-backed updates because they mutate differentiable parameters from
+self-state deltas. The counterfactual ladder does not: it still ranks discrete
+interventions explicitly.
 
 ### Persistent Self-Core
 
@@ -357,9 +425,10 @@ Current implementation slice:
   memory stack in recency order (`active`, `past_week`, `past_month`,
   `past_quarter`, `past_year`, `all_time`),
 - bounded remediation currently targets Active LoRA only, with tool-oriented
-  counterfactuals yielding `gather_info` plans that can now be typed as generic
-  tool work or hard-memory query work, and high-risk updater-policy proposals
-  denied or deferred,
+  counterfactuals yielding `gather_info` plans that can now be typed as
+  first-class bash CLI work or hard-memory query work, with bash requests and
+  results carried through explicit bounded structs and executed only in
+  `llama-server`, and high-risk updater-policy proposals denied or deferred,
 - repair urgency now contributes to the same DMN admission gate through
   updater-program policy (`repair_admission_floor` and
   `repair_admission_weight`) instead of bypassing the scheduler,
@@ -446,6 +515,7 @@ Control logic and typed state management should remain in standard C++:
 - DMN scheduling,
 - broadcast and inhibition policy,
 - tool orchestration,
+- bash CLI request or result policy,
 - reactivation scheduling,
 - self-improvement proposal management,
 - tracing and governance.

@@ -90,8 +90,10 @@ int main(int argc, char ** argv) {
     }
 
     if (!stats.enabled || stats.selected_rank < 1 ||
+        stats.optimizer_step_count != 0 ||
         stats.embedding_type != LLAMA_ACTIVE_LORA_EMBEDDING_HIDDEN_STATE ||
-        stats.embedding_is_custom || stats.embedding_dim != (uint32_t) llama_model_n_embd_out(model)) {
+        stats.embedding_is_custom || stats.embedding_dim != (uint32_t) llama_model_n_embd_out(model) ||
+        stats.optimizer_last_update_norm != 0.0f) {
         fprintf(stderr, "unexpected Active LoRA init stats\n");
         llama_free(ctx);
         llama_model_free(model);
@@ -110,9 +112,18 @@ int main(int argc, char ** argv) {
         if (llama_functional_lora_family_config_get(ctx, family, &config) != 0 ||
             llama_functional_lora_family_state_get(ctx, family, &state) != 0 ||
             !config.enabled ||
+            config.gain_clip_min != 0.0f ||
+            config.gain_clip_max != 2.0f ||
+            config.default_gain < 0.999f ||
+            config.default_gain > 1.001f ||
+            config.exploration_noise_initial_std <= config.exploration_noise_min_std ||
             !state.compatible ||
             state.active_now ||
-            state.current_gain != 0.0f) {
+            state.current_gain != 0.0f ||
+            state.predicted_gain < 0.999f ||
+            state.predicted_gain > 1.001f ||
+            state.last_noise != 0.0f ||
+            state.last_meta_loss != 0.0f) {
             fprintf(stderr, "unexpected functional LoRA registry state for family %d\n", family);
             llama_free(ctx);
             llama_model_free(model);
@@ -133,6 +144,8 @@ int main(int argc, char ** argv) {
         temporal_bias.dampening_bias != 0.0f ||
         temporal_bias.effective_write_scale < 0.999f ||
         temporal_bias.effective_write_scale > 1.001f ||
+        temporal_bias.last_update_norm != 0.0f ||
+        temporal_bias.adam_step != 0 ||
         temporal_bias.applied_update_count != 0 ||
         temporal_bias.last_update_monotonic_ms != 0) {
         fprintf(stderr, "unexpected default temporal encoding bias\n");
@@ -162,8 +175,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (stats.updates_applied < 1 || stats.tokens_ingested < tokens.size() || !stats.rollover_ready ||
-        stats.gain_mean <= 0.0f || stats.gain_max <= 0.0f || stats.gain_max > params.gain_max + 1.0e-6f) {
+    if (stats.updates_applied < 1 || stats.optimizer_step_count < 1 || stats.tokens_ingested < tokens.size() || !stats.rollover_ready ||
+        stats.gain_mean <= 0.0f || stats.gain_max <= 0.0f || stats.gain_max > params.gain_max + 1.0e-6f ||
+        stats.optimizer_last_update_norm <= 0.0f) {
         fprintf(stderr, "unexpected Active LoRA ingest stats\n");
         llama_free(ctx);
         llama_model_free(model);

@@ -516,6 +516,7 @@ extern "C" {
         bool     rollover_ready;
         uint32_t selected_rank;
         uint32_t updates_applied;
+        uint64_t optimizer_step_count;
         uint64_t tokens_ingested;
         float    host_memory_ratio;
         float    device_memory_ratio;
@@ -525,6 +526,7 @@ extern "C" {
         bool     embedding_is_custom;
         float    gain_mean;
         float    gain_max;
+        float    optimizer_last_update_norm;
         int32_t  embedding_type;
     };
 
@@ -578,7 +580,12 @@ extern "C" {
         uint32_t rank_max;
         float gain_min;
         float gain_max;
+        float gain_clip_min;
+        float gain_clip_max;
         float default_gain;
+        float exploration_noise_initial_std;
+        float exploration_noise_min_std;
+        uint32_t exploration_noise_decay_invocations;
         float negative_update_scale;
         float positive_update_scale;
         uint32_t top_k_priority;
@@ -611,6 +618,14 @@ extern "C" {
         float signed_outcome;
         float magnitude;
         float metrics[6];
+        float meta_loss;
+        float allostatic_distance_before;
+        float allostatic_distance_after;
+        float exploration_std;
+        float parameter_update_norm;
+        uint64_t adam_step;
+        float adapter_update_norm;
+        uint64_t adapter_optimizer_step;
         struct llama_functional_outcome_snapshot before_snapshot;
         struct llama_functional_outcome_snapshot after_snapshot;
     };
@@ -636,10 +651,16 @@ extern "C" {
         int32_t top_family;
         int32_t family_count;
         float gains[LLAMA_FUNCTIONAL_LORA_COUNT];
+        float predicted_gains[LLAMA_FUNCTIONAL_LORA_COUNT];
+        float sampled_noise[LLAMA_FUNCTIONAL_LORA_COUNT];
         int32_t hold_unit[LLAMA_FUNCTIONAL_LORA_COUNT];
         uint32_t hold_value[LLAMA_FUNCTIONAL_LORA_COUNT];
         float priority[LLAMA_FUNCTIONAL_LORA_COUNT];
         uint32_t reason_mask[LLAMA_FUNCTIONAL_LORA_COUNT];
+        float exploration_std;
+        float allostatic_distance;
+        float allostatic_gradient_norm;
+        uint64_t gating_invocation_count;
     };
 
     struct llama_functional_lora_family_state {
@@ -648,11 +669,14 @@ extern "C" {
         bool compatible;
         bool active_now;
         float current_gain;
+        float predicted_gain;
+        float last_noise;
         int32_t current_microphase;
         int32_t current_hold_unit;
         uint32_t current_hold_remaining;
         uint64_t update_count;
         float last_signed_outcome;
+        float last_meta_loss;
     };
 
     struct llama_functional_lora_trace {
@@ -681,6 +705,8 @@ extern "C" {
         float reward_bias;
         float dampening_bias;
         float effective_write_scale;
+        float last_update_norm;
+        uint64_t adam_step;
         uint64_t applied_update_count;
         int64_t last_update_monotonic_ms;
     };
