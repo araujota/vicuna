@@ -12,7 +12,9 @@ public:
     bool init(const llama_active_lora_params & params);
     bool init_past(const llama_past_lora_params & params);
     bool ingest(const llama_token * tokens, size_t n_tokens);
+    bool ingest(const llama_self_state_event & event, const llama_self_state_feature_vector * features);
     bool remediate(const llama_token * tokens, size_t n_tokens, float budget_scale);
+    bool remediate(const llama_self_state_event & event, float budget_scale, const llama_self_state_feature_vector * features);
     bool get_stats(llama_active_lora_stats * out_stats) const;
     bool tick_past(uint64_t now_us);
     bool get_past_stats(llama_past_lora_stats * out_stats) const;

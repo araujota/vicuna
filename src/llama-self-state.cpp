@@ -80,6 +80,14 @@ static float clamp_range(float value, float lo, float hi) {
     return std::min(hi, std::max(lo, value));
 }
 
+static float blend_value(float current, float target, float gain) {
+    return current + clamp_unit(gain) * (target - current);
+}
+
+static float max4(float a, float b, float c, float d) {
+    return std::max(std::max(a, b), std::max(c, d));
+}
+
 static std::vector<float> capture_self_register_scalars(const llama_context & ctx) {
     const int32_t count = ctx.self_state_register_count();
     std::vector<float> values(std::max(0, count), 0.0f);
@@ -432,6 +440,12 @@ std::array<llama_self_register_definition, LLAMA_SELF_REGISTER_COUNT> llama_self
         { LLAMA_SELF_REGISTER_MEMORY_WRITE_PRIORITY, "r_memory_write_priority",  LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
         { LLAMA_SELF_REGISTER_TIME_PHASE,            "r_time_phase",             LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
         { LLAMA_SELF_REGISTER_TOOL_SALIENCE,         "r_tool_salience",          LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
+        { LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK,"r_user_satisfaction_risk",LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
+        { LLAMA_SELF_REGISTER_GOAL_PROGRESS_PRESSURE,"r_goal_progress_pressure",LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
+        { LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY,     "r_loop_inefficiency",      LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
+        { LLAMA_SELF_REGISTER_RECOVERY_URGENCY,      "r_recovery_urgency",       LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
+        { LLAMA_SELF_REGISTER_ANSWERABILITY,         "r_answerability",          LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
+        { LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY,"r_preference_uncertainty", LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
         { LLAMA_SELF_REGISTER_CHANNEL_STATE,         "r_channel_state",          LLAMA_SELF_REGISTER_FAMILY_CATEGORICAL,    0.0f, 2.0f, 0.0f, LLAMA_SELF_STATE_CHANNEL_WAITING },
     }};
 }
@@ -464,6 +478,7 @@ llama_self_state::llama_self_state() : definitions(build_definitions()) {
     }
 
     update_categorical_register(LLAMA_SELF_REGISTER_CHANNEL_STATE, channel_state, LLAMA_SELF_SOURCE_INIT);
+    initialize_model_state();
     (void) refresh_time();
 }
 
@@ -1115,6 +1130,20 @@ bool llama_self_state::get_social_state(llama_self_social_state_info * out_info)
     return true;
 }
 
+bool llama_self_state::get_model_state(llama_self_model_state_info * out_info) const {
+    if (!out_info) {
+        return false;
+    }
+
+    out_info->horizon_count = LLAMA_SELF_HORIZON_COUNT;
+    for (int32_t i = 0; i < LLAMA_SELF_HORIZON_COUNT; ++i) {
+        out_info->horizons[i] = model_horizons[(size_t) i];
+    }
+    out_info->forecast = model_forecast;
+    out_info->prediction_error = prediction_error;
+    return true;
+}
+
 int32_t llama_self_state::trace_count() const {
     return (int32_t) trace_items.size();
 }
@@ -1297,6 +1326,7 @@ void llama_self_state::reset_dynamic_state_preserve_static() {
     social_reciprocity = 0.5f;
     social_recent_user_valence = 0.0f;
     social_dissatisfaction = 0.0f;
+    initialize_model_state();
     session_start_wall_ms = -1;
     session_start_monotonic_ms = -1;
     has_explicit_time = false;
@@ -1790,6 +1820,7 @@ bool llama_self_state::build_features(
             0.15f * features.contradiction_score +
             0.10f * features.uncertainty_score) : 0.0f;
     features.negative_user_valence = clamp_unit(negative_valence_ratio);
+    features.question_ratio = question_hint;
     if (postwrite) {
         features.broadcast_pressure_hint = run_broadcast_head(features.broadcast_pressure_hint, features);
     }
@@ -1849,6 +1880,7 @@ bool llama_self_state::apply_postwrite(const llama_self_state_event & event, con
 
     if (event.channel != LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL) {
         update_social_state(event, features);
+        update_expanded_model(event, features, source_mask);
     }
     previous_event_sketch = build_event_sketch(event);
     has_previous_event_sketch = event.n_tokens > 0;
@@ -1988,6 +2020,531 @@ void llama_self_state::update_social_state(
             0.20f * (1.0f - social_reciprocity));
 }
 
+void llama_self_state::initialize_model_state() {
+    for (int32_t i = 0; i < LLAMA_SELF_HORIZON_COUNT; ++i) {
+        model_horizons[(size_t) i] = {};
+        model_horizons[(size_t) i].horizon_id = i;
+        model_horizons[(size_t) i].last_update_monotonic_ms = -1;
+    }
+    model_forecast = {};
+    prediction_error = {};
+}
+
+void llama_self_state::update_summary_registers(uint32_t source_mask) {
+    const auto & instant = model_horizons[(size_t) LLAMA_SELF_HORIZON_INSTANT];
+    const float satisfaction_risk = clamp_unit(
+            0.55f * instant.user_outcome.frustration_risk +
+            0.25f * instant.user_outcome.misunderstanding_risk +
+            0.20f * instant.user_outcome.trust_repair_need);
+    const float goal_progress_pressure = clamp_unit(
+            0.55f * (1.0f - instant.goal_progress.goal_progress_estimate) +
+            0.25f * instant.goal_progress.blocker_severity +
+            0.20f * instant.goal_progress.urgency);
+    const float recovery_urgency = clamp_unit(
+            0.35f * max4(
+                    instant.recovery.favorable_divergence_goal,
+                    instant.recovery.favorable_divergence_social,
+                    instant.recovery.favorable_divergence_epistemic,
+                    instant.recovery.favorable_divergence_action) +
+            0.25f * instant.recovery.regulation_debt +
+            0.20f * instant.recovery.unresolved_tension_load +
+            0.20f * (1.0f - instant.recovery.recovery_momentum));
+
+    blend_scalar_register(LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK, satisfaction_risk, params.postwrite_gain, source_mask);
+    blend_scalar_register(LLAMA_SELF_REGISTER_GOAL_PROGRESS_PRESSURE, goal_progress_pressure, params.postwrite_gain, source_mask);
+    blend_scalar_register(LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY, instant.efficiency.loop_inefficiency, params.postwrite_gain, source_mask);
+    blend_scalar_register(LLAMA_SELF_REGISTER_RECOVERY_URGENCY, recovery_urgency, params.postwrite_gain, source_mask);
+    blend_scalar_register(LLAMA_SELF_REGISTER_ANSWERABILITY, instant.epistemic.answerability, params.postwrite_gain, source_mask);
+    blend_scalar_register(LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY, instant.user_outcome.preference_uncertainty, params.postwrite_gain, source_mask);
+}
+
+void llama_self_state::update_expanded_model(
+        const llama_self_state_event & event,
+        const llama_self_state_feature_vector & features,
+        uint32_t source_mask) {
+    const llama_self_tool_state_info tool_state = build_tool_state_info(tool_jobs);
+    const float contradiction = current_scalar_register(LLAMA_SELF_REGISTER_CONTRADICTION);
+    const float uncertainty = current_scalar_register(LLAMA_SELF_REGISTER_UNCERTAINTY);
+    const float goal_relevance = current_scalar_register(LLAMA_SELF_REGISTER_GOAL_RELEVANCE);
+    const float self_relevance = current_scalar_register(LLAMA_SELF_REGISTER_SELF_RELEVANCE);
+    const float social_relevance = current_scalar_register(LLAMA_SELF_REGISTER_SOCIAL_RELEVANCE);
+    const float affordance = current_scalar_register(LLAMA_SELF_REGISTER_AFFORDANCE);
+    const float broadcast_pressure = current_scalar_register(LLAMA_SELF_REGISTER_BROADCAST_PRESSURE);
+    const float broadcast_inhibition = current_scalar_register(LLAMA_SELF_REGISTER_BROADCAST_INHIBITION);
+    const float continuation = current_scalar_register(LLAMA_SELF_REGISTER_FOLLOWUP_CONTINUATION);
+    const float memory_write_priority = current_scalar_register(LLAMA_SELF_REGISTER_MEMORY_WRITE_PRIORITY);
+    const bool tool_failed = (event.flags & LLAMA_SELF_STATE_EVENT_TOOL_FAILED) != 0;
+    const bool tool_completed = (event.flags & LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED) != 0;
+    const bool is_tool = event.role == LLAMA_SELF_STATE_EVENT_TOOL;
+
+    llama_self_model_horizon_info instant = {};
+    instant.horizon_id = LLAMA_SELF_HORIZON_INSTANT;
+    instant.last_update_monotonic_ms = datetime.monotonic_ms;
+
+    instant.goal_progress.goal_progress_estimate = clamp_unit(
+            0.38f * goal_relevance +
+            0.18f * features.working_memory_top_similarity +
+            0.12f * features.memory_handle_top_similarity +
+            0.14f * (1.0f - contradiction) +
+            0.10f * (1.0f - uncertainty) +
+            0.08f * (tool_completed ? 1.0f : 0.0f));
+    instant.goal_progress.blocker_severity = clamp_unit(
+            0.35f * features.tool_pending_pressure +
+            0.25f * contradiction +
+            0.20f * uncertainty +
+            0.20f * (tool_failed ? 1.0f : 0.0f));
+    instant.goal_progress.dependency_readiness = clamp_unit(
+            0.45f * tool_state.readiness +
+            0.20f * (1.0f - features.tool_pending_pressure) +
+            0.20f * features.memory_handle_top_similarity +
+            0.15f * features.working_memory_top_similarity);
+    instant.goal_progress.urgency = clamp_unit(
+            0.38f * goal_relevance +
+            0.18f * features.followup_hint +
+            0.18f * social_dissatisfaction +
+            0.14f * features.recency_user +
+            0.12f * continuation);
+    instant.goal_progress.expected_next_action_gain = clamp_unit(
+            0.30f * (1.0f - uncertainty) +
+            0.20f * affordance +
+            0.20f * tool_state.readiness +
+            0.20f * goal_relevance +
+            0.10f * (tool_completed ? 1.0f : 0.0f));
+    instant.goal_progress.commitment_slippage_risk = clamp_unit(
+            0.45f * features.commitment_top_similarity * std::max(contradiction, uncertainty) +
+            0.35f * instant.goal_progress.blocker_severity +
+            0.20f * (1.0f - instant.goal_progress.goal_progress_estimate));
+    instant.goal_progress.confidence = clamp_unit(
+            0.45f * (1.0f - uncertainty) +
+            0.20f * features.decoder_top_margin +
+            0.20f * (1.0f - features.novelty) +
+            0.15f * features.memory_handle_top_similarity);
+
+    instant.user_outcome.satisfaction_estimate = clamp_unit(
+            0.28f * social_trust +
+            0.18f * social_reciprocity +
+            0.16f * (1.0f - social_recent_user_valence) +
+            0.14f * (1.0f - contradiction) +
+            0.12f * (1.0f - uncertainty) +
+            0.12f * instant.goal_progress.goal_progress_estimate);
+    instant.user_outcome.frustration_risk = clamp_unit(
+            0.40f * social_recent_user_valence +
+            0.20f * social_dissatisfaction +
+            0.15f * contradiction +
+            0.10f * uncertainty +
+            0.15f * (tool_failed ? 1.0f : 0.0f));
+    instant.user_outcome.misunderstanding_risk = clamp_unit(
+            0.35f * uncertainty +
+            0.20f * features.question_ratio +
+            0.15f * features.topic_shift +
+            0.15f * (1.0f - features.working_memory_top_similarity) +
+            0.15f * features.uncertainty_lexical_ratio);
+    instant.user_outcome.trust_repair_need = clamp_unit(
+            0.45f * (1.0f - social_trust) +
+            0.30f * instant.user_outcome.frustration_risk +
+            0.15f * contradiction +
+            0.10f * (tool_failed ? 1.0f : 0.0f));
+    instant.user_outcome.preference_uncertainty = clamp_unit(
+            0.40f * features.topic_shift +
+            0.20f * features.novelty +
+            0.20f * instant.user_outcome.misunderstanding_risk +
+            0.20f * (1.0f - features.working_memory_top_similarity));
+    instant.user_outcome.cognitive_load_estimate = clamp_unit(
+            0.25f * features.token_count_log +
+            0.25f * instant.user_outcome.misunderstanding_risk +
+            0.20f * contradiction +
+            0.15f * uncertainty +
+            0.15f * features.question_ratio);
+    instant.user_outcome.autonomy_tolerance_estimate = clamp_unit(
+            0.35f * social_trust +
+            0.20f * social_reciprocity +
+            0.20f * instant.goal_progress.goal_progress_estimate +
+            0.15f * (1.0f - instant.user_outcome.frustration_risk) +
+            0.10f * (1.0f - instant.user_outcome.preference_uncertainty));
+    instant.user_outcome.confidence = clamp_unit(
+            0.40f * (1.0f - instant.user_outcome.preference_uncertainty) +
+            0.25f * (1.0f - uncertainty) +
+            0.20f * features.working_memory_top_similarity +
+            0.15f * features.decoder_top_margin);
+
+    instant.epistemic.answerability = clamp_unit(
+            0.28f * (1.0f - uncertainty) +
+            0.18f * (1.0f - contradiction) +
+            0.18f * features.memory_handle_top_similarity +
+            0.16f * features.working_memory_top_similarity +
+            0.10f * goal_relevance +
+            0.10f * tool_state.readiness);
+    instant.epistemic.evidence_sufficiency = clamp_unit(
+            0.32f * features.memory_handle_top_similarity +
+            0.28f * features.working_memory_top_similarity +
+            0.20f * goal_relevance +
+            0.10f * (1.0f - features.novelty) +
+            0.10f * self_relevance);
+    instant.epistemic.ambiguity_concentration = clamp_unit(
+            0.35f * features.uncertainty_lexical_ratio +
+            0.25f * features.decoder_entropy +
+            0.20f * features.question_ratio +
+            0.20f * features.topic_shift);
+    instant.epistemic.self_estimate_confidence = clamp_unit(
+            0.35f * (1.0f - uncertainty) +
+            0.20f * features.decoder_top_margin +
+            0.20f * (1.0f - contradiction) +
+            0.15f * (1.0f - features.novelty) +
+            0.10f * features.memory_handle_top_similarity);
+    instant.epistemic.tool_need_confidence = clamp_unit(
+            0.40f * affordance +
+            0.25f * instant.goal_progress.blocker_severity +
+            0.20f * (1.0f - tool_state.readiness) +
+            0.15f * features.tool_pending_pressure);
+    instant.epistemic.contradiction_load = contradiction;
+    instant.epistemic.uncertainty_load = uncertainty;
+
+    instant.efficiency.expected_steps_remaining = clamp_unit(
+            0.45f * (1.0f - instant.goal_progress.goal_progress_estimate) +
+            0.20f * instant.goal_progress.blocker_severity +
+            0.15f * uncertainty +
+            0.10f * continuation +
+            0.10f * instant.user_outcome.misunderstanding_risk);
+    instant.efficiency.tool_roundtrip_cost = clamp_unit(
+            0.45f * features.tool_pending_pressure +
+            0.35f * (1.0f - tool_state.readiness) +
+            0.20f * (is_tool ? 0.35f : 0.0f));
+    instant.efficiency.context_thrash_risk = clamp_unit(
+            0.40f * features.topic_shift +
+            0.25f * features.novelty +
+            0.20f * features.memory_handle_similarity_variance +
+            0.15f * uncertainty);
+    instant.efficiency.repetition_risk = clamp_unit(
+            0.35f * (1.0f - features.novelty) +
+            0.30f * features.working_memory_top_similarity +
+            0.20f * continuation +
+            0.15f * memory_write_priority);
+    instant.efficiency.loop_inefficiency = clamp_unit(
+            0.30f * continuation +
+            0.25f * instant.efficiency.repetition_risk +
+            0.20f * instant.efficiency.context_thrash_risk +
+            0.15f * uncertainty +
+            0.10f * (1.0f - instant.goal_progress.expected_next_action_gain));
+    instant.efficiency.expected_inference_cost_remaining = clamp_unit(
+            0.45f * instant.efficiency.expected_steps_remaining +
+            0.30f * instant.efficiency.tool_roundtrip_cost +
+            0.15f * instant.efficiency.loop_inefficiency +
+            0.10f * instant.efficiency.context_thrash_risk);
+    instant.efficiency.response_compaction_opportunity = clamp_unit(
+            0.35f * instant.epistemic.answerability +
+            0.25f * instant.epistemic.evidence_sufficiency +
+            0.20f * (1.0f - instant.user_outcome.cognitive_load_estimate) +
+            0.20f * (1.0f - instant.efficiency.expected_steps_remaining));
+
+    instant.recovery.favorable_divergence_goal = clamp_unit(
+            0.55f * (1.0f - instant.goal_progress.goal_progress_estimate) +
+            0.25f * instant.goal_progress.blocker_severity +
+            0.20f * continuation);
+    instant.recovery.favorable_divergence_social = clamp_unit(
+            0.45f * instant.user_outcome.frustration_risk +
+            0.30f * instant.user_outcome.trust_repair_need +
+            0.25f * social_dissatisfaction);
+    instant.recovery.favorable_divergence_epistemic = clamp_unit(
+            0.40f * uncertainty +
+            0.30f * contradiction +
+            0.30f * (1.0f - instant.epistemic.answerability));
+    instant.recovery.favorable_divergence_action = clamp_unit(
+            0.35f * instant.efficiency.loop_inefficiency +
+            0.30f * instant.efficiency.tool_roundtrip_cost +
+            0.20f * broadcast_pressure +
+            0.15f * broadcast_inhibition);
+    instant.recovery.regulation_debt = clamp_unit(
+            0.30f * broadcast_pressure +
+            0.25f * broadcast_inhibition +
+            0.25f * continuation +
+            0.20f * memory_write_priority);
+    instant.recovery.unresolved_tension_load = clamp_unit(
+            0.40f * instant.goal_progress.commitment_slippage_risk +
+            0.25f * continuation +
+            0.20f * contradiction +
+            0.15f * instant.user_outcome.trust_repair_need);
+    instant.recovery.recovery_cost_estimate = clamp_unit(
+            0.35f * max4(
+                    instant.recovery.favorable_divergence_goal,
+                    instant.recovery.favorable_divergence_social,
+                    instant.recovery.favorable_divergence_epistemic,
+                    instant.recovery.favorable_divergence_action) +
+            0.35f * instant.efficiency.expected_steps_remaining +
+            0.30f * instant.efficiency.expected_inference_cost_remaining);
+
+    instant.strategy.answer_bias = clamp_unit(
+            0.45f * instant.epistemic.answerability +
+            0.20f * instant.goal_progress.expected_next_action_gain +
+            0.20f * (1.0f - instant.user_outcome.cognitive_load_estimate) +
+            0.15f * (tool_completed ? 1.0f : 0.0f));
+    instant.strategy.ask_bias = clamp_unit(
+            0.40f * instant.user_outcome.misunderstanding_risk +
+            0.30f * uncertainty +
+            0.20f * instant.user_outcome.preference_uncertainty +
+            0.10f * features.question_ratio);
+    instant.strategy.act_bias = clamp_unit(
+            0.45f * instant.epistemic.tool_need_confidence +
+            0.25f * affordance +
+            0.15f * instant.goal_progress.urgency +
+            0.15f * tool_state.readiness);
+    instant.strategy.wait_bias = clamp_unit(
+            0.40f * broadcast_inhibition +
+            0.25f * (is_tool && tool_state.running_jobs > 0 ? 1.0f : 0.0f) +
+            0.20f * (1.0f - social_relevance) +
+            0.15f * (1.0f - goal_relevance));
+    instant.strategy.exploit_bias = clamp_unit(
+            0.40f * instant.epistemic.evidence_sufficiency +
+            0.35f * (1.0f - features.novelty) +
+            0.25f * (1.0f - instant.user_outcome.preference_uncertainty));
+    instant.strategy.deliberate_bias = clamp_unit(
+            0.35f * uncertainty +
+            0.25f * contradiction +
+            0.20f * instant.goal_progress.blocker_severity +
+            0.20f * instant.user_outcome.cognitive_load_estimate);
+    instant.strategy.write_internal_bias = clamp_unit(
+            0.45f * memory_write_priority +
+            0.30f * instant.recovery.regulation_debt +
+            0.25f * instant.goal_progress.commitment_slippage_risk);
+    instant.strategy.act_external_bias = clamp_unit(
+            0.40f * std::max(instant.strategy.answer_bias, instant.strategy.act_bias) +
+            0.35f * instant.goal_progress.urgency +
+            0.25f * (1.0f - instant.strategy.wait_bias));
+
+    instant.self_improvement.update_worthiness = clamp_unit(
+            0.30f * instant.recovery.recovery_cost_estimate +
+            0.25f * instant.efficiency.loop_inefficiency +
+            0.25f * instant.user_outcome.frustration_risk +
+            0.20f * instant.goal_progress.commitment_slippage_risk);
+    instant.self_improvement.expected_gain = clamp_unit(
+            0.30f * instant.efficiency.expected_inference_cost_remaining +
+            0.25f * instant.recovery.recovery_cost_estimate +
+            0.25f * instant.goal_progress.blocker_severity +
+            0.20f * instant.user_outcome.trust_repair_need);
+    instant.self_improvement.evidence_deficit = clamp_unit(
+            0.45f * (1.0f - instant.epistemic.self_estimate_confidence) +
+            0.30f * instant.user_outcome.preference_uncertainty +
+            0.25f * instant.epistemic.ambiguity_concentration);
+    instant.self_improvement.blast_radius_risk = clamp_unit(
+            0.30f * goal_relevance +
+            0.20f * social_relevance +
+            0.20f * instant.recovery.regulation_debt +
+            0.15f * continuation +
+            0.15f * self_relevance);
+    instant.self_improvement.observability_deficit = clamp_unit(
+            0.45f * instant.user_outcome.preference_uncertainty +
+            0.30f * uncertainty +
+            0.25f * features.novelty);
+    instant.self_improvement.reversibility = clamp_unit(
+            0.40f * (1.0f - instant.self_improvement.blast_radius_risk) +
+            0.35f * (1.0f - instant.self_improvement.observability_deficit) +
+            0.25f * (1.0f - continuation));
+    instant.self_improvement.readiness = clamp_unit(
+            instant.self_improvement.update_worthiness *
+            (1.0f - instant.self_improvement.evidence_deficit) *
+            instant.self_improvement.reversibility);
+
+    const auto prev_instant = model_horizons[(size_t) LLAMA_SELF_HORIZON_INSTANT];
+    const auto prev_short = model_horizons[(size_t) LLAMA_SELF_HORIZON_SHORT];
+    const float prev_aggregate_div = max4(
+            prev_instant.recovery.favorable_divergence_goal,
+            prev_instant.recovery.favorable_divergence_social,
+            prev_instant.recovery.favorable_divergence_epistemic,
+            prev_instant.recovery.favorable_divergence_action);
+    const float current_aggregate_div = max4(
+            instant.recovery.favorable_divergence_goal,
+            instant.recovery.favorable_divergence_social,
+            instant.recovery.favorable_divergence_epistemic,
+            instant.recovery.favorable_divergence_action);
+    instant.recovery.recovery_momentum = clamp_unit(
+            0.50f * clamp_unit(0.5f + 0.5f * (prev_aggregate_div - current_aggregate_div)) +
+            0.30f * clamp_unit(0.5f + 0.5f * (prev_short.goal_progress.goal_progress_estimate - prev_instant.goal_progress.goal_progress_estimate + instant.goal_progress.goal_progress_estimate)) +
+            0.20f * (1.0f - instant.efficiency.loop_inefficiency));
+
+    if (model_forecast.valid) {
+        const float prev_predicted_satisfaction = clamp_range(
+                prev_instant.user_outcome.satisfaction_estimate + model_forecast.predicted_satisfaction_delta,
+                0.0f, 1.0f);
+        const float prev_predicted_recovery = clamp_range(
+                prev_aggregate_div - model_forecast.predicted_recovery_delta,
+                0.0f, 1.0f);
+        const float prev_predicted_goal_progress = clamp_range(
+                prev_instant.goal_progress.goal_progress_estimate + model_forecast.predicted_goal_progress_delta,
+                0.0f, 1.0f);
+        prediction_error.valid = true;
+        prediction_error.observed_after_monotonic_ms = datetime.monotonic_ms;
+        prediction_error.steps_error = std::fabs(model_forecast.predicted_steps_remaining - instant.efficiency.expected_steps_remaining);
+        prediction_error.inference_cost_error = std::fabs(model_forecast.predicted_inference_cost_remaining - instant.efficiency.expected_inference_cost_remaining);
+        prediction_error.satisfaction_error = std::fabs(prev_predicted_satisfaction - instant.user_outcome.satisfaction_estimate);
+        prediction_error.recovery_error = std::fabs(prev_predicted_recovery - current_aggregate_div);
+        prediction_error.goal_progress_error = std::fabs(prev_predicted_goal_progress - instant.goal_progress.goal_progress_estimate);
+    }
+
+    model_horizons[(size_t) LLAMA_SELF_HORIZON_INSTANT] = instant;
+
+    auto & short_horizon = model_horizons[(size_t) LLAMA_SELF_HORIZON_SHORT];
+    if (short_horizon.last_update_monotonic_ms < 0) {
+        short_horizon = instant;
+        short_horizon.horizon_id = LLAMA_SELF_HORIZON_SHORT;
+    } else {
+        const float gain = 0.35f;
+        short_horizon.last_update_monotonic_ms = datetime.monotonic_ms;
+#define BLEND_FIELD(profile, field) short_horizon.profile.field = blend_value(short_horizon.profile.field, instant.profile.field, gain)
+        BLEND_FIELD(goal_progress, goal_progress_estimate);
+        BLEND_FIELD(goal_progress, blocker_severity);
+        BLEND_FIELD(goal_progress, dependency_readiness);
+        BLEND_FIELD(goal_progress, urgency);
+        BLEND_FIELD(goal_progress, expected_next_action_gain);
+        BLEND_FIELD(goal_progress, commitment_slippage_risk);
+        BLEND_FIELD(goal_progress, confidence);
+        BLEND_FIELD(user_outcome, satisfaction_estimate);
+        BLEND_FIELD(user_outcome, frustration_risk);
+        BLEND_FIELD(user_outcome, misunderstanding_risk);
+        BLEND_FIELD(user_outcome, trust_repair_need);
+        BLEND_FIELD(user_outcome, preference_uncertainty);
+        BLEND_FIELD(user_outcome, cognitive_load_estimate);
+        BLEND_FIELD(user_outcome, autonomy_tolerance_estimate);
+        BLEND_FIELD(user_outcome, confidence);
+        BLEND_FIELD(epistemic, answerability);
+        BLEND_FIELD(epistemic, evidence_sufficiency);
+        BLEND_FIELD(epistemic, ambiguity_concentration);
+        BLEND_FIELD(epistemic, self_estimate_confidence);
+        BLEND_FIELD(epistemic, tool_need_confidence);
+        BLEND_FIELD(epistemic, contradiction_load);
+        BLEND_FIELD(epistemic, uncertainty_load);
+        BLEND_FIELD(efficiency, expected_steps_remaining);
+        BLEND_FIELD(efficiency, expected_inference_cost_remaining);
+        BLEND_FIELD(efficiency, loop_inefficiency);
+        BLEND_FIELD(efficiency, repetition_risk);
+        BLEND_FIELD(efficiency, context_thrash_risk);
+        BLEND_FIELD(efficiency, tool_roundtrip_cost);
+        BLEND_FIELD(efficiency, response_compaction_opportunity);
+        BLEND_FIELD(recovery, favorable_divergence_goal);
+        BLEND_FIELD(recovery, favorable_divergence_social);
+        BLEND_FIELD(recovery, favorable_divergence_epistemic);
+        BLEND_FIELD(recovery, favorable_divergence_action);
+        BLEND_FIELD(recovery, recovery_momentum);
+        BLEND_FIELD(recovery, regulation_debt);
+        BLEND_FIELD(recovery, unresolved_tension_load);
+        BLEND_FIELD(recovery, recovery_cost_estimate);
+        BLEND_FIELD(strategy, answer_bias);
+        BLEND_FIELD(strategy, ask_bias);
+        BLEND_FIELD(strategy, act_bias);
+        BLEND_FIELD(strategy, wait_bias);
+        BLEND_FIELD(strategy, exploit_bias);
+        BLEND_FIELD(strategy, deliberate_bias);
+        BLEND_FIELD(strategy, write_internal_bias);
+        BLEND_FIELD(strategy, act_external_bias);
+        BLEND_FIELD(self_improvement, update_worthiness);
+        BLEND_FIELD(self_improvement, expected_gain);
+        BLEND_FIELD(self_improvement, evidence_deficit);
+        BLEND_FIELD(self_improvement, reversibility);
+        BLEND_FIELD(self_improvement, blast_radius_risk);
+        BLEND_FIELD(self_improvement, observability_deficit);
+        BLEND_FIELD(self_improvement, readiness);
+#undef BLEND_FIELD
+    }
+
+    auto & long_horizon = model_horizons[(size_t) LLAMA_SELF_HORIZON_LONG];
+    if (long_horizon.last_update_monotonic_ms < 0) {
+        long_horizon = instant;
+        long_horizon.horizon_id = LLAMA_SELF_HORIZON_LONG;
+    } else {
+        const float gain = 0.12f;
+        long_horizon.last_update_monotonic_ms = datetime.monotonic_ms;
+#define BLEND_FIELD(profile, field) long_horizon.profile.field = blend_value(long_horizon.profile.field, instant.profile.field, gain)
+        BLEND_FIELD(goal_progress, goal_progress_estimate);
+        BLEND_FIELD(goal_progress, blocker_severity);
+        BLEND_FIELD(goal_progress, dependency_readiness);
+        BLEND_FIELD(goal_progress, urgency);
+        BLEND_FIELD(goal_progress, expected_next_action_gain);
+        BLEND_FIELD(goal_progress, commitment_slippage_risk);
+        BLEND_FIELD(goal_progress, confidence);
+        BLEND_FIELD(user_outcome, satisfaction_estimate);
+        BLEND_FIELD(user_outcome, frustration_risk);
+        BLEND_FIELD(user_outcome, misunderstanding_risk);
+        BLEND_FIELD(user_outcome, trust_repair_need);
+        BLEND_FIELD(user_outcome, preference_uncertainty);
+        BLEND_FIELD(user_outcome, cognitive_load_estimate);
+        BLEND_FIELD(user_outcome, autonomy_tolerance_estimate);
+        BLEND_FIELD(user_outcome, confidence);
+        BLEND_FIELD(epistemic, answerability);
+        BLEND_FIELD(epistemic, evidence_sufficiency);
+        BLEND_FIELD(epistemic, ambiguity_concentration);
+        BLEND_FIELD(epistemic, self_estimate_confidence);
+        BLEND_FIELD(epistemic, tool_need_confidence);
+        BLEND_FIELD(epistemic, contradiction_load);
+        BLEND_FIELD(epistemic, uncertainty_load);
+        BLEND_FIELD(efficiency, expected_steps_remaining);
+        BLEND_FIELD(efficiency, expected_inference_cost_remaining);
+        BLEND_FIELD(efficiency, loop_inefficiency);
+        BLEND_FIELD(efficiency, repetition_risk);
+        BLEND_FIELD(efficiency, context_thrash_risk);
+        BLEND_FIELD(efficiency, tool_roundtrip_cost);
+        BLEND_FIELD(efficiency, response_compaction_opportunity);
+        BLEND_FIELD(recovery, favorable_divergence_goal);
+        BLEND_FIELD(recovery, favorable_divergence_social);
+        BLEND_FIELD(recovery, favorable_divergence_epistemic);
+        BLEND_FIELD(recovery, favorable_divergence_action);
+        BLEND_FIELD(recovery, recovery_momentum);
+        BLEND_FIELD(recovery, regulation_debt);
+        BLEND_FIELD(recovery, unresolved_tension_load);
+        BLEND_FIELD(recovery, recovery_cost_estimate);
+        BLEND_FIELD(strategy, answer_bias);
+        BLEND_FIELD(strategy, ask_bias);
+        BLEND_FIELD(strategy, act_bias);
+        BLEND_FIELD(strategy, wait_bias);
+        BLEND_FIELD(strategy, exploit_bias);
+        BLEND_FIELD(strategy, deliberate_bias);
+        BLEND_FIELD(strategy, write_internal_bias);
+        BLEND_FIELD(strategy, act_external_bias);
+        BLEND_FIELD(self_improvement, update_worthiness);
+        BLEND_FIELD(self_improvement, expected_gain);
+        BLEND_FIELD(self_improvement, evidence_deficit);
+        BLEND_FIELD(self_improvement, reversibility);
+        BLEND_FIELD(self_improvement, blast_radius_risk);
+        BLEND_FIELD(self_improvement, observability_deficit);
+        BLEND_FIELD(self_improvement, readiness);
+#undef BLEND_FIELD
+    }
+
+    model_forecast.valid = true;
+    model_forecast.issued_monotonic_ms = datetime.monotonic_ms;
+    model_forecast.predicted_steps_remaining = clamp_unit(
+            0.60f * instant.efficiency.expected_steps_remaining +
+            0.25f * short_horizon.efficiency.expected_steps_remaining +
+            0.15f * long_horizon.efficiency.expected_steps_remaining);
+    model_forecast.predicted_inference_cost_remaining = clamp_unit(
+            0.60f * instant.efficiency.expected_inference_cost_remaining +
+            0.25f * short_horizon.efficiency.expected_inference_cost_remaining +
+            0.15f * long_horizon.efficiency.expected_inference_cost_remaining);
+    model_forecast.predicted_satisfaction_delta = clamp_range(
+            0.35f * instant.goal_progress.expected_next_action_gain +
+            0.25f * instant.epistemic.answerability +
+            0.20f * instant.efficiency.response_compaction_opportunity -
+            0.30f * instant.user_outcome.frustration_risk -
+            0.20f * instant.user_outcome.misunderstanding_risk,
+            -1.0f, 1.0f);
+    model_forecast.predicted_recovery_delta = clamp_range(
+            0.45f * instant.recovery.recovery_momentum +
+            0.20f * instant.goal_progress.expected_next_action_gain -
+            0.25f * instant.recovery.regulation_debt -
+            0.20f * instant.efficiency.loop_inefficiency,
+            -1.0f, 1.0f);
+    model_forecast.predicted_goal_progress_delta = clamp_range(
+            0.50f * instant.goal_progress.expected_next_action_gain +
+            0.20f * instant.epistemic.answerability -
+            0.20f * instant.goal_progress.blocker_severity -
+            0.10f * instant.user_outcome.misunderstanding_risk,
+            -1.0f, 1.0f);
+    model_forecast.confidence = clamp_unit(
+            0.40f * instant.epistemic.self_estimate_confidence +
+            0.25f * instant.goal_progress.confidence +
+            0.20f * instant.user_outcome.confidence +
+            0.15f * (1.0f - instant.self_improvement.evidence_deficit));
+
+    update_summary_registers(source_mask);
+}
+
 bool llama_context::self_state_refresh_time() {
     return self_state && self_state->refresh_time();
 }
@@ -2092,6 +2649,10 @@ bool llama_context::self_state_get_tool_state(llama_self_tool_state_info * out_i
 
 bool llama_context::self_state_get_social_state(llama_self_social_state_info * out_info) const {
     return self_state && self_state->get_social_state(out_info);
+}
+
+bool llama_context::self_state_get_model_state(llama_self_model_state_info * out_info) const {
+    return self_state && self_state->get_model_state(out_info);
 }
 
 int32_t llama_context::self_state_trace_count() const {
@@ -2535,6 +3096,12 @@ int32_t llama_self_state_get_social_state(
         const struct llama_context * ctx,
         struct llama_self_social_state_info * out_info) {
     return ctx && ctx->self_state_get_social_state(out_info) ? 0 : -1;
+}
+
+int32_t llama_self_state_get_model_state(
+        const struct llama_context * ctx,
+        struct llama_self_model_state_info * out_info) {
+    return ctx && ctx->self_state_get_model_state(out_info) ? 0 : -1;
 }
 
 int32_t llama_self_state_trace_count(const struct llama_context * ctx) {

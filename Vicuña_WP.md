@@ -133,7 +133,8 @@ Implementation discipline for this stage:
 - "fixed-size" should be computed from explicit fractions of currently available RAM and VRAM, not a universal byte constant,
 - Active updates should be represented as normalized low-rank directions plus bounded gain surfaces so semantic direction and update strength remain separately controllable,
 - the write path should be explicit and inspectable, and any auxiliary machinery used to support writes should obey the same budget discipline rather than hiding extra long-lived memory outside the adapter accounting,
-- and the embedding strategy used to admit or seed writes should remain swappable, including model-specific callback-backed embedders, because open-source model families may not share a compatible embedding space.
+- the default embedder should be hidden-state-derived from the same base model family used for serving, while the embedding strategy remains swappable, including model-specific callback-backed embedders, because open-source model families may not share a compatible embedding space,
+- and write directions should be derived from hidden-state content plus typed self-state features so the active stage captures durable behavioral bias rather than only token identity.
 
 The active LoRA is the first durable stage after token eviction. It is the bridge between raw context and sedimented memory.
 
@@ -227,6 +228,15 @@ The self-core should include:
 - unresolved commitments,
 - and handles to relevant memory clusters or frozen LoRAs.
 
+The current implementation direction expands this into a layered self-model:
+
+- a fast scalar control bank for low-latency routing,
+- typed profile families for goal progress, user outcome, epistemic condition,
+  efficiency, recovery, strategy, and self-improvement readiness,
+- multi-timescale slices over those profiles,
+- and bounded forecasts plus prediction-error traces so later evaluators can
+  calibrate the self-model rather than reconstruct it from raw logs.
+
 ### 5.2 What does not belong solely in the LoRA stack
 
 The following should **not** be represented only as LoRA memory:
@@ -251,6 +261,11 @@ If the self-state lives only in text or only in a hidden compressed memory mecha
 The register bank is a persistent typed state object, separate from the active LoRA.
 
 A sufficient initial spec is to group registers into five families.
+
+The current implementation now treats that bank as only the first layer. The
+register bank remains the fast routing surface, while richer typed profiles and
+forecast traces carry the more semantically structured self-estimates that do
+not belong in one flat enum.
 
 ### 6.1 Epistemic pressure registers
 
@@ -445,6 +460,16 @@ The active loop differs because:
 - latency matters more,
 - and the broadcast policy is less speculative.
 
+The implementation direction is therefore not a single generic ReAct loop
+duplicated into both paths. Instead, Vicuña uses a shared bounded act/observe
+substrate with explicit phase, terminal-reason, tool-proposal, and observation
+state, while keeping distinct foreground and DMN control policies.
+
+In the current runtime this substrate is a real planner-executor runner, not
+just trace metadata. The active loop now persists episode state, exposes
+host-visible pending commands for `emit_answer`, `emit_ask`, and `invoke_tool`,
+and resumes the same episode when a tool observation returns.
+
 ### 9.3 What the active loop is for
 
 The active loop should:
@@ -500,6 +525,16 @@ register bank
 -> latent seed
 -> silent candidate thoughts
 ```
+
+In implementation terms, the DMN should sit on the same bounded tool-loop
+substrate used by the active loop, but with different admission, governance,
+and continuation policy. That preserves inspectability while still allowing
+background tool use, remediation, and simulation to grow over time.
+
+Current runtime policy is stricter than "run whenever polled": the DMN defers
+while foreground runner work is still outstanding, and admitted DMN runs may
+take one or two bounded internal continuation steps before yielding a tool or
+background-emit command.
 
 ### 10.4 DMN output discipline
 
@@ -617,6 +652,15 @@ on_user_message(msg)
   -> log_episode(...)
 ```
 
+Implementation note:
+
+- foreground planning now materializes a host-visible command queue instead of
+  leaving execution intent only in traces,
+- `ACT` yields a pending tool command and a waiting runner state,
+- `ANSWER` and `ASK` yield pending emit commands,
+- and tool observations resume the same bounded episode rather than opening a
+  new one.
+
 ### 12.1 Special case: tool return during active conversation
 
 ```text
@@ -662,6 +706,13 @@ dmn_tick()
   -> refresh_reactivation_priorities(...)
   -> schedule_next_tick(...)
 ```
+
+Implementation note:
+
+- a DMN tick first defers if foreground runner work is still active,
+- admitted runs can continue locally after `internal_write`,
+- and any resulting tool or emit work is exposed as a pending background
+  command with explicit origin and loop metadata.
 
 ### 13.1 DMN invariants
 

@@ -176,6 +176,122 @@ static bool expect_dmn_action(
     return true;
 }
 
+static bool expect_single_command(
+        const char * label,
+        llama_context * ctx,
+        int32_t expected_origin,
+        int32_t expected_kind,
+        llama_cognitive_command * out_command = nullptr) {
+    const int32_t count = llama_cognitive_command_count(ctx);
+    if (count != 1) {
+        std::fprintf(stderr, "%s: unexpected cognitive command count %d\n", label, count);
+        return false;
+    }
+
+    llama_cognitive_command command = {};
+    if (llama_cognitive_command_get(ctx, 0, &command) != 0) {
+        std::fprintf(stderr, "%s: failed to retrieve cognitive command\n", label);
+        return false;
+    }
+    if (command.origin != expected_origin || command.kind != expected_kind) {
+        std::fprintf(stderr, "%s: unexpected command origin/kind (%d/%d)\n", label, command.origin, command.kind);
+        return false;
+    }
+    if (out_command) {
+        *out_command = command;
+    }
+    return true;
+}
+
+static bool settle_active_runner(const char * label, llama_context * ctx) {
+    while (llama_cognitive_command_count(ctx) > 0) {
+        llama_cognitive_command command = {};
+        if (llama_cognitive_command_get(ctx, 0, &command) != 0) {
+            std::fprintf(stderr, "%s: failed to retrieve pending active command\n", label);
+            return false;
+        }
+        if (command.origin != LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+            std::fprintf(stderr, "%s: encountered non-active pending command while settling foreground state\n", label);
+            return false;
+        }
+
+        if (command.kind == LLAMA_COG_COMMAND_EMIT_ANSWER || command.kind == LLAMA_COG_COMMAND_EMIT_ASK) {
+            llama_cognitive_active_runner_status runner = {};
+            if (llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
+                llama_active_loop_note_emit(ctx, runner.episode_id, 1) != 0) {
+                std::fprintf(stderr, "%s: failed to settle foreground emit command\n", label);
+                return false;
+            }
+        } else if (command.kind == LLAMA_COG_COMMAND_INVOKE_TOOL) {
+            if (llama_cognitive_command_complete(ctx, command.command_id, true) != 0) {
+                std::fprintf(stderr, "%s: failed to cancel foreground tool command\n", label);
+                return false;
+            }
+        } else {
+            std::fprintf(stderr, "%s: unexpected foreground command kind %d while settling\n", label, command.kind);
+            return false;
+        }
+    }
+
+    llama_cognitive_active_runner_status runner = {};
+    if (llama_cognitive_active_runner_get(ctx, &runner) != 0 || runner.active || !runner.completed) {
+        std::fprintf(stderr, "%s: foreground runner did not settle to terminal state\n", label);
+        return false;
+    }
+
+    return true;
+}
+
+static bool ingest_event_without_runner(
+        const char * label,
+        llama_context * ctx,
+        const llama_self_state_event & event) {
+    if (llama_self_state_set_channel_state(ctx, LLAMA_SELF_STATE_CHANNEL_ACTIVE) != 0) {
+        std::fprintf(stderr, "%s: failed to set self-state channel\n", label);
+        return false;
+    }
+    if ((event.role == LLAMA_SELF_STATE_EVENT_TOOL &&
+            llama_self_state_note_tool_event(ctx) != 0) ||
+        (event.role != LLAMA_SELF_STATE_EVENT_TOOL &&
+            llama_self_state_note_user_event(ctx) != 0)) {
+        std::fprintf(stderr, "%s: failed to note self-state event\n", label);
+        return false;
+    }
+
+    llama_self_state_event mutable_event = event;
+    llama_self_state_feature_vector pre = {};
+    llama_self_state_feature_vector post = {};
+    if (llama_self_state_build_prewrite_features(ctx, &mutable_event, &pre) != 0 ||
+        llama_self_state_apply_prewrite(ctx, &mutable_event, &pre) != 0) {
+        std::fprintf(stderr, "%s: failed to apply prewrite state\n", label);
+        return false;
+    }
+
+    const bool admitted =
+            mutable_event.n_tokens > 0 ||
+            pre.memory_write_pressure > 0.12f ||
+            mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL;
+    if (admitted) {
+        mutable_event.flags |= LLAMA_SELF_STATE_EVENT_ADMITTED;
+    }
+
+    if (llama_self_state_build_postwrite_features(ctx, &mutable_event, &post) != 0 ||
+        llama_self_state_apply_postwrite(ctx, &mutable_event, &post) != 0) {
+        std::fprintf(stderr, "%s: failed to apply postwrite state\n", label);
+        return false;
+    }
+
+    if ((mutable_event.flags & LLAMA_SELF_STATE_EVENT_ADMITTED) &&
+        mutable_event.tokens &&
+        mutable_event.n_tokens > 0 &&
+        llama_active_lora_ingest(ctx, mutable_event.tokens, mutable_event.n_tokens) != 0) {
+        std::fprintf(stderr, "%s: failed to ingest active LoRA span\n", label);
+        return false;
+    }
+
+    return true;
+}
+
 int main(int argc, char ** argv) {
     char * model_path = get_model_or_exit(argc, argv);
 
@@ -204,6 +320,17 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        llama_cognitive_tool_spec spec = {};
+        if (llama_cognitive_tool_spec_count(ctx) < 3 ||
+            llama_cognitive_tool_spec_get(ctx, 0, &spec) != 0 ||
+            spec.tool_kind != LLAMA_TOOL_KIND_GENERIC ||
+            spec.name[0] == '\0') {
+            std::fprintf(stderr, "default cognitive tool registry was not populated\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
         const std::vector<llama_token> tokens = tokenize_or_die(vocab, "The tool finished and the result is ready.");
         const llama_self_state_event event = {
             /*.tokens =*/ tokens.data(),
@@ -221,9 +348,41 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
+        if (trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_FINISH ||
+            trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_ANSWER_READY ||
+            trace.loop_state.tool_registry_count < 3 ||
+            trace.tool_proposal.valid ||
+            !trace.observation.valid ||
+            trace.observation.status != LLAMA_SELF_TOOL_JOB_COMPLETED) {
+            std::fprintf(stderr, "active answer trace did not expose bounded loop scaffolding\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        llama_cognitive_command command = {};
+        llama_cognitive_active_runner_status runner = {};
+        if (!expect_single_command("active-answer-command", ctx, LLAMA_COG_COMMAND_ORIGIN_ACTIVE, LLAMA_COG_COMMAND_EMIT_ANSWER, &command) ||
+            llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
+            !runner.active ||
+            runner.completed ||
+            runner.pending_command_id != command.command_id) {
+            std::fprintf(stderr, "active answer runner did not retain pending emit command\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
 
         if (llama_active_loop_note_emit(ctx, trace.episode_id, 32) != 0) {
             std::fprintf(stderr, "failed to note active emit\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (llama_cognitive_command_count(ctx) != 0 ||
+            llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
+            runner.active ||
+            !runner.completed) {
+            std::fprintf(stderr, "active answer runner did not clear after emit\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -232,6 +391,19 @@ int main(int argc, char ** argv) {
         llama_active_loop_trace latest = {};
         if (llama_active_loop_get_last_trace(ctx, &latest) != 0 || !latest.emit_noted) {
             std::fprintf(stderr, "failed to retrieve active loop trace\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_self_model_state_info model_state = {};
+        llama_self_register_info register_info = {};
+        if (llama_self_state_get_model_state(ctx, &model_state) != 0 ||
+            !model_state.forecast.valid ||
+            model_state.horizons[LLAMA_SELF_HORIZON_INSTANT].epistemic.answerability <= 0.0f ||
+            llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_ANSWERABILITY, &register_info) != 0 ||
+            register_info.scalar_value <= 0.0f) {
+            std::fprintf(stderr, "active loop did not preserve expanded self-model state\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -304,7 +476,43 @@ int main(int argc, char ** argv) {
             /*.decoder_top_margin =*/ 1.0f,
         };
 
-        if (!expect_active_action("active-act", ctx, event, LLAMA_ACTIVE_LOOP_ACTION_ACT)) {
+        llama_active_loop_trace trace = {};
+        if (!expect_active_action("active-act", ctx, event, LLAMA_ACTIVE_LOOP_ACTION_ACT, &trace)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_PREPARE_TOOL ||
+            trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_TOOL_REQUIRED ||
+            !trace.loop_state.continuation_allowed ||
+            !trace.loop_state.waiting_on_tool ||
+            !trace.tool_proposal.valid ||
+            trace.tool_proposal.tool_kind != LLAMA_TOOL_KIND_GENERIC ||
+            trace.tool_proposal.expected_steps <= 0) {
+            std::fprintf(stderr, "active act trace did not expose tool preparation scaffolding\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        llama_cognitive_command command = {};
+        llama_cognitive_active_runner_status runner = {};
+        if (!expect_single_command("active-act-command", ctx, LLAMA_COG_COMMAND_ORIGIN_ACTIVE, LLAMA_COG_COMMAND_INVOKE_TOOL, &command) ||
+            command.tool_job_id <= 0 ||
+            llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
+            !runner.active ||
+            !runner.waiting_on_tool ||
+            runner.pending_command_id != command.command_id) {
+            std::fprintf(stderr, "active act runner did not retain waiting tool command\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (llama_cognitive_command_complete(ctx, command.command_id, false) != 0 ||
+            llama_cognitive_command_count(ctx) != 0 ||
+            llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
+            !runner.active ||
+            !runner.waiting_on_tool) {
+            std::fprintf(stderr, "active act runner did not remain waiting after host completion\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -328,7 +536,33 @@ int main(int argc, char ** argv) {
             /*.decoder_entropy =*/ 0.0f,
             /*.decoder_top_margin =*/ 1.0f,
         };
-        if (!expect_active_action("active-tool-followup", ctx, tool_event, LLAMA_ACTIVE_LOOP_ACTION_ANSWER)) {
+        const int32_t original_episode = trace.episode_id;
+        if (!expect_active_action("active-tool-followup", ctx, tool_event, LLAMA_ACTIVE_LOOP_ACTION_ANSWER, &trace)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (!trace.observation.valid ||
+            trace.observation.status != LLAMA_SELF_TOOL_JOB_COMPLETED ||
+            trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_ANSWER_READY ||
+            trace.episode_id != original_episode) {
+            std::fprintf(stderr, "tool followup did not surface tool observation scaffolding\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (!expect_single_command("active-tool-followup-command", ctx, LLAMA_COG_COMMAND_ORIGIN_ACTIVE, LLAMA_COG_COMMAND_EMIT_ANSWER, &command) ||
+            llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
+            !runner.active ||
+            runner.waiting_on_tool) {
+            std::fprintf(stderr, "active tool followup did not schedule final emit command\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (llama_active_loop_note_emit(ctx, trace.episode_id, 24) != 0 ||
+            llama_cognitive_command_count(ctx) != 0) {
+            std::fprintf(stderr, "active tool followup emit did not clear pending command\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -366,7 +600,15 @@ int main(int argc, char ** argv) {
             /*.decoder_top_margin =*/ 1.0f,
         };
 
-        if (!expect_active_action("active-wait", ctx, event, LLAMA_ACTIVE_LOOP_ACTION_WAIT)) {
+        llama_active_loop_trace trace = {};
+        if (!expect_active_action("active-wait", ctx, event, LLAMA_ACTIVE_LOOP_ACTION_WAIT, &trace)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_FINISH ||
+            trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_WAITING_ON_TOOL) {
+            std::fprintf(stderr, "active wait trace did not expose bounded terminal state\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -396,6 +638,23 @@ int main(int argc, char ** argv) {
         }
         if (trace.winner_action != LLAMA_DMN_ACTION_SILENT) {
             std::fprintf(stderr, "unexpected low-pressure DMN action\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_FINISH ||
+            trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_PRESSURE_NOT_ADMITTED) {
+            std::fprintf(stderr, "low-pressure DMN trace did not expose admission stop reason\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        llama_cognitive_dmn_runner_status runner = {};
+        if (llama_cognitive_command_count(ctx) != 0 ||
+            llama_cognitive_dmn_runner_get(ctx, &runner) != 0 ||
+            runner.active ||
+            !runner.completed) {
+            std::fprintf(stderr, "low-pressure DMN runner state was not terminal\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -446,14 +705,40 @@ int main(int argc, char ** argv) {
             /*.decoder_entropy =*/ 1.0f,
             /*.decoder_top_margin =*/ 0.0f,
         };
-        if (llama_active_loop_process(ctx, &event, nullptr) != 0) {
+        if (!ingest_event_without_runner("seed-internal-dmn", ctx, event)) {
             std::fprintf(stderr, "failed to seed internal-write pressure\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
         }
 
-        if (!expect_dmn_action("dmn-internal-write", ctx, 6000, LLAMA_DMN_ACTION_INTERNAL_WRITE)) {
+        llama_dmn_tick_trace trace = {};
+        if (llama_dmn_tick(ctx, 6000, &trace) != 0 ||
+            !trace.admitted ||
+            trace.winner_action != LLAMA_DMN_ACTION_INTERNAL_WRITE) {
+            std::fprintf(stderr, "dmn-internal-write: failed to tick DMN (admitted=%d winner=%d terminal=%d deferred=%d)\n",
+                    trace.admitted ? 1 : 0,
+                    trace.winner_action,
+                    trace.loop_state.terminal_reason,
+                    trace.deferred_for_foreground ? 1 : 0);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_FINISH ||
+            trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_INTERNAL_WRITE_READY ||
+            !trace.observation.valid ||
+            trace.observation.status != LLAMA_SELF_TOOL_JOB_COMPLETED) {
+            std::fprintf(stderr, "internal-write DMN trace did not expose bounded loop observation state\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        llama_cognitive_dmn_runner_status runner = {};
+        if (llama_cognitive_dmn_runner_get(ctx, &runner) != 0 ||
+            runner.steps_taken < 2 ||
+            runner.active) {
+            std::fprintf(stderr, "internal-write DMN runner did not finish bounded local execution\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -563,7 +848,49 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        if (!expect_dmn_action("dmn-invoke-tool", ctx, 7000, LLAMA_DMN_ACTION_INVOKE_TOOL)) {
+        llama_dmn_tick_trace trace = {};
+        if (llama_dmn_tick(ctx, 7000, &trace) != 0 ||
+            trace.admitted ||
+            !trace.deferred_for_foreground ||
+            trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_BACKGROUND_DEFERRED) {
+            std::fprintf(stderr, "DMN did not defer while foreground runner work was still pending\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (!settle_active_runner("settle-active-before-dmn", ctx)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        if (llama_dmn_tick(ctx, 7001, &trace) != 0 ||
+            !trace.admitted ||
+            trace.winner_action != LLAMA_DMN_ACTION_INVOKE_TOOL) {
+            std::fprintf(stderr, "dmn-invoke-tool: failed to tick DMN\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_PREPARE_TOOL ||
+            trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_TOOL_REQUIRED ||
+            !trace.loop_state.waiting_on_tool ||
+            !trace.tool_proposal.valid ||
+            trace.tool_proposal.job_id <= 0) {
+            std::fprintf(stderr, "tool-focused DMN trace did not expose tool proposal scaffolding\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        llama_cognitive_command command = {};
+        llama_cognitive_dmn_runner_status runner = {};
+        if (!expect_single_command("dmn-invoke-tool-command", ctx, LLAMA_COG_COMMAND_ORIGIN_DMN, LLAMA_COG_COMMAND_INVOKE_TOOL, &command) ||
+            command.tool_job_id != trace.tool_job_id ||
+            llama_cognitive_dmn_runner_get(ctx, &runner) != 0 ||
+            !runner.active ||
+            !runner.waiting_on_tool ||
+            runner.pending_command_id != command.command_id) {
+            std::fprintf(stderr, "tool-focused DMN runner did not retain pending tool command\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -616,8 +943,8 @@ int main(int argc, char ** argv) {
             /*.decoder_entropy =*/ 0.0f,
             /*.decoder_top_margin =*/ 1.0f,
         };
-        if (llama_active_loop_process(ctx, &event, nullptr) != 0 ||
-            llama_active_loop_process(ctx, &event, nullptr) != 0) {
+        if (!ingest_event_without_runner("seed-emit-dmn-first", ctx, event) ||
+            !ingest_event_without_runner("seed-emit-dmn-second", ctx, event)) {
             std::fprintf(stderr, "failed to seed emit DMN context\n");
             llama_free(ctx);
             llama_model_free(model);
@@ -690,8 +1017,8 @@ int main(int argc, char ** argv) {
         }
 
         for (int i = 0; i < 3; ++i) {
-            if (llama_active_loop_process(no_repair_ctx, &complaint_event, nullptr) != 0 ||
-                llama_active_loop_process(repair_ctx, &complaint_event, nullptr) != 0) {
+            if (!ingest_event_without_runner("seed-no-repair-dmn", no_repair_ctx, complaint_event) ||
+                !ingest_event_without_runner("seed-repair-dmn", repair_ctx, complaint_event)) {
                 std::fprintf(stderr, "failed to seed repair-pressure dissatisfaction\n");
                 llama_free(no_repair_ctx);
                 llama_free(repair_ctx);
@@ -751,7 +1078,15 @@ int main(int argc, char ** argv) {
             no_repair_trace.pressure.total >= 0.24f ||
             !repair_trace.admitted ||
             repair_trace.pressure.total < 0.24f) {
-            std::fprintf(stderr, "repair pressure did not control DMN admission through the single threshold\n");
+            std::fprintf(stderr,
+                    "repair pressure did not control DMN admission through the single threshold "
+                    "(no_repair admitted=%d total=%.3f repair=%.3f, repair admitted=%d total=%.3f repair=%.3f)\n",
+                    no_repair_trace.admitted ? 1 : 0,
+                    no_repair_trace.pressure.total,
+                    no_repair_trace.pressure.repair,
+                    repair_trace.admitted ? 1 : 0,
+                    repair_trace.pressure.total,
+                    repair_trace.pressure.repair);
             llama_free(no_repair_ctx);
             llama_free(repair_ctx);
             llama_model_free(model);
@@ -826,7 +1161,7 @@ int main(int argc, char ** argv) {
             /*.decoder_top_margin =*/ 1.0f,
         };
         for (int i = 0; i < 5; ++i) {
-            if (llama_active_loop_process(ctx, &complaint_event, nullptr) != 0) {
+            if (!ingest_event_without_runner("seed-repair-governance-complaint", ctx, complaint_event)) {
                 std::fprintf(stderr, "failed to seed repair-governance dissatisfaction\n");
                 llama_free(ctx);
                 llama_model_free(model);
@@ -843,7 +1178,7 @@ int main(int argc, char ** argv) {
             /*.decoder_entropy =*/ 0.0f,
             /*.decoder_top_margin =*/ 0.0f,
         };
-        if (llama_active_loop_process(ctx, &failed_tool_event, nullptr) != 0) {
+        if (!ingest_event_without_runner("seed-repair-governance-tool-failure", ctx, failed_tool_event)) {
             std::fprintf(stderr, "failed to seed repair-governance tool failure\n");
             llama_free(ctx);
             llama_model_free(model);

@@ -418,6 +418,7 @@ extern "C" {
     enum llama_active_lora_embedding_type {
         LLAMA_ACTIVE_LORA_EMBEDDING_HASH       = 0,
         LLAMA_ACTIVE_LORA_EMBEDDING_TOKEN_POOL = 1,
+        LLAMA_ACTIVE_LORA_EMBEDDING_HIDDEN_STATE = 2,
     };
 
     enum llama_memory_lora_bucket {
@@ -549,6 +550,12 @@ extern "C" {
         LLAMA_SELF_REGISTER_MEMORY_WRITE_PRIORITY,
         LLAMA_SELF_REGISTER_TIME_PHASE,
         LLAMA_SELF_REGISTER_TOOL_SALIENCE,
+        LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK,
+        LLAMA_SELF_REGISTER_GOAL_PROGRESS_PRESSURE,
+        LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY,
+        LLAMA_SELF_REGISTER_RECOVERY_URGENCY,
+        LLAMA_SELF_REGISTER_ANSWERABILITY,
+        LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY,
         LLAMA_SELF_REGISTER_CHANNEL_STATE,
         LLAMA_SELF_REGISTER_COUNT,
     };
@@ -748,6 +755,7 @@ extern "C" {
         float broadcast_inhibition_hint;
         float followup_hint;
         float negative_user_valence;
+        float question_ratio;
     };
 
     typedef bool (*llama_self_state_head_callback)(
@@ -801,6 +809,136 @@ extern "C" {
         int32_t user_turn_count;
         int32_t system_turn_count;
         int64_t last_update_monotonic_ms;
+    };
+
+    enum llama_self_profile_id {
+        LLAMA_SELF_PROFILE_GOAL_PROGRESS = 0,
+        LLAMA_SELF_PROFILE_USER_OUTCOME,
+        LLAMA_SELF_PROFILE_EPISTEMIC,
+        LLAMA_SELF_PROFILE_EFFICIENCY,
+        LLAMA_SELF_PROFILE_RECOVERY,
+        LLAMA_SELF_PROFILE_STRATEGY,
+        LLAMA_SELF_PROFILE_SELF_IMPROVEMENT,
+    };
+
+    enum llama_self_horizon_id {
+        LLAMA_SELF_HORIZON_INSTANT = 0,
+        LLAMA_SELF_HORIZON_SHORT = 1,
+        LLAMA_SELF_HORIZON_LONG = 2,
+        LLAMA_SELF_HORIZON_COUNT = 3,
+    };
+
+    struct llama_self_goal_progress_profile {
+        float goal_progress_estimate;
+        float blocker_severity;
+        float dependency_readiness;
+        float urgency;
+        float expected_next_action_gain;
+        float commitment_slippage_risk;
+        float confidence;
+    };
+
+    struct llama_self_user_outcome_profile {
+        float satisfaction_estimate;
+        float frustration_risk;
+        float misunderstanding_risk;
+        float trust_repair_need;
+        float preference_uncertainty;
+        float cognitive_load_estimate;
+        float autonomy_tolerance_estimate;
+        float confidence;
+    };
+
+    struct llama_self_epistemic_profile {
+        float answerability;
+        float evidence_sufficiency;
+        float ambiguity_concentration;
+        float self_estimate_confidence;
+        float tool_need_confidence;
+        float contradiction_load;
+        float uncertainty_load;
+    };
+
+    struct llama_self_efficiency_profile {
+        float expected_steps_remaining;
+        float expected_inference_cost_remaining;
+        float loop_inefficiency;
+        float repetition_risk;
+        float context_thrash_risk;
+        float tool_roundtrip_cost;
+        float response_compaction_opportunity;
+    };
+
+    struct llama_self_recovery_profile {
+        float favorable_divergence_goal;
+        float favorable_divergence_social;
+        float favorable_divergence_epistemic;
+        float favorable_divergence_action;
+        float recovery_momentum;
+        float regulation_debt;
+        float unresolved_tension_load;
+        float recovery_cost_estimate;
+    };
+
+    struct llama_self_strategy_profile {
+        float answer_bias;
+        float ask_bias;
+        float act_bias;
+        float wait_bias;
+        float exploit_bias;
+        float deliberate_bias;
+        float write_internal_bias;
+        float act_external_bias;
+    };
+
+    struct llama_self_improvement_profile {
+        float update_worthiness;
+        float expected_gain;
+        float evidence_deficit;
+        float reversibility;
+        float blast_radius_risk;
+        float observability_deficit;
+        float readiness;
+    };
+
+    struct llama_self_model_horizon_info {
+        int32_t horizon_id;
+        int64_t last_update_monotonic_ms;
+        struct llama_self_goal_progress_profile goal_progress;
+        struct llama_self_user_outcome_profile user_outcome;
+        struct llama_self_epistemic_profile epistemic;
+        struct llama_self_efficiency_profile efficiency;
+        struct llama_self_recovery_profile recovery;
+        struct llama_self_strategy_profile strategy;
+        struct llama_self_improvement_profile self_improvement;
+    };
+
+    struct llama_self_forecast_trace {
+        bool valid;
+        int64_t issued_monotonic_ms;
+        float predicted_steps_remaining;
+        float predicted_inference_cost_remaining;
+        float predicted_satisfaction_delta;
+        float predicted_recovery_delta;
+        float predicted_goal_progress_delta;
+        float confidence;
+    };
+
+    struct llama_self_prediction_error_trace {
+        bool valid;
+        int64_t observed_after_monotonic_ms;
+        float steps_error;
+        float inference_cost_error;
+        float satisfaction_error;
+        float recovery_error;
+        float goal_progress_error;
+    };
+
+    struct llama_self_model_state_info {
+        int32_t horizon_count;
+        struct llama_self_model_horizon_info horizons[LLAMA_SELF_HORIZON_COUNT];
+        struct llama_self_forecast_trace forecast;
+        struct llama_self_prediction_error_trace prediction_error;
     };
 
     struct llama_self_register_updater_rule {
@@ -866,6 +1004,63 @@ extern "C" {
         LLAMA_DMN_ACTION_INTERNAL_WRITE = 1,
         LLAMA_DMN_ACTION_INVOKE_TOOL    = 2,
         LLAMA_DMN_ACTION_EMIT           = 3,
+    };
+
+    enum llama_cognitive_loop_phase {
+        LLAMA_COG_LOOP_PHASE_ASSEMBLE     = 0,
+        LLAMA_COG_LOOP_PHASE_PROPOSE      = 1,
+        LLAMA_COG_LOOP_PHASE_PREPARE_TOOL = 2,
+        LLAMA_COG_LOOP_PHASE_WAIT_TOOL    = 3,
+        LLAMA_COG_LOOP_PHASE_OBSERVE      = 4,
+        LLAMA_COG_LOOP_PHASE_FINISH       = 5,
+    };
+
+    enum llama_cognitive_terminal_reason {
+        LLAMA_COG_TERMINAL_NONE                  = 0,
+        LLAMA_COG_TERMINAL_ANSWER_READY          = 1,
+        LLAMA_COG_TERMINAL_ASK_USER              = 2,
+        LLAMA_COG_TERMINAL_TOOL_REQUIRED         = 3,
+        LLAMA_COG_TERMINAL_WAITING_ON_TOOL       = 4,
+        LLAMA_COG_TERMINAL_BACKGROUND_DEFERRED   = 5,
+        LLAMA_COG_TERMINAL_PRESSURE_NOT_ADMITTED = 6,
+        LLAMA_COG_TERMINAL_INTERNAL_WRITE_READY  = 7,
+        LLAMA_COG_TERMINAL_EMIT_READY            = 8,
+        LLAMA_COG_TERMINAL_GOVERNANCE_BLOCKED    = 9,
+    };
+
+    enum llama_cognitive_tool_flags {
+        LLAMA_COG_TOOL_ACTIVE_ELIGIBLE      = 1u << 0,
+        LLAMA_COG_TOOL_DMN_ELIGIBLE         = 1u << 1,
+        LLAMA_COG_TOOL_SIMULATION_SAFE      = 1u << 2,
+        LLAMA_COG_TOOL_REMEDIATION_SAFE     = 1u << 3,
+        LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT = 1u << 4,
+    };
+
+    enum llama_cognitive_tool_latency_class {
+        LLAMA_COG_TOOL_LATENCY_LOW    = 0,
+        LLAMA_COG_TOOL_LATENCY_MEDIUM = 1,
+        LLAMA_COG_TOOL_LATENCY_HIGH   = 2,
+    };
+
+    enum llama_cognitive_command_kind {
+        LLAMA_COG_COMMAND_NONE            = 0,
+        LLAMA_COG_COMMAND_EMIT_ANSWER     = 1,
+        LLAMA_COG_COMMAND_EMIT_ASK        = 2,
+        LLAMA_COG_COMMAND_INVOKE_TOOL     = 3,
+        LLAMA_COG_COMMAND_INTERNAL_WRITE  = 4,
+        LLAMA_COG_COMMAND_EMIT_BACKGROUND = 5,
+    };
+
+    enum llama_cognitive_command_origin {
+        LLAMA_COG_COMMAND_ORIGIN_ACTIVE = 0,
+        LLAMA_COG_COMMAND_ORIGIN_DMN    = 1,
+    };
+
+    enum llama_cognitive_command_status {
+        LLAMA_COG_COMMAND_STATUS_PENDING   = 0,
+        LLAMA_COG_COMMAND_STATUS_ACKED     = 1,
+        LLAMA_COG_COMMAND_STATUS_COMPLETED = 2,
+        LLAMA_COG_COMMAND_STATUS_CANCELLED = 3,
     };
 
     enum llama_cognitive_reason_flags {
@@ -959,6 +1154,9 @@ extern "C" {
         LLAMA_HARD_MEMORY_MAX_PROFILE_CHARS = 512,
         LLAMA_HARD_MEMORY_QUERY_MAX_CHARS = 256,
         LLAMA_SELF_STATE_MAX_DELTA_DIMS = 8,
+        LLAMA_COGNITIVE_MAX_TOOL_SPECS = 8,
+        LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS = 48,
+        LLAMA_COGNITIVE_MAX_PENDING_COMMANDS = 16,
     };
 
     struct llama_hard_memory_config {
@@ -1101,6 +1299,82 @@ extern "C" {
         char repair_message[LLAMA_REPAIR_MESSAGE_MAX_CHARS];
     };
 
+    struct llama_cognitive_tool_spec {
+        int32_t tool_kind;
+        uint32_t flags;
+        int32_t latency_class;
+        int32_t max_steps_reserved;
+        char name[LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS];
+    };
+
+    struct llama_cognitive_tool_proposal {
+        bool valid;
+        int32_t tool_kind;
+        int32_t spec_index;
+        uint32_t reason_mask;
+        int32_t source_family;
+        uint32_t safety_flags;
+        int32_t expected_steps;
+        float expected_observation_gain;
+        int32_t job_id;
+    };
+
+    struct llama_cognitive_observation {
+        bool valid;
+        int32_t tool_kind;
+        int32_t job_id;
+        int32_t status;
+        float signal;
+        float followup_affinity;
+    };
+
+    struct llama_cognitive_loop_state {
+        int32_t phase;
+        int32_t terminal_reason;
+        int32_t max_steps;
+        int32_t steps_taken;
+        bool continuation_allowed;
+        bool waiting_on_tool;
+        int32_t tool_registry_count;
+    };
+
+    struct llama_cognitive_command {
+        int32_t command_id;
+        int32_t origin;
+        int32_t kind;
+        int32_t status;
+        int32_t episode_id;
+        int32_t tick_id;
+        int32_t tool_kind;
+        int32_t tool_job_id;
+        uint32_t reason_mask;
+        float priority;
+        int32_t source_family;
+        int32_t loop_phase;
+    };
+
+    struct llama_cognitive_active_runner_status {
+        int32_t episode_id;
+        bool active;
+        bool waiting_on_tool;
+        bool completed;
+        int32_t steps_taken;
+        int32_t max_steps;
+        int32_t pending_command_id;
+        int32_t last_command_id;
+    };
+
+    struct llama_cognitive_dmn_runner_status {
+        int32_t tick_id;
+        bool active;
+        bool waiting_on_tool;
+        bool completed;
+        int32_t steps_taken;
+        int32_t max_steps;
+        int32_t pending_command_id;
+        int32_t last_command_id;
+    };
+
     struct llama_active_loop_candidate {
         int32_t action;
         float score;
@@ -1123,6 +1397,9 @@ extern "C" {
         bool emit_allowed;
         bool emit_noted;
         bool tool_followup_expected;
+        struct llama_cognitive_loop_state loop_state;
+        struct llama_cognitive_tool_proposal tool_proposal;
+        struct llama_cognitive_observation observation;
         struct llama_self_state_feature_vector prewrite_features;
         struct llama_self_state_feature_vector postwrite_features;
         int32_t candidate_count;
@@ -1187,6 +1464,9 @@ extern "C" {
         int32_t tool_kind;
         int32_t tool_job_id;
         float favorable_divergence;
+        struct llama_cognitive_loop_state loop_state;
+        struct llama_cognitive_tool_proposal tool_proposal;
+        struct llama_cognitive_observation observation;
     };
 
     // Helpers for getting default parameters
@@ -1583,6 +1863,9 @@ extern "C" {
     LLAMA_API int32_t llama_self_state_get_social_state(
             const struct llama_context * ctx,
             struct llama_self_social_state_info * out_info);
+    LLAMA_API int32_t llama_self_state_get_model_state(
+            const struct llama_context * ctx,
+            struct llama_self_model_state_info * out_info);
     LLAMA_API int32_t llama_self_state_trace_count(const struct llama_context * ctx);
     LLAMA_API int32_t llama_self_state_clear_trace(struct llama_context * ctx);
     LLAMA_API int32_t llama_self_state_replay_trace(struct llama_context * ctx, int32_t upto_count);
@@ -1651,6 +1934,36 @@ extern "C" {
     LLAMA_API int32_t llama_hard_memory_get_last_archive_trace(
             const struct llama_context * ctx,
             struct llama_hard_memory_archive_trace * out_trace);
+
+    LLAMA_API int32_t llama_cognitive_tool_spec_count(
+            const struct llama_context * ctx);
+    LLAMA_API int32_t llama_cognitive_tool_spec_get(
+            const struct llama_context * ctx,
+            int32_t index,
+            struct llama_cognitive_tool_spec * out_spec);
+    LLAMA_API int32_t llama_cognitive_tool_spec_set(
+            struct llama_context * ctx,
+            const struct llama_cognitive_tool_spec * specs,
+            int32_t count);
+    LLAMA_API int32_t llama_cognitive_command_count(
+            const struct llama_context * ctx);
+    LLAMA_API int32_t llama_cognitive_command_get(
+            const struct llama_context * ctx,
+            int32_t index,
+            struct llama_cognitive_command * out_command);
+    LLAMA_API int32_t llama_cognitive_command_ack(
+            struct llama_context * ctx,
+            int32_t command_id);
+    LLAMA_API int32_t llama_cognitive_command_complete(
+            struct llama_context * ctx,
+            int32_t command_id,
+            bool cancelled);
+    LLAMA_API int32_t llama_cognitive_active_runner_get(
+            const struct llama_context * ctx,
+            struct llama_cognitive_active_runner_status * out_status);
+    LLAMA_API int32_t llama_cognitive_dmn_runner_get(
+            const struct llama_context * ctx,
+            struct llama_cognitive_dmn_runner_status * out_status);
 
     // Run the active engagement loop for one user or tool event.
     LLAMA_API int32_t llama_active_loop_process(

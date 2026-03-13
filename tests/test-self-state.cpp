@@ -225,6 +225,12 @@ int main(int argc, char ** argv) {
         llama_model_free(model);
         return 1;
     }
+    if (!llama_self_state_register_name(LLAMA_SELF_REGISTER_ANSWERABILITY)) {
+        std::fprintf(stderr, "missing expanded self-state register name\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
 
     const llama_self_state_time_point t0 = {
         /*.wall_clock_ms =*/ 1700000000000,
@@ -529,6 +535,29 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    llama_self_model_state_info model_state = {};
+    if (llama_self_state_get_model_state(ctx, &model_state) != 0 ||
+        model_state.horizon_count != LLAMA_SELF_HORIZON_COUNT ||
+        !model_state.forecast.valid ||
+        model_state.horizons[LLAMA_SELF_HORIZON_INSTANT].epistemic.answerability <= 0.0f ||
+        model_state.horizons[LLAMA_SELF_HORIZON_SHORT].efficiency.expected_steps_remaining <= 0.0f ||
+        model_state.horizons[LLAMA_SELF_HORIZON_LONG].user_outcome.satisfaction_estimate < 0.0f ||
+        model_state.horizons[LLAMA_SELF_HORIZON_INSTANT].self_improvement.update_worthiness <= 0.0f) {
+        std::fprintf(stderr, "expanded self-model state was not populated\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    if (llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_ANSWERABILITY, &register_info) != 0 ||
+        llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK, &register_info) != 0 ||
+        llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_RECOVERY_URGENCY, &register_info) != 0) {
+        std::fprintf(stderr, "expanded summary registers were not addressable\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
     llama_self_reactivation_info reactivation = {};
     if (llama_self_state_reactivation_count(ctx) <= 0 ||
         llama_self_state_get_reactivation(ctx, 0, &reactivation) != 0 ||
@@ -549,6 +578,16 @@ int main(int argc, char ** argv) {
         llama_self_state_working_memory_count(ctx) != 3 ||
         llama_self_state_trace_count(ctx) != 3) {
         std::fprintf(stderr, "trace replay did not preserve deterministic state\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    if (llama_self_state_get_model_state(ctx, &model_state) != 0 ||
+        !model_state.prediction_error.valid ||
+        model_state.prediction_error.steps_error < 0.0f ||
+        model_state.prediction_error.goal_progress_error < 0.0f) {
+        std::fprintf(stderr, "self-model forecast error trace was not preserved\n");
         llama_free(ctx);
         llama_model_free(model);
         return 1;

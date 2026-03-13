@@ -38,7 +38,8 @@ Current implementation constraints for the active stage:
 - fixed-size means a proportion of currently available host memory and device memory, not a hard-coded byte cap,
 - evicted spans enter the stage through an explicit write path that can be logged and audited,
 - Active updates are represented as normalized low-rank directions plus bounded gain scalars so semantic direction and update magnitude remain separately inspectable,
-- the span-embedding strategy remains swappable, including callback-backed model-specific embedders, so incompatible model families do not force one embedding space on the whole runtime,
+- the default span embedder is now hidden-state-derived from an auxiliary context of the same base model family, while the strategy remains swappable through explicit token-pool, hash, or callback-backed alternatives,
+- the write rule now derives bounded low-rank directions from hidden-state content plus typed self-state features instead of token-identity modulo heuristics,
 - and auxiliary write machinery must fit the same budget discipline rather than hiding extra long-lived memory outside the adapter accounting.
 
 Current implementation constraints for the past stage:
@@ -98,6 +99,11 @@ Both loops share state, but they do not share identical triggers or output polic
 
 - The active loop is externally triggered and optimized for responsiveness, user relevance, and coherent action.
 - The DMN loop is pressure-driven and optimized for reactivation, contradiction surfacing, consolidation, endogenous thought, and strategic follow-up.
+- The runtime now exposes a shared bounded tool-loop substrate under both paths:
+  explicit phase, terminal reason, tool proposal, observation, and tool-registry
+  metadata are public trace surfaces.
+- This is intentionally not "generic ReAct everywhere." The active loop and DMN
+  use different policies on top of the same bounded scaffold.
 
 ### Persistent Self-Core
 
@@ -125,7 +131,12 @@ Current implementation slice:
 - event anchors for user, tool, and emit events drive the first analytic updates for `r_time_phase`, `r_tool_salience`, and `r_channel_state`,
 - explicit prewrite and postwrite feature builders now produce typed feature vectors from token events, decoder stats, and recency state,
 - bounded analytic updates now drive the first register recomputation path,
-- and learned contradiction and uncertainty heads are exposed as optional callback-backed hooks behind explicit flags.
+- learned contradiction and uncertainty heads are exposed as optional callback-backed hooks behind explicit flags,
+- and the self-state now also maintains a layered typed self-model with:
+  - a small expanded fast control bank for `user_satisfaction_risk`, `goal_progress_pressure`, `loop_inefficiency`, `recovery_urgency`, `answerability`, and `preference_uncertainty`,
+  - grouped profile families for goal progress, user outcome, epistemic condition, efficiency, recovery, strategy, and self-improvement readiness,
+  - explicit `instant`, `short`, and `long` horizon slices,
+  - and bounded forecast / prediction-error traces for remaining steps, remaining inference cost, expected user-outcome change, and expected recovery change.
 
 ### Extensibility
 
@@ -151,8 +162,12 @@ Initial register families:
 - Broadcast control: `r_broadcast_pressure`, `r_broadcast_inhibition`, `r_followup_continuation`
 - Memory control: `r_memory_write_priority`, `r_reactivation_priority[...]`
 - Environment and system state: `r_time_phase`, `r_tool_salience`, `r_channel_state`
+- Expanded routing summaries: `r_user_satisfaction_risk`, `r_goal_progress_pressure`, `r_loop_inefficiency`, `r_recovery_urgency`, `r_answerability`, `r_preference_uncertainty`
 
 Registers are updated from embeddings, retrieval geometry, decoder statistics, learned probes, tool/environment deltas, and decayed prior state. They are not raw prompt text.
+
+The register bank is no longer the whole self-model. It is now the fast routing
+surface layered on top of richer typed profile state.
 
 ## Update Order
 
@@ -257,6 +272,12 @@ Current implementation slice:
   `ask`, `act`, and `wait` candidates,
 - foreground episodes run through shared self-state and memory surfaces instead
   of bypassing them in host code,
+- the foreground path is now backed by a bounded planner-executor runner with a
+  persistent episode record, explicit max-step budget, and a host-visible
+  pending-command queue for `emit_answer`, `emit_ask`, and `invoke_tool`,
+- tool completions resume the same foreground episode rather than starting a
+  fresh one, while host completion of a tool command leaves the runner waiting
+  for the actual tool observation,
 - and `llama-server` classifies foreground user versus tool episodes before
   templating and records real outward emission back into the loop trace.
 
@@ -348,6 +369,12 @@ Current implementation slice:
   silently applying them,
 - governance traces now record proposal family, risk tier, evidence, user
   dissatisfaction, recent negative valence, and optional repair messaging,
+- DMN ticks now defer explicitly while foreground runner work is still
+  outstanding, which keeps the background process aligned with idle-mode
+  semantics instead of competing with a live active episode,
+- admitted DMN runs now execute as bounded planner-executors rather than
+  single-step routers: `internal_write` may continue locally within budget and
+  then yield a tool or background emit command through the same public queue,
 - and `llama-server` polls the DMN only from idle states while recording
   foreground deferral when user-facing work is still active.
 

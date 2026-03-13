@@ -98,6 +98,7 @@ public:
     bool upsert_tool_job(int32_t job_id, int32_t status, float importance);
     bool get_tool_state(llama_self_tool_state_info * out_info) const;
     bool get_social_state(llama_self_social_state_info * out_info) const;
+    bool get_model_state(llama_self_model_state_info * out_info) const;
     int32_t trace_count() const;
     bool clear_trace();
     bool replay_trace(const llama_vocab * vocab, int32_t upto_count, int32_t override_channel);
@@ -133,6 +134,9 @@ private:
     void append_trace(const llama_self_state_event & event);
     void bridge_working_memory_to_handles(const std::array<float, 32> & sketch, float salience);
     void update_social_state(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
+    void initialize_model_state();
+    void update_expanded_model(const llama_self_state_event & event, const llama_self_state_feature_vector & features, uint32_t source_mask);
+    void update_summary_registers(uint32_t source_mask);
 
     void recompute_time_surface(uint32_t source_mask);
     void update_scalar_register(int32_t register_id, float value, uint32_t source_mask);
@@ -174,6 +178,9 @@ private:
     float social_reciprocity = 0.5f;
     float social_recent_user_valence = 0.0f;
     float social_dissatisfaction = 0.0f;
+    std::array<llama_self_model_horizon_info, LLAMA_SELF_HORIZON_COUNT> model_horizons = {};
+    llama_self_forecast_trace model_forecast = {};
+    llama_self_prediction_error_trace prediction_error = {};
     std::vector<llama_self_sketch_surface> goals;
     std::vector<llama_self_sketch_surface> commitments;
     std::vector<llama_self_working_memory_item> working_memory;

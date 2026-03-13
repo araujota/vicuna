@@ -1254,6 +1254,21 @@ private:
                         task.active_trace.winner_action,
                         task.active_trace.winner_score,
                         task.active_trace.deferred_background ? 1 : 0);
+                llama_cognitive_active_runner_status runner = {};
+                llama_cognitive_command command = {};
+                if (llama_cognitive_active_runner_get(ctx, &runner) == 0 && runner.pending_command_id > 0) {
+                    for (int32_t i = 0, n = llama_cognitive_command_count(ctx); i < n; ++i) {
+                        if (llama_cognitive_command_get(ctx, i, &command) == 0 &&
+                                command.command_id == runner.pending_command_id) {
+                            SLT_INF(slot, "active runner episode %d command=%d kind=%d status=%d\n",
+                                    runner.episode_id,
+                                    command.command_id,
+                                    command.kind,
+                                    command.status);
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -2080,6 +2095,21 @@ private:
                             dmn_trace.winner_action,
                             dmn_trace.winner_score,
                             dmn_trace.burst_count);
+                    llama_cognitive_dmn_runner_status runner = {};
+                    llama_cognitive_command command = {};
+                    if (llama_cognitive_dmn_runner_get(ctx, &runner) == 0 && runner.pending_command_id > 0) {
+                        for (int32_t i = 0, n = llama_cognitive_command_count(ctx); i < n; ++i) {
+                            if (llama_cognitive_command_get(ctx, i, &command) == 0 &&
+                                    command.command_id == runner.pending_command_id) {
+                                SRV_INF("dmn runner tick %d command=%d kind=%d status=%d\n",
+                                        runner.tick_id,
+                                        command.command_id,
+                                        command.kind,
+                                        command.status);
+                                break;
+                            }
+                        }
+                    }
                 }
                 SRV_INF("%s", "all slots are idle\n");
 

@@ -122,7 +122,9 @@ struct llama_context {
 
     bool active_lora_init(const llama_active_lora_params & params);
     bool active_lora_ingest(const llama_token * tokens, size_t n_tokens);
+    bool active_lora_ingest(const llama_self_state_event & event, const llama_self_state_feature_vector * features = nullptr);
     bool active_lora_remediate(const llama_token * tokens, size_t n_tokens, float budget_scale);
+    bool active_lora_remediate(const llama_self_state_event & event, float budget_scale, const llama_self_state_feature_vector * features = nullptr);
     bool active_lora_get_stats(llama_active_lora_stats * out_stats) const;
     bool past_lora_init(const llama_past_lora_params & params);
     bool past_lora_tick(uint64_t now_us);
@@ -152,6 +154,7 @@ struct llama_context {
     bool self_state_upsert_tool_job(int32_t job_id, int32_t status, float importance);
     bool self_state_get_tool_state(llama_self_tool_state_info * out_info) const;
     bool self_state_get_social_state(llama_self_social_state_info * out_info) const;
+    bool self_state_get_model_state(llama_self_model_state_info * out_info) const;
     int32_t self_state_trace_count() const;
     bool self_state_clear_trace();
     bool self_state_replay_trace(int32_t upto_count);
@@ -172,6 +175,15 @@ struct llama_context {
     bool hard_memory_query(const llama_hard_memory_query_request & query, llama_hard_memory_result * out_result);
     bool hard_memory_get_last_result(llama_hard_memory_result * out_result) const;
     bool hard_memory_get_last_archive_trace(llama_hard_memory_archive_trace * out_trace) const;
+    int32_t cognitive_tool_spec_count() const;
+    bool cognitive_tool_spec_get(int32_t index, llama_cognitive_tool_spec * out_spec) const;
+    bool cognitive_tool_spec_set(const llama_cognitive_tool_spec * specs, int32_t count);
+    int32_t cognitive_command_count() const;
+    bool cognitive_command_get(int32_t index, llama_cognitive_command * out_command) const;
+    bool cognitive_command_ack(int32_t command_id);
+    bool cognitive_command_complete(int32_t command_id, bool cancelled);
+    bool cognitive_active_runner_get(llama_cognitive_active_runner_status * out_status) const;
+    bool cognitive_dmn_runner_get(llama_cognitive_dmn_runner_status * out_status) const;
     bool active_loop_process(const llama_self_state_event & event, llama_active_loop_trace * out_trace);
     bool active_loop_note_emit(int32_t episode_id, size_t emitted_text_bytes);
     bool active_loop_get_last_trace(llama_active_loop_trace * out_trace) const;

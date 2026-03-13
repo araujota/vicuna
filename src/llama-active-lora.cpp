@@ -127,12 +127,121 @@ struct active_lora_embedding {
     float norm = 0.0f;
 };
 
+struct llama_context_deleter {
+    void operator()(llama_context * ctx) const {
+        if (ctx) {
+            llama_free(ctx);
+        }
+    }
+};
+
+using llama_context_ptr = std::unique_ptr<llama_context, llama_context_deleter>;
+
+struct active_lora_write_features {
+    std::vector<float> content_signal;
+    std::vector<float> state_signal;
+    float update_emphasis = 0.0f;
+    float goal_alignment = 0.0f;
+    float repair_pressure = 0.0f;
+    float social_alignment = 0.0f;
+};
+
+void normalize_vector(std::vector<float> & vec);
+
+static uint64_t mix_seed(uint64_t value) {
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33;
+    value *= 0xc4ceb9fe1a85ec53ULL;
+    value ^= value >> 33;
+    return value;
+}
+
+static float decoder_entropy_feature(float entropy) {
+    if (entropy <= 0.0f) {
+        return 0.0f;
+    }
+    return entropy / (entropy + 1.0f);
+}
+
+static float sample_signal(const std::vector<float> & signal, size_t index, uint64_t seed) {
+    if (signal.empty()) {
+        return 0.0f;
+    }
+
+    const size_t n = signal.size();
+    const size_t base = seed % n;
+    const size_t stride = ((seed >> 17) % n) | size_t(1);
+    const float first = signal[(base + index * stride) % n];
+    if (n == 1) {
+        return first;
+    }
+
+    const float second = signal[(base + index * (stride + 2) + 1) % n];
+    const float third = signal[(base + index * (stride + 4) + 3) % n];
+    const float sign = ((seed >> 41) & 1ULL) ? -1.0f : 1.0f;
+    return 0.60f * first + 0.30f * second + 0.10f * third * sign;
+}
+
+static std::vector<float> project_signal(const std::vector<float> & src, size_t out_dim, uint64_t seed) {
+    std::vector<float> out(out_dim, 0.0f);
+    if (src.empty() || out_dim == 0) {
+        return out;
+    }
+
+    if (src.size() == out_dim) {
+        out = src;
+    } else {
+        for (size_t i = 0; i < out_dim; ++i) {
+            out[i] = sample_signal(src, i, seed + i * 0x9e3779b97f4a7c15ULL);
+        }
+    }
+
+    normalize_vector(out);
+    return out;
+}
+
+static uint64_t hash_signal_prefix(const std::vector<float> & signal, size_t limit, uint64_t seed) {
+    uint64_t hash = mix_seed(seed ^ 1469598103934665603ULL);
+    for (size_t i = 0; i < std::min(limit, signal.size()); ++i) {
+        const int32_t quantized = static_cast<int32_t>(std::lrint(signal[i] * 4096.0f));
+        hash ^= static_cast<uint32_t>(quantized);
+        hash *= 1099511628211ULL;
+        hash = mix_seed(hash + i);
+    }
+    return hash;
+}
+
+static size_t parse_layer_index(const std::string & tensor_name) {
+    const std::string marker = "blk.";
+    const size_t pos = tensor_name.find(marker);
+    if (pos == std::string::npos) {
+        return std::numeric_limits<size_t>::max();
+    }
+
+    size_t value = 0;
+    bool saw_digit = false;
+    for (size_t i = pos + marker.size(); i < tensor_name.size(); ++i) {
+        const char ch = tensor_name[i];
+        if (ch < '0' || ch > '9') {
+            break;
+        }
+        saw_digit = true;
+        value = value * 10 + static_cast<size_t>(ch - '0');
+    }
+
+    return saw_digit ? value : std::numeric_limits<size_t>::max();
+}
+
 class active_lora_embedder {
 public:
     virtual ~active_lora_embedder() = default;
     virtual int32_t type() const = 0;
     virtual bool is_custom() const = 0;
     virtual uint32_t dim() const = 0;
+    virtual bool ready() const {
+        return dim() > 0;
+    }
     virtual active_lora_embedding embed(const llama_token * tokens, size_t n_tokens) const = 0;
 };
 
@@ -260,6 +369,157 @@ private:
     int32_t declared_type = LLAMA_ACTIVE_LORA_EMBEDDING_HASH;
 };
 
+class active_lora_hidden_state_embedder final : public active_lora_embedder {
+public:
+    active_lora_hidden_state_embedder(const llama_context & owner, const llama_active_lora_params & params) :
+        owner(owner) {
+        const auto & cparams = owner.get_cparams();
+        llama_context_params aux_params = llama_context_default_params();
+        const uint32_t planned_tokens = std::max<uint32_t>(8, params.train_context_tokens);
+        const uint32_t aux_ctx_tokens = std::max<uint32_t>(
+                16,
+                std::min<uint32_t>(std::max<uint32_t>(planned_tokens, params.train_stride_tokens + 1), cparams.n_ctx));
+
+        aux_params.n_ctx = aux_ctx_tokens;
+        aux_params.n_batch = aux_ctx_tokens;
+        aux_params.n_ubatch = aux_ctx_tokens;
+        aux_params.n_seq_max = 1;
+        aux_params.n_threads = cparams.n_threads;
+        aux_params.n_threads_batch = cparams.n_threads_batch;
+        aux_params.rope_freq_base = cparams.rope_freq_base;
+        aux_params.rope_freq_scale = cparams.rope_freq_scale;
+        aux_params.yarn_orig_ctx = cparams.n_ctx_orig_yarn;
+        aux_params.yarn_ext_factor = cparams.yarn_ext_factor;
+        aux_params.yarn_attn_factor = cparams.yarn_attn_factor;
+        aux_params.yarn_beta_fast = cparams.yarn_beta_fast;
+        aux_params.yarn_beta_slow = cparams.yarn_beta_slow;
+        aux_params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        aux_params.embeddings = true;
+        aux_params.offload_kqv = cparams.offload_kqv;
+        aux_params.no_perf = true;
+        aux_params.op_offload = cparams.op_offload;
+        aux_params.kv_unified = cparams.kv_unified;
+
+        aux_ctx.reset(llama_init_from_model(const_cast<llama_model *>(&owner.get_model()), aux_params));
+        if (!aux_ctx) {
+            return;
+        }
+
+        llama_set_embeddings(aux_ctx.get(), true);
+        source_dim = static_cast<uint32_t>(std::max(0, llama_model_n_embd_out(&owner.get_model())));
+        embedding_dim = params.embedding_dim ? params.embedding_dim : source_dim;
+        chunk_tokens = std::max<uint32_t>(1, std::min<uint32_t>(aux_ctx_tokens, planned_tokens));
+        stride_tokens = params.train_stride_tokens == 0 ? chunk_tokens : std::min<uint32_t>(chunk_tokens, params.train_stride_tokens);
+    }
+
+    int32_t type() const override {
+        return LLAMA_ACTIVE_LORA_EMBEDDING_HIDDEN_STATE;
+    }
+
+    bool is_custom() const override {
+        return false;
+    }
+
+    uint32_t dim() const override {
+        return embedding_dim;
+    }
+
+    bool ready() const override {
+        return aux_ctx && source_dim > 0 && embedding_dim > 0;
+    }
+
+    active_lora_embedding embed(const llama_token * tokens, size_t n_tokens) const override {
+        active_lora_embedding result;
+        if (!ready() || !tokens || n_tokens == 0) {
+            return result;
+        }
+
+        result.values.assign(embedding_dim, 0.0f);
+        uint32_t chunks = 0;
+        size_t offset = 0;
+
+        while (offset < n_tokens) {
+            const size_t count = std::min<size_t>(chunk_tokens, n_tokens - offset);
+            llama_memory_clear(llama_get_memory(aux_ctx.get()), true);
+
+            llama_batch batch = llama_batch_init(static_cast<int32_t>(count), 0, 1);
+            batch.n_tokens = static_cast<int32_t>(count);
+            for (size_t i = 0; i < count; ++i) {
+                batch.token[i] = tokens[offset + i];
+                batch.pos[i] = static_cast<llama_pos>(i);
+                batch.n_seq_id[i] = 1;
+                batch.seq_id[i][0] = 0;
+                batch.logits[i] = 1;
+            }
+            const int32_t decode_rc = llama_decode(aux_ctx.get(), batch);
+            llama_batch_free(batch);
+            if (decode_rc != 0) {
+                result.values.clear();
+                result.norm = 0.0f;
+                return result;
+            }
+
+            std::vector<float> chunk_values(source_dim, 0.0f);
+            uint32_t seen = 0;
+            for (size_t i = 0; i < count; ++i) {
+                const float * token_embedding = llama_get_embeddings_ith(aux_ctx.get(), static_cast<int32_t>(i));
+                if (!token_embedding) {
+                    continue;
+                }
+
+                float token_norm = 0.0f;
+                for (uint32_t d = 0; d < source_dim; ++d) {
+                    token_norm += token_embedding[d] * token_embedding[d];
+                }
+                token_norm = std::sqrt(token_norm);
+                const float scale = token_norm > DIRECTION_EPS ? 1.0f / token_norm : 1.0f;
+                for (uint32_t d = 0; d < source_dim; ++d) {
+                    chunk_values[d] += token_embedding[d] * scale;
+                }
+                ++seen;
+            }
+
+            if (seen > 0) {
+                for (float & value : chunk_values) {
+                    value /= static_cast<float>(seen);
+                }
+                std::vector<float> projected = project_signal(chunk_values, embedding_dim, 0x6a09e667f3bcc909ULL + chunks);
+                for (uint32_t d = 0; d < embedding_dim; ++d) {
+                    result.values[d] += projected[d];
+                }
+                ++chunks;
+            }
+
+            if (offset + count >= n_tokens) {
+                break;
+            }
+            const size_t step = stride_tokens == 0 ? count : std::max<size_t>(1, stride_tokens);
+            offset += std::min(step, count);
+        }
+
+        if (chunks == 0) {
+            result.values.clear();
+            return result;
+        }
+
+        float sum_sq = 0.0f;
+        for (float & value : result.values) {
+            value /= static_cast<float>(chunks);
+            sum_sq += value * value;
+        }
+        result.norm = std::sqrt(sum_sq);
+        return result;
+    }
+
+private:
+    const llama_context & owner;
+    llama_context_ptr aux_ctx;
+    uint32_t source_dim = 0;
+    uint32_t embedding_dim = 0;
+    uint32_t chunk_tokens = 0;
+    uint32_t stride_tokens = 0;
+};
+
 std::unique_ptr<active_lora_embedder> make_embedder(const llama_context & owner, const llama_active_lora_params & params) {
     if (params.embedding_callback != nullptr) {
         return std::make_unique<active_lora_callback_embedder>(
@@ -271,6 +531,16 @@ std::unique_ptr<active_lora_embedder> make_embedder(const llama_context & owner,
     }
 
     switch (params.embedding_type) {
+        case LLAMA_ACTIVE_LORA_EMBEDDING_HIDDEN_STATE:
+            {
+                auto embedder = std::make_unique<active_lora_hidden_state_embedder>(owner, params);
+                if (embedder->ready()) {
+                    return embedder;
+                }
+
+                LLAMA_LOG_WARN("%s: hidden-state embedder unavailable, falling back to hash embedder\n", __func__);
+                return std::make_unique<active_lora_hash_embedder>();
+            }
         case LLAMA_ACTIVE_LORA_EMBEDDING_TOKEN_POOL:
             return std::make_unique<active_lora_token_pool_embedder>();
         case LLAMA_ACTIVE_LORA_EMBEDDING_HASH:
@@ -791,6 +1061,162 @@ struct llama_active_lora_manager::impl {
     bool initialized = false;
     bool past_initialized = false;
 
+    llama_self_state_event default_event(
+            const llama_token * tokens,
+            size_t n_tokens,
+            bool remediation) const {
+        return {
+            /*.tokens =*/ tokens,
+            /*.n_tokens =*/ n_tokens,
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
+            /*.channel =*/ remediation ? LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL : LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
+            /*.decoder_entropy =*/ 0.0f,
+            /*.decoder_top_margin =*/ remediation ? 1.0f : 0.85f,
+        };
+    }
+
+    active_lora_write_features build_write_features(
+            const active_lora_embedding & embedding,
+            const llama_self_state_event & event,
+            const llama_self_state_feature_vector * provided_features,
+            bool remediation) const {
+        active_lora_write_features result;
+        result.content_signal = embedding.values;
+        normalize_vector(result.content_signal);
+
+        llama_self_state_feature_vector features = {};
+        bool have_features = false;
+        if (provided_features) {
+            features = *provided_features;
+            have_features = true;
+        } else {
+            have_features = owner.self_state_build_postwrite_features(event, &features);
+        }
+
+        if (!have_features) {
+            result.state_signal = {
+                clamp_unit(static_cast<float>(std::log1p(static_cast<double>(event.n_tokens)) / 6.0)),
+                event.role == LLAMA_SELF_STATE_EVENT_USER ? 1.0f : 0.0f,
+                event.role == LLAMA_SELF_STATE_EVENT_TOOL ? 1.0f : 0.0f,
+                event.role == LLAMA_SELF_STATE_EVENT_SYSTEM ? 1.0f : 0.0f,
+                event.channel == LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL ? 1.0f : 0.0f,
+                remediation ? 1.0f : 0.0f,
+                decoder_entropy_feature(event.decoder_entropy),
+                clamp_unit(1.0f - event.decoder_top_margin),
+            };
+            normalize_vector(result.state_signal);
+            result.update_emphasis = remediation ? 0.75f : 0.55f;
+            result.goal_alignment = remediation ? 0.60f : 0.40f;
+            result.repair_pressure = remediation ? 0.70f : 0.30f;
+            result.social_alignment = event.role == LLAMA_SELF_STATE_EVENT_USER ? 0.65f : 0.45f;
+            return result;
+        }
+
+        result.goal_alignment = clamp_unit(
+                0.45f * features.goal_top_similarity +
+                0.20f * features.commitment_top_similarity +
+                0.15f * features.social_trust +
+                0.10f * features.social_reciprocity +
+                0.10f * (1.0f - features.negative_user_valence));
+        result.repair_pressure = clamp_unit(
+                0.35f * features.contradiction_score +
+                0.25f * features.uncertainty_score +
+                0.20f * features.followup_hint +
+                0.10f * features.tool_pending_pressure +
+                0.10f * (1.0f - features.social_trust));
+        result.social_alignment = clamp_unit(
+                0.35f * features.social_trust +
+                0.20f * features.social_reciprocity +
+                0.15f * features.social_familiarity +
+                0.15f * (1.0f - features.negative_user_valence) +
+                0.15f * features.broadcast_inhibition_hint);
+        result.update_emphasis = clamp_unit(
+                0.15f +
+                0.18f * features.novelty +
+                0.18f * features.memory_write_pressure +
+                0.17f * result.goal_alignment +
+                0.12f * result.social_alignment +
+                0.10f * features.tool_pending_pressure +
+                0.10f * (remediation ? result.repair_pressure : 0.0f));
+
+        result.state_signal = {
+            clamp_unit(features.novelty),
+            clamp_unit(features.topic_shift),
+            clamp_unit(features.goal_top_similarity),
+            clamp_unit(features.commitment_top_similarity),
+            clamp_unit(features.working_memory_top_similarity),
+            clamp_unit(features.memory_handle_top_similarity),
+            clamp_unit(features.social_trust),
+            clamp_unit(features.social_reciprocity),
+            clamp_unit(features.tool_readiness_score),
+            clamp_unit(features.tool_pending_pressure),
+            clamp_unit(features.contradiction_score),
+            clamp_unit(features.uncertainty_score),
+            clamp_unit(features.memory_write_pressure),
+            clamp_unit(features.broadcast_pressure_hint),
+            clamp_unit(features.broadcast_inhibition_hint),
+            clamp_unit(features.followup_hint),
+            clamp_unit(features.negative_user_valence),
+            clamp_unit(1.0f - features.negative_user_valence),
+            clamp_unit(result.goal_alignment),
+            clamp_unit(result.repair_pressure),
+            clamp_unit(result.social_alignment),
+            event.role == LLAMA_SELF_STATE_EVENT_USER ? 1.0f : 0.0f,
+            event.role == LLAMA_SELF_STATE_EVENT_TOOL ? 1.0f : 0.0f,
+            event.role == LLAMA_SELF_STATE_EVENT_SYSTEM ? 1.0f : 0.0f,
+            event.channel == LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL ? 1.0f : 0.0f,
+            (event.flags & LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED) ? 1.0f : 0.0f,
+            remediation ? 1.0f : 0.0f,
+            decoder_entropy_feature(event.decoder_entropy),
+            clamp_unit(1.0f - event.decoder_top_margin),
+        };
+        normalize_vector(result.state_signal);
+        return result;
+    }
+
+    size_t select_slot(const active_lora_write_features & features, size_t rank) const {
+        if (rank == 0) {
+            return 0;
+        }
+
+        uint64_t hash = hash_signal_prefix(features.content_signal, 24, 0x243f6a8885a308d3ULL);
+        hash ^= hash_signal_prefix(features.state_signal, 24, 0x13198a2e03707344ULL);
+        return static_cast<size_t>(hash % rank);
+    }
+
+    float tensor_update_scale(
+            const std::string & tensor_name,
+            const active_lora_write_features & features,
+            bool remediation) const {
+        float scale = 0.55f + 0.70f * features.update_emphasis;
+
+        const bool is_attention = tensor_name.find("attn") != std::string::npos ||
+                tensor_name.find("wq") != std::string::npos ||
+                tensor_name.find("wv") != std::string::npos ||
+                tensor_name.find("wo") != std::string::npos ||
+                tensor_name.find("wqkv") != std::string::npos;
+        const bool is_mlp = tensor_name.find("ffn") != std::string::npos;
+        if (is_attention) {
+            scale *= 0.90f + 0.40f * std::max(features.goal_alignment, remediation ? features.repair_pressure : features.social_alignment);
+        } else if (is_mlp) {
+            scale *= 0.85f + 0.35f * (0.5f * features.goal_alignment + 0.5f * features.social_alignment);
+        }
+
+        const size_t layer_index = parse_layer_index(tensor_name);
+        if (layer_index != std::numeric_limits<size_t>::max()) {
+            const float denom = static_cast<float>(std::max<int32_t>(1, owner.get_model().hparams.n_layer - 1));
+            const float layer_ratio = static_cast<float>(layer_index) / denom;
+            scale *= 0.70f + 0.30f * layer_ratio;
+        }
+
+        if (remediation) {
+            scale *= 0.90f + 0.35f * features.repair_pressure;
+        }
+
+        return std::max(0.0f, scale);
+    }
+
     uint32_t compute_rank(
             uint64_t host_budget_bytes,
             uint64_t device_budget_bytes,
@@ -859,16 +1285,15 @@ struct llama_active_lora_manager::impl {
 
     bool train_on_span(
             const active_lora_embedding & embedding,
-            const llama_token * tokens,
-            size_t n_tokens,
-            float budget_scale) const {
-        if (embedding.values.empty() || n_tokens == 0 || !adapter) {
+            const active_lora_write_features & write_features,
+            float budget_scale,
+            bool remediation) const {
+        if (embedding.values.empty() || !adapter) {
             return false;
         }
 
-        const float token_scale = 1.0f / std::max<size_t>(1, n_tokens);
         const float base_scale = params.learning_rate > 0.0f ? params.learning_rate : 1.0e-4f;
-        const float update_scale = base_scale * clamp_unit(budget_scale);
+        const float update_scale = base_scale * clamp_unit(budget_scale) * std::max(0.15f, write_features.update_emphasis);
         if (update_scale <= 0.0f) {
             return false;
         }
@@ -890,20 +1315,85 @@ struct llama_active_lora_manager::impl {
             ggml_backend_tensor_get(tensor_a, data_a.data(), 0, data_a.size() * sizeof(float));
             ggml_backend_tensor_get(tensor_b, data_b.data(), 0, data_b.size() * sizeof(float));
 
-            const size_t slot = updates_seen % ne1_a;
+            const size_t slot = select_slot(write_features, ne1_a);
+            const float tensor_scale = update_scale * tensor_update_scale(it.first, write_features, remediation);
+            if (tensor_scale <= 0.0f) {
+                continue;
+            }
+
+            if (params.weight_decay > 0.0f) {
+                const float decay = std::max(0.0f, 1.0f - std::min(0.95f, params.weight_decay));
+                for (float & value : data_a) {
+                    value *= decay;
+                }
+                for (float & value : data_b) {
+                    value *= decay;
+                }
+            }
+
+            const uint64_t right_seed = hash_signal_prefix(write_features.content_signal, 16, mix_seed(hash_signal_prefix(write_features.state_signal, 16, 0x9e3779b97f4a7c15ULL) + slot));
+            const uint64_t left_seed = mix_seed(right_seed ^ hash_signal_prefix(write_features.state_signal, 16, 0xbf58476d1ce4e5b9ULL));
             for (size_t i = 0; i < ne0_a; ++i) {
-                const float emb = embedding.values[i % embedding.values.size()];
-                data_a[slot*ne0_a + i] += update_scale * emb;
+                const float content = sample_signal(write_features.content_signal, i, right_seed);
+                const float state = sample_signal(write_features.state_signal, i, right_seed ^ 0x94d049bb133111ebULL);
+                data_a[slot*ne0_a + i] += tensor_scale * (0.78f * content + 0.22f * state);
             }
 
             for (size_t j = 0; j < ne1_b; ++j) {
-                const float tok = static_cast<float>(tokens[j % n_tokens] % 1024) * token_scale;
-                data_b[j*ne0_b + slot] += update_scale * tok;
+                const float steer = sample_signal(write_features.state_signal, j, left_seed);
+                const float content = sample_signal(write_features.content_signal, j, left_seed ^ 0xd6e8feb86659fd93ULL);
+                data_b[j*ne0_b + slot] += tensor_scale * (0.65f * steer + 0.35f * content);
             }
 
             ggml_backend_tensor_set(tensor_a, data_a.data(), 0, data_a.size() * sizeof(float));
             ggml_backend_tensor_set(tensor_b, data_b.data(), 0, data_b.size() * sizeof(float));
-            normalize_active_weight(it.second, update_scale, params.gain_decay, params.gain_max);
+            normalize_active_weight(it.second, tensor_scale, params.gain_decay, params.gain_max);
+        }
+
+        return true;
+    }
+
+    bool apply_write(
+            const llama_self_state_event & event,
+            const llama_self_state_feature_vector * features,
+            float budget_scale,
+            bool remediation) {
+        if (!event.tokens || event.n_tokens == 0) {
+            return false;
+        }
+
+        const active_lora_embedding embedding = embedder->embed(event.tokens, event.n_tokens);
+        if (embedding.values.empty()) {
+            return false;
+        }
+
+        if (!remediation) {
+            const float similarity = cosine_similarity(embedding, last_embedding);
+            if (similarity > 0.995f) {
+                LLAMA_LOG_INFO("%s: skipping Active LoRA write for highly redundant span (cos=%.4f)\n", __func__, similarity);
+                return true;
+            }
+        }
+
+        const active_lora_write_features write_features = build_write_features(embedding, event, features, remediation);
+        if (!train_on_span(embedding, write_features, budget_scale, remediation)) {
+            return false;
+        }
+
+        last_embedding = embedding;
+        stats.updates_applied++;
+        stats.tokens_ingested += event.n_tokens;
+        updates_seen++;
+        stats.rollover_ready = updates_seen >= params.max_updates_before_rollover;
+        active_last_update_us = llama_time_us();
+        update_active_gain_stats();
+
+        if (remediation) {
+            LLAMA_LOG_INFO("%s: Active LoRA remediation applied (%zu tokens, budget=%.3f, update=%u)\n",
+                    __func__, event.n_tokens, budget_scale, stats.updates_applied);
+        } else {
+            LLAMA_LOG_INFO("%s: Active LoRA write accepted (%zu tokens, update=%u, rollover_ready=%s)\n",
+                    __func__, event.n_tokens, stats.updates_applied, stats.rollover_ready ? "true" : "false");
         }
 
         return true;
@@ -1217,57 +1707,22 @@ bool llama_active_lora_manager::init_past(const llama_past_lora_params & params)
 }
 
 bool llama_active_lora_manager::ingest(const llama_token * tokens, size_t n_tokens) {
-    if (!pimpl->initialized || !tokens || n_tokens == 0) {
-        return false;
-    }
+    return pimpl->initialized && pimpl->apply_write(pimpl->default_event(tokens, n_tokens, false), nullptr, 1.0f, false);
+}
 
-    const active_lora_embedding embedding = pimpl->embedder->embed(tokens, n_tokens);
-    const float similarity = cosine_similarity(embedding, pimpl->last_embedding);
-    if (similarity > 0.995f) {
-        LLAMA_LOG_INFO("%s: skipping Active LoRA write for highly redundant span (cos=%.4f)\n", __func__, similarity);
-        return true;
-    }
-
-    if (!pimpl->train_on_span(embedding, tokens, n_tokens, 1.0f)) {
-        return false;
-    }
-
-    pimpl->last_embedding = embedding;
-    pimpl->stats.updates_applied++;
-    pimpl->stats.tokens_ingested += n_tokens;
-    pimpl->updates_seen++;
-    pimpl->stats.rollover_ready = pimpl->updates_seen >= pimpl->params.max_updates_before_rollover;
-    pimpl->active_last_update_us = llama_time_us();
-    pimpl->update_active_gain_stats();
-
-    LLAMA_LOG_INFO("%s: Active LoRA write accepted (%zu tokens, update=%u, rollover_ready=%s)\n",
-            __func__, n_tokens, pimpl->stats.updates_applied, pimpl->stats.rollover_ready ? "true" : "false");
-
-    return true;
+bool llama_active_lora_manager::ingest(const llama_self_state_event & event, const llama_self_state_feature_vector * features) {
+    return pimpl->initialized && pimpl->apply_write(event, features, 1.0f, false);
 }
 
 bool llama_active_lora_manager::remediate(const llama_token * tokens, size_t n_tokens, float budget_scale) {
-    if (!pimpl->initialized || !tokens || n_tokens == 0) {
-        return false;
-    }
+    return pimpl->initialized && pimpl->apply_write(pimpl->default_event(tokens, n_tokens, true), nullptr, budget_scale, true);
+}
 
-    const active_lora_embedding embedding = pimpl->embedder->embed(tokens, n_tokens);
-    if (!pimpl->train_on_span(embedding, tokens, n_tokens, budget_scale)) {
-        return false;
-    }
-
-    pimpl->last_embedding = embedding;
-    pimpl->stats.updates_applied++;
-    pimpl->stats.tokens_ingested += n_tokens;
-    pimpl->updates_seen++;
-    pimpl->stats.rollover_ready = pimpl->updates_seen >= pimpl->params.max_updates_before_rollover;
-    pimpl->active_last_update_us = llama_time_us();
-    pimpl->update_active_gain_stats();
-
-    LLAMA_LOG_INFO("%s: Active LoRA remediation applied (%zu tokens, budget=%.3f, update=%u)\n",
-            __func__, n_tokens, budget_scale, pimpl->stats.updates_applied);
-
-    return true;
+bool llama_active_lora_manager::remediate(
+        const llama_self_state_event & event,
+        float budget_scale,
+        const llama_self_state_feature_vector * features) {
+    return pimpl->initialized && pimpl->apply_write(event, features, budget_scale, true);
 }
 
 bool llama_active_lora_manager::get_stats(llama_active_lora_stats * out_stats) const {

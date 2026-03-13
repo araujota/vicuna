@@ -286,6 +286,191 @@ static void set_repair_message(llama_governance_trace & trace, const std::string
     trace.repair_message_length = (int32_t) copy_len;
 }
 
+static void set_bounded_cstr(char * dst, size_t dst_size, const char * src) {
+    if (!dst || dst_size == 0) {
+        return;
+    }
+    std::memset(dst, 0, dst_size);
+    if (!src) {
+        return;
+    }
+    const size_t copy_len = std::min(std::strlen(src), dst_size - 1);
+    std::memcpy(dst, src, copy_len);
+}
+
+static llama_cognitive_tool_spec make_tool_spec(
+        int32_t tool_kind,
+        uint32_t flags,
+        int32_t latency_class,
+        int32_t max_steps_reserved,
+        const char * name) {
+    llama_cognitive_tool_spec spec = {};
+    spec.tool_kind = tool_kind;
+    spec.flags = flags;
+    spec.latency_class = latency_class;
+    spec.max_steps_reserved = max_steps_reserved;
+    set_bounded_cstr(spec.name, sizeof(spec.name), name);
+    return spec;
+}
+
+static int32_t find_tool_spec_index(
+        const llama_cognitive_tool_spec * specs,
+        int32_t spec_count,
+        int32_t tool_kind) {
+    for (int32_t i = 0; i < spec_count; ++i) {
+        if (specs[i].tool_kind == tool_kind) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static const llama_cognitive_tool_spec * find_tool_spec(
+        const llama_cognitive_tool_spec * specs,
+        int32_t spec_count,
+        int32_t tool_kind,
+        int32_t * out_index = nullptr) {
+    const int32_t index = find_tool_spec_index(specs, spec_count, tool_kind);
+    if (out_index) {
+        *out_index = index;
+    }
+    return index >= 0 ? &specs[index] : nullptr;
+}
+
+static void set_loop_state(
+        llama_cognitive_loop_state & state,
+        int32_t phase,
+        int32_t terminal_reason,
+        int32_t max_steps,
+        int32_t steps_taken,
+        bool continuation_allowed,
+        bool waiting_on_tool,
+        int32_t tool_registry_count) {
+    state.phase = phase;
+    state.terminal_reason = terminal_reason;
+    state.max_steps = max_steps;
+    state.steps_taken = steps_taken;
+    state.continuation_allowed = continuation_allowed;
+    state.waiting_on_tool = waiting_on_tool;
+    state.tool_registry_count = tool_registry_count;
+}
+
+static void set_tool_proposal(
+        llama_cognitive_tool_proposal & proposal,
+        const llama_cognitive_tool_spec * spec,
+        int32_t spec_index,
+        int32_t tool_kind,
+        uint32_t reason_mask,
+        int32_t source_family,
+        int32_t expected_steps,
+        float expected_observation_gain,
+        int32_t job_id) {
+    proposal.valid = tool_kind != LLAMA_TOOL_KIND_NONE;
+    proposal.tool_kind = tool_kind;
+    proposal.spec_index = spec_index;
+    proposal.reason_mask = reason_mask;
+    proposal.source_family = source_family;
+    proposal.safety_flags = spec ? spec->flags : 0u;
+    proposal.expected_steps = expected_steps;
+    proposal.expected_observation_gain = clamp_unit(expected_observation_gain);
+    proposal.job_id = job_id;
+}
+
+static void set_observation(
+        llama_cognitive_observation & observation,
+        bool valid,
+        int32_t tool_kind,
+        int32_t job_id,
+        int32_t status,
+        float signal,
+        float followup_affinity) {
+    observation.valid = valid;
+    observation.tool_kind = tool_kind;
+    observation.job_id = job_id;
+    observation.status = status;
+    observation.signal = clamp_unit(signal);
+    observation.followup_affinity = clamp_unit(followup_affinity);
+}
+
+static int32_t find_command_index(
+        const llama_cognitive_command * queue,
+        int32_t count,
+        int32_t command_id) {
+    for (int32_t i = 0; i < count; ++i) {
+        if (queue[i].command_id == command_id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool has_command_origin(
+        const llama_cognitive_command * queue,
+        int32_t count,
+        int32_t origin) {
+    for (int32_t i = 0; i < count; ++i) {
+        if (queue[i].origin == origin &&
+                (queue[i].status == LLAMA_COG_COMMAND_STATUS_PENDING ||
+                 queue[i].status == LLAMA_COG_COMMAND_STATUS_ACKED)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void compact_command_queue(
+        llama_cognitive_command * queue,
+        int32_t * count) {
+    if (!queue || !count) {
+        return;
+    }
+
+    int32_t write = 0;
+    for (int32_t read = 0; read < *count; ++read) {
+        const bool keep =
+                queue[read].status != LLAMA_COG_COMMAND_STATUS_COMPLETED &&
+                queue[read].status != LLAMA_COG_COMMAND_STATUS_CANCELLED;
+        if (keep) {
+            if (write != read) {
+                queue[write] = queue[read];
+            }
+            ++write;
+        }
+    }
+
+    for (int32_t i = write; i < *count; ++i) {
+        queue[i] = {};
+    }
+    *count = write;
+}
+
+static void init_command(
+        llama_cognitive_command & command,
+        int32_t command_id,
+        int32_t origin,
+        int32_t kind,
+        int32_t episode_id,
+        int32_t tick_id,
+        int32_t tool_kind,
+        int32_t tool_job_id,
+        uint32_t reason_mask,
+        float priority,
+        int32_t source_family,
+        int32_t loop_phase) {
+    command.command_id = command_id;
+    command.origin = origin;
+    command.kind = kind;
+    command.status = LLAMA_COG_COMMAND_STATUS_PENDING;
+    command.episode_id = episode_id;
+    command.tick_id = tick_id;
+    command.tool_kind = tool_kind;
+    command.tool_job_id = tool_job_id;
+    command.reason_mask = reason_mask;
+    command.priority = clamp_unit(priority);
+    command.source_family = source_family;
+    command.loop_phase = loop_phase;
+}
+
 static std::vector<llama_token> tokenize_text(const llama_vocab * vocab, const std::string & text) {
     if (!vocab || text.empty()) {
         return {};
@@ -378,8 +563,10 @@ public:
         llama_favorable_state_profile profile = {};
         llama_self_tool_state_info tool_state = {};
         llama_self_social_state_info social = {};
+        llama_self_model_state_info model_state = {};
         (void) ctx.self_state_get_tool_state(&tool_state);
         (void) ctx.self_state_get_social_state(&social);
+        (void) ctx.self_state_get_model_state(&model_state);
 
         const float contradiction = get_scalar_register(ctx, LLAMA_SELF_REGISTER_CONTRADICTION);
         const float uncertainty = get_scalar_register(ctx, LLAMA_SELF_REGISTER_UNCERTAINTY);
@@ -388,24 +575,36 @@ public:
         const float broadcast_inhibition = get_scalar_register(ctx, LLAMA_SELF_REGISTER_BROADCAST_INHIBITION);
         const float continuation = get_scalar_register(ctx, LLAMA_SELF_REGISTER_FOLLOWUP_CONTINUATION);
         const float goal_relevance = get_scalar_register(ctx, LLAMA_SELF_REGISTER_GOAL_RELEVANCE);
+        const float satisfaction_risk = get_scalar_register(ctx, LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK);
+        const float recovery_urgency = get_scalar_register(ctx, LLAMA_SELF_REGISTER_RECOVERY_URGENCY);
         const float tool_backlog = clamp_unit(
                 0.45f * std::min(1.0f, (float) tool_state.pending_jobs) +
                 0.35f * std::min(1.0f, (float) tool_state.running_jobs) +
                 0.20f * std::min(1.0f, (float) tool_state.failed_jobs));
-        const float dissatisfaction = clamp_unit(social.dissatisfaction);
+        const float dissatisfaction = clamp_unit(std::max(social.dissatisfaction, satisfaction_risk));
         const float reactivation = top_reactivation_priority();
+        const llama_self_model_horizon_info & instant = model_state.horizons[LLAMA_SELF_HORIZON_INSTANT];
+        const float epistemic_divergence = clamp_unit(std::max(
+                instant.recovery.favorable_divergence_epistemic,
+                instant.user_outcome.misunderstanding_risk));
+        const float goal_divergence = clamp_unit(std::max(
+                instant.recovery.favorable_divergence_goal,
+                get_scalar_register(ctx, LLAMA_SELF_REGISTER_GOAL_PROGRESS_PRESSURE)));
+        const float action_divergence = clamp_unit(std::max(
+                instant.recovery.favorable_divergence_action,
+                get_scalar_register(ctx, LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY)));
 
-        add_dimension(profile, LLAMA_FAVORABLE_DIM_CONTRADICTION, contradiction, 0.05f, 0.05f, 1.00f, true);
-        add_dimension(profile, LLAMA_FAVORABLE_DIM_UNCERTAINTY, uncertainty, 0.12f, 0.08f, 0.85f, true);
+        add_dimension(profile, LLAMA_FAVORABLE_DIM_CONTRADICTION, std::max(contradiction, instant.epistemic.contradiction_load), 0.05f, 0.05f, 1.00f, true);
+        add_dimension(profile, LLAMA_FAVORABLE_DIM_UNCERTAINTY, std::max(uncertainty, epistemic_divergence), 0.12f, 0.08f, 0.85f, true);
         add_dimension(profile, LLAMA_FAVORABLE_DIM_MEMORY_WRITE_PRIORITY, memory_write, 0.22f, 0.10f, 0.45f, false);
         add_dimension(profile, LLAMA_FAVORABLE_DIM_REACTIVATION_PRIORITY, reactivation, 0.12f, 0.10f, 0.55f, false);
-        add_dimension(profile, LLAMA_FAVORABLE_DIM_TOOL_BACKLOG, tool_backlog, 0.10f, 0.10f, 0.80f, false);
+        add_dimension(profile, LLAMA_FAVORABLE_DIM_TOOL_BACKLOG, std::max(tool_backlog, action_divergence), 0.10f, 0.10f, 0.80f, false);
         add_dimension(profile, LLAMA_FAVORABLE_DIM_TOOL_READINESS, clamp_unit(tool_state.readiness), 0.85f, 0.10f, 0.75f, false);
         add_dimension(profile, LLAMA_FAVORABLE_DIM_SOCIAL_TRUST, clamp_unit(social.trust), 0.78f, 0.12f, 0.80f, true);
         add_dimension(profile, LLAMA_FAVORABLE_DIM_SOCIAL_RECIPROCITY, clamp_unit(social.reciprocity), 0.72f, 0.12f, 0.55f, true);
-        add_dimension(profile, LLAMA_FAVORABLE_DIM_BROADCAST_PRESSURE, broadcast_pressure, dissatisfaction > 0.40f ? 0.48f : 0.25f, 0.15f, 0.35f, false);
-        add_dimension(profile, LLAMA_FAVORABLE_DIM_BROADCAST_INHIBITION, broadcast_inhibition, goal_relevance > 0.55f ? 0.35f : 0.50f, 0.15f, 0.35f, false);
-        add_dimension(profile, LLAMA_FAVORABLE_DIM_FOLLOWUP_CONTINUATION, continuation, goal_relevance > 0.60f || dissatisfaction > 0.45f ? 0.55f : 0.22f, 0.20f, 0.40f, false);
+        add_dimension(profile, LLAMA_FAVORABLE_DIM_BROADCAST_PRESSURE, std::max(broadcast_pressure, recovery_urgency * 0.85f), dissatisfaction > 0.40f ? 0.48f : 0.25f, 0.15f, 0.35f, false);
+        add_dimension(profile, LLAMA_FAVORABLE_DIM_BROADCAST_INHIBITION, broadcast_inhibition, goal_relevance > 0.55f || goal_divergence > 0.45f ? 0.35f : 0.50f, 0.15f, 0.35f, false);
+        add_dimension(profile, LLAMA_FAVORABLE_DIM_FOLLOWUP_CONTINUATION, std::max(continuation, goal_divergence * 0.75f), goal_relevance > 0.60f || dissatisfaction > 0.45f ? 0.55f : 0.22f, 0.20f, 0.40f, false);
         add_dimension(profile, LLAMA_FAVORABLE_DIM_SOCIAL_DISSATISFACTION, dissatisfaction, 0.08f, 0.07f, 0.95f, false);
 
         float weight_total = 0.0f;
@@ -828,6 +1027,147 @@ private:
 };
 
 llama_cognitive_loop::llama_cognitive_loop(llama_context & ctx) : ctx(ctx) {
+    const llama_cognitive_tool_spec defaults[] = {
+        make_tool_spec(
+                LLAMA_TOOL_KIND_GENERIC,
+                LLAMA_COG_TOOL_ACTIVE_ELIGIBLE |
+                        LLAMA_COG_TOOL_DMN_ELIGIBLE |
+                        LLAMA_COG_TOOL_REMEDIATION_SAFE |
+                        LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT,
+                LLAMA_COG_TOOL_LATENCY_MEDIUM,
+                2,
+                "generic"),
+        make_tool_spec(
+                LLAMA_TOOL_KIND_HARD_MEMORY_QUERY,
+                LLAMA_COG_TOOL_ACTIVE_ELIGIBLE |
+                        LLAMA_COG_TOOL_DMN_ELIGIBLE |
+                        LLAMA_COG_TOOL_SIMULATION_SAFE |
+                        LLAMA_COG_TOOL_REMEDIATION_SAFE,
+                LLAMA_COG_TOOL_LATENCY_MEDIUM,
+                2,
+                "hard_memory_query"),
+        make_tool_spec(
+                LLAMA_TOOL_KIND_HARD_MEMORY_WRITE,
+                LLAMA_COG_TOOL_DMN_ELIGIBLE |
+                        LLAMA_COG_TOOL_REMEDIATION_SAFE |
+                        LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT,
+                LLAMA_COG_TOOL_LATENCY_HIGH,
+                3,
+                "hard_memory_write"),
+    };
+    (void) cognitive_tool_spec_set(defaults, (int32_t) (sizeof(defaults) / sizeof(defaults[0])));
+}
+
+int32_t llama_cognitive_loop::cognitive_tool_spec_count() const {
+    return tool_spec_count;
+}
+
+bool llama_cognitive_loop::cognitive_tool_spec_get(int32_t index, llama_cognitive_tool_spec * out_spec) const {
+    if (!out_spec || index < 0 || index >= tool_spec_count) {
+        return false;
+    }
+    *out_spec = tool_specs[index];
+    return true;
+}
+
+bool llama_cognitive_loop::cognitive_tool_spec_set(const llama_cognitive_tool_spec * specs, int32_t count) {
+    if (count < 0 || count > LLAMA_COGNITIVE_MAX_TOOL_SPECS || (count > 0 && !specs)) {
+        return false;
+    }
+
+    std::memset(tool_specs, 0, sizeof(tool_specs));
+    tool_spec_count = count;
+    for (int32_t i = 0; i < count; ++i) {
+        tool_specs[i] = specs[i];
+        tool_specs[i].name[LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS - 1] = '\0';
+        tool_specs[i].max_steps_reserved = std::max(0, tool_specs[i].max_steps_reserved);
+    }
+    return true;
+}
+
+int32_t llama_cognitive_loop::cognitive_command_count() const {
+    return command_count;
+}
+
+bool llama_cognitive_loop::cognitive_command_get(int32_t index, llama_cognitive_command * out_command) const {
+    if (!out_command || index < 0 || index >= command_count) {
+        return false;
+    }
+    *out_command = command_queue[index];
+    return true;
+}
+
+bool llama_cognitive_loop::cognitive_command_ack(int32_t command_id) {
+    const int32_t index = find_command_index(command_queue, command_count, command_id);
+    if (index < 0) {
+        return false;
+    }
+    if (command_queue[index].status == LLAMA_COG_COMMAND_STATUS_PENDING) {
+        command_queue[index].status = LLAMA_COG_COMMAND_STATUS_ACKED;
+    }
+    return true;
+}
+
+bool llama_cognitive_loop::cognitive_command_complete(int32_t command_id, bool cancelled) {
+    const int32_t index = find_command_index(command_queue, command_count, command_id);
+    if (index < 0) {
+        return false;
+    }
+
+    llama_cognitive_command & command = command_queue[index];
+    command.status = cancelled ? LLAMA_COG_COMMAND_STATUS_CANCELLED : LLAMA_COG_COMMAND_STATUS_COMPLETED;
+
+    if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE &&
+            active_runner.pending_command_id == command_id) {
+        active_runner.pending_command_id = -1;
+        active_runner.last_command_id = command_id;
+        if (command.kind == LLAMA_COG_COMMAND_INVOKE_TOOL) {
+            if (cancelled && host_state.pending_tool_followup_count > 0) {
+                --host_state.pending_tool_followup_count;
+            }
+            active_runner.waiting_on_tool = !cancelled;
+            active_runner.completed = cancelled;
+            active_runner.active = !cancelled;
+        } else {
+            active_runner.waiting_on_tool = false;
+            active_runner.completed = true;
+            active_runner.active = false;
+        }
+    }
+
+    if (command.origin == LLAMA_COG_COMMAND_ORIGIN_DMN &&
+            dmn_runner.pending_command_id == command_id) {
+        dmn_runner.pending_command_id = -1;
+        dmn_runner.last_command_id = command_id;
+        if (command.kind == LLAMA_COG_COMMAND_INVOKE_TOOL) {
+            dmn_runner.waiting_on_tool = !cancelled;
+            dmn_runner.completed = cancelled;
+            dmn_runner.active = !cancelled;
+        } else {
+            dmn_runner.waiting_on_tool = false;
+            dmn_runner.completed = true;
+            dmn_runner.active = false;
+        }
+    }
+
+    compact_command_queue(command_queue, &command_count);
+    return true;
+}
+
+bool llama_cognitive_loop::cognitive_active_runner_get(llama_cognitive_active_runner_status * out_status) const {
+    if (!out_status) {
+        return false;
+    }
+    *out_status = active_runner;
+    return true;
+}
+
+bool llama_cognitive_loop::cognitive_dmn_runner_get(llama_cognitive_dmn_runner_status * out_status) const {
+    if (!out_status) {
+        return false;
+    }
+    *out_status = dmn_runner;
+    return true;
 }
 
 bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & event, llama_active_loop_trace * out_trace) {
@@ -835,8 +1175,37 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
         return false;
     }
 
+    auto enqueue_command = [&](int32_t kind, int32_t episode_id, int32_t tool_kind, int32_t tool_job_id, uint32_t reason_mask, float priority, int32_t source_family, int32_t loop_phase) -> int32_t {
+        compact_command_queue(command_queue, &command_count);
+        if (command_count >= LLAMA_COGNITIVE_MAX_PENDING_COMMANDS) {
+            return -1;
+        }
+
+        const int32_t command_id = next_command_id++;
+        init_command(
+                command_queue[command_count++],
+                command_id,
+                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                kind,
+                episode_id,
+                0,
+                tool_kind,
+                tool_job_id,
+                reason_mask,
+                priority,
+                source_family,
+                loop_phase);
+        return command_id;
+    };
+
+    const bool resuming_active_tool =
+            event.role == LLAMA_SELF_STATE_EVENT_TOOL &&
+            active_runner.active &&
+            active_runner.waiting_on_tool &&
+            !active_runner.completed;
+
     llama_active_loop_trace trace = {};
-    trace.episode_id = next_episode_id++;
+    trace.episode_id = resuming_active_tool ? active_runner.episode_id : next_episode_id++;
     trace.source_role = event.role;
     trace.channel = event.channel;
     trace.event_flags = event.flags;
@@ -844,6 +1213,19 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
 
     if (event.role == LLAMA_SELF_STATE_EVENT_TOOL && host_state.pending_tool_followup_count > 0) {
         --host_state.pending_tool_followup_count;
+    }
+
+    if (resuming_active_tool) {
+        active_runner.waiting_on_tool = false;
+        active_runner.pending_command_id = -1;
+        active_runner.completed = false;
+    } else {
+        active_runner = {};
+        active_runner.episode_id = trace.episode_id;
+        active_runner.active = true;
+        active_runner.max_steps = 3;
+        active_runner.pending_command_id = -1;
+        active_runner.last_command_id = -1;
     }
 
     (void) ctx.self_state_set_channel_state(LLAMA_SELF_STATE_CHANNEL_ACTIVE);
@@ -876,7 +1258,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     }
 
     if ((mutable_event.flags & LLAMA_SELF_STATE_EVENT_ADMITTED) && mutable_event.tokens && mutable_event.n_tokens > 0) {
-        (void) ctx.active_lora_ingest(mutable_event.tokens, mutable_event.n_tokens);
+        (void) ctx.active_lora_ingest(mutable_event, &trace.postwrite_features);
     }
 
     const lexical_signals lex = analyze_event_lexicon(vocab, mutable_event);
@@ -885,6 +1267,11 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     const float broadcast_pressure = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_BROADCAST_PRESSURE));
     const float goal_relevance = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_GOAL_RELEVANCE));
     const float tool_affordance = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_AFFORDANCE));
+    const float satisfaction_risk = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK));
+    const float answerability = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_ANSWERABILITY));
+    const float loop_inefficiency = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY));
+    const float recovery_urgency = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_RECOVERY_URGENCY));
+    const float preference_uncertainty = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY));
     const bool tool_completed = (mutable_event.flags & LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED) != 0;
 
     llama_self_social_state_info social = {};
@@ -915,7 +1302,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     fill_active_candidate(
             trace.candidates[0],
             LLAMA_ACTIVE_LOOP_ACTION_ANSWER,
-            0.10f + 0.40f * user_relevance + 0.10f * broadcast_pressure + 0.10f * (1.0f - uncertainty) + 0.18f * (tool_completed ? 1.0f : 0.0f) + 0.08f * (1.0f - inhibition),
+            0.10f + 0.34f * user_relevance + 0.10f * broadcast_pressure + 0.18f * answerability + 0.10f * (1.0f - uncertainty) + 0.14f * (tool_completed ? 1.0f : 0.0f) + 0.06f * (1.0f - inhibition) + 0.04f * satisfaction_risk,
             user_relevance,
             latency_pressure,
             tool_affinity,
@@ -924,7 +1311,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     fill_active_candidate(
             trace.candidates[1],
             LLAMA_ACTIVE_LOOP_ACTION_ASK,
-            0.12f + 0.42f * std::max(lex.question, lex.uncertainty) + 0.26f * uncertainty + 0.12f * (1.0f - mutable_event.decoder_top_margin) + 0.08f * (1.0f - social.trust),
+            0.12f + 0.32f * std::max(lex.question, lex.uncertainty) + 0.20f * uncertainty + 0.14f * preference_uncertainty + 0.10f * (1.0f - answerability) + 0.12f * (1.0f - mutable_event.decoder_top_margin) + 0.08f * (1.0f - social.trust),
             user_relevance,
             latency_pressure,
             tool_affinity,
@@ -933,7 +1320,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     fill_active_candidate(
             trace.candidates[2],
             LLAMA_ACTIVE_LOOP_ACTION_ACT,
-            0.14f + 0.62f * tool_affinity + 0.16f * (tool_state.pending_jobs > 0 ? 1.0f : trace.postwrite_features.tool_readiness_score) + 0.10f * lex.question + 0.10f * goal_relevance,
+            0.14f + 0.56f * tool_affinity + 0.16f * (tool_state.pending_jobs > 0 ? 1.0f : trace.postwrite_features.tool_readiness_score) + 0.10f * lex.question + 0.08f * goal_relevance + 0.06f * recovery_urgency,
             user_relevance,
             latency_pressure,
             tool_affinity,
@@ -942,7 +1329,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     fill_active_candidate(
             trace.candidates[3],
             LLAMA_ACTIVE_LOOP_ACTION_WAIT,
-            0.06f + 0.58f * inhibition + 0.42f * (mutable_event.n_tokens == 0 ? 1.0f : 0.0f) + 0.14f * (1.0f - user_relevance) + 0.10f * (tool_state.running_jobs > 0 ? 1.0f : 0.0f),
+            0.06f + 0.56f * inhibition + 0.42f * (mutable_event.n_tokens == 0 ? 1.0f : 0.0f) + 0.10f * (1.0f - user_relevance) + 0.10f * (tool_state.running_jobs > 0 ? 1.0f : 0.0f) - 0.08f * recovery_urgency - 0.04f * loop_inefficiency,
             user_relevance,
             latency_pressure,
             tool_affinity,
@@ -972,6 +1359,101 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
         ++host_state.background_deferred_count;
     }
 
+    const bool waiting_on_tool =
+            trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT ||
+            (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_WAIT && tool_state.running_jobs > 0);
+    const int32_t proposed_tool_kind =
+            trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT ? LLAMA_TOOL_KIND_GENERIC :
+            (mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL ? LLAMA_TOOL_KIND_GENERIC : LLAMA_TOOL_KIND_NONE);
+    int32_t proposed_spec_index = -1;
+    const llama_cognitive_tool_spec * proposed_spec =
+            find_tool_spec(tool_specs, tool_spec_count, proposed_tool_kind, &proposed_spec_index);
+
+    if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
+        const int32_t tool_job_id = next_tool_job_id++;
+        trace.tool_proposal.job_id = tool_job_id;
+        (void) ctx.self_state_upsert_tool_job(tool_job_id, LLAMA_SELF_TOOL_JOB_PENDING, clamp_unit(trace.winner_score));
+        set_loop_state(
+                trace.loop_state,
+                LLAMA_COG_LOOP_PHASE_PREPARE_TOOL,
+                LLAMA_COG_TERMINAL_TOOL_REQUIRED,
+                active_runner.max_steps,
+                std::min(active_runner.max_steps, resuming_active_tool ? active_runner.steps_taken + 1 : 2),
+                true,
+                true,
+                tool_spec_count);
+        set_tool_proposal(
+                trace.tool_proposal,
+                proposed_spec,
+                proposed_spec_index,
+                proposed_tool_kind,
+                trace.reason_mask,
+                -1,
+                proposed_spec ? std::max(1, proposed_spec->max_steps_reserved) : 1,
+                0.55f * tool_affinity + 0.25f * uncertainty + 0.20f * goal_relevance,
+                tool_job_id);
+        active_runner.steps_taken = trace.loop_state.steps_taken;
+        active_runner.waiting_on_tool = true;
+        active_runner.pending_command_id = enqueue_command(
+                LLAMA_COG_COMMAND_INVOKE_TOOL,
+                trace.episode_id,
+                proposed_tool_kind,
+                tool_job_id,
+                trace.reason_mask,
+                trace.winner_score,
+                -1,
+                trace.loop_state.phase);
+        active_runner.last_command_id = active_runner.pending_command_id > 0 ? active_runner.pending_command_id : active_runner.last_command_id;
+    } else {
+        const int32_t terminal_reason =
+                trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ANSWER ? LLAMA_COG_TERMINAL_ANSWER_READY :
+                trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ASK    ? LLAMA_COG_TERMINAL_ASK_USER :
+                                                                         LLAMA_COG_TERMINAL_WAITING_ON_TOOL;
+        set_loop_state(
+                trace.loop_state,
+                LLAMA_COG_LOOP_PHASE_FINISH,
+                terminal_reason,
+                active_runner.max_steps,
+                std::min(active_runner.max_steps, resuming_active_tool ? active_runner.steps_taken + 1 : 1),
+                trace.winner_action != LLAMA_ACTIVE_LOOP_ACTION_ANSWER,
+                waiting_on_tool,
+                tool_spec_count);
+        active_runner.steps_taken = trace.loop_state.steps_taken;
+        active_runner.waiting_on_tool = waiting_on_tool;
+        if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ANSWER || trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ASK) {
+            active_runner.pending_command_id = enqueue_command(
+                    trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ANSWER ? LLAMA_COG_COMMAND_EMIT_ANSWER : LLAMA_COG_COMMAND_EMIT_ASK,
+                    trace.episode_id,
+                    LLAMA_TOOL_KIND_NONE,
+                    -1,
+                    trace.reason_mask,
+                    trace.winner_score,
+                    -1,
+                    trace.loop_state.phase);
+            active_runner.last_command_id = active_runner.pending_command_id > 0 ? active_runner.pending_command_id : active_runner.last_command_id;
+            active_runner.completed = false;
+            active_runner.active = active_runner.pending_command_id > 0;
+        } else {
+            active_runner.completed = !waiting_on_tool;
+            active_runner.active = waiting_on_tool;
+        }
+    }
+
+    if (mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
+        const int32_t observation_status =
+                (mutable_event.flags & LLAMA_SELF_STATE_EVENT_TOOL_FAILED) ? LLAMA_SELF_TOOL_JOB_FAILED :
+                (mutable_event.flags & LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED) ? LLAMA_SELF_TOOL_JOB_COMPLETED :
+                                                                                LLAMA_SELF_TOOL_JOB_RUNNING;
+        set_observation(
+                trace.observation,
+                true,
+                LLAMA_TOOL_KIND_GENERIC,
+                -1,
+                observation_status,
+                0.55f * trace.winner_score + 0.45f * answerability,
+                0.50f * lex.followup + 0.30f * goal_relevance + 0.20f * recovery_urgency);
+    }
+
     trace.completed_time_us = llama_time_us();
     host_state.shared_state_version += 1;
     host_state.active_episode_count += 1;
@@ -994,6 +1476,9 @@ bool llama_cognitive_loop::active_loop_note_emit(int32_t episode_id, size_t emit
     }
 
     last_active_trace.emit_noted = true;
+    if (active_runner.episode_id == episode_id && active_runner.pending_command_id > 0) {
+        (void) cognitive_command_complete(active_runner.pending_command_id, false);
+    }
     (void) ctx.self_state_note_emit_event();
     return true;
 }
@@ -1027,6 +1512,19 @@ bool llama_cognitive_loop::dmn_defer(uint64_t now_us, llama_dmn_tick_trace * out
     trace.runner_up_action = LLAMA_DMN_ACTION_SILENT;
     trace.runner_up_score = 0.0f;
     trace.favorable_divergence = last_favorable_profile.aggregate_divergence;
+    set_loop_state(
+            trace.loop_state,
+            LLAMA_COG_LOOP_PHASE_FINISH,
+            LLAMA_COG_TERMINAL_BACKGROUND_DEFERRED,
+            1,
+            0,
+            true,
+            false,
+            tool_spec_count);
+    dmn_runner = {};
+    dmn_runner.tick_id = next_tick_id;
+    dmn_runner.completed = true;
+    dmn_runner.max_steps = 1;
     ++host_state.background_deferred_count;
     trace.tick_id = next_tick_id;
     host_state.last_dmn_time_us = now_us;
@@ -1038,9 +1536,39 @@ bool llama_cognitive_loop::dmn_defer(uint64_t now_us, llama_dmn_tick_trace * out
 }
 
 bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_trace) {
+    auto enqueue_command = [&](int32_t kind, int32_t tick_id, int32_t tool_kind, int32_t tool_job_id, uint32_t reason_mask, float priority, int32_t source_family, int32_t loop_phase) -> int32_t {
+        compact_command_queue(command_queue, &command_count);
+        if (command_count >= LLAMA_COGNITIVE_MAX_PENDING_COMMANDS) {
+            return -1;
+        }
+
+        const int32_t command_id = next_command_id++;
+        init_command(
+                command_queue[command_count++],
+                command_id,
+                LLAMA_COG_COMMAND_ORIGIN_DMN,
+                kind,
+                0,
+                tick_id,
+                tool_kind,
+                tool_job_id,
+                reason_mask,
+                priority,
+                source_family,
+                loop_phase);
+        return command_id;
+    };
+
     const llama_cognitive_runtime_impl runtime(ctx);
     llama_dmn_tick_trace trace = {};
     trace.pressure = runtime.compute_pressure();
+    const bool foreground_outstanding =
+            active_runner.active ||
+            active_runner.pending_command_id > 0 ||
+            has_command_origin(command_queue, command_count, LLAMA_COG_COMMAND_ORIGIN_ACTIVE);
+    if (foreground_outstanding) {
+        return dmn_defer(now_us, out_trace);
+    }
     trace.winner_action = LLAMA_DMN_ACTION_SILENT;
     trace.runner_up_action = LLAMA_DMN_ACTION_SILENT;
     trace.tool_job_id = -1;
@@ -1055,10 +1583,25 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     last_remediation_plan.tool_job_id = -1;
     last_governance_trace = {};
     last_governance_trace.proposal_family = -1;
+    dmn_runner = {};
+    dmn_runner.max_steps = 3;
+    dmn_runner.pending_command_id = -1;
+    dmn_runner.last_command_id = -1;
 
     if (!pressure_crossed(trace.pressure)) {
         trace.admitted = false;
         trace.burst_count = 0;
+        set_loop_state(
+                trace.loop_state,
+                LLAMA_COG_LOOP_PHASE_FINISH,
+                LLAMA_COG_TERMINAL_PRESSURE_NOT_ADMITTED,
+                1,
+                0,
+                false,
+                false,
+                tool_spec_count);
+        dmn_runner.completed = true;
+        dmn_runner.max_steps = 1;
         last_dmn_trace = trace;
         host_state.last_dmn_time_us = now_us;
         if (out_trace) {
@@ -1069,6 +1612,8 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
 
     trace.tick_id = next_tick_id++;
     trace.admitted = true;
+    dmn_runner.tick_id = trace.tick_id;
+    dmn_runner.active = true;
     (void) ctx.self_state_set_channel_state(LLAMA_SELF_STATE_CHANNEL_WAITING);
     runtime.select_reactivation_targets(trace);
     runtime.assemble_seed(trace.pressure, trace);
@@ -1149,14 +1694,17 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     trace.winner_score = trace.candidates[best].score;
     trace.runner_up_action = second >= 0 ? trace.candidates[second].action : trace.candidates[best].action;
     trace.runner_up_score = second >= 0 ? trace.candidates[second].score : trace.candidates[best].score;
+    uint32_t selected_reason_mask = trace.candidates[best].reason_mask;
 
     if (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR) {
         trace.winner_action = LLAMA_DMN_ACTION_EMIT;
         trace.winner_score = trace.candidates[3].score;
+        selected_reason_mask = trace.candidates[3].reason_mask;
     } else if (last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO &&
             last_governance_trace.outcome != LLAMA_GOVERNANCE_OUTCOME_DENY) {
         trace.winner_action = LLAMA_DMN_ACTION_INVOKE_TOOL;
         trace.winner_score = trace.candidates[2].score;
+        selected_reason_mask = trace.candidates[2].reason_mask;
     }
 
     const int32_t working_memory_count = ctx.self_state_working_memory_count();
@@ -1176,7 +1724,21 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         const llama_vocab * vocab = llama_model_get_vocab(&ctx.get_model());
         const std::string prompt = remediation_prompt_for_family(last_remediation_plan.source_family);
         const std::vector<llama_token> tokens = tokenize_text(vocab, prompt);
-        if (!tokens.empty() && ctx.active_lora_remediate(tokens.data(), tokens.size(), last_remediation_plan.budget)) {
+        const llama_self_state_event remediation_event = {
+            /*.tokens =*/ tokens.data(),
+            /*.n_tokens =*/ tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
+            /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
+            /*.decoder_entropy =*/ 0.0f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+        llama_self_state_feature_vector remediation_features = {};
+        const bool have_remediation_features = ctx.self_state_build_postwrite_features(remediation_event, &remediation_features);
+        if (!tokens.empty() && ctx.active_lora_remediate(
+                    remediation_event,
+                    last_remediation_plan.budget,
+                    have_remediation_features ? &remediation_features : nullptr)) {
             last_remediation_plan.applied = true;
         }
     }
@@ -1199,6 +1761,103 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         if (ctx.self_state_build_postwrite_features(internal_event, &post)) {
             (void) ctx.self_state_apply_postwrite(internal_event, post);
         }
+        set_loop_state(
+                trace.loop_state,
+                LLAMA_COG_LOOP_PHASE_FINISH,
+                LLAMA_COG_TERMINAL_INTERNAL_WRITE_READY,
+                dmn_runner.max_steps,
+                2,
+                false,
+                false,
+                tool_spec_count);
+        set_observation(
+                trace.observation,
+                true,
+                LLAMA_TOOL_KIND_NONE,
+                -1,
+                LLAMA_SELF_TOOL_JOB_COMPLETED,
+                0.55f * trace.pressure.counterfactual + 0.45f * trace.favorable_divergence,
+                trace.pressure.continuation);
+        dmn_runner.steps_taken = 2;
+
+        const bool should_emit_followup =
+                last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR ||
+                (continuation > 0.55f && inhibition < 0.60f);
+        const bool should_gather_followup =
+                last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO &&
+                last_governance_trace.outcome != LLAMA_GOVERNANCE_OUTCOME_DENY;
+
+        if (should_gather_followup && dmn_runner.steps_taken < dmn_runner.max_steps) {
+            trace.winner_action = LLAMA_DMN_ACTION_INVOKE_TOOL;
+            trace.tool_job_id = next_tool_job_id++;
+            trace.tool_kind = last_remediation_plan.tool_kind;
+            (void) ctx.self_state_upsert_tool_job(trace.tool_job_id, LLAMA_SELF_TOOL_JOB_PENDING, clamp_unit(trace.winner_score));
+            last_remediation_plan.tool_job_id = trace.tool_job_id;
+            int32_t spec_index = -1;
+            const llama_cognitive_tool_spec * spec =
+                    find_tool_spec(tool_specs, tool_spec_count, trace.tool_kind, &spec_index);
+            set_loop_state(
+                    trace.loop_state,
+                    LLAMA_COG_LOOP_PHASE_PREPARE_TOOL,
+                    LLAMA_COG_TERMINAL_TOOL_REQUIRED,
+                    dmn_runner.max_steps,
+                    3,
+                    true,
+                    true,
+                    tool_spec_count);
+            set_tool_proposal(
+                    trace.tool_proposal,
+                    spec,
+                    spec_index,
+                    trace.tool_kind,
+                    selected_reason_mask,
+                    last_remediation_plan.source_family,
+                    spec ? std::max(1, spec->max_steps_reserved) : 1,
+                    last_remediation_plan.expected_improvement * last_remediation_plan.confidence +
+                            0.20f * trace.pressure.tool_delta,
+                    trace.tool_job_id);
+            dmn_runner.steps_taken = 3;
+            dmn_runner.waiting_on_tool = true;
+            dmn_runner.pending_command_id = enqueue_command(
+                    LLAMA_COG_COMMAND_INVOKE_TOOL,
+                    trace.tick_id,
+                    trace.tool_kind,
+                    trace.tool_job_id,
+                    selected_reason_mask,
+                    trace.winner_score,
+                    last_remediation_plan.source_family,
+                    trace.loop_state.phase);
+            dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
+        } else if (should_emit_followup && dmn_runner.steps_taken < dmn_runner.max_steps) {
+            trace.winner_action = LLAMA_DMN_ACTION_EMIT;
+            trace.burst_count =
+                    last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR ? 1 :
+                    (continuation > 0.0f && inhibition < 0.60f ? 2 : 1);
+            host_state.pending_dmn_emits += trace.burst_count;
+            set_loop_state(
+                    trace.loop_state,
+                    LLAMA_COG_LOOP_PHASE_FINISH,
+                    LLAMA_COG_TERMINAL_EMIT_READY,
+                    dmn_runner.max_steps,
+                    3,
+                    continuation > 0.0f && inhibition < 0.60f,
+                    false,
+                    tool_spec_count);
+            dmn_runner.steps_taken = 3;
+            dmn_runner.pending_command_id = enqueue_command(
+                    LLAMA_COG_COMMAND_EMIT_BACKGROUND,
+                    trace.tick_id,
+                    LLAMA_TOOL_KIND_NONE,
+                    -1,
+                    selected_reason_mask,
+                    trace.winner_score,
+                    last_remediation_plan.source_family,
+                    trace.loop_state.phase);
+            dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
+        } else {
+            dmn_runner.completed = true;
+            dmn_runner.active = false;
+        }
     } else if (trace.winner_action == LLAMA_DMN_ACTION_INVOKE_TOOL) {
         trace.tool_job_id = next_tool_job_id++;
         trace.tool_kind = last_remediation_plan.tool_kind;
@@ -1206,11 +1865,84 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         if (last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO) {
             last_remediation_plan.tool_job_id = trace.tool_job_id;
         }
+        int32_t spec_index = -1;
+        const llama_cognitive_tool_spec * spec =
+                find_tool_spec(tool_specs, tool_spec_count, trace.tool_kind, &spec_index);
+        set_loop_state(
+                trace.loop_state,
+                LLAMA_COG_LOOP_PHASE_PREPARE_TOOL,
+                LLAMA_COG_TERMINAL_TOOL_REQUIRED,
+                dmn_runner.max_steps,
+                2,
+                true,
+                true,
+                tool_spec_count);
+        set_tool_proposal(
+                trace.tool_proposal,
+                spec,
+                spec_index,
+                trace.tool_kind,
+                selected_reason_mask,
+                last_remediation_plan.source_family,
+                spec ? std::max(1, spec->max_steps_reserved) : 1,
+                last_remediation_plan.expected_improvement * last_remediation_plan.confidence +
+                        0.20f * trace.pressure.tool_delta,
+                trace.tool_job_id);
+        dmn_runner.steps_taken = 2;
+        dmn_runner.waiting_on_tool = true;
+        dmn_runner.pending_command_id = enqueue_command(
+                LLAMA_COG_COMMAND_INVOKE_TOOL,
+                trace.tick_id,
+                trace.tool_kind,
+                trace.tool_job_id,
+                selected_reason_mask,
+                trace.winner_score,
+                last_remediation_plan.source_family,
+                trace.loop_state.phase);
+        dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
     } else if (trace.winner_action == LLAMA_DMN_ACTION_EMIT) {
         trace.burst_count =
                 last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR ? 1 :
                 (continuation > 0.0f && inhibition < 0.60f ? 2 : 1);
         host_state.pending_dmn_emits += trace.burst_count;
+        set_loop_state(
+                trace.loop_state,
+                LLAMA_COG_LOOP_PHASE_FINISH,
+                LLAMA_COG_TERMINAL_EMIT_READY,
+                2,
+                1,
+                continuation > 0.0f && inhibition < 0.60f,
+                false,
+                tool_spec_count);
+        dmn_runner.steps_taken = 1;
+        dmn_runner.pending_command_id = enqueue_command(
+                LLAMA_COG_COMMAND_EMIT_BACKGROUND,
+                trace.tick_id,
+                LLAMA_TOOL_KIND_NONE,
+                -1,
+                selected_reason_mask,
+                trace.winner_score,
+                last_remediation_plan.source_family,
+                trace.loop_state.phase);
+        dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
+    } else {
+        const int32_t terminal_reason =
+                (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DENY ||
+                 last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DEFER) ?
+                        LLAMA_COG_TERMINAL_GOVERNANCE_BLOCKED :
+                        LLAMA_COG_TERMINAL_PRESSURE_NOT_ADMITTED;
+        set_loop_state(
+                trace.loop_state,
+                LLAMA_COG_LOOP_PHASE_FINISH,
+                terminal_reason,
+                2,
+                1,
+                false,
+                false,
+                tool_spec_count);
+        dmn_runner.steps_taken = 1;
+        dmn_runner.completed = true;
+        dmn_runner.active = false;
     }
 
     if (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR && !last_governance_trace.repair_rendered) {
@@ -1223,6 +1955,14 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         last_remediation_plan.post_divergence = post_profile.aggregate_divergence;
     } else {
         last_remediation_plan.post_divergence = last_remediation_plan.pre_divergence;
+    }
+
+    if (dmn_runner.pending_command_id > 0) {
+        dmn_runner.active = true;
+        dmn_runner.completed = false;
+    } else if (!dmn_runner.waiting_on_tool) {
+        dmn_runner.active = false;
+        dmn_runner.completed = true;
     }
 
     host_state.shared_state_version += 1;
@@ -1284,6 +2024,42 @@ bool llama_cognitive_loop::governance_get_last_trace(llama_governance_trace * ou
     return true;
 }
 
+int32_t llama_context::cognitive_tool_spec_count() const {
+    return cognitive_loop ? cognitive_loop->cognitive_tool_spec_count() : 0;
+}
+
+bool llama_context::cognitive_tool_spec_get(int32_t index, llama_cognitive_tool_spec * out_spec) const {
+    return cognitive_loop && cognitive_loop->cognitive_tool_spec_get(index, out_spec);
+}
+
+bool llama_context::cognitive_tool_spec_set(const llama_cognitive_tool_spec * specs, int32_t count) {
+    return cognitive_loop && cognitive_loop->cognitive_tool_spec_set(specs, count);
+}
+
+int32_t llama_context::cognitive_command_count() const {
+    return cognitive_loop ? cognitive_loop->cognitive_command_count() : 0;
+}
+
+bool llama_context::cognitive_command_get(int32_t index, llama_cognitive_command * out_command) const {
+    return cognitive_loop && cognitive_loop->cognitive_command_get(index, out_command);
+}
+
+bool llama_context::cognitive_command_ack(int32_t command_id) {
+    return cognitive_loop && cognitive_loop->cognitive_command_ack(command_id);
+}
+
+bool llama_context::cognitive_command_complete(int32_t command_id, bool cancelled) {
+    return cognitive_loop && cognitive_loop->cognitive_command_complete(command_id, cancelled);
+}
+
+bool llama_context::cognitive_active_runner_get(llama_cognitive_active_runner_status * out_status) const {
+    return cognitive_loop && cognitive_loop->cognitive_active_runner_get(out_status);
+}
+
+bool llama_context::cognitive_dmn_runner_get(llama_cognitive_dmn_runner_status * out_status) const {
+    return cognitive_loop && cognitive_loop->cognitive_dmn_runner_get(out_status);
+}
+
 bool llama_context::active_loop_process(const llama_self_state_event & event, llama_active_loop_trace * out_trace) {
     return cognitive_loop && cognitive_loop->active_loop_process(event, out_trace);
 }
@@ -1326,6 +2102,60 @@ bool llama_context::remediation_get_last_plan(llama_remediation_plan * out_plan)
 
 bool llama_context::governance_get_last_trace(llama_governance_trace * out_trace) const {
     return cognitive_loop && cognitive_loop->governance_get_last_trace(out_trace);
+}
+
+int32_t llama_cognitive_tool_spec_count(const struct llama_context * ctx) {
+    return ctx ? ctx->cognitive_tool_spec_count() : 0;
+}
+
+int32_t llama_cognitive_tool_spec_get(
+        const struct llama_context * ctx,
+        int32_t index,
+        struct llama_cognitive_tool_spec * out_spec) {
+    return ctx && ctx->cognitive_tool_spec_get(index, out_spec) ? 0 : -1;
+}
+
+int32_t llama_cognitive_tool_spec_set(
+        struct llama_context * ctx,
+        const struct llama_cognitive_tool_spec * specs,
+        int32_t count) {
+    return ctx && ctx->cognitive_tool_spec_set(specs, count) ? 0 : -1;
+}
+
+int32_t llama_cognitive_command_count(const struct llama_context * ctx) {
+    return ctx ? ctx->cognitive_command_count() : 0;
+}
+
+int32_t llama_cognitive_command_get(
+        const struct llama_context * ctx,
+        int32_t index,
+        struct llama_cognitive_command * out_command) {
+    return ctx && ctx->cognitive_command_get(index, out_command) ? 0 : -1;
+}
+
+int32_t llama_cognitive_command_ack(
+        struct llama_context * ctx,
+        int32_t command_id) {
+    return ctx && ctx->cognitive_command_ack(command_id) ? 0 : -1;
+}
+
+int32_t llama_cognitive_command_complete(
+        struct llama_context * ctx,
+        int32_t command_id,
+        bool cancelled) {
+    return ctx && ctx->cognitive_command_complete(command_id, cancelled) ? 0 : -1;
+}
+
+int32_t llama_cognitive_active_runner_get(
+        const struct llama_context * ctx,
+        struct llama_cognitive_active_runner_status * out_status) {
+    return ctx && ctx->cognitive_active_runner_get(out_status) ? 0 : -1;
+}
+
+int32_t llama_cognitive_dmn_runner_get(
+        const struct llama_context * ctx,
+        struct llama_cognitive_dmn_runner_status * out_status) {
+    return ctx && ctx->cognitive_dmn_runner_get(out_status) ? 0 : -1;
 }
 
 int32_t llama_active_loop_process(

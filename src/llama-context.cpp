@@ -1181,8 +1181,16 @@ bool llama_context::active_lora_ingest(const llama_token * tokens, size_t n_toke
     return active_lora_manager && active_lora_manager->ingest(tokens, n_tokens);
 }
 
+bool llama_context::active_lora_ingest(const llama_self_state_event & event, const llama_self_state_feature_vector * features) {
+    return active_lora_manager && active_lora_manager->ingest(event, features);
+}
+
 bool llama_context::active_lora_remediate(const llama_token * tokens, size_t n_tokens, float budget_scale) {
     return active_lora_manager && active_lora_manager->remediate(tokens, n_tokens, budget_scale);
+}
+
+bool llama_context::active_lora_remediate(const llama_self_state_event & event, float budget_scale, const llama_self_state_feature_vector * features) {
+    return active_lora_manager && active_lora_manager->remediate(event, budget_scale, features);
 }
 
 bool llama_context::active_lora_get_stats(llama_active_lora_stats * out_stats) const {
