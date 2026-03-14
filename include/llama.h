@@ -439,17 +439,20 @@ extern "C" {
         LLAMA_SERVING_LORA_LAYER_PAST_WEEK    = 5,
         LLAMA_SERVING_LORA_LAYER_ACTIVE       = 6,
         LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_TOOL_SELECTION  = 7,
-        LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_COUNTERFACTUAL  = 8,
-        LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_MEMORY_COMPRESS = 9,
-        LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_SELF_OBSERVE    = 10,
+        LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_PLANNING_COMPOSITION = 8,
+        LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_COUNTERFACTUAL  = 9,
+        LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_MEMORY_COMPRESS = 10,
+        LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_SELF_OBSERVE    = 11,
+        LLAMA_SERVING_LORA_LAYER_USER_PERSONALITY           = 12,
     };
 
     enum llama_functional_lora_family {
         LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION = 0,
-        LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL = 1,
-        LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION = 2,
-        LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION = 3,
-        LLAMA_FUNCTIONAL_LORA_COUNT = 4,
+        LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION = 1,
+        LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL = 2,
+        LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION = 3,
+        LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION = 4,
+        LLAMA_FUNCTIONAL_LORA_COUNT = 5,
     };
 
     enum llama_functional_microphase {
@@ -465,6 +468,9 @@ extern "C" {
         LLAMA_FUNCTIONAL_MICROPHASE_SELF_OBSERVE = 9,
         LLAMA_FUNCTIONAL_MICROPHASE_SELF_FORECAST = 10,
         LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION = 11,
+        LLAMA_FUNCTIONAL_MICROPHASE_PLAN_DRAFT = 12,
+        LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE = 13,
+        LLAMA_FUNCTIONAL_MICROPHASE_PLAN_REVISE = 14,
     };
 
     enum llama_functional_hold_unit {
@@ -530,6 +536,20 @@ extern "C" {
         int32_t  embedding_type;
     };
 
+    struct llama_user_personality_lora_stats {
+        bool     enabled;
+        bool     attached_for_simulation;
+        uint32_t selected_rank;
+        uint32_t updates_applied;
+        uint64_t optimizer_step_count;
+        uint64_t tokens_ingested;
+        float    adapter_scale;
+        float    gain_mean;
+        float    gain_max;
+        float    optimizer_last_update_norm;
+        float    confidence;
+    };
+
     struct llama_past_lora_params {
         bool     enabled;
         float    host_memory_ratio[LLAMA_MEMORY_LORA_BUCKET_COUNT];
@@ -586,6 +606,10 @@ extern "C" {
         float exploration_noise_initial_std;
         float exploration_noise_min_std;
         uint32_t exploration_noise_decay_invocations;
+        float bootstrap_perturbation_initial_std;
+        float bootstrap_perturbation_min_std;
+        uint32_t bootstrap_perturbation_decay_activations;
+        float bootstrap_weight_init_std;
         float negative_update_scale;
         float positive_update_scale;
         uint32_t top_k_priority;
@@ -640,6 +664,8 @@ extern "C" {
         uint32_t hold_budget;
         uint32_t hold_remaining;
         float gain;
+        float bootstrap_std;
+        float bootstrap_perturbation;
         bool replay_boundary_required;
     };
 
@@ -653,6 +679,8 @@ extern "C" {
         float gains[LLAMA_FUNCTIONAL_LORA_COUNT];
         float predicted_gains[LLAMA_FUNCTIONAL_LORA_COUNT];
         float sampled_noise[LLAMA_FUNCTIONAL_LORA_COUNT];
+        float bootstrap_std[LLAMA_FUNCTIONAL_LORA_COUNT];
+        float bootstrap_perturbation[LLAMA_FUNCTIONAL_LORA_COUNT];
         int32_t hold_unit[LLAMA_FUNCTIONAL_LORA_COUNT];
         uint32_t hold_value[LLAMA_FUNCTIONAL_LORA_COUNT];
         float priority[LLAMA_FUNCTIONAL_LORA_COUNT];
@@ -671,9 +699,12 @@ extern "C" {
         float current_gain;
         float predicted_gain;
         float last_noise;
+        float current_bootstrap_std;
+        float last_bootstrap_perturbation;
         int32_t current_microphase;
         int32_t current_hold_unit;
         uint32_t current_hold_remaining;
+        uint64_t activation_count;
         uint64_t update_count;
         float last_signed_outcome;
         float last_meta_loss;
@@ -753,6 +784,12 @@ extern "C" {
         LLAMA_SELF_REGISTER_RECOVERY_URGENCY,
         LLAMA_SELF_REGISTER_ANSWERABILITY,
         LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY,
+        LLAMA_SELF_REGISTER_USER_DIRECTNESS_PREFERENCE,
+        LLAMA_SELF_REGISTER_USER_VERBOSITY_PREFERENCE,
+        LLAMA_SELF_REGISTER_USER_STRUCTURE_PREFERENCE,
+        LLAMA_SELF_REGISTER_USER_AUTONOMY_PREFERENCE,
+        LLAMA_SELF_REGISTER_USER_CLARIFICATION_PREFERENCE,
+        LLAMA_SELF_REGISTER_USER_DISAGREEMENT_SENSITIVITY,
         LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY,
         LLAMA_SELF_REGISTER_CHANNEL_STATE,
         LLAMA_SELF_REGISTER_COUNT,
@@ -807,6 +844,36 @@ extern "C" {
         LLAMA_TOOL_KIND_HARD_MEMORY_QUERY = 2,
         LLAMA_TOOL_KIND_HARD_MEMORY_WRITE = 3,
         LLAMA_TOOL_KIND_BASH_CLI          = 4,
+    };
+
+    enum llama_self_model_extension_kind {
+        LLAMA_SELF_MODEL_EXTENSION_MEMORY_CONTEXT = 0,
+        LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM   = 1,
+    };
+
+    enum llama_self_model_extension_source {
+        LLAMA_SELF_MODEL_EXTENSION_SOURCE_COUNTERFACTUAL = 0,
+        LLAMA_SELF_MODEL_EXTENSION_SOURCE_TOOL_HARD_MEMORY = 1,
+        LLAMA_SELF_MODEL_EXTENSION_SOURCE_TOOL_BASH_CLI = 2,
+        LLAMA_SELF_MODEL_EXTENSION_SOURCE_TOOL_EXTERNAL = 3,
+    };
+
+    enum llama_self_model_extension_domain {
+        LLAMA_SELF_MODEL_EXTENSION_DOMAIN_GOAL_PROGRESS    = 0,
+        LLAMA_SELF_MODEL_EXTENSION_DOMAIN_USER_OUTCOME     = 1,
+        LLAMA_SELF_MODEL_EXTENSION_DOMAIN_EPISTEMIC        = 2,
+        LLAMA_SELF_MODEL_EXTENSION_DOMAIN_EFFICIENCY       = 3,
+        LLAMA_SELF_MODEL_EXTENSION_DOMAIN_RECOVERY         = 4,
+        LLAMA_SELF_MODEL_EXTENSION_DOMAIN_STRATEGY         = 5,
+        LLAMA_SELF_MODEL_EXTENSION_DOMAIN_SELF_IMPROVEMENT = 6,
+    };
+
+    enum llama_self_model_extension_flags {
+        LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE            = 1u << 0,
+        LLAMA_SELF_MODEL_EXTENSION_FLAG_HAS_DESIRED_STATE = 1u << 1,
+        LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_GAIN       = 1u << 2,
+        LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS = 1u << 3,
+        LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED        = 1u << 4,
     };
 
     enum llama_self_memory_handle_kind {
@@ -955,6 +1022,10 @@ extern "C" {
         float followup_hint;
         float negative_user_valence;
         float question_ratio;
+        float imperative_ratio;
+        float list_ratio;
+        float newline_ratio;
+        float emphasis_ratio;
     };
 
     typedef bool (*llama_self_state_head_callback)(
@@ -972,6 +1043,18 @@ extern "C" {
         float tool_salience_half_life_ms;
         float prewrite_gain;
         float postwrite_gain;
+        bool enable_belief_state;
+        int32_t belief_slot_count;
+        float belief_residual_decay;
+        float belief_pressure_clip;
+        float belief_confidence_floor;
+        float belief_promotion_threshold;
+        float belief_max_update_step;
+        float belief_missing_observation_weight;
+        float belief_unmodeled_care_weight;
+        float belief_forecast_error_weight;
+        float belief_counterfactual_miss_weight;
+        float belief_memory_residue_weight;
         llama_self_state_head_callback contradiction_head_callback;
         void * contradiction_head_user_data;
         llama_self_state_head_callback uncertainty_head_callback;
@@ -1048,6 +1131,19 @@ extern "C" {
         float confidence;
     };
 
+    struct llama_self_user_preference_profile {
+        float directness_preference;
+        float verbosity_preference;
+        float structure_preference;
+        float clarification_preference;
+        float autonomy_preference;
+        float disagreement_sensitivity;
+        float rhetorical_intensity;
+        float preference_confidence;
+        float rhetorical_confidence;
+        float simulator_readiness;
+    };
+
     struct llama_self_epistemic_profile {
         float answerability;
         float evidence_sufficiency;
@@ -1100,11 +1196,93 @@ extern "C" {
         float readiness;
     };
 
+    enum {
+        LLAMA_SELF_MODEL_EXTENSION_KEY_MAX_CHARS = 96,
+        LLAMA_SELF_MODEL_EXTENSION_LABEL_MAX_CHARS = 128,
+        LLAMA_SELF_MODEL_EXTENSION_CONTENT_MAX_CHARS = 256,
+    };
+
+    struct llama_self_model_extension_update {
+        int32_t source;
+        int32_t source_tool_kind;
+        int32_t kind;
+        int32_t domain;
+        uint32_t flags;
+        float value;
+        float desired_value;
+        float confidence;
+        float salience;
+        float gain_weight;
+        float allostatic_weight;
+        char key[LLAMA_SELF_MODEL_EXTENSION_KEY_MAX_CHARS];
+        char label[LLAMA_SELF_MODEL_EXTENSION_LABEL_MAX_CHARS];
+        char content[LLAMA_SELF_MODEL_EXTENSION_CONTENT_MAX_CHARS];
+    };
+
+    struct llama_self_model_extension_info {
+        int32_t slot;
+        int32_t source;
+        int32_t source_tool_kind;
+        int32_t kind;
+        int32_t domain;
+        uint32_t flags;
+        int64_t last_update_monotonic_ms;
+        uint32_t activation_count;
+        float value;
+        float desired_value;
+        float confidence;
+        float salience;
+        float gain_weight;
+        float allostatic_weight;
+        char key[LLAMA_SELF_MODEL_EXTENSION_KEY_MAX_CHARS];
+        char label[LLAMA_SELF_MODEL_EXTENSION_LABEL_MAX_CHARS];
+        char content[LLAMA_SELF_MODEL_EXTENSION_CONTENT_MAX_CHARS];
+    };
+
+    struct llama_self_model_extension_summary {
+        int32_t active_count;
+        int32_t gain_count;
+        int32_t allostatic_count;
+        int32_t hard_memory_count;
+        int32_t tool_count;
+        float mean_confidence;
+        float mean_salience;
+        float max_salience;
+        float gain_signal;
+        float gain_signal_abs;
+        float context_activation;
+        float allostatic_divergence;
+    };
+
+    enum {
+        LLAMA_SELF_MODEL_EXTENSION_MAX_CANDIDATES = 4,
+    };
+
+    struct llama_self_model_extension_candidate {
+        bool promoted;
+        int32_t source_tool_kind;
+        int32_t domain;
+        float expected_gain_improvement;
+        float expected_allostatic_delta;
+        float confidence;
+        char key[LLAMA_SELF_MODEL_EXTENSION_KEY_MAX_CHARS];
+        char label[LLAMA_SELF_MODEL_EXTENSION_LABEL_MAX_CHARS];
+    };
+
+    struct llama_self_model_extension_trace {
+        bool valid;
+        int32_t candidate_count;
+        int32_t promoted_count;
+        int32_t winner_index;
+        struct llama_self_model_extension_candidate candidates[LLAMA_SELF_MODEL_EXTENSION_MAX_CANDIDATES];
+    };
+
     struct llama_self_model_horizon_info {
         int32_t horizon_id;
         int64_t last_update_monotonic_ms;
         struct llama_self_goal_progress_profile goal_progress;
         struct llama_self_user_outcome_profile user_outcome;
+        struct llama_self_user_preference_profile user_preference;
         struct llama_self_epistemic_profile epistemic;
         struct llama_self_efficiency_profile efficiency;
         struct llama_self_recovery_profile recovery;
@@ -1133,11 +1311,55 @@ extern "C" {
         float goal_progress_error;
     };
 
+    enum {
+        LLAMA_SELF_BELIEF_MAX_SLOTS = 4,
+        LLAMA_SELF_BELIEF_MAX_PROMOTION_CANDIDATES = 4,
+    };
+
+    struct llama_self_belief_slot_info {
+        float pressure;
+        float confidence;
+        float novelty_support;
+        float memory_support;
+        float forecast_error_support;
+        int64_t last_update_monotonic_ms;
+    };
+
+    struct llama_self_belief_summary {
+        bool valid;
+        float known_care_uncertainty;
+        float missing_observation_uncertainty;
+        float unmodeled_care_uncertainty;
+        float residual_allostatic_pressure;
+        float promotion_readiness;
+        float belief_entropy;
+        float belief_confidence;
+        float max_slot_pressure;
+        float slot_pressure_mean;
+    };
+
+    struct llama_self_model_promotion_candidate {
+        bool valid;
+        int32_t slot_index;
+        float support_score;
+        float allostatic_relevance;
+        float suggested_desired_value;
+        float stability_score;
+        char suggested_label[LLAMA_SELF_MODEL_EXTENSION_LABEL_MAX_CHARS];
+    };
+
     struct llama_self_model_state_info {
         int32_t horizon_count;
+        int32_t belief_slot_count;
+        int32_t promotion_candidate_count;
         struct llama_self_model_horizon_info horizons[LLAMA_SELF_HORIZON_COUNT];
         struct llama_self_forecast_trace forecast;
         struct llama_self_prediction_error_trace prediction_error;
+        struct llama_self_belief_summary belief_summary;
+        struct llama_self_belief_slot_info belief_slots[LLAMA_SELF_BELIEF_MAX_SLOTS];
+        struct llama_self_model_promotion_candidate promotion_candidates[LLAMA_SELF_BELIEF_MAX_PROMOTION_CANDIDATES];
+        struct llama_self_model_extension_summary extension_summary;
+        struct llama_self_model_extension_trace last_extension_trace;
     };
 
     struct llama_self_register_updater_rule {
@@ -1225,6 +1447,41 @@ extern "C" {
         LLAMA_COG_TERMINAL_INTERNAL_WRITE_READY  = 7,
         LLAMA_COG_TERMINAL_EMIT_READY            = 8,
         LLAMA_COG_TERMINAL_GOVERNANCE_BLOCKED    = 9,
+    };
+
+    enum llama_cognitive_plan_mode {
+        LLAMA_COG_PLAN_MODE_NONE = 0,
+        LLAMA_COG_PLAN_MODE_COMPOSITION = 1,
+    };
+
+    enum llama_cognitive_plan_status {
+        LLAMA_COG_PLAN_STATUS_NONE = 0,
+        LLAMA_COG_PLAN_STATUS_DRAFT = 1,
+        LLAMA_COG_PLAN_STATUS_EXECUTING = 2,
+        LLAMA_COG_PLAN_STATUS_WAITING_TOOL = 3,
+        LLAMA_COG_PLAN_STATUS_COMPLETED = 4,
+        LLAMA_COG_PLAN_STATUS_BLOCKED = 5,
+    };
+
+    enum llama_cognitive_plan_step_kind {
+        LLAMA_COG_PLAN_STEP_NONE = 0,
+        LLAMA_COG_PLAN_STEP_EMIT_ANSWER = 1,
+        LLAMA_COG_PLAN_STEP_EMIT_ASK = 2,
+        LLAMA_COG_PLAN_STEP_INVOKE_TOOL = 3,
+        LLAMA_COG_PLAN_STEP_OBSERVE_TOOL = 4,
+        LLAMA_COG_PLAN_STEP_INTERNAL_WRITE = 5,
+        LLAMA_COG_PLAN_STEP_EMIT_BACKGROUND = 6,
+        LLAMA_COG_PLAN_STEP_WAIT = 7,
+    };
+
+    enum llama_cognitive_plan_step_status {
+        LLAMA_COG_PLAN_STEP_STATUS_NONE = 0,
+        LLAMA_COG_PLAN_STEP_STATUS_PENDING = 1,
+        LLAMA_COG_PLAN_STEP_STATUS_READY = 2,
+        LLAMA_COG_PLAN_STEP_STATUS_ACTIVE = 3,
+        LLAMA_COG_PLAN_STEP_STATUS_COMPLETED = 4,
+        LLAMA_COG_PLAN_STEP_STATUS_BLOCKED = 5,
+        LLAMA_COG_PLAN_STEP_STATUS_SKIPPED = 6,
     };
 
     enum llama_cognitive_tool_flags {
@@ -1352,6 +1609,8 @@ extern "C" {
         LLAMA_HARD_MEMORY_MAX_ERROR_CHARS = 256,
         LLAMA_HARD_MEMORY_MAX_PROFILE_CHARS = 512,
         LLAMA_HARD_MEMORY_QUERY_MAX_CHARS = 256,
+        LLAMA_HARD_MEMORY_MAX_PRIMITIVES = 6,
+        LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS = 4,
         LLAMA_BASH_TOOL_PATH_MAX_CHARS = 256,
         LLAMA_BASH_TOOL_CWD_MAX_CHARS = 256,
         LLAMA_BASH_TOOL_COMMAND_MAX_CHARS = 512,
@@ -1363,6 +1622,8 @@ extern "C" {
         LLAMA_COGNITIVE_MAX_TOOL_SPECS = 8,
         LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS = 48,
         LLAMA_COGNITIVE_MAX_PENDING_COMMANDS = 16,
+        LLAMA_COGNITIVE_MAX_PLAN_STEPS = 5,
+        LLAMA_SELF_MODEL_EXTENSION_MAX_ITEMS = 32,
     };
 
     struct llama_hard_memory_config {
@@ -1380,6 +1641,87 @@ extern "C" {
         char runtime_identity[LLAMA_HARD_MEMORY_MAX_TAG_CHARS];
     };
 
+    enum llama_hard_memory_primitive_kind {
+        LLAMA_HARD_MEMORY_PRIMITIVE_EVENT_FRAGMENT      = 0,
+        LLAMA_HARD_MEMORY_PRIMITIVE_TRAJECTORY          = 1,
+        LLAMA_HARD_MEMORY_PRIMITIVE_OUTCOME             = 2,
+        LLAMA_HARD_MEMORY_PRIMITIVE_TOOL_OBSERVATION    = 3,
+        LLAMA_HARD_MEMORY_PRIMITIVE_USER_MODEL          = 4,
+        LLAMA_HARD_MEMORY_PRIMITIVE_SELF_MODEL_FRAGMENT = 5,
+    };
+
+    enum llama_hard_memory_domain {
+        LLAMA_HARD_MEMORY_DOMAIN_GOAL_PROGRESS    = 0,
+        LLAMA_HARD_MEMORY_DOMAIN_USER_OUTCOME     = 1,
+        LLAMA_HARD_MEMORY_DOMAIN_EPISTEMIC        = 2,
+        LLAMA_HARD_MEMORY_DOMAIN_EFFICIENCY       = 3,
+        LLAMA_HARD_MEMORY_DOMAIN_RECOVERY         = 4,
+        LLAMA_HARD_MEMORY_DOMAIN_STRATEGY         = 5,
+        LLAMA_HARD_MEMORY_DOMAIN_SELF_IMPROVEMENT = 6,
+    };
+
+    enum llama_hard_memory_primitive_flags {
+        LLAMA_HARD_MEMORY_PRIMITIVE_AFFECT_GAIN       = 1u << 0,
+        LLAMA_HARD_MEMORY_PRIMITIVE_AFFECT_ALLOSTASIS = 1u << 1,
+        LLAMA_HARD_MEMORY_PRIMITIVE_VALIDATED         = 1u << 2,
+        LLAMA_HARD_MEMORY_PRIMITIVE_TOOL_DERIVED      = 1u << 3,
+    };
+
+    struct llama_hard_memory_primitive {
+        int32_t kind;
+        int32_t domain;
+        int32_t source_role;
+        int32_t source_channel;
+        int32_t source_tool_kind;
+        int32_t transaction_id;
+        uint32_t flags;
+        float importance;
+        float confidence;
+        float gain_bias;
+        float allostatic_relevance;
+        char key[LLAMA_HARD_MEMORY_MAX_ID_CHARS];
+        char title[LLAMA_HARD_MEMORY_MAX_TITLE_CHARS];
+        char content[LLAMA_HARD_MEMORY_MAX_TEXT_CHARS];
+        char tags[LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS][LLAMA_HARD_MEMORY_MAX_TAG_CHARS];
+    };
+
+    struct llama_hard_memory_primitive_summary {
+        int32_t kind;
+        int32_t domain;
+        int32_t source_tool_kind;
+        uint32_t flags;
+        float importance;
+        float confidence;
+        float gain_bias;
+        float allostatic_relevance;
+        char key[LLAMA_HARD_MEMORY_MAX_ID_CHARS];
+        char title[LLAMA_HARD_MEMORY_MAX_TITLE_CHARS];
+    };
+
+    struct llama_hard_memory_retrieval_summary {
+        int32_t event_count;
+        int32_t trajectory_count;
+        int32_t outcome_count;
+        int32_t tool_observation_count;
+        int32_t user_model_count;
+        int32_t self_model_count;
+        float mean_similarity;
+        float max_similarity;
+        float importance_signal;
+        float confidence_signal;
+        float gain_support;
+        float allostatic_support;
+        float goal_support;
+        float user_support;
+        float epistemic_support;
+        float efficiency_support;
+        float recovery_support;
+        float strategy_support;
+        float self_improvement_support;
+        float user_preference_support;
+        float user_rhetorical_support;
+    };
+
     struct llama_hard_memory_query_request {
         int32_t limit;
         float threshold;
@@ -1393,9 +1735,20 @@ extern "C" {
     struct llama_hard_memory_hit {
         bool memory_result;
         float similarity;
+        int32_t kind;
+        int32_t domain;
+        int32_t source_role;
+        int32_t source_channel;
+        int32_t source_tool_kind;
+        uint32_t flags;
+        float importance;
+        float confidence;
+        float gain_bias;
+        float allostatic_relevance;
         char id[LLAMA_HARD_MEMORY_MAX_ID_CHARS];
         char title[LLAMA_HARD_MEMORY_MAX_TITLE_CHARS];
         char content[LLAMA_HARD_MEMORY_MAX_TEXT_CHARS];
+        char tags[LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS][LLAMA_HARD_MEMORY_MAX_TAG_CHARS];
     };
 
     struct llama_self_state_delta_dimension {
@@ -1427,6 +1780,7 @@ extern "C" {
         char profile_static[LLAMA_HARD_MEMORY_MAX_PROFILE_CHARS];
         char profile_dynamic[LLAMA_HARD_MEMORY_MAX_PROFILE_CHARS];
         char error[LLAMA_HARD_MEMORY_MAX_ERROR_CHARS];
+        struct llama_hard_memory_retrieval_summary retrieval_summary;
         struct llama_hard_memory_hit results[LLAMA_HARD_MEMORY_MAX_RESULTS];
     };
 
@@ -1435,6 +1789,7 @@ extern "C" {
         bool archived;
         int32_t tool_kind;
         int32_t status_code;
+        int32_t primitive_count;
         int64_t request_started_us;
         int64_t request_completed_us;
         char custom_id[LLAMA_HARD_MEMORY_MAX_ID_CHARS];
@@ -1442,6 +1797,7 @@ extern "C" {
         char content_excerpt[LLAMA_HARD_MEMORY_MAX_TEXT_CHARS];
         char error[LLAMA_HARD_MEMORY_MAX_ERROR_CHARS];
         struct llama_self_state_delta_summary delta;
+        struct llama_hard_memory_primitive_summary primitives[LLAMA_HARD_MEMORY_MAX_PRIMITIVES];
     };
 
     struct llama_bash_tool_config {
@@ -1513,12 +1869,28 @@ extern "C" {
         float confidence;
     };
 
+    struct llama_user_simulation_trace {
+        bool valid;
+        bool used_user_personality_adapter;
+        bool temporal_layers_ablated;
+        int32_t source_family;
+        int32_t prompt_token_count;
+        int32_t reply_token_count;
+        float simulation_confidence;
+        float pre_simulation_divergence;
+        float post_simulation_divergence;
+        float signed_self_state_outcome;
+        char candidate_message[LLAMA_HARD_MEMORY_MAX_TEXT_CHARS];
+        char simulated_user_reply[LLAMA_HARD_MEMORY_MAX_TEXT_CHARS];
+    };
+
     struct llama_counterfactual_trace {
         int32_t candidate_count;
         struct llama_counterfactual_candidate candidates[LLAMA_COUNTERFACTUAL_MAX_CANDIDATES];
         int32_t winner_index;
         bool escalated;
         int32_t escalation_family;
+        struct llama_user_simulation_trace simulated_user;
     };
 
     struct llama_remediation_plan {
@@ -1601,16 +1973,50 @@ extern "C" {
         int32_t loop_phase;
     };
 
+    struct llama_cognitive_plan_step {
+        int32_t kind;
+        int32_t status;
+        int32_t tool_kind;
+        int32_t source_family;
+        uint32_t reason_mask;
+        float priority;
+        int32_t expected_steps;
+        bool requires_tool_result;
+    };
+
+    struct llama_cognitive_plan_trace {
+        bool valid;
+        int32_t plan_id;
+        int32_t origin;
+        int32_t mode;
+        int32_t status;
+        int32_t revision_count;
+        int32_t current_step_index;
+        int32_t step_count;
+        int32_t selected_family;
+        int32_t terminal_reason;
+        uint32_t reason_mask;
+        float plan_score;
+        float ambiguity;
+        struct llama_cognitive_plan_step steps[LLAMA_COGNITIVE_MAX_PLAN_STEPS];
+    };
+
     struct llama_cognitive_active_runner_status {
         int32_t episode_id;
         bool active;
         bool waiting_on_tool;
         bool completed;
+        bool planning_active;
         int32_t steps_taken;
         int32_t max_steps;
         int32_t pending_command_id;
         int32_t last_command_id;
         int32_t functional_microphase;
+        int32_t plan_id;
+        int32_t plan_mode;
+        int32_t plan_status;
+        int32_t plan_revision_count;
+        int32_t current_plan_step;
     };
 
     struct llama_cognitive_dmn_runner_status {
@@ -1618,11 +2024,17 @@ extern "C" {
         bool active;
         bool waiting_on_tool;
         bool completed;
+        bool planning_active;
         int32_t steps_taken;
         int32_t max_steps;
         int32_t pending_command_id;
         int32_t last_command_id;
         int32_t functional_microphase;
+        int32_t plan_id;
+        int32_t plan_mode;
+        int32_t plan_status;
+        int32_t plan_revision_count;
+        int32_t current_plan_step;
     };
 
     struct llama_active_loop_candidate {
@@ -1659,6 +2071,7 @@ extern "C" {
         int32_t runner_up_action;
         float runner_up_score;
         uint32_t reason_mask;
+        struct llama_cognitive_plan_trace plan;
         struct llama_functional_activation_decision functional_activation;
     };
 
@@ -1715,10 +2128,12 @@ extern "C" {
         int32_t tool_kind;
         int32_t tool_job_id;
         float favorable_divergence;
+        struct llama_cognitive_plan_trace plan;
         struct llama_functional_activation_decision functional_activation;
         struct llama_cognitive_loop_state loop_state;
         struct llama_cognitive_tool_proposal tool_proposal;
         struct llama_cognitive_observation observation;
+        struct llama_user_simulation_trace simulated_user;
     };
 
     // Helpers for getting default parameters
@@ -1732,6 +2147,7 @@ extern "C" {
     LLAMA_API struct llama_self_state_params     llama_self_state_default_params(void);
     LLAMA_API struct llama_self_updater_program  llama_self_state_default_updater_program(void);
     LLAMA_API struct llama_hard_memory_config    llama_hard_memory_default_config(void);
+    LLAMA_API struct llama_hard_memory_primitive llama_hard_memory_default_primitive(void);
     LLAMA_API struct llama_bash_tool_config      llama_bash_tool_default_config(void);
 
     // Initialize the llama + ggml backend
@@ -2017,6 +2433,9 @@ extern "C" {
     LLAMA_API int32_t llama_active_lora_get_stats(
             const struct llama_context * ctx,
             struct llama_active_lora_stats * out_stats);
+    LLAMA_API int32_t llama_user_personality_lora_get_stats(
+            const struct llama_context * ctx,
+            struct llama_user_personality_lora_stats * out_stats);
 
     // Initialize the frozen temporal past-LoRA stack on the context.
     LLAMA_API int32_t llama_past_lora_init(
@@ -2147,6 +2566,18 @@ extern "C" {
     LLAMA_API int32_t llama_self_state_get_model_state(
             const struct llama_context * ctx,
             struct llama_self_model_state_info * out_info);
+    LLAMA_API struct llama_self_model_extension_update llama_self_model_extension_default_update(void);
+    LLAMA_API int32_t llama_self_state_model_extension_count(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_get_model_extension(
+            const struct llama_context * ctx,
+            int32_t index,
+            struct llama_self_model_extension_info * out_info);
+    LLAMA_API int32_t llama_self_state_upsert_model_extension(
+            struct llama_context * ctx,
+            struct llama_self_model_extension_update update);
+    LLAMA_API int32_t llama_self_state_remove_model_extension(
+            struct llama_context * ctx,
+            const char * key);
     LLAMA_API int32_t llama_self_state_trace_count(const struct llama_context * ctx);
     LLAMA_API int32_t llama_self_state_clear_trace(struct llama_context * ctx);
     LLAMA_API int32_t llama_self_state_replay_trace(struct llama_context * ctx, int32_t upto_count);
@@ -2209,6 +2640,10 @@ extern "C" {
             struct llama_context * ctx,
             const struct llama_hard_memory_query_request * query,
             struct llama_hard_memory_result * out_result);
+    LLAMA_API int32_t llama_hard_memory_archive_primitives(
+            struct llama_context * ctx,
+            const struct llama_hard_memory_primitive * primitives,
+            int32_t primitive_count);
     LLAMA_API int32_t llama_hard_memory_get_last_result(
             const struct llama_context * ctx,
             struct llama_hard_memory_result * out_result);

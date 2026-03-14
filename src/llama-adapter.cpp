@@ -33,7 +33,9 @@ int32_t llama_adapter_lora_layer_precedence(llama_adapter_lora_layer_role role) 
         case LLAMA_ADAPTER_LORA_LAYER_PAST_MONTH:   return 130;
         case LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK:    return 140;
         case LLAMA_ADAPTER_LORA_LAYER_ACTIVE:       return 150;
+        case LLAMA_ADAPTER_LORA_LAYER_USER_PERSONALITY: return 155;
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_TOOL_SELECTION:   return 160;
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_PLANNING_COMPOSITION: return 165;
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_COUNTERFACTUAL:   return 170;
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_MEMORY_COMPRESSION:return 180;
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_SELF_OBSERVATION: return 190;
@@ -50,7 +52,9 @@ const char * llama_adapter_lora_layer_role_name(llama_adapter_lora_layer_role ro
         case LLAMA_ADAPTER_LORA_LAYER_PAST_MONTH:   return "past_month";
         case LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK:    return "past_week";
         case LLAMA_ADAPTER_LORA_LAYER_ACTIVE:       return "active";
+        case LLAMA_ADAPTER_LORA_LAYER_USER_PERSONALITY: return "user_personality";
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_TOOL_SELECTION:   return "functional_tool_selection";
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_PLANNING_COMPOSITION: return "functional_planning_composition";
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_COUNTERFACTUAL:   return "functional_counterfactual";
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_MEMORY_COMPRESSION:return "functional_memory_compression";
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_SELF_OBSERVATION: return "functional_self_observation";

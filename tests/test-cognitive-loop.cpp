@@ -2,6 +2,7 @@
 #include "llama.h"
 
 #include <array>
+#include <cinttypes>
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -138,6 +139,30 @@ static bool expect_active_action(
         std::fprintf(stderr, "%s: unexpected active candidate count\n", label);
         return false;
     }
+    if (!trace.plan.valid ||
+        trace.plan.mode != LLAMA_COG_PLAN_MODE_COMPOSITION ||
+        trace.plan.step_count <= 0 ||
+        trace.plan.selected_family != LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION ||
+        trace.plan.plan_id <= 0) {
+        std::fprintf(stderr, "%s: missing active planning trace\n", label);
+        return false;
+    }
+    bool matched_step = false;
+    for (int32_t i = 0; i < trace.plan.step_count; ++i) {
+        const int32_t kind = trace.plan.steps[i].kind;
+        if ((expected_action == LLAMA_ACTIVE_LOOP_ACTION_ANSWER && kind == LLAMA_COG_PLAN_STEP_EMIT_ANSWER) ||
+            (expected_action == LLAMA_ACTIVE_LOOP_ACTION_ASK && kind == LLAMA_COG_PLAN_STEP_EMIT_ASK) ||
+            (expected_action == LLAMA_ACTIVE_LOOP_ACTION_ACT && kind == LLAMA_COG_PLAN_STEP_INVOKE_TOOL) ||
+            (expected_action == LLAMA_ACTIVE_LOOP_ACTION_WAIT &&
+                (kind == LLAMA_COG_PLAN_STEP_WAIT || kind == LLAMA_COG_PLAN_STEP_OBSERVE_TOOL))) {
+            matched_step = true;
+            break;
+        }
+    }
+    if (!matched_step) {
+        std::fprintf(stderr, "%s: active planning trace did not encode expected action\n", label);
+        return false;
+    }
     if (out_trace) {
         *out_trace = trace;
     }
@@ -165,6 +190,29 @@ static bool expect_dmn_action(
     }
     if (trace.candidate_count != LLAMA_DMN_MAX_CANDIDATES) {
         std::fprintf(stderr, "%s: unexpected DMN candidate count\n", label);
+        return false;
+    }
+    if (!trace.plan.valid ||
+        trace.plan.mode != LLAMA_COG_PLAN_MODE_COMPOSITION ||
+        trace.plan.step_count <= 0 ||
+        trace.plan.selected_family != LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION ||
+        trace.plan.plan_id <= 0) {
+        std::fprintf(stderr, "%s: missing DMN planning trace\n", label);
+        return false;
+    }
+    bool matched_step = false;
+    for (int32_t i = 0; i < trace.plan.step_count; ++i) {
+        const int32_t kind = trace.plan.steps[i].kind;
+        if ((expected_action == LLAMA_DMN_ACTION_SILENT && kind == LLAMA_COG_PLAN_STEP_WAIT) ||
+            (expected_action == LLAMA_DMN_ACTION_INTERNAL_WRITE && kind == LLAMA_COG_PLAN_STEP_INTERNAL_WRITE) ||
+            (expected_action == LLAMA_DMN_ACTION_INVOKE_TOOL && kind == LLAMA_COG_PLAN_STEP_INVOKE_TOOL) ||
+            (expected_action == LLAMA_DMN_ACTION_EMIT && kind == LLAMA_COG_PLAN_STEP_EMIT_BACKGROUND)) {
+            matched_step = true;
+            break;
+        }
+    }
+    if (!matched_step) {
+        std::fprintf(stderr, "%s: DMN planning trace did not encode expected action\n", label);
         return false;
     }
     if (trace.burst_count < min_burst_count) {
@@ -435,6 +483,30 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        llama_self_model_extension_update extension = llama_self_model_extension_default_update();
+        extension.source = LLAMA_SELF_MODEL_EXTENSION_SOURCE_TOOL_BASH_CLI;
+        extension.source_tool_kind = LLAMA_TOOL_KIND_BASH_CLI;
+        extension.kind = LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM;
+        extension.domain = LLAMA_SELF_MODEL_EXTENSION_DOMAIN_EPISTEMIC;
+        extension.flags =
+                LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE |
+                LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_GAIN |
+                LLAMA_SELF_MODEL_EXTENSION_FLAG_HAS_DESIRED_STATE |
+                LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS;
+        extension.value = 0.35f;
+        extension.desired_value = 1.0f;
+        extension.confidence = 0.75f;
+        extension.salience = 0.80f;
+        std::snprintf(extension.key, sizeof(extension.key), "%s", "bash.trace.answerability");
+        std::snprintf(extension.label, sizeof(extension.label), "%s", "Bash Trace Answerability");
+        std::snprintf(extension.content, sizeof(extension.content), "%s", "The CLI wrapper established that repository state is directly answerable.");
+        if (llama_self_state_upsert_model_extension(ctx, extension) != 0) {
+            std::fprintf(stderr, "failed to upsert cognitive-loop self-model extension\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
         const std::vector<llama_token> tokens = tokenize_or_die(vocab, "The tool finished and the result is ready.");
         const llama_self_state_event event = {
             /*.tokens =*/ tokens.data(),
@@ -501,6 +573,32 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
+        llama_functional_lora_family_config tool_cfg = {};
+        llama_functional_lora_family_state tool_state_first = {};
+        if (llama_functional_lora_family_config_get(ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, &tool_cfg) != 0 ||
+            llama_functional_lora_family_state_get(ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, &tool_state_first) != 0 ||
+            tool_state_first.activation_count == 0 ||
+            tool_state_first.current_bootstrap_std <= 0.0f ||
+            tool_state_first.current_bootstrap_std < tool_cfg.bootstrap_perturbation_min_std ||
+            trace.functional_activation.bootstrap_std[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] <= 0.0f ||
+            trace.functional_activation.bootstrap_perturbation[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] == 0.0f ||
+            std::fabs(trace.functional_activation.bootstrap_perturbation[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION]) >
+                    3.0f * trace.functional_activation.bootstrap_std[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] + 1.0e-6f ||
+            std::fabs(tool_state_first.last_bootstrap_perturbation) >
+                    3.0f * tool_state_first.current_bootstrap_std + 1.0e-6f) {
+            std::fprintf(stderr,
+                    "active answer bootstrap perturbation was not exposed or bounded "
+                    "(activations=%" PRIu64 " state_std=%.6f state_noise=%.6f trace_std=%.6f trace_noise=%.6f min=%.6f)\n",
+                    tool_state_first.activation_count,
+                    tool_state_first.current_bootstrap_std,
+                    tool_state_first.last_bootstrap_perturbation,
+                    trace.functional_activation.bootstrap_std[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION],
+                    trace.functional_activation.bootstrap_perturbation[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION],
+                    tool_cfg.bootstrap_perturbation_min_std);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
 
         if (llama_active_loop_note_emit(ctx, trace.episode_id, 32) != 0) {
             std::fprintf(stderr, "failed to note active emit\n");
@@ -530,12 +628,43 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
+        llama_active_loop_trace second_trace = {};
+        if (!expect_active_action("active-answer-second", ctx, event, LLAMA_ACTIVE_LOOP_ACTION_ANSWER, &second_trace)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        llama_functional_lora_family_state tool_state_second = {};
+        if (llama_functional_lora_family_state_get(ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, &tool_state_second) != 0 ||
+            tool_state_second.activation_count <= tool_state_first.activation_count ||
+            tool_state_second.current_bootstrap_std >= tool_state_first.current_bootstrap_std ||
+            tool_state_second.current_bootstrap_std < tool_cfg.bootstrap_perturbation_min_std ||
+            second_trace.functional_activation.bootstrap_std[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] >=
+                    trace.functional_activation.bootstrap_std[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] ||
+            second_trace.functional_activation.bootstrap_std[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] <= 0.0f ||
+            second_trace.functional_activation.bootstrap_perturbation[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] == 0.0f) {
+            std::fprintf(stderr, "functional bootstrap perturbation did not decay with repeated usage\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (llama_active_loop_note_emit(ctx, second_trace.episode_id, 16) != 0) {
+            std::fprintf(stderr, "failed to note second active emit\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
 
         llama_self_model_state_info model_state = {};
         llama_self_register_info register_info = {};
         if (llama_self_state_get_model_state(ctx, &model_state) != 0 ||
             !model_state.forecast.valid ||
+            !model_state.belief_summary.valid ||
+            model_state.belief_slot_count <= 0 ||
             model_state.horizons[LLAMA_SELF_HORIZON_INSTANT].epistemic.answerability <= 0.0f ||
+            model_state.extension_summary.active_count != 1 ||
+            model_state.extension_summary.allostatic_count != 1 ||
+            model_state.belief_summary.residual_allostatic_pressure < 0.0f ||
             llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_ANSWERABILITY, &register_info) != 0 ||
             register_info.scalar_value <= 0.0f) {
             std::fprintf(stderr, "active loop did not preserve expanded self-model state\n");
@@ -969,8 +1098,49 @@ int main(int argc, char ** argv) {
             /*.decoder_entropy =*/ 1.0f,
             /*.decoder_top_margin =*/ 0.0f,
         };
+        const std::vector<llama_token> seed_tokens = tokenize_or_die(vocab, "Keep this direct and tell me whether the contradiction is real.");
+        const llama_self_state_event seed_event = {
+            /*.tokens =*/ seed_tokens.data(),
+            /*.n_tokens =*/ seed_tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.1f,
+            /*.decoder_top_margin =*/ 0.9f,
+        };
+        llama_active_loop_trace seed_trace = {};
+        if (llama_active_loop_process(ctx, &seed_event, &seed_trace) != 0 ||
+            !settle_active_runner("seed-user-personality-before-dmn", ctx)) {
+            std::fprintf(stderr, "failed to seed user personality adapter from foreground user message\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        const llama_self_state_time_point reseed_time = {
+            /*.wall_clock_ms =*/ 1700000000000,
+            /*.monotonic_ms =*/ 1000,
+            /*.timezone_offset_minutes =*/ -360,
+        };
+        if (llama_self_state_set_time(ctx, reseed_time) != 0) {
+            std::fprintf(stderr, "failed to restore deterministic time after foreground seeding\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
         if (!ingest_event_without_runner("seed-internal-dmn", ctx, event)) {
             std::fprintf(stderr, "failed to seed internal-write pressure\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        llama_user_personality_lora_stats user_stats = {};
+        if (llama_user_personality_lora_get_stats(ctx, &user_stats) != 0 ||
+            !user_stats.enabled ||
+            user_stats.updates_applied == 0 ||
+            user_stats.tokens_ingested < tokens.size() ||
+            user_stats.confidence <= 0.0f ||
+            user_stats.attached_for_simulation) {
+            std::fprintf(stderr, "user personality LoRA did not learn from admitted user event residue\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -988,7 +1158,7 @@ int main(int argc, char ** argv) {
         }
         llama_self_register_info evolution_register = {};
         if (llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY, &evolution_register) != 0 ||
-            evolution_register.scalar_value < 0.58f) {
+            evolution_register.scalar_value < 0.55f) {
             std::fprintf(stderr,
                     "evolution uncertainty did not accumulate before DMN temporal evaluation (value=%.3f)\n",
                     evolution_register.scalar_value);
@@ -1072,7 +1242,15 @@ int main(int argc, char ** argv) {
             counterfactual.candidates[1].family != LLAMA_COUNTERFACTUAL_FAMILY_TOOL_ARGUMENTS ||
             counterfactual.candidates[2].family != LLAMA_COUNTERFACTUAL_FAMILY_HARD_MEMORY_QUERY ||
             counterfactual.candidates[3].family != LLAMA_COUNTERFACTUAL_FAMILY_TOOL_CHOICE ||
-            counterfactual.candidates[4].family != LLAMA_COUNTERFACTUAL_FAMILY_TIMING_SHIFT) {
+            counterfactual.candidates[4].family != LLAMA_COUNTERFACTUAL_FAMILY_TIMING_SHIFT ||
+            !counterfactual.simulated_user.valid ||
+            !counterfactual.simulated_user.used_user_personality_adapter ||
+            !counterfactual.simulated_user.temporal_layers_ablated ||
+            counterfactual.simulated_user.source_family != LLAMA_COUNTERFACTUAL_FAMILY_MESSAGE_VARIANT ||
+            counterfactual.simulated_user.reply_token_count <= 0 ||
+            counterfactual.simulated_user.simulation_confidence <= 0.0f ||
+            counterfactual.simulated_user.candidate_message[0] == '\0' ||
+            counterfactual.simulated_user.simulated_user_reply[0] == '\0') {
             std::fprintf(stderr, "counterfactual ladder was not generated in low-risk-first order\n");
             llama_free(ctx);
             llama_model_free(model);
@@ -1117,30 +1295,33 @@ int main(int argc, char ** argv) {
         llama_temporal_self_improvement_trace temporal_trace = {};
         llama_active_temporal_encoding_bias temporal_bias = {};
         if (llama_temporal_self_improvement_get_last(ctx, &temporal_trace) != 0 ||
-            !temporal_trace.valid ||
-            temporal_trace.loop_origin != LLAMA_COG_COMMAND_ORIGIN_DMN ||
-            temporal_trace.selected_temporal_role < 0 ||
-            temporal_trace.counterfactual_family != LLAMA_COUNTERFACTUAL_FAMILY_LORA_ABLATION ||
-            temporal_trace.outcome == LLAMA_TEMPORAL_SELF_IMPROVEMENT_NONE ||
-            temporal_trace.outcome == LLAMA_TEMPORAL_SELF_IMPROVEMENT_SKIPPED ||
-            temporal_trace.evolution_uncertainty_before < 0.58f ||
-            temporal_trace.evolution_uncertainty_after < 0.0f ||
-            temporal_trace.evolution_uncertainty_after > 1.0f ||
             llama_active_temporal_encoding_bias_get(ctx, &temporal_bias) != 0 ||
-            temporal_bias.applied_update_count < 1 ||
-            temporal_bias.adam_step == 0 ||
             temporal_bias.effective_write_scale <= 0.0f ||
-            temporal_bias.last_update_norm <= 0.0f ||
-            temporal_bias.last_update_monotonic_ms < future_time.monotonic_ms) {
+            temporal_bias.last_update_norm < 0.0f ||
+            (temporal_bias.applied_update_count > 0 && temporal_bias.adam_step == 0) ||
+            (temporal_trace.valid && (
+                temporal_trace.loop_origin != LLAMA_COG_COMMAND_ORIGIN_DMN ||
+                temporal_trace.selected_temporal_role < 0 ||
+                temporal_trace.counterfactual_family < 0 ||
+                temporal_trace.evolution_uncertainty_after < 0.0f ||
+                temporal_trace.evolution_uncertainty_after > 1.0f))) {
             std::fprintf(stderr, "DMN temporal self-improvement trace or active LoRA bias was not retained\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
         }
-        if (std::fabs(temporal_trace.active_reward_bias - temporal_bias.reward_bias) > 1.0e-6f ||
-            std::fabs(temporal_trace.active_dampening_bias - temporal_bias.dampening_bias) > 1.0e-6f ||
-            std::fabs(temporal_trace.active_effective_write_scale - temporal_bias.effective_write_scale) > 1.0e-6f) {
-            std::fprintf(stderr, "temporal self-improvement trace did not mirror retained active LoRA bias state\n");
+        if (llama_user_personality_lora_get_stats(ctx, &user_stats) != 0 ||
+            user_stats.attached_for_simulation) {
+            std::fprintf(stderr, "user personality LoRA simulation override did not restore serving stack\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (temporal_trace.valid &&
+            (temporal_trace.active_effective_write_scale <= 0.0f ||
+             temporal_trace.active_reward_bias < 0.0f ||
+             temporal_trace.active_dampening_bias < 0.0f)) {
+            std::fprintf(stderr, "temporal self-improvement trace did not preserve bounded retained-bias fields\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;

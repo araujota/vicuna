@@ -24,6 +24,7 @@ The core architecture consists of the following components:
 - `server_response_reader`: Higher-level wrapper around the two queues above for cleaner code.
 - `server_task`: Unit of work pushed into `server_queue`.
 - `server_task_result`: Unit of result pushed into `server_response`.
+- `server-bash-tool`: Host-side bounded bash executor used for first-class cognitive CLI tool requests.
 - `server_tokens`: Unified representation of token sequences (supports both text and multimodal tokens); used by `server_task` and `server_slot`.
 - `server_prompt_checkpoint`: For recurrent (e.g., RWKV) and SWA models, stores snapshots of KV cache state. Enables reuse when subsequent requests share the same prompt prefix, saving redundant computation.
 - `server_models`: Standalone component for managing multiple backend instances (used in router mode). It is completely independent of `server_context`.
@@ -69,6 +70,114 @@ Each incoming HTTP request is handled by its own thread managed by the HTTP libr
 
 - All JSON formatting and chat template logic must stay in the HTTP layer.
 - Avoid passing raw JSON between the HTTP layer and `server_slot`. Instead, parse everything into native C++ types as early as possible.
+
+### Cognitive Bash Tool Path
+
+The cognitive runtime can now emit first-class `LLAMA_TOOL_KIND_BASH_CLI`
+commands instead of opaque generic tool placeholders. The core runtime keeps
+policy and request state typed in `llama_bash_tool_config`,
+`llama_bash_tool_request`, and `llama_bash_tool_result`; `llama-server` owns
+actual process launch and output capture through `server-bash-tool.cpp`.
+
+Execution remains intentionally bounded and host-visible:
+
+- `VICUNA_BASH_TOOL_ENABLED`: enable or disable host execution
+- `VICUNA_BASH_TOOL_PATH`: absolute bash-compatible executable path
+- `VICUNA_BASH_TOOL_WORKDIR`: working directory for launched commands
+- `VICUNA_BASH_TOOL_TIMEOUT_MS`: per-command timeout budget
+- `VICUNA_BASH_TOOL_MAX_STDOUT_BYTES`: bounded stdout capture budget
+- `VICUNA_BASH_TOOL_MAX_STDERR_BYTES`: bounded stderr capture budget
+- `VICUNA_BASH_TOOL_LOGIN_SHELL`: use `bash -lc` instead of `bash -c`
+- `VICUNA_BASH_TOOL_INHERIT_ENV`: inherit the server environment or launch with an empty one
+
+`server_context` acks pending bash commands, executes them synchronously on the
+host, submits typed results back into the runtime, and only then lets the
+active-loop or DMN runner continue. Unsupported hosts, disabled execution,
+timeouts, and launch failures are surfaced through typed result fields instead
+of silent shell fallbacks.
+
+### Tool-Authored Self-Model Extensions
+
+Vicuña now supports a bounded self-model extension registry above the authored
+self-model core. `llama-server` does not invent these additions from shell text
+automatically; host code should capture them explicitly and write them through
+`llama_self_state_upsert_model_extension()`.
+
+Use this path when a tool learns something that should persist in the self-model
+as structured state rather than only as prose. The write contract is:
+
+- choose `MEMORY_CONTEXT` for contextual representations that should bias future
+  gain control but should not become objectives
+- choose `SCALAR_PARAM` for typed internal parameters that may optionally carry
+  a desired state
+- keep keys stable across repeated writes so updates replace prior values
+- keep values, confidence, salience, and weights normalized to `[0, 1]`
+- set `AFFECT_ALLOSTASIS` only when the tool is writing a real internal target
+  with a meaningful desired state
+
+Accuracy guidance for tool integrations:
+
+- use the most specific domain that matches the observation
+- populate `content` for memory-like extensions so the runtime can sketch and
+  reactivate them correctly
+- avoid encoding self-model additions only in `stdout`/`stderr`; capture the
+  structured finding in host code and upsert it explicitly
+- do not mark hard-memory-like retrieved facts as allostatic targets by default
+
+### User-Model Capture Guidance
+
+Vicuña now distinguishes between durable user memory, bounded user-preference
+state, and rhetorical simulation substrate.
+
+Host integrations should preserve that split:
+
+- archive repeated user facts, stable preferences, and relationship residue as
+  `USER_MODEL` hard-memory primitives
+- write self-state extensions only when a tool learned something that should
+  become a bounded control variable rather than a retrieved memory
+- do not try to write directly into the user-personality LoRA from host code;
+  that LoRA is trained only from admitted user-message residue inside the
+  runtime
+
+For the bare-minimum shipped tool surface, the bash CLI wrapper should usually
+contribute user-model state indirectly:
+
+- if command output reveals a durable user preference, archive a `USER_MODEL`
+  primitive
+- if command output reveals a bounded internal target about how the runtime
+  should regulate itself, upsert a typed self-model extension
+- otherwise keep the result as `TOOL_OBSERVATION` or `OUTCOME`
+
+### Hard-Memory Primitive Authoring
+
+Tool integrations should also decide whether a result belongs in hard memory.
+Vicuña now stores bounded typed primitives instead of relying on one generic
+archive string. Host code should use `llama_hard_memory_archive_primitives()`
+when a tool result should remain durable beyond the immediate turn.
+
+Choose the narrowest primitive kind that matches the residue:
+
+- `TRAJECTORY` for multi-step execution traces or plans
+- `OUTCOME` for settled result summaries, failures, or success residue
+- `TOOL_OBSERVATION` for bounded evidence extracted from stdout, stderr, or an
+  API response
+- `USER_MODEL` for durable preference or relationship residue
+- `SELF_MODEL_FRAGMENT` for durable control-state residue
+
+Authoring rules:
+
+- keep `importance`, `confidence`, `gain_bias`, and `allostatic_relevance`
+  normalized to `[0, 1]`
+- use stable keys when repeated writes should update the same semantic object
+- set `AFFECT_ALLOSTASIS` only for primitives that truly encode desirable
+  internal regulation state
+- prefer archiving a small batch of typed primitives over one large prose blob
+
+For the bare-minimum shipped system, the only first-class tool path is the bash
+CLI wrapper. That path should remain conservative: write `TOOL_OBSERVATION` or
+`OUTCOME` when command results are durable, and use self-model extension writes
+only when the command changed the system's internal model rather than merely
+producing evidence.
 
 ### Example trace of a request
 

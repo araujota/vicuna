@@ -69,6 +69,26 @@ struct llama_self_trace_item {
     std::vector<llama_token> tokens;
 };
 
+struct llama_self_model_extension_entry {
+    int32_t source = LLAMA_SELF_MODEL_EXTENSION_SOURCE_TOOL_EXTERNAL;
+    int32_t source_tool_kind = LLAMA_TOOL_KIND_NONE;
+    int32_t kind = LLAMA_SELF_MODEL_EXTENSION_MEMORY_CONTEXT;
+    int32_t domain = LLAMA_SELF_MODEL_EXTENSION_DOMAIN_EPISTEMIC;
+    uint32_t flags = LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE | LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_GAIN;
+    int64_t last_update_monotonic_ms = -1;
+    uint32_t activation_count = 0;
+    float value = 0.0f;
+    float desired_value = 0.0f;
+    float confidence = 0.0f;
+    float salience = 0.0f;
+    float gain_weight = 1.0f;
+    float allostatic_weight = 0.0f;
+    char key[LLAMA_HARD_MEMORY_MAX_ID_CHARS] = {};
+    char label[LLAMA_HARD_MEMORY_MAX_TITLE_CHARS] = {};
+    char content[LLAMA_HARD_MEMORY_MAX_TEXT_CHARS] = {};
+    std::array<float, 32> sketch = {};
+};
+
 class llama_self_state {
 public:
     llama_self_state();
@@ -99,6 +119,13 @@ public:
     bool get_tool_state(llama_self_tool_state_info * out_info) const;
     bool get_social_state(llama_self_social_state_info * out_info) const;
     bool get_model_state(llama_self_model_state_info * out_info) const;
+    int32_t model_extension_count() const;
+    bool get_model_extension(int32_t index, llama_self_model_extension_info * out_info) const;
+    bool upsert_model_extension(const llama_self_model_extension_update & update);
+    bool remove_model_extension(const char * key);
+    bool promote_hard_memory_query(
+            const llama_hard_memory_query_request & request,
+            const llama_hard_memory_result & result);
     int32_t trace_count() const;
     bool clear_trace();
     bool replay_trace(const llama_vocab * vocab, int32_t upto_count, int32_t override_channel);
@@ -108,6 +135,11 @@ public:
     bool trace_export(void * dst, size_t size) const;
     bool trace_import(const void * src, size_t size, bool replace_existing);
     bool evaluate_counterfactual(const llama_vocab * vocab, const llama_self_updater_program & program, int32_t upto_count, int32_t replay_channel, llama_self_counterfactual_result * out_result) const;
+    bool evaluate_hypothetical_event(
+            const llama_vocab * vocab,
+            const llama_self_state_event & event,
+            llama_self_state_delta_summary * out_delta,
+            llama_self_model_state_info * out_model_state) const;
     bool build_prewrite_features(const llama_vocab * vocab, const llama_self_state_event & event, llama_self_state_feature_vector * out_features) const;
     bool apply_prewrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
     bool build_postwrite_features(const llama_vocab * vocab, const llama_self_state_event & event, llama_self_state_feature_vector * out_features) const;
@@ -136,6 +168,11 @@ private:
     void bridge_working_memory_to_handles(const std::array<float, 32> & sketch, float salience);
     void update_social_state(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
     void initialize_model_state();
+    void refresh_model_extension_summary();
+    void initialize_belief_state();
+    void refresh_belief_summary();
+    void refresh_belief_promotion_candidates();
+    void update_belief_state(const llama_self_state_event & event, const llama_self_state_feature_vector & features, uint32_t source_mask);
     void update_expanded_model(const llama_self_state_event & event, const llama_self_state_feature_vector & features, uint32_t source_mask);
     void update_summary_registers(uint32_t source_mask);
     void update_evolution_uncertainty(uint32_t source_mask, float signed_progress, float efficiency_advantage);
@@ -148,6 +185,7 @@ private:
     bool validate_updater_program(const llama_self_updater_program & program) const;
     bool apply_register_update_rules(uint32_t phase_mask, const llama_self_state_event & event, const llama_self_state_feature_vector & features, uint32_t source_mask);
     float updater_feature_value(int32_t feature_id, const llama_self_state_event & event, const llama_self_state_feature_vector & features) const;
+    bool validate_model_extension_update(llama_self_model_extension_update * update) const;
 
     static const llama_self_register_definition * get_definition(int32_t register_id);
     static std::array<llama_self_register_definition, LLAMA_SELF_REGISTER_COUNT> build_definitions();
@@ -182,13 +220,22 @@ private:
     float social_reciprocity = 0.5f;
     float social_recent_user_valence = 0.0f;
     float social_dissatisfaction = 0.0f;
+    llama_self_user_preference_profile user_preference = {};
     std::array<llama_self_model_horizon_info, LLAMA_SELF_HORIZON_COUNT> model_horizons = {};
     llama_self_forecast_trace model_forecast = {};
     llama_self_prediction_error_trace prediction_error = {};
+    llama_self_belief_summary belief_summary = {};
+    std::array<llama_self_belief_slot_info, LLAMA_SELF_BELIEF_MAX_SLOTS> belief_slots = {};
+    std::array<std::array<float, 4>, LLAMA_SELF_BELIEF_MAX_SLOTS> belief_slot_signatures = {};
+    std::array<llama_self_model_promotion_candidate, LLAMA_SELF_BELIEF_MAX_PROMOTION_CANDIDATES> promotion_candidates = {};
+    int32_t promotion_candidate_count = 0;
+    llama_self_model_extension_summary extension_summary = {};
+    llama_self_model_extension_trace extension_trace = {};
     std::vector<llama_self_sketch_surface> goals;
     std::vector<llama_self_sketch_surface> commitments;
     std::vector<llama_self_working_memory_item> working_memory;
     std::vector<llama_self_memory_handle> memory_handles;
+    std::vector<llama_self_model_extension_entry> model_extensions;
     std::vector<llama_self_reactivation_info> reactivation_priorities;
     std::vector<llama_self_tool_job> tool_jobs;
     std::vector<llama_self_trace_item> trace_items;

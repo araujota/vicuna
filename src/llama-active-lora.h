@@ -2,7 +2,27 @@
 
 #include "llama.h"
 
+#include <array>
 #include <memory>
+
+struct llama_functional_gating_observation {
+    int32_t loop_origin = 0;
+    int32_t microphase = 0;
+    uint64_t eligible_mask = 0;
+    llama_functional_outcome_snapshot snapshot = {};
+    float uncertainty = 0.0f;
+    float tool_affinity = 0.0f;
+    float continuation = 0.0f;
+    float memory_pressure = 0.0f;
+    float recovery_urgency = 0.0f;
+    float prediction_error = 0.0f;
+    float planning_pressure = 0.0f;
+    float plan_complexity = 0.0f;
+    float plan_revision = 0.0f;
+    llama_self_belief_summary belief_summary = {};
+    llama_self_model_extension_summary extension_summary = {};
+    llama_hard_memory_retrieval_summary hard_memory_summary = {};
+};
 
 class llama_active_lora_manager {
 public:
@@ -16,6 +36,7 @@ public:
     bool remediate(const llama_token * tokens, size_t n_tokens, float budget_scale);
     bool remediate(const llama_self_state_event & event, float budget_scale, const llama_self_state_feature_vector * features);
     bool get_stats(llama_active_lora_stats * out_stats) const;
+    bool user_personality_get_stats(llama_user_personality_lora_stats * out_stats) const;
     bool tick_past(uint64_t now_us);
     bool get_past_stats(llama_past_lora_stats * out_stats) const;
     static int32_t functional_family_count();
@@ -27,6 +48,10 @@ public:
     bool functional_get_ablation(llama_functional_lora_ablation_config * out_config) const;
     bool temporal_encoding_bias_get(llama_active_temporal_encoding_bias * out_bias) const;
     bool temporal_encoding_bias_apply(float signed_advantage, float efficiency_advantage, int64_t monotonic_ms);
+    bool functional_predict_activation(
+            const llama_functional_gating_observation & observation,
+            const llama_functional_activation_decision & policy_seed,
+            llama_functional_activation_decision * out_decision);
     bool functional_activate(const llama_functional_activation_decision & decision);
     bool functional_note_command_complete(int32_t origin);
     bool functional_apply_update(
@@ -44,6 +69,9 @@ public:
             float magnitude,
             const llama_self_state_event & event,
             const llama_self_state_feature_vector * features);
+    llama_adapter_lora * user_personality_adapter() const;
+    float user_personality_scale() const;
+    bool user_personality_set_attached(bool attached);
 
 private:
     struct impl;

@@ -66,6 +66,7 @@ request adapters (if any)
 -> past_week
 -> active
 -> functional_tool_selection
+-> functional_planning_composition
 -> functional_counterfactual
 -> functional_memory_compression
 -> functional_self_observation
@@ -77,9 +78,13 @@ The functional bank is intentionally separate from the temporal cascade:
 
 - temporal LoRAs encode time-sliced behavioral residue from lived history
 - functional LoRAs encode reusable operation-local bias for tool choice,
-  counterfactual comparison, memory compression, and self-observation
-- all four functional adapters stay attached at stable zero-or-gain scale rather
-  than being created and destroyed per phase
+  planning/composition, counterfactual comparison, memory compression, and
+  self-observation
+- each functional family now keeps two explicit runtime adapters:
+  a learned adapter that starts as a true no-op and a tiny bootstrap adapter
+  that provides signed stochastic perturbation early in the family lifecycle
+- bootstrap perturbation decays with family activation count toward a positive
+  floor rather than disappearing entirely
 - routing still keeps eligibility, hold windows, and ablations in explicit
   CPU-side policy, but the applied gain now comes from a small shared gating
   MLP driven by a typed self-state gradient toward favorable allostasis
@@ -134,6 +139,9 @@ The shared functional microphase vocabulary currently includes:
 - `TOOL_CLASS_SELECTION`
 - `TOOL_ARGUMENT_PREP`
 - `TOOL_RESULT_INTEGRATION`
+- `PLAN_DRAFT`
+- `PLAN_COMPOSE`
+- `PLAN_REVISE`
 - `COUNTERFACTUAL_GENERATE`
 - `COUNTERFACTUAL_COMPARE`
 - `MEMORY_COMPRESSION`
@@ -145,6 +153,8 @@ The shared functional microphase vocabulary currently includes:
 The intended bias families are:
 
 - `functional_tool_selection`: active and DMN tool-class bias under uncertainty
+- `functional_planning_composition`: bounded plan drafting, revision, and
+  composition bias shared by active and DMN
 - `functional_counterfactual`: comparative simulation and alternative ranking
 - `functional_memory_compression`: preservation bias for salient evicted spans
 - `functional_self_observation`: "what changed in me" interpretation and forecast
@@ -153,6 +163,9 @@ Family updates are outcome-weighted rather than generic:
 
 - tool-selection opens on tool commitment and settles only after tool output has
   actually been integrated into the active loop
+- planning/composition opens during plan draft or revision and settles against
+  the quality of the composed plan as judged by later favorable-state,
+  answerability, efficiency, and recovery deltas
 - counterfactual settles against favorable-state and efficiency deltas after DMN
   comparison and remediation choice
 - memory-compression settles when compression pressure and later audit signals
@@ -163,10 +176,30 @@ Family updates are outcome-weighted rather than generic:
 Functional gain control now follows a bounded loop:
 
 1. observe the current self-state gradient and allostatic distance,
-2. predict per-family gains with the gating MLP,
-3. apply bounded Gaussian exploration and clip gains into `[0, 2]`,
-4. execute the functional-biased loop step and let registers shift,
-5. settle a bounded training tuple and update the gate with Adam.
+2. derive a bounded belief summary over incompletely modeled cares from
+   forecast error, residual allostatic pressure, novelty, and memory residue,
+3. predict per-family gains with the gating MLP from the explicit gradient plus
+   the fixed belief-summary tail,
+4. apply bounded Gaussian exploration and clip gains into `[0, 2]`,
+5. if a family is invoked, apply its routed learned gain plus a separate
+   bounded bootstrap perturbation that decays with family usage toward a
+   nonzero floor,
+6. execute the functional-biased loop step and let registers shift,
+7. settle a bounded training tuple and update the gate with Adam.
+
+This is intentionally not a replacement of the explicit self-state. The
+register bank and typed self-model remain the observation layer. The belief
+layer is a small residual controller for partial observability: it represents
+the possibility that the runtime is missing something it should care about,
+without letting opaque latent text into the gating path.
+
+The old action/state switches are now subordinate to a shared plan surface:
+
+- active and DMN both compose bounded plans with typed steps
+- tool paths are represented explicitly as `INVOKE_TOOL -> OBSERVE_TOOL`
+- internal-write paths can append emit or tool follow-up steps in the same plan
+- runner status and traces expose `plan_id`, revision count, current step, and
+  plan status so the host can inspect composition directly
 
 Outside that gate, runtime LoRA tensor mutation and temporal write-bias control
 also use Adam-backed updates because they mutate differentiable parameters from
@@ -204,7 +237,76 @@ Current implementation slice:
   - a small expanded fast control bank for `user_satisfaction_risk`, `goal_progress_pressure`, `loop_inefficiency`, `recovery_urgency`, `answerability`, and `preference_uncertainty`,
   - grouped profile families for goal progress, user outcome, epistemic condition, efficiency, recovery, strategy, and self-improvement readiness,
   - explicit `instant`, `short`, and `long` horizon slices,
-  - and bounded forecast / prediction-error traces for remaining steps, remaining inference cost, expected user-outcome change, and expected recovery change.
+  - bounded forecast / prediction-error traces for remaining steps, remaining inference cost, expected user-outcome change, and expected recovery change,
+  - and a bounded self-model extension registry that sits above the authored core.
+
+The authored profiles remain the stable prior of the system. Runtime extensions
+are additive and typed:
+
+- hard-memory query can counterfactually promote `MEMORY_CONTEXT` extensions
+  when representing a retrieved memory inside self-model appears useful
+- tool or host code can upsert `SCALAR_PARAM` extensions with optional desired
+  state
+- hard-memory-derived extensions affect gain-control context but do not
+  participate in allostasis by default
+- tool-authored scalar parameters may participate in allostasis when they
+  explicitly declare a desired state
+
+The functional gating MLP does not consume a raw variable-length extension set.
+It consumes a fixed summary tail derived from the extension registry, preserving
+bounded control and compatibility with the existing self-state-gradient-driven
+gain path.
+
+The same principle now applies to belief under incomplete self-modeling. The
+runtime keeps a bounded belief summary and a very small number of latent
+concern slots. These slots are generic residual buckets, not a second hidden
+self-model. They update from prediction-error residue, novelty, and
+memory-supported mismatch; only the fixed summary tail reaches the gate. If a
+slot remains stable and predictive, it is surfaced as a promotion candidate for
+the explicit self-model extension registry rather than becoming durable state
+automatically.
+
+## Hard Memory
+
+Hard memory is now a typed persistent substrate rather than a single textual
+archive lane. The runtime emits bounded primitives:
+
+- `EVENT_FRAGMENT`
+- `TRAJECTORY`
+- `OUTCOME`
+- `TOOL_OBSERVATION`
+- `USER_MODEL`
+- `SELF_MODEL_FRAGMENT`
+
+This is the bridge between episodic residue, user-model residue, and durable
+control-state residue. The core policy stays explicit and CPU-side:
+
+- self-state postwrite archival emits event, user-model, and self-model
+  primitives when the delta exceeds threshold
+- active-loop execution emits trajectories, outcomes, and tool observations
+- DMN execution emits trajectories, outcomes, and self-model fragments
+- retrieval parses primitive metadata back into typed hits and a bounded
+  retrieval summary
+
+The retrieval summary is the critical integration surface. Instead of piping raw
+retrieved text into the gain controller, the runtime projects retrieval into a
+bounded vector of:
+
+- similarity support,
+- importance and confidence support,
+- gain and allostatic support,
+- and domain-specific support for goal progress, user outcome, epistemic state,
+  efficiency, recovery, strategy, and self-improvement.
+
+That summary cooperates with the functional LoRA stack in two ways:
+
+- it feeds the gating MLP as part of the self-state-gradient-driven activation
+  input
+- it can promote selected retrieved memories into bounded self-model extensions,
+  which then contribute to the self-model summary consumed by the same gate
+
+This keeps hard memory, self-model state, and LoRA modulation coupled through
+typed bounded surfaces rather than prompt text.
 
 ### Extensibility
 
@@ -460,6 +562,24 @@ reactivation / pressure spike
 -> governance gate
 -> Active LoRA update, gather-info tool job, defer, deny, or repair emit
 ```
+
+The message-variant branch now includes a bounded user-response simulation
+subpass:
+
+```text
+candidate assistant message
+-> ablate temporal/runtime memory adapters
+-> attach only base model + user-personality LoRA
+-> decode bounded simulated user reply
+-> replay simulated reply on counterfactual self-state channel
+-> score signed self-state outcome
+-> restore normal serving stack
+```
+
+This is not a general second agent. It is a narrow evaluation mode used only by
+DMN counterfactual search. The user-personality LoRA is trained continuously
+from admitted user-message residue and stays fixed-size rather than versioned.
+Its job is rhetorical simulation, not durable memory storage.
 
 Useful meta-registers and governance inputs include:
 

@@ -164,6 +164,246 @@ static bool query_enabled(const llama_hard_memory_config & config) {
     return config.enabled && config.base_url[0] != '\0' && config.auth_token[0] != '\0';
 }
 
+static float clamp_unit(float value) {
+    return std::max(0.0f, std::min(1.0f, value));
+}
+
+static const char * primitive_kind_name(int32_t kind) {
+    switch (kind) {
+        case LLAMA_HARD_MEMORY_PRIMITIVE_EVENT_FRAGMENT:      return "event_fragment";
+        case LLAMA_HARD_MEMORY_PRIMITIVE_TRAJECTORY:          return "trajectory";
+        case LLAMA_HARD_MEMORY_PRIMITIVE_OUTCOME:             return "outcome";
+        case LLAMA_HARD_MEMORY_PRIMITIVE_TOOL_OBSERVATION:    return "tool_observation";
+        case LLAMA_HARD_MEMORY_PRIMITIVE_USER_MODEL:          return "user_model";
+        case LLAMA_HARD_MEMORY_PRIMITIVE_SELF_MODEL_FRAGMENT: return "self_model_fragment";
+        default: return "event_fragment";
+    }
+}
+
+static int32_t parse_primitive_kind(const json & value) {
+    const std::string name = value.is_string() ? value.get<std::string>() : std::string();
+    if (name == "trajectory") {
+        return LLAMA_HARD_MEMORY_PRIMITIVE_TRAJECTORY;
+    }
+    if (name == "outcome") {
+        return LLAMA_HARD_MEMORY_PRIMITIVE_OUTCOME;
+    }
+    if (name == "tool_observation") {
+        return LLAMA_HARD_MEMORY_PRIMITIVE_TOOL_OBSERVATION;
+    }
+    if (name == "user_model") {
+        return LLAMA_HARD_MEMORY_PRIMITIVE_USER_MODEL;
+    }
+    if (name == "self_model_fragment") {
+        return LLAMA_HARD_MEMORY_PRIMITIVE_SELF_MODEL_FRAGMENT;
+    }
+    if (name == "event_fragment") {
+        return LLAMA_HARD_MEMORY_PRIMITIVE_EVENT_FRAGMENT;
+    }
+    return value.is_number_integer() ? value.get<int32_t>() : LLAMA_HARD_MEMORY_PRIMITIVE_EVENT_FRAGMENT;
+}
+
+static const char * domain_name(int32_t domain) {
+    switch (domain) {
+        case LLAMA_HARD_MEMORY_DOMAIN_GOAL_PROGRESS:    return "goal_progress";
+        case LLAMA_HARD_MEMORY_DOMAIN_USER_OUTCOME:     return "user_outcome";
+        case LLAMA_HARD_MEMORY_DOMAIN_EPISTEMIC:        return "epistemic";
+        case LLAMA_HARD_MEMORY_DOMAIN_EFFICIENCY:       return "efficiency";
+        case LLAMA_HARD_MEMORY_DOMAIN_RECOVERY:         return "recovery";
+        case LLAMA_HARD_MEMORY_DOMAIN_STRATEGY:         return "strategy";
+        case LLAMA_HARD_MEMORY_DOMAIN_SELF_IMPROVEMENT: return "self_improvement";
+        default: return "epistemic";
+    }
+}
+
+static int32_t parse_domain(const json & value) {
+    const std::string name = value.is_string() ? value.get<std::string>() : std::string();
+    if (name == "goal_progress") {
+        return LLAMA_HARD_MEMORY_DOMAIN_GOAL_PROGRESS;
+    }
+    if (name == "user_outcome") {
+        return LLAMA_HARD_MEMORY_DOMAIN_USER_OUTCOME;
+    }
+    if (name == "epistemic") {
+        return LLAMA_HARD_MEMORY_DOMAIN_EPISTEMIC;
+    }
+    if (name == "efficiency") {
+        return LLAMA_HARD_MEMORY_DOMAIN_EFFICIENCY;
+    }
+    if (name == "recovery") {
+        return LLAMA_HARD_MEMORY_DOMAIN_RECOVERY;
+    }
+    if (name == "strategy") {
+        return LLAMA_HARD_MEMORY_DOMAIN_STRATEGY;
+    }
+    if (name == "self_improvement") {
+        return LLAMA_HARD_MEMORY_DOMAIN_SELF_IMPROVEMENT;
+    }
+    return value.is_number_integer() ? value.get<int32_t>() : LLAMA_HARD_MEMORY_DOMAIN_EPISTEMIC;
+}
+
+static bool validate_primitive(llama_hard_memory_primitive * primitive) {
+    if (!primitive ||
+        primitive->kind < LLAMA_HARD_MEMORY_PRIMITIVE_EVENT_FRAGMENT ||
+        primitive->kind > LLAMA_HARD_MEMORY_PRIMITIVE_SELF_MODEL_FRAGMENT ||
+        primitive->domain < LLAMA_HARD_MEMORY_DOMAIN_GOAL_PROGRESS ||
+        primitive->domain > LLAMA_HARD_MEMORY_DOMAIN_SELF_IMPROVEMENT ||
+        primitive->key[0] == '\0' ||
+        primitive->content[0] == '\0') {
+        return false;
+    }
+
+    const float * bounded_values[] = {
+        &primitive->importance,
+        &primitive->confidence,
+        &primitive->gain_bias,
+        &primitive->allostatic_relevance,
+    };
+    for (const float * value : bounded_values) {
+        if (!std::isfinite(*value)) {
+            return false;
+        }
+    }
+
+    primitive->importance = clamp_unit(primitive->importance);
+    primitive->confidence = clamp_unit(primitive->confidence);
+    primitive->gain_bias = clamp_unit(primitive->gain_bias);
+    primitive->allostatic_relevance = clamp_unit(primitive->allostatic_relevance);
+    return true;
+}
+
+static void copy_tags(
+        char (&dst)[LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS][LLAMA_HARD_MEMORY_MAX_TAG_CHARS],
+        const json & tags) {
+    for (int32_t i = 0; i < LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS; ++i) {
+        std::memset(dst[i], 0, sizeof(dst[i]));
+    }
+    if (!tags.is_array()) {
+        return;
+    }
+    int32_t index = 0;
+    for (const auto & item : tags) {
+        if (index >= LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS || !item.is_string()) {
+            break;
+        }
+        copy_cstr(dst[index++], item.get<std::string>());
+    }
+}
+
+static json tags_to_json(
+        const char (&tags)[LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS][LLAMA_HARD_MEMORY_MAX_TAG_CHARS]) {
+    json out = json::array();
+    for (int32_t i = 0; i < LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS; ++i) {
+        if (tags[i][0] != '\0') {
+            out.push_back(read_cstr(tags[i]));
+        }
+    }
+    return out;
+}
+
+static void fill_primitive_summary(
+        llama_hard_memory_primitive_summary & summary,
+        const llama_hard_memory_primitive & primitive) {
+    summary = {};
+    summary.kind = primitive.kind;
+    summary.domain = primitive.domain;
+    summary.source_tool_kind = primitive.source_tool_kind;
+    summary.flags = primitive.flags;
+    summary.importance = primitive.importance;
+    summary.confidence = primitive.confidence;
+    summary.gain_bias = primitive.gain_bias;
+    summary.allostatic_relevance = primitive.allostatic_relevance;
+    copy_cstr(summary.key, read_cstr(primitive.key));
+    copy_cstr(summary.title, read_cstr(primitive.title));
+}
+
+static json primitive_metadata_json(
+        const llama_hard_memory_primitive & primitive,
+        const std::string & runtime_identity,
+        const llama_self_state_delta_summary * delta_summary) {
+    json metadata = {
+        {"source", "vicuna"},
+        {"runtimeIdentity", runtime_identity},
+        {"kind", primitive_kind_name(primitive.kind)},
+        {"domain", domain_name(primitive.domain)},
+        {"sourceRole", primitive.source_role},
+        {"sourceChannel", primitive.source_channel},
+        {"sourceToolKind", primitive.source_tool_kind},
+        {"transactionId", primitive.transaction_id},
+        {"flags", primitive.flags},
+        {"importance", primitive.importance},
+        {"confidence", primitive.confidence},
+        {"gainBias", primitive.gain_bias},
+        {"allostaticRelevance", primitive.allostatic_relevance},
+        {"key", read_cstr(primitive.key)},
+        {"title", read_cstr(primitive.title)},
+        {"tags", tags_to_json(primitive.tags)},
+    };
+
+    if (delta_summary) {
+        metadata["totalDelta"] = delta_summary->total_delta;
+        metadata["maxDelta"] = delta_summary->max_delta;
+        json changed = json::array();
+        for (int32_t i = 0; i < delta_summary->dimension_count; ++i) {
+            changed.push_back({
+                {"registerId", delta_summary->dimensions[i].register_id},
+                {"registerName", llama_self_state_register_name(delta_summary->dimensions[i].register_id)},
+                {"before", delta_summary->dimensions[i].before_value},
+                {"after", delta_summary->dimensions[i].after_value},
+                {"absDelta", delta_summary->dimensions[i].abs_delta},
+            });
+        }
+        metadata["changedRegisters"] = changed;
+    }
+    return metadata;
+}
+
+static void accumulate_retrieval_summary(
+        llama_hard_memory_retrieval_summary & summary,
+        const llama_hard_memory_hit & hit) {
+    const float weighted_similarity = clamp_unit(hit.similarity) * std::max(0.05f, hit.importance);
+    switch (hit.kind) {
+        case LLAMA_HARD_MEMORY_PRIMITIVE_EVENT_FRAGMENT:      ++summary.event_count; break;
+        case LLAMA_HARD_MEMORY_PRIMITIVE_TRAJECTORY:          ++summary.trajectory_count; break;
+        case LLAMA_HARD_MEMORY_PRIMITIVE_OUTCOME:             ++summary.outcome_count; break;
+        case LLAMA_HARD_MEMORY_PRIMITIVE_TOOL_OBSERVATION:    ++summary.tool_observation_count; break;
+        case LLAMA_HARD_MEMORY_PRIMITIVE_USER_MODEL:          ++summary.user_model_count; break;
+        case LLAMA_HARD_MEMORY_PRIMITIVE_SELF_MODEL_FRAGMENT: ++summary.self_model_count; break;
+        default: break;
+    }
+
+    summary.mean_similarity += clamp_unit(hit.similarity);
+    summary.max_similarity = std::max(summary.max_similarity, clamp_unit(hit.similarity));
+    summary.importance_signal += weighted_similarity;
+    summary.confidence_signal += clamp_unit(hit.similarity) * std::max(0.05f, hit.confidence);
+    summary.gain_support += clamp_unit(hit.similarity) * hit.gain_bias;
+    summary.allostatic_support += clamp_unit(hit.similarity) * hit.allostatic_relevance;
+
+    float * domain_support = nullptr;
+    switch (hit.domain) {
+        case LLAMA_HARD_MEMORY_DOMAIN_GOAL_PROGRESS:    domain_support = &summary.goal_support; break;
+        case LLAMA_HARD_MEMORY_DOMAIN_USER_OUTCOME:     domain_support = &summary.user_support; break;
+        case LLAMA_HARD_MEMORY_DOMAIN_EPISTEMIC:        domain_support = &summary.epistemic_support; break;
+        case LLAMA_HARD_MEMORY_DOMAIN_EFFICIENCY:       domain_support = &summary.efficiency_support; break;
+        case LLAMA_HARD_MEMORY_DOMAIN_RECOVERY:         domain_support = &summary.recovery_support; break;
+        case LLAMA_HARD_MEMORY_DOMAIN_STRATEGY:         domain_support = &summary.strategy_support; break;
+        case LLAMA_HARD_MEMORY_DOMAIN_SELF_IMPROVEMENT: domain_support = &summary.self_improvement_support; break;
+        default: break;
+    }
+    if (domain_support) {
+        *domain_support = clamp_unit(*domain_support + weighted_similarity);
+    }
+
+    for (size_t i = 0; i < LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS; ++i) {
+        if (std::strcmp(hit.tags[i], "preference") == 0) {
+            summary.user_preference_support = clamp_unit(summary.user_preference_support + weighted_similarity);
+        }
+        if (std::strcmp(hit.tags[i], "rhetoric") == 0) {
+            summary.user_rhetorical_support = clamp_unit(summary.user_rhetorical_support + weighted_similarity);
+        }
+    }
+}
+
 } // namespace
 
 llama_hard_memory::llama_hard_memory() {
@@ -281,9 +521,29 @@ bool llama_hard_memory::query(const llama_hard_memory_query_request & request, l
             auto & dst = result.results[result.result_count++];
             dst.memory_result = item.contains("memory") || !item.contains("chunk");
             dst.similarity = item.value("similarity", item.value("score", 0.0f));
+            const json metadata = item.value("metadata", json::object());
+            dst.kind = parse_primitive_kind(metadata.contains("kind") ? metadata.at("kind") : json());
+            dst.domain = parse_domain(metadata.contains("domain") ? metadata.at("domain") : json());
+            dst.source_role = metadata.value("sourceRole", LLAMA_SELF_STATE_EVENT_SYSTEM);
+            dst.source_channel = metadata.value("sourceChannel", LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY);
+            dst.source_tool_kind = metadata.value("sourceToolKind", LLAMA_TOOL_KIND_NONE);
+            dst.flags = metadata.value("flags", 0u);
+            dst.importance = clamp_unit(metadata.value("importance", clamp_unit(dst.similarity)));
+            dst.confidence = clamp_unit(metadata.value("confidence", clamp_unit(dst.similarity)));
+            dst.gain_bias = clamp_unit(metadata.value("gainBias", clamp_unit(dst.similarity)));
+            dst.allostatic_relevance = clamp_unit(metadata.value("allostaticRelevance", 0.0f));
             copy_cstr(dst.id, item.value("id", std::string()));
-            copy_cstr(dst.title, item.value("title", std::string()));
+            copy_cstr(dst.title, item.value("title", metadata.value("title", std::string())));
             copy_cstr(dst.content, trim_text(item.value("memory", item.value("chunk", item.value("content", std::string()))), LLAMA_HARD_MEMORY_MAX_TEXT_CHARS - 1));
+            copy_tags(dst.tags, metadata.value("tags", item.value("tags", json::array())));
+            accumulate_retrieval_summary(result.retrieval_summary, dst);
+        }
+        if (result.result_count > 0) {
+            result.retrieval_summary.mean_similarity = clamp_unit(result.retrieval_summary.mean_similarity / (float) result.result_count);
+            result.retrieval_summary.importance_signal = clamp_unit(result.retrieval_summary.importance_signal / (float) result.result_count);
+            result.retrieval_summary.confidence_signal = clamp_unit(result.retrieval_summary.confidence_signal / (float) result.result_count);
+            result.retrieval_summary.gain_support = clamp_unit(result.retrieval_summary.gain_support / (float) result.result_count);
+            result.retrieval_summary.allostatic_support = clamp_unit(result.retrieval_summary.allostatic_support / (float) result.result_count);
         }
     } catch (const std::exception & e) {
         result.ok = false;
@@ -305,13 +565,15 @@ bool llama_hard_memory::get_last_result(llama_hard_memory_result * out_result) c
     return true;
 }
 
-bool llama_hard_memory::archive_event(
-        const llama_vocab * vocab,
-        const llama_self_state_event & event,
-        const llama_self_state_delta_summary & delta) {
+bool llama_hard_memory::archive_primitives(
+        const llama_hard_memory_primitive * input_primitives,
+        int32_t primitive_count,
+        const llama_self_state_delta_summary * delta_summary) {
     llama_hard_memory_archive_trace trace = {};
     init_archive(trace);
-    trace.delta = delta;
+    if (delta_summary) {
+        trace.delta = *delta_summary;
+    }
 
     const std::string tag = effective_container_tag(config, nullptr);
     copy_cstr(trace.container_tag, tag);
@@ -323,69 +585,74 @@ bool llama_hard_memory::archive_event(
         return true;
     }
 
-    const std::string text = event_text(vocab, event);
-    const std::string excerpt = trim_text(text, LLAMA_HARD_MEMORY_MAX_TEXT_CHARS - 1);
-    copy_cstr(trace.content_excerpt, excerpt);
-
-    if (tag.empty() || text.empty()) {
-        copy_cstr(trace.error, "hard memory archival requires non-empty container tag and event text");
+    if (!input_primitives || primitive_count <= 0) {
+        copy_cstr(trace.error, "hard memory archival requires at least one primitive");
         trace.request_completed_us = ggml_time_us();
         last_archive = trace;
         return true;
     }
 
-    trace.attempted = true;
+    if (tag.empty()) {
+        copy_cstr(trace.error, "hard memory container tag is empty");
+        trace.request_completed_us = ggml_time_us();
+        last_archive = trace;
+        return true;
+    }
 
+    std::vector<llama_hard_memory_primitive> primitives;
+    primitives.reserve((size_t) std::min<int32_t>(primitive_count, LLAMA_HARD_MEMORY_MAX_PRIMITIVES));
+    for (int32_t i = 0; i < primitive_count; ++i) {
+        llama_hard_memory_primitive primitive = input_primitives[i];
+        if (!validate_primitive(&primitive)) {
+            continue;
+        }
+        primitives.push_back(primitive);
+    }
+    if (primitives.empty()) {
+        copy_cstr(trace.error, "hard memory archival rejected all primitives");
+        trace.request_completed_us = ggml_time_us();
+        last_archive = trace;
+        return true;
+    }
+
+    std::sort(primitives.begin(), primitives.end(), [](const llama_hard_memory_primitive & lhs, const llama_hard_memory_primitive & rhs) {
+        if (lhs.importance == rhs.importance) {
+            return std::strcmp(lhs.key, rhs.key) < 0;
+        }
+        return lhs.importance > rhs.importance;
+    });
+    if ((int32_t) primitives.size() > LLAMA_HARD_MEMORY_MAX_PRIMITIVES) {
+        primitives.resize(LLAMA_HARD_MEMORY_MAX_PRIMITIVES);
+    }
+
+    trace.attempted = true;
+    trace.primitive_count = (int32_t) primitives.size();
     const std::string identity = read_cstr(config.runtime_identity).empty() ? "vicuna" : read_cstr(config.runtime_identity);
-    const std::string digest_input = identity + "|" + text + "|" + std::to_string(event.role) + "|" + std::to_string(event.channel) + "|" + std::to_string((unsigned long long) event.flags) + "|" + std::to_string(delta.total_delta);
+
+    std::string digest_input = identity + "|" + tag;
+    json memories = json::array();
+    for (size_t i = 0; i < primitives.size(); ++i) {
+        const auto & primitive = primitives[i];
+        digest_input += "|" + read_cstr(primitive.key) + "|" + read_cstr(primitive.title) + "|" + read_cstr(primitive.content);
+        fill_primitive_summary(trace.primitives[i], primitive);
+        if (i == 0) {
+            copy_cstr(trace.content_excerpt, trim_text(read_cstr(primitive.content), LLAMA_HARD_MEMORY_MAX_TEXT_CHARS - 1));
+        }
+        memories.push_back({
+            {"content", trim_text(read_cstr(primitive.content), 1024)},
+            {"isStatic", false},
+            {"metadata", primitive_metadata_json(primitive, identity, delta_summary)},
+        });
+    }
+
     char custom_id[LLAMA_HARD_MEMORY_MAX_ID_CHARS] = {};
     std::snprintf(custom_id, sizeof(custom_id), "vicuna-%016llx",
             (unsigned long long) fnv1a64(digest_input));
     copy_cstr(trace.custom_id, custom_id);
 
-    std::ostringstream content;
-    content.setf(std::ios::fixed);
-    content.precision(3);
-    content << "vicuna self-state perturbation event\n"
-            << "runtime: " << identity << "\n"
-            << "role: " << event.role << "\n"
-            << "channel: " << event.channel << "\n"
-            << "flags: " << event.flags << "\n"
-            << "total_delta: " << delta.total_delta << "\n"
-            << "max_delta: " << delta.max_delta << "\n"
-            << "changed_registers: " << register_delta_summary(delta) << "\n"
-            << "message: " << text;
-
-    json metadata = {
-        {"source", "vicuna"},
-        {"runtimeIdentity", identity},
-        {"eventRole", event.role},
-        {"eventChannel", event.channel},
-        {"eventFlags", event.flags},
-        {"totalDelta", delta.total_delta},
-        {"maxDelta", delta.max_delta},
-    };
-    json changed = json::array();
-    for (int32_t i = 0; i < delta.dimension_count; ++i) {
-        changed.push_back({
-            {"registerId", delta.dimensions[i].register_id},
-            {"registerName", llama_self_state_register_name(delta.dimensions[i].register_id)},
-            {"before", delta.dimensions[i].before_value},
-            {"after", delta.dimensions[i].after_value},
-            {"absDelta", delta.dimensions[i].abs_delta},
-        });
-    }
-    metadata["changedRegisters"] = changed;
-
     json body = {
         {"containerTag", tag},
-        {"memories", json::array({
-            {
-                {"content", trim_text(content.str(), 1024)},
-                {"isStatic", false},
-                {"metadata", metadata},
-            }
-        })}
+        {"memories", memories},
     };
 
     httplib::Client cli(read_cstr(config.base_url));
@@ -413,12 +680,74 @@ bool llama_hard_memory::archive_event(
     return true;
 }
 
+bool llama_hard_memory::archive_event(
+        const llama_vocab * vocab,
+        const llama_self_state_event & event,
+        const llama_self_state_delta_summary & delta) {
+    const std::string text = event_text(vocab, event);
+    if (text.empty()) {
+        llama_hard_memory_archive_trace trace = {};
+        init_archive(trace);
+        copy_cstr(trace.error, "hard memory archival requires non-empty event text");
+        trace.request_completed_us = ggml_time_us();
+        last_archive = trace;
+        return true;
+    }
+
+    llama_hard_memory_primitive primitive = llama_hard_memory_default_primitive();
+    primitive.kind = LLAMA_HARD_MEMORY_PRIMITIVE_EVENT_FRAGMENT;
+    primitive.domain = LLAMA_HARD_MEMORY_DOMAIN_EPISTEMIC;
+    primitive.source_role = event.role;
+    primitive.source_channel = event.channel;
+    primitive.source_tool_kind = event.role == LLAMA_SELF_STATE_EVENT_TOOL ? LLAMA_TOOL_KIND_GENERIC : LLAMA_TOOL_KIND_NONE;
+    primitive.transaction_id = (int32_t) fnv1a64(text);
+    primitive.importance = clamp_unit(0.25f + 0.35f * clamp_unit(delta.total_delta / 2.0f) + 0.40f * delta.max_delta);
+    primitive.confidence = clamp_unit(0.55f + 0.30f * delta.max_delta);
+    primitive.gain_bias = clamp_unit(0.20f + 0.60f * delta.max_delta);
+    primitive.allostatic_relevance = 0.0f;
+    copy_cstr(primitive.key, "event");
+    copy_cstr(primitive.title, "self-state event");
+
+    std::ostringstream content;
+    content.setf(std::ios::fixed);
+    content.precision(3);
+    content << "vicuna self-state perturbation event\n"
+            << "role: " << event.role << "\n"
+            << "channel: " << event.channel << "\n"
+            << "flags: " << event.flags << "\n"
+            << "total_delta: " << delta.total_delta << "\n"
+            << "max_delta: " << delta.max_delta << "\n"
+            << "changed_registers: " << register_delta_summary(delta) << "\n"
+            << "message: " << text;
+    copy_cstr(primitive.content, trim_text(content.str(), LLAMA_HARD_MEMORY_MAX_TEXT_CHARS - 1));
+    copy_cstr(primitive.tags[0], "event");
+    copy_cstr(primitive.tags[1], event.channel == LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL ? "counterfactual" : "primary");
+
+    return archive_primitives(&primitive, 1, &delta);
+}
+
 bool llama_hard_memory::get_last_archive_trace(llama_hard_memory_archive_trace * out_trace) const {
     if (!out_trace) {
         return false;
     }
     *out_trace = last_archive;
     return true;
+}
+
+llama_hard_memory_primitive llama_hard_memory_default_primitive(void) {
+    llama_hard_memory_primitive primitive = {};
+    primitive.kind = LLAMA_HARD_MEMORY_PRIMITIVE_EVENT_FRAGMENT;
+    primitive.domain = LLAMA_HARD_MEMORY_DOMAIN_EPISTEMIC;
+    primitive.source_role = LLAMA_SELF_STATE_EVENT_SYSTEM;
+    primitive.source_channel = LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY;
+    primitive.source_tool_kind = LLAMA_TOOL_KIND_NONE;
+    primitive.transaction_id = -1;
+    primitive.flags = LLAMA_HARD_MEMORY_PRIMITIVE_AFFECT_GAIN;
+    primitive.importance = 0.5f;
+    primitive.confidence = 0.5f;
+    primitive.gain_bias = 0.5f;
+    primitive.allostatic_relevance = 0.0f;
+    return primitive;
 }
 
 llama_hard_memory_config llama_hard_memory_default_config(void) {

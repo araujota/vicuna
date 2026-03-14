@@ -11,6 +11,10 @@ public:
     bool configure(const llama_hard_memory_config & config);
     bool get_config(llama_hard_memory_config * out_config) const;
     bool query(const llama_hard_memory_query_request & query, llama_hard_memory_result * out_result);
+    bool archive_primitives(
+            const llama_hard_memory_primitive * primitives,
+            int32_t primitive_count,
+            const llama_self_state_delta_summary * delta_summary = nullptr);
     bool get_last_result(llama_hard_memory_result * out_result) const;
     bool archive_event(
             const llama_vocab * vocab,

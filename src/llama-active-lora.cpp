@@ -34,9 +34,10 @@ constexpr size_t PAST_BUCKET_COUNT = LLAMA_MEMORY_LORA_BUCKET_COUNT;
 constexpr float DIRECTION_EPS = 1.0e-8f;
 constexpr float FUNCTIONAL_GAIN_CLIP_MIN = 0.0f;
 constexpr float FUNCTIONAL_GAIN_CLIP_MAX = 2.0f;
-constexpr size_t FUNCTIONAL_GATING_INPUT_DIM = 21;
+constexpr size_t FUNCTIONAL_GATING_INPUT_DIM = 50;
 constexpr size_t FUNCTIONAL_GATING_HIDDEN_DIM = 16;
 constexpr uint64_t FUNCTIONAL_GATING_INIT_SEED = 0x6d6574616c6f7373ULL;
+constexpr uint64_t FUNCTIONAL_BOOTSTRAP_INIT_SEED = 0x626f6f7473747270ULL;
 
 float clamp_unit(float value) {
     return std::min(1.0f, std::max(0.0f, value));
@@ -44,6 +45,18 @@ float clamp_unit(float value) {
 
 float clamp_range(float value, float lo, float hi) {
     return std::min(hi, std::max(lo, value));
+}
+
+float clamp_signed_unit(float value) {
+    return clamp_range(value, -1.0f, 1.0f);
+}
+
+float decayed_std(float initial_std, float min_std, uint64_t count, uint32_t decay_horizon) {
+    const float init = std::max(0.0f, initial_std);
+    const float floor = std::max(0.0f, std::min(init, min_std));
+    const float decay = std::max<uint32_t>(1u, decay_horizon);
+    const float scaled = std::sqrt(1.0f + static_cast<float>(count) / static_cast<float>(decay));
+    return floor + (init - floor) / scaled;
 }
 
 const char * past_bucket_name(size_t bucket) {
@@ -250,8 +263,10 @@ float functional_default_gain(int32_t family) {
 
 uint32_t functional_top_k_priority(int32_t family) {
     switch (family) {
-        case LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL:
+        case LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION:
             return 4;
+        case LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL:
+            return 5;
         case LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION:
             return 3;
         case LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION:
@@ -264,6 +279,8 @@ uint32_t functional_top_k_priority(int32_t family) {
 
 uint32_t functional_update_horizon_steps(int32_t family) {
     switch (family) {
+        case LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION:
+            return 2;
         case LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL:
             return 3;
         case LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION:
@@ -381,11 +398,28 @@ struct runtime_lora_write_result {
 };
 
 float gating_noise_std(const llama_functional_lora_family_config & config, uint64_t invocation_count) {
-    const float init = std::max(0.0f, config.exploration_noise_initial_std);
-    const float min_std = std::max(0.0f, std::min(init, config.exploration_noise_min_std));
-    const float decay = std::max<uint32_t>(1u, config.exploration_noise_decay_invocations);
-    const float scaled = std::sqrt(1.0f + static_cast<float>(invocation_count) / static_cast<float>(decay));
-    return min_std + (init - min_std) / scaled;
+    return decayed_std(
+            config.exploration_noise_initial_std,
+            config.exploration_noise_min_std,
+            invocation_count,
+            config.exploration_noise_decay_invocations);
+}
+
+float bootstrap_noise_std(const llama_functional_lora_family_config & config, uint64_t activation_count) {
+    return decayed_std(
+            config.bootstrap_perturbation_initial_std,
+            config.bootstrap_perturbation_min_std,
+            activation_count,
+            config.bootstrap_perturbation_decay_activations);
+}
+
+float sample_bounded_gaussian(std::mt19937_64 & rng, float stddev) {
+    if (stddev <= 0.0f) {
+        return 0.0f;
+    }
+
+    std::normal_distribution<float> dist(0.0f, stddev);
+    return clamp_range(dist(rng), -3.0f * stddev, 3.0f * stddev);
 }
 
 class active_lora_embedder {
@@ -764,6 +798,29 @@ void zero_weight(llama_adapter_lora_weight & weight) {
 void zero_adapter(llama_adapter_lora & adapter) {
     for (auto & it : adapter.ab_map) {
         zero_weight(it.second);
+    }
+}
+
+void randomize_adapter(llama_adapter_lora & adapter, std::mt19937_64 & rng, float weight_std) {
+    if (weight_std <= 0.0f) {
+        zero_adapter(adapter);
+        return;
+    }
+
+    std::normal_distribution<float> dist(0.0f, weight_std);
+    for (auto & it : adapter.ab_map) {
+        auto & weight = it.second;
+        std::vector<float> data_a(weight.a->ne[0] * weight.a->ne[1], 0.0f);
+        std::vector<float> data_b(weight.b->ne[0] * weight.b->ne[1], 0.0f);
+        for (float & value : data_a) {
+            value = dist(rng);
+        }
+        for (float & value : data_b) {
+            value = dist(rng);
+        }
+        ggml_backend_tensor_set(weight.a, data_a.data(), 0, data_a.size() * sizeof(float));
+        ggml_backend_tensor_set(weight.b, data_b.data(), 0, data_b.size() * sizeof(float));
+        weight.gain = 1.0f;
     }
 }
 
@@ -1184,6 +1241,8 @@ llama_adapter_lora_layer_role past_bucket_role(size_t bucket) {
 llama_adapter_lora_layer_role functional_family_role(int32_t family) {
     switch (family) {
         case LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION:    return LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_TOOL_SELECTION;
+        case LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION:
+            return LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_PLANNING_COMPOSITION;
         case LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL:    return LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_COUNTERFACTUAL;
         case LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION:return LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_MEMORY_COMPRESSION;
         case LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION: return LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_SELF_OBSERVATION;
@@ -1194,6 +1253,7 @@ llama_adapter_lora_layer_role functional_family_role(int32_t family) {
 const char * functional_family_name(int32_t family) {
     switch (family) {
         case LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION:     return "tool_selection";
+        case LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION:return "planning_composition";
         case LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL:     return "counterfactual";
         case LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION: return "memory_compression";
         case LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION:   return "self_observation";
@@ -1219,13 +1279,16 @@ struct llama_active_lora_manager::impl {
     llama_context & owner;
     llama_active_lora_params params = llama_active_lora_default_params();
     llama_active_lora_stats stats = {};
+    llama_user_personality_lora_stats user_personality_stats = {};
     llama_past_lora_params past_params = llama_past_lora_default_params();
     llama_past_lora_stats past_stats = {};
     std::unique_ptr<llama_adapter_lora> adapter;
+    std::unique_ptr<llama_adapter_lora> user_personality_adapter;
     std::unique_ptr<active_lora_embedder> embedder;
     std::array<bucket_runtime, PAST_BUCKET_COUNT> buckets = {};
     std::array<job_runtime, PAST_BUCKET_COUNT> jobs = {};
     std::array<std::unique_ptr<llama_adapter_lora>, LLAMA_FUNCTIONAL_LORA_COUNT> functional_adapters = {};
+    std::array<std::unique_ptr<llama_adapter_lora>, LLAMA_FUNCTIONAL_LORA_COUNT> functional_bootstrap_adapters = {};
     std::array<llama_functional_lora_family_config, LLAMA_FUNCTIONAL_LORA_COUNT> functional_configs = {};
     std::array<llama_functional_lora_family_state, LLAMA_FUNCTIONAL_LORA_COUNT> functional_states = {};
     std::array<llama_functional_lora_update_info, LLAMA_FUNCTIONAL_LORA_COUNT> functional_updates = {};
@@ -1233,6 +1296,7 @@ struct llama_active_lora_manager::impl {
     llama_functional_lora_ablation_config functional_ablation = {};
     std::vector<ggml_tensor *> targets;
     active_lora_embedding last_embedding;
+    active_lora_embedding last_user_personality_embedding;
     uint64_t updates_seen = 0;
     uint64_t active_started_at_us = 0;
     uint64_t active_last_update_us = 0;
@@ -1245,6 +1309,7 @@ struct llama_active_lora_manager::impl {
     std::unordered_map<const ggml_tensor *, runtime_lora_adam_state> runtime_lora_adam = {};
     std::unordered_map<const llama_adapter_lora *, uint64_t> runtime_lora_write_count = {};
     std::mt19937_64 gating_rng { FUNCTIONAL_GATING_INIT_SEED };
+    std::mt19937_64 bootstrap_rng { FUNCTIONAL_BOOTSTRAP_INIT_SEED };
     uint64_t gating_invocation_count = 0;
     bool initialized = false;
     bool past_initialized = false;
@@ -1266,6 +1331,10 @@ struct llama_active_lora_manager::impl {
             cfg.exploration_noise_initial_std = 0.08f;
             cfg.exploration_noise_min_std = 0.01f;
             cfg.exploration_noise_decay_invocations = 512;
+            cfg.bootstrap_perturbation_initial_std = 0.05f;
+            cfg.bootstrap_perturbation_min_std = 0.005f;
+            cfg.bootstrap_perturbation_decay_activations = 256;
+            cfg.bootstrap_weight_init_std = 0.01f;
             cfg.negative_update_scale = 0.65f;
             cfg.positive_update_scale = 1.0f;
             cfg.top_k_priority = functional_top_k_priority(family);
@@ -1281,6 +1350,7 @@ struct llama_active_lora_manager::impl {
             state.enabled = true;
             state.compatible = true;
             state.predicted_gain = cfg.default_gain;
+            state.current_bootstrap_std = bootstrap_noise_std(cfg, 0);
 
             functional_trace.holds[family] = {};
             functional_trace.holds[family].family = family;
@@ -1351,10 +1421,39 @@ struct llama_active_lora_manager::impl {
         input[14] = -clamp_unit(observation.prediction_error);
         input[15] = observation.loop_origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE ? 1.0f : 0.0f;
         input[16] = observation.loop_origin == LLAMA_COG_COMMAND_ORIGIN_DMN ? 1.0f : 0.0f;
-        input[17] = (observation.eligible_mask & (1ull << LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION)) != 0 ? 1.0f : 0.0f;
-        input[18] = (observation.eligible_mask & (1ull << LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL)) != 0 ? 1.0f : 0.0f;
-        input[19] = (observation.eligible_mask & (1ull << LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION)) != 0 ? 1.0f : 0.0f;
-        input[20] = (observation.eligible_mask & (1ull << LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION)) != 0 ? 1.0f : 0.0f;
+        input[17] = clamp_unit(observation.planning_pressure);
+        input[18] = clamp_unit(observation.plan_complexity);
+        input[19] = clamp_unit(observation.plan_revision);
+        input[20] = (observation.eligible_mask & (1ull << LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION)) != 0 ? 1.0f : 0.0f;
+        input[21] = (observation.eligible_mask & (1ull << LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION)) != 0 ? 1.0f : 0.0f;
+        input[22] = (observation.eligible_mask & (1ull << LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL)) != 0 ? 1.0f : 0.0f;
+        input[23] = (observation.eligible_mask & (1ull << LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION)) != 0 ? 1.0f : 0.0f;
+        input[24] = (observation.eligible_mask & (1ull << LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION)) != 0 ? 1.0f : 0.0f;
+        input[25] = clamp_signed_unit(observation.extension_summary.gain_signal);
+        input[26] = clamp_unit(observation.extension_summary.gain_signal_abs);
+        input[27] = clamp_unit(observation.extension_summary.context_activation);
+        input[28] = clamp_unit(observation.extension_summary.allostatic_divergence);
+        input[29] = clamp_unit(observation.extension_summary.mean_confidence);
+        input[30] = clamp_unit(observation.extension_summary.max_salience);
+        input[31] = clamp_unit(observation.hard_memory_summary.mean_similarity);
+        input[32] = clamp_unit(observation.hard_memory_summary.max_similarity);
+        input[33] = clamp_unit(observation.hard_memory_summary.importance_signal);
+        input[34] = clamp_unit(observation.hard_memory_summary.confidence_signal);
+        input[35] = clamp_unit(observation.hard_memory_summary.gain_support);
+        input[36] = clamp_unit(observation.hard_memory_summary.goal_support);
+        input[37] = clamp_unit(observation.hard_memory_summary.user_support);
+        input[38] = clamp_unit(observation.hard_memory_summary.epistemic_support);
+        input[39] = clamp_unit(observation.hard_memory_summary.efficiency_support);
+        input[40] = clamp_unit(observation.hard_memory_summary.recovery_support);
+        input[41] = observation.belief_summary.valid ? 1.0f : 0.0f;
+        input[42] = clamp_unit(observation.belief_summary.known_care_uncertainty);
+        input[43] = clamp_unit(observation.belief_summary.missing_observation_uncertainty);
+        input[44] = clamp_unit(observation.belief_summary.unmodeled_care_uncertainty);
+        input[45] = clamp_unit(observation.belief_summary.residual_allostatic_pressure);
+        input[46] = clamp_unit(observation.belief_summary.promotion_readiness);
+        input[47] = clamp_unit(observation.belief_summary.belief_entropy);
+        input[48] = clamp_unit(observation.belief_summary.belief_confidence);
+        input[49] = clamp_unit(observation.belief_summary.max_slot_pressure);
 
         if (out_gradient_norm) {
             *out_gradient_norm = std::sqrt(norm_sq);
@@ -1417,6 +1516,8 @@ struct llama_active_lora_manager::impl {
                     0.0f;
             decision.predicted_gains[family] = means[family];
             decision.sampled_noise[family] = sampled_noise;
+            decision.bootstrap_std[family] = 0.0f;
+            decision.bootstrap_perturbation[family] = 0.0f;
             decision.gains[family] = gain;
             decision.priority[family] = gain;
 
@@ -1781,7 +1882,8 @@ struct llama_active_lora_manager::impl {
             uint32_t rank,
             const std::string & name_prefix,
             float initial_scale,
-            llama_adapter_lora_layer_role role) {
+            llama_adapter_lora_layer_role role,
+            bool attach_runtime = true) {
         out = std::make_unique<llama_adapter_lora>();
         std::vector<std::pair<ggml_tensor *, uint32_t>> runtime_targets;
         runtime_targets.reserve(targets.size());
@@ -1795,7 +1897,9 @@ struct llama_active_lora_manager::impl {
         }
 
         zero_adapter(*out);
-        owner.attach_adapter_runtime(out.get(), initial_scale, role);
+        if (attach_runtime) {
+            owner.attach_adapter_runtime(out.get(), initial_scale, role);
+        }
         return true;
     }
 
@@ -1816,6 +1920,7 @@ struct llama_active_lora_manager::impl {
         }
 
         base.state_signal.push_back(family == LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ? 1.0f : 0.0f);
+        base.state_signal.push_back(family == LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION ? 1.0f : 0.0f);
         base.state_signal.push_back(family == LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL ? 1.0f : 0.0f);
         base.state_signal.push_back(family == LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION ? 1.0f : 0.0f);
         base.state_signal.push_back(family == LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION ? 1.0f : 0.0f);
@@ -2002,6 +2107,61 @@ struct llama_active_lora_manager::impl {
                     __func__, event.n_tokens, stats.updates_applied, stats.rollover_ready ? "true" : "false");
         }
 
+        return true;
+    }
+
+    void refresh_user_personality_gain_stats() {
+        const auto gains = user_personality_adapter ?
+                adapter_gain_stats(*user_personality_adapter) :
+                std::pair<float, float>(0.0f, 0.0f);
+        user_personality_stats.gain_mean = gains.first;
+        user_personality_stats.gain_max = gains.second;
+    }
+
+    float user_personality_confidence() const {
+        if (!user_personality_stats.enabled) {
+            return 0.0f;
+        }
+        const float update_signal = clamp_unit((float) user_personality_stats.updates_applied / 8.0f);
+        const float token_signal = clamp_unit((float) std::min<uint64_t>(user_personality_stats.tokens_ingested, 2048) / 2048.0f);
+        return clamp_unit(0.55f * update_signal + 0.45f * token_signal);
+    }
+
+    bool apply_user_personality_write(
+            const llama_self_state_event & event,
+            const llama_self_state_feature_vector * features) {
+        if (!user_personality_adapter ||
+                !event.tokens || event.n_tokens == 0 ||
+                event.role != LLAMA_SELF_STATE_EVENT_USER) {
+            return false;
+        }
+
+        const active_lora_embedding embedding = embedder->embed(event.tokens, event.n_tokens);
+        if (embedding.values.empty()) {
+            return false;
+        }
+
+        const float similarity = cosine_similarity(embedding, last_user_personality_embedding);
+        if (similarity > 0.997f) {
+            return true;
+        }
+
+        active_lora_write_features write_features = build_write_features(embedding, event, features, false);
+        write_features.update_emphasis = clamp_unit(std::max(write_features.update_emphasis, 0.20f + 0.45f * write_features.social_alignment));
+        write_features.social_alignment = clamp_unit(std::max(write_features.social_alignment, 0.55f));
+
+        runtime_lora_write_result write_result = {};
+        if (!train_on_adapter(*user_personality_adapter, embedding, write_features, 1.0f, false, &write_result)) {
+            return false;
+        }
+
+        last_user_personality_embedding = embedding;
+        user_personality_stats.updates_applied++;
+        user_personality_stats.optimizer_step_count = write_result.transaction_step;
+        user_personality_stats.tokens_ingested += event.n_tokens;
+        user_personality_stats.optimizer_last_update_norm = write_result.update_norm;
+        user_personality_stats.confidence = user_personality_confidence();
+        refresh_user_personality_gain_stats();
         return true;
     }
 
@@ -2196,7 +2356,17 @@ llama_active_lora_manager::~llama_active_lora_manager() {
         pimpl->owner.detach_adapter_runtime(pimpl->adapter.get());
         const_cast<llama_model &>(pimpl->owner.model).loras.erase(pimpl->adapter.get());
     }
+    if (pimpl->user_personality_adapter) {
+        pimpl->owner.detach_adapter_runtime(pimpl->user_personality_adapter.get());
+        const_cast<llama_model &>(pimpl->owner.model).loras.erase(pimpl->user_personality_adapter.get());
+    }
     for (auto & adapter : pimpl->functional_adapters) {
+        if (adapter) {
+            pimpl->owner.detach_adapter_runtime(adapter.get());
+            const_cast<llama_model &>(pimpl->owner.model).loras.erase(adapter.get());
+        }
+    }
+    for (auto & adapter : pimpl->functional_bootstrap_adapters) {
         if (adapter) {
             pimpl->owner.detach_adapter_runtime(adapter.get());
             const_cast<llama_model &>(pimpl->owner.model).loras.erase(adapter.get());
@@ -2247,6 +2417,18 @@ bool llama_active_lora_manager::init(const llama_active_lora_params & params) {
         }
     }
 
+    if (!pimpl->user_personality_adapter) {
+        if (!pimpl->create_runtime_adapter(
+                    pimpl->user_personality_adapter,
+                    selected_rank,
+                    "memory.user_personality",
+                    params.adapter_scale,
+                    LLAMA_ADAPTER_LORA_LAYER_USER_PERSONALITY,
+                    false)) {
+            return false;
+        }
+    }
+
     pimpl->stats.enabled = true;
     pimpl->stats.rollover_ready = false;
     pimpl->stats.selected_rank = selected_rank;
@@ -2263,6 +2445,10 @@ bool llama_active_lora_manager::init(const llama_active_lora_params & params) {
     pimpl->stats.gain_mean = 0.0f;
     pimpl->stats.gain_max = 0.0f;
     pimpl->stats.optimizer_last_update_norm = 0.0f;
+    pimpl->user_personality_stats = {};
+    pimpl->user_personality_stats.enabled = pimpl->user_personality_adapter != nullptr;
+    pimpl->user_personality_stats.selected_rank = selected_rank;
+    pimpl->user_personality_stats.adapter_scale = params.adapter_scale;
     pimpl->runtime_lora_adam.clear();
     pimpl->runtime_lora_write_count.clear();
     pimpl->temporal_bias_adam = {};
@@ -2270,6 +2456,7 @@ bool llama_active_lora_manager::init(const llama_active_lora_params & params) {
     pimpl->temporal_encoding_bias.last_update_norm = 0.0f;
     pimpl->initialized = true;
     pimpl->reset_active_stage(llama_time_us());
+    pimpl->last_user_personality_embedding = {};
     pimpl->initialize_functional_defaults(selected_rank);
 
     for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
@@ -2283,7 +2470,23 @@ bool llama_active_lora_manager::init(const llama_active_lora_params & params) {
                 return false;
             }
         }
-        pimpl->functional_states[family].compatible = pimpl->functional_adapters[family] != nullptr;
+        if (!pimpl->functional_bootstrap_adapters[family]) {
+            if (!pimpl->create_runtime_adapter(
+                        pimpl->functional_bootstrap_adapters[family],
+                        selected_rank,
+                        std::string("functional.bootstrap.") + functional_family_name(family),
+                        0.0f,
+                        functional_family_role(family))) {
+                return false;
+            }
+            randomize_adapter(
+                    *pimpl->functional_bootstrap_adapters[family],
+                    pimpl->bootstrap_rng,
+                    pimpl->functional_configs[family].bootstrap_weight_init_std);
+        }
+        pimpl->functional_states[family].compatible =
+                pimpl->functional_adapters[family] != nullptr &&
+                pimpl->functional_bootstrap_adapters[family] != nullptr;
         pimpl->functional_trace.family_state[family] = pimpl->functional_states[family];
     }
 
@@ -2351,7 +2554,14 @@ bool llama_active_lora_manager::ingest(const llama_token * tokens, size_t n_toke
 }
 
 bool llama_active_lora_manager::ingest(const llama_self_state_event & event, const llama_self_state_feature_vector * features) {
-    return pimpl->initialized && pimpl->apply_write(event, features, 1.0f, false);
+    if (!pimpl->initialized) {
+        return false;
+    }
+    const bool active_ok = pimpl->apply_write(event, features, 1.0f, false);
+    if (event.role == LLAMA_SELF_STATE_EVENT_USER) {
+        (void) pimpl->apply_user_personality_write(event, features);
+    }
+    return active_ok;
 }
 
 bool llama_active_lora_manager::remediate(const llama_token * tokens, size_t n_tokens, float budget_scale) {
@@ -2371,6 +2581,29 @@ bool llama_active_lora_manager::get_stats(llama_active_lora_stats * out_stats) c
     }
 
     *out_stats = pimpl->stats;
+    return true;
+}
+
+bool llama_active_lora_manager::user_personality_get_stats(llama_user_personality_lora_stats * out_stats) const {
+    if (!out_stats || !pimpl->initialized) {
+        return false;
+    }
+
+    llama_user_personality_lora_stats stats = pimpl->user_personality_stats;
+    stats.attached_for_simulation = false;
+    if (pimpl->user_personality_adapter) {
+        llama_serving_lora_layer_info layer = {};
+        const int32_t count = pimpl->owner.serving_lora_stack_count();
+        for (int32_t i = 0; i < count; ++i) {
+            if (pimpl->owner.serving_lora_stack_layer(i, &layer) &&
+                    layer.role == LLAMA_SERVING_LORA_LAYER_USER_PERSONALITY &&
+                    layer.scale > 0.0f) {
+                stats.attached_for_simulation = true;
+                break;
+            }
+        }
+    }
+    *out_stats = stats;
     return true;
 }
 
@@ -2540,7 +2773,7 @@ bool llama_active_lora_manager::functional_activate(const llama_functional_activ
 
     const bool disable_stack = pimpl->functional_ablation.disable_functional_stack;
     const bool disable_holds = pimpl->functional_ablation.disable_hold_windows;
-    pimpl->functional_trace.last_activation = decision;
+    llama_functional_activation_decision applied = decision;
 
     for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
         auto & hold = pimpl->functional_trace.holds[family];
@@ -2556,6 +2789,8 @@ bool llama_active_lora_manager::functional_activate(const llama_functional_activ
             if (hold.hold_remaining == 0) {
                 hold.active = false;
                 hold.gain = 0.0f;
+                hold.bootstrap_std = 0.0f;
+                hold.bootstrap_perturbation = 0.0f;
             }
         }
 
@@ -2572,6 +2807,10 @@ bool llama_active_lora_manager::functional_activate(const llama_functional_activ
                 decision.gains[family] > 0.0f;
 
         if (activate_now) {
+            const float bootstrap_std = bootstrap_noise_std(
+                    pimpl->functional_configs[family],
+                    state.activation_count);
+            const float bootstrap_perturbation = sample_bounded_gaussian(pimpl->bootstrap_rng, bootstrap_std);
             hold.active = true;
             hold.loop_origin = decision.loop_origin;
             hold.microphase_started = decision.microphase;
@@ -2583,28 +2822,50 @@ bool llama_active_lora_manager::functional_activate(const llama_functional_activ
                     decision.gains[family],
                     pimpl->functional_configs[family].gain_clip_min,
                     pimpl->functional_configs[family].gain_clip_max);
+            hold.bootstrap_std = bootstrap_std;
+            hold.bootstrap_perturbation = bootstrap_perturbation;
         } else if (hold.active) {
             hold.microphase_current = decision.microphase;
         }
 
         const float gain = hold.active ? hold.gain : 0.0f;
+        const float bootstrap_perturbation = hold.active ? hold.bootstrap_perturbation : 0.0f;
         if (pimpl->functional_adapters[family]) {
             pimpl->set_adapter_scale(pimpl->functional_adapters[family].get(), gain, functional_family_role(family));
+        }
+        if (pimpl->functional_bootstrap_adapters[family]) {
+            pimpl->set_adapter_scale(
+                    pimpl->functional_bootstrap_adapters[family].get(),
+                    bootstrap_perturbation,
+                    functional_family_role(family));
         }
 
         state.family = family;
         state.enabled = pimpl->functional_configs[family].enabled && !family_disabled;
-        state.compatible = pimpl->functional_adapters[family] != nullptr;
+        state.compatible =
+                pimpl->functional_adapters[family] != nullptr &&
+                pimpl->functional_bootstrap_adapters[family] != nullptr;
         state.active_now = gain > 0.0f;
         state.current_gain = gain;
         state.predicted_gain = decision.predicted_gains[family];
         state.last_noise = decision.sampled_noise[family];
+        state.current_bootstrap_std = hold.active ?
+                hold.bootstrap_std :
+                bootstrap_noise_std(pimpl->functional_configs[family], state.activation_count);
+        state.last_bootstrap_perturbation = bootstrap_perturbation;
         state.current_microphase = hold.active ? decision.microphase : LLAMA_FUNCTIONAL_MICROPHASE_NONE;
         state.current_hold_unit = hold.active ? hold.hold_unit : LLAMA_FUNCTIONAL_HOLD_LOOP_STEPS;
         state.current_hold_remaining = hold.active ? hold.hold_remaining : 0;
+        if (activate_now) {
+            state.activation_count += 1;
+        }
+        applied.bootstrap_std[family] = hold.active ? hold.bootstrap_std : state.current_bootstrap_std;
+        applied.bootstrap_perturbation[family] = bootstrap_perturbation;
+        pimpl->functional_trace.holds[family] = hold;
         pimpl->functional_trace.family_state[family] = state;
     }
 
+    pimpl->functional_trace.last_activation = applied;
     return true;
 }
 
@@ -2623,12 +2884,25 @@ bool llama_active_lora_manager::functional_note_command_complete(int32_t origin)
             if (hold.hold_remaining == 0) {
                 hold.active = false;
                 hold.gain = 0.0f;
+                hold.bootstrap_std = 0.0f;
+                hold.bootstrap_perturbation = 0.0f;
                 if (pimpl->functional_adapters[family]) {
                     pimpl->set_adapter_scale(pimpl->functional_adapters[family].get(), 0.0f, functional_family_role(family));
                 }
+                if (pimpl->functional_bootstrap_adapters[family]) {
+                    pimpl->set_adapter_scale(
+                            pimpl->functional_bootstrap_adapters[family].get(),
+                            0.0f,
+                            functional_family_role(family));
+                }
                 pimpl->functional_states[family].active_now = false;
                 pimpl->functional_states[family].current_gain = 0.0f;
+                pimpl->functional_states[family].current_bootstrap_std = bootstrap_noise_std(
+                        pimpl->functional_configs[family],
+                        pimpl->functional_states[family].activation_count);
+                pimpl->functional_states[family].last_bootstrap_perturbation = 0.0f;
                 pimpl->functional_states[family].current_hold_remaining = 0;
+                pimpl->functional_trace.holds[family] = hold;
                 pimpl->functional_trace.family_state[family] = pimpl->functional_states[family];
             }
         }
@@ -2715,5 +2989,30 @@ bool llama_active_lora_manager::functional_apply_update(
     pimpl->functional_states[family].last_signed_outcome = signed_outcome;
     pimpl->functional_states[family].last_meta_loss = update.meta_loss;
     pimpl->functional_trace.family_state[family] = pimpl->functional_states[family];
+    return true;
+}
+
+llama_adapter_lora * llama_active_lora_manager::user_personality_adapter() const {
+    return pimpl->user_personality_adapter.get();
+}
+
+float llama_active_lora_manager::user_personality_scale() const {
+    return pimpl->user_personality_stats.adapter_scale;
+}
+
+bool llama_active_lora_manager::user_personality_set_attached(bool attached) {
+    if (!pimpl->initialized || !pimpl->user_personality_adapter) {
+        return false;
+    }
+
+    if (attached) {
+        pimpl->owner.attach_adapter_runtime(
+                pimpl->user_personality_adapter.get(),
+                std::max(0.0f, pimpl->user_personality_stats.adapter_scale),
+                LLAMA_ADAPTER_LORA_LAYER_USER_PERSONALITY);
+    } else {
+        pimpl->owner.detach_adapter_runtime(pimpl->user_personality_adapter.get());
+    }
+    pimpl->user_personality_stats.attached_for_simulation = attached;
     return true;
 }

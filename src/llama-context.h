@@ -19,6 +19,7 @@ class llama_self_state;
 class llama_cognitive_loop;
 class llama_hard_memory;
 class llama_bash_tool;
+struct llama_functional_gating_observation;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -127,6 +128,7 @@ struct llama_context {
     bool active_lora_remediate(const llama_token * tokens, size_t n_tokens, float budget_scale);
     bool active_lora_remediate(const llama_self_state_event & event, float budget_scale, const llama_self_state_feature_vector * features = nullptr);
     bool active_lora_get_stats(llama_active_lora_stats * out_stats) const;
+    bool user_personality_lora_get_stats(llama_user_personality_lora_stats * out_stats) const;
     bool past_lora_init(const llama_past_lora_params & params);
     bool past_lora_tick(uint64_t now_us);
     bool past_lora_get_stats(llama_past_lora_stats * out_stats) const;
@@ -141,6 +143,10 @@ struct llama_context {
     bool functional_lora_get_ablation(llama_functional_lora_ablation_config * out_config) const;
     bool active_temporal_encoding_bias_get(llama_active_temporal_encoding_bias * out_bias) const;
     bool active_temporal_encoding_bias_apply(float signed_advantage, float efficiency_advantage, int64_t monotonic_ms);
+    bool functional_lora_predict_activation(
+            const llama_functional_gating_observation & observation,
+            const llama_functional_activation_decision & policy_seed,
+            llama_functional_activation_decision * out_decision);
     bool functional_lora_activate(const llama_functional_activation_decision & decision);
     bool functional_lora_note_command_complete(int32_t origin);
     bool functional_lora_apply_update(
@@ -182,6 +188,10 @@ struct llama_context {
     bool self_state_get_tool_state(llama_self_tool_state_info * out_info) const;
     bool self_state_get_social_state(llama_self_social_state_info * out_info) const;
     bool self_state_get_model_state(llama_self_model_state_info * out_info) const;
+    int32_t self_state_model_extension_count() const;
+    bool self_state_get_model_extension(int32_t index, llama_self_model_extension_info * out_info) const;
+    bool self_state_upsert_model_extension(const llama_self_model_extension_update & update);
+    bool self_state_remove_model_extension(const char * key);
     int32_t self_state_trace_count() const;
     bool self_state_clear_trace();
     bool self_state_replay_trace(int32_t upto_count);
@@ -193,6 +203,10 @@ struct llama_context {
     bool self_state_trace_import(const void * src, size_t size, bool replace_existing);
     bool self_state_evaluate_counterfactual(const llama_self_updater_program & program, int32_t upto_count, llama_self_counterfactual_result * out_result) const;
     bool self_state_evaluate_counterfactual_on_channel(const llama_self_updater_program & program, int32_t upto_count, int32_t replay_channel, llama_self_counterfactual_result * out_result) const;
+    bool self_state_evaluate_hypothetical_event(
+            const llama_self_state_event & event,
+            llama_self_state_delta_summary * out_delta,
+            llama_self_model_state_info * out_model_state) const;
     bool self_state_build_prewrite_features(const llama_self_state_event & event, llama_self_state_feature_vector * out_features) const;
     bool self_state_apply_prewrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
     bool self_state_build_postwrite_features(const llama_self_state_event & event, llama_self_state_feature_vector * out_features) const;
@@ -201,6 +215,10 @@ struct llama_context {
     bool hard_memory_configure(const llama_hard_memory_config & config);
     bool hard_memory_get_config(llama_hard_memory_config * out_config) const;
     bool hard_memory_query(const llama_hard_memory_query_request & query, llama_hard_memory_result * out_result);
+    bool hard_memory_archive_primitives(
+            const llama_hard_memory_primitive * primitives,
+            int32_t primitive_count,
+            const llama_self_state_delta_summary * delta_summary = nullptr);
     bool hard_memory_get_last_result(llama_hard_memory_result * out_result) const;
     bool hard_memory_get_last_archive_trace(llama_hard_memory_archive_trace * out_trace) const;
     bool bash_tool_configure(const llama_bash_tool_config & config);
@@ -232,6 +250,8 @@ struct llama_context {
     bool remediation_get_last_plan(llama_remediation_plan * out_plan) const;
     bool governance_get_last_trace(llama_governance_trace * out_trace) const;
     bool temporal_self_improvement_get_last(llama_temporal_self_improvement_trace * out_trace) const;
+    bool user_simulation_override_begin();
+    bool user_simulation_override_end();
 
     void attach_adapter_runtime(llama_adapter_lora * adapter, float scale, llama_adapter_lora_layer_role role);
     void detach_adapter_runtime(llama_adapter_lora * adapter);
@@ -388,6 +408,9 @@ private:
     llama_adapter_lora_stack_ptr  runtime_loras;
     llama_adapter_lora_stack_ptr  loras;
     uint64_t                      lora_stack_version = 0;
+    llama_adapter_lora_stack_ptr  user_sim_saved_request_loras;
+    llama_adapter_lora_stack_ptr  user_sim_saved_runtime_loras;
+    bool                          user_sim_override_active = false;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

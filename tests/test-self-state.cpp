@@ -109,12 +109,38 @@ struct mock_supermemory_server {
                             {"memory", "Earlier repair attempt referenced the strict memory runtime."},
                             {"similarity", 0.91},
                             {"title", "repair-memory"},
+                            {"metadata", {
+                                {"kind", "self_model_fragment"},
+                                {"domain", "epistemic"},
+                                {"sourceRole", LLAMA_SELF_STATE_EVENT_SYSTEM},
+                                {"sourceChannel", LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY},
+                                {"sourceToolKind", LLAMA_TOOL_KIND_HARD_MEMORY_QUERY},
+                                {"flags", LLAMA_HARD_MEMORY_PRIMITIVE_AFFECT_GAIN},
+                                {"importance", 0.86},
+                                {"confidence", 0.79},
+                                {"gainBias", 0.88},
+                                {"allostaticRelevance", 0.12},
+                                {"tags", json::array({"repair", "self_model", "epistemic"})},
+                            }},
                         },
                         {
                             {"id", "chunk_beta"},
                             {"chunk", "Older context from last week favored a narrower repository query."},
                             {"similarity", 0.83},
                             {"title", "last-week-query"},
+                            {"metadata", {
+                                {"kind", "user_model"},
+                                {"domain", "user_outcome"},
+                                {"sourceRole", LLAMA_SELF_STATE_EVENT_USER},
+                                {"sourceChannel", LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY},
+                                {"sourceToolKind", LLAMA_TOOL_KIND_HARD_MEMORY_QUERY},
+                                {"flags", LLAMA_HARD_MEMORY_PRIMITIVE_AFFECT_GAIN},
+                                {"importance", 0.63},
+                                {"confidence", 0.71},
+                                {"gainBias", 0.52},
+                                {"allostaticRelevance", 0.34},
+                                {"tags", json::array({"user_model", "last_week"})},
+                            }},
                         }
                     })}
                 }}
@@ -493,6 +519,30 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const std::vector<llama_token> preference_tokens = tokenize_or_die(
+            vocab,
+            "Be direct.\n- Show the failing path\n- Fix it\nDo not ask extra questions.");
+    llama_self_state_event preference_event = {
+        /*.tokens =*/ preference_tokens.data(),
+        /*.n_tokens =*/ preference_tokens.size(),
+        /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+        /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+        /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
+        /*.decoder_entropy =*/ 0.15f,
+        /*.decoder_top_margin =*/ 0.92f,
+    };
+    llama_self_state_feature_vector preference_prewrite = {};
+    llama_self_state_feature_vector preference_postwrite = {};
+    if (llama_self_state_build_prewrite_features(ctx, &preference_event, &preference_prewrite) != 0 ||
+        llama_self_state_apply_prewrite(ctx, &preference_event, &preference_prewrite) != 0 ||
+        llama_self_state_build_postwrite_features(ctx, &preference_event, &preference_postwrite) != 0 ||
+        llama_self_state_apply_postwrite(ctx, &preference_event, &preference_postwrite) != 0) {
+        std::fprintf(stderr, "failed to apply user-preference rhetorical event\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
     if (llama_self_state_upsert_tool_job(ctx, 3, LLAMA_SELF_TOOL_JOB_PENDING, 0.6f) != 0 ||
         llama_self_state_upsert_tool_job(ctx, 4, LLAMA_SELF_TOOL_JOB_RUNNING, 0.8f) != 0) {
         std::fprintf(stderr, "failed to update tool jobs\n");
@@ -538,12 +588,86 @@ int main(int argc, char ** argv) {
     llama_self_model_state_info model_state = {};
     if (llama_self_state_get_model_state(ctx, &model_state) != 0 ||
         model_state.horizon_count != LLAMA_SELF_HORIZON_COUNT ||
+        !model_state.belief_summary.valid ||
+        model_state.belief_slot_count <= 0 ||
         !model_state.forecast.valid ||
         model_state.horizons[LLAMA_SELF_HORIZON_INSTANT].epistemic.answerability <= 0.0f ||
         model_state.horizons[LLAMA_SELF_HORIZON_SHORT].efficiency.expected_steps_remaining <= 0.0f ||
         model_state.horizons[LLAMA_SELF_HORIZON_LONG].user_outcome.satisfaction_estimate < 0.0f ||
-        model_state.horizons[LLAMA_SELF_HORIZON_INSTANT].self_improvement.update_worthiness <= 0.0f) {
+        model_state.horizons[LLAMA_SELF_HORIZON_INSTANT].self_improvement.update_worthiness <= 0.0f ||
+        model_state.horizons[LLAMA_SELF_HORIZON_INSTANT].user_preference.directness_preference <= 0.0f ||
+        model_state.horizons[LLAMA_SELF_HORIZON_INSTANT].user_preference.structure_preference <= 0.0f ||
+        model_state.horizons[LLAMA_SELF_HORIZON_INSTANT].user_preference.simulator_readiness <= 0.0f ||
+        model_state.belief_summary.known_care_uncertainty < 0.0f ||
+        model_state.belief_summary.belief_confidence < 0.0f) {
         std::fprintf(stderr, "expanded self-model state was not populated\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    if (llama_self_state_model_extension_count(ctx) != 0) {
+        std::fprintf(stderr, "unexpected default self-model extension count\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    llama_self_model_extension_update tool_extension = llama_self_model_extension_default_update();
+    tool_extension.source = LLAMA_SELF_MODEL_EXTENSION_SOURCE_TOOL_BASH_CLI;
+    tool_extension.source_tool_kind = LLAMA_TOOL_KIND_BASH_CLI;
+    tool_extension.kind = LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM;
+    tool_extension.domain = LLAMA_SELF_MODEL_EXTENSION_DOMAIN_EPISTEMIC;
+    tool_extension.flags =
+            LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE |
+            LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_GAIN |
+            LLAMA_SELF_MODEL_EXTENSION_FLAG_HAS_DESIRED_STATE |
+            LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS;
+    tool_extension.value = 0.20f;
+    tool_extension.desired_value = 1.0f;
+    tool_extension.confidence = 0.80f;
+    tool_extension.salience = 0.90f;
+    tool_extension.gain_weight = 0.70f;
+    tool_extension.allostatic_weight = 0.90f;
+    std::snprintf(tool_extension.key, sizeof(tool_extension.key), "%s", "bash.answerability");
+    std::snprintf(tool_extension.label, sizeof(tool_extension.label), "%s", "Bash Answerability");
+    std::snprintf(tool_extension.content, sizeof(tool_extension.content), "%s", "CLI tool discovered whether the repository state is answerable.");
+
+    if (llama_self_state_upsert_model_extension(ctx, tool_extension) != 0 ||
+        llama_self_state_model_extension_count(ctx) != 1) {
+        std::fprintf(stderr, "failed to upsert tool-authored self-model extension\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    llama_self_model_extension_info extension_info = {};
+    if (llama_self_state_get_model_extension(ctx, 0, &extension_info) != 0 ||
+        extension_info.source_tool_kind != LLAMA_TOOL_KIND_BASH_CLI ||
+        extension_info.kind != LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM ||
+        extension_info.domain != LLAMA_SELF_MODEL_EXTENSION_DOMAIN_EPISTEMIC ||
+        extension_info.desired_value < 0.99f ||
+        extension_info.value > 0.21f) {
+        std::fprintf(stderr, "tool-authored self-model extension was not preserved\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    if (llama_self_state_get_model_state(ctx, &model_state) != 0 ||
+        model_state.extension_summary.active_count != 1 ||
+        model_state.extension_summary.gain_count != 1 ||
+        model_state.extension_summary.allostatic_count != 1 ||
+        model_state.extension_summary.allostatic_divergence <= 0.70f) {
+        std::fprintf(stderr, "self-model extension summary did not reflect tool-authored allostatic state\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    if (llama_self_state_remove_model_extension(ctx, "bash.answerability") != 0 ||
+        llama_self_state_model_extension_count(ctx) != 0) {
+        std::fprintf(stderr, "failed to remove tool-authored self-model extension\n");
         llama_free(ctx);
         llama_model_free(model);
         return 1;
@@ -551,7 +675,13 @@ int main(int argc, char ** argv) {
 
     if (llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_ANSWERABILITY, &register_info) != 0 ||
         llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK, &register_info) != 0 ||
-        llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_RECOVERY_URGENCY, &register_info) != 0) {
+        llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_RECOVERY_URGENCY, &register_info) != 0 ||
+        llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_USER_DIRECTNESS_PREFERENCE, &register_info) != 0 ||
+        register_info.scalar_value <= 0.0f ||
+        llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_USER_STRUCTURE_PREFERENCE, &register_info) != 0 ||
+        register_info.scalar_value <= 0.0f ||
+        llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_USER_AUTONOMY_PREFERENCE, &register_info) != 0 ||
+        register_info.scalar_value <= 0.0f) {
         std::fprintf(stderr, "expanded summary registers were not addressable\n");
         llama_free(ctx);
         llama_model_free(model);
@@ -570,13 +700,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (llama_self_state_trace_count(ctx) != 3 ||
+    const int32_t expected_trace_count = llama_self_state_trace_count(ctx);
+    const int32_t expected_working_memory_count = llama_self_state_working_memory_count(ctx);
+    if (expected_trace_count <= 0 ||
+        expected_working_memory_count <= 0 ||
         llama_self_state_replay_trace(ctx, 1) != 0 ||
         llama_self_state_working_memory_count(ctx) != 1 ||
-        llama_self_state_trace_count(ctx) != 3 ||
+        llama_self_state_trace_count(ctx) != expected_trace_count ||
         llama_self_state_replay_trace(ctx, -1) != 0 ||
-        llama_self_state_working_memory_count(ctx) != 3 ||
-        llama_self_state_trace_count(ctx) != 3) {
+        llama_self_state_working_memory_count(ctx) != expected_working_memory_count ||
+        llama_self_state_trace_count(ctx) != expected_trace_count) {
         std::fprintf(stderr, "trace replay did not preserve deterministic state\n");
         llama_free(ctx);
         llama_model_free(model);
@@ -586,8 +719,31 @@ int main(int argc, char ** argv) {
     if (llama_self_state_get_model_state(ctx, &model_state) != 0 ||
         !model_state.prediction_error.valid ||
         model_state.prediction_error.steps_error < 0.0f ||
-        model_state.prediction_error.goal_progress_error < 0.0f) {
+        model_state.prediction_error.goal_progress_error < 0.0f ||
+        !model_state.belief_summary.valid ||
+        model_state.belief_summary.residual_allostatic_pressure <= 0.0f ||
+        model_state.belief_summary.max_slot_pressure <= 0.0f) {
         std::fprintf(stderr, "self-model forecast error trace was not preserved\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    llama_self_state_params no_belief = llama_self_state_default_params();
+    no_belief.enable_belief_state = false;
+    no_belief.belief_slot_count = 0;
+    if (llama_self_state_configure(ctx, no_belief) != 0 ||
+        llama_self_state_get_model_state(ctx, &model_state) != 0 ||
+        model_state.belief_summary.valid ||
+        model_state.belief_slot_count != 0 ||
+        model_state.promotion_candidate_count != 0) {
+        std::fprintf(stderr, "belief-state disable path did not clear bounded uncertainty surface\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+    if (llama_self_state_configure(ctx, llama_self_state_default_params()) != 0) {
+        std::fprintf(stderr, "failed to restore belief-state defaults\n");
         llama_free(ctx);
         llama_model_free(model);
         return 1;
@@ -650,8 +806,8 @@ int main(int argc, char ** argv) {
         llama_self_state_evaluate_counterfactual(ctx, program, -1, &counterfactual) != 0 ||
         counterfactual.updater_version != 2 ||
         counterfactual.replay_channel != LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL ||
-        counterfactual.replayed_events != 3 ||
-        counterfactual.working_memory_count != 3 ||
+        counterfactual.replayed_events != expected_trace_count ||
+        counterfactual.working_memory_count != expected_working_memory_count ||
         counterfactual.broadcast_pressure <= 0.0f) {
         std::fprintf(stderr, "counterfactual updater evaluation failed\n");
         llama_free(ctx);
@@ -700,9 +856,9 @@ int main(int argc, char ** argv) {
     }
 
     if (llama_self_state_trace_import(imported_ctx, trace_blob.data(), trace_blob.size(), true) != 0 ||
-        llama_self_state_trace_count(imported_ctx) != 3 ||
+        llama_self_state_trace_count(imported_ctx) != expected_trace_count ||
         llama_self_state_replay_trace(imported_ctx, -1) != 0 ||
-        llama_self_state_working_memory_count(imported_ctx) != 3) {
+        llama_self_state_working_memory_count(imported_ctx) != expected_working_memory_count) {
         std::fprintf(stderr, "trace import/replay failed\n");
         llama_free(imported_ctx);
         llama_free(ctx);
@@ -773,6 +929,46 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        if (hard_memory_result.results[0].kind != LLAMA_HARD_MEMORY_PRIMITIVE_SELF_MODEL_FRAGMENT ||
+            hard_memory_result.results[0].domain != LLAMA_HARD_MEMORY_DOMAIN_EPISTEMIC ||
+            hard_memory_result.results[0].source_tool_kind != LLAMA_TOOL_KIND_HARD_MEMORY_QUERY ||
+            hard_memory_result.results[0].gain_bias < 0.87f ||
+            std::string(hard_memory_result.results[0].tags[1]) != "self_model" ||
+            hard_memory_result.retrieval_summary.self_model_count != 1 ||
+            hard_memory_result.retrieval_summary.user_model_count != 1 ||
+            hard_memory_result.retrieval_summary.mean_similarity < 0.86f ||
+            hard_memory_result.retrieval_summary.max_similarity < 0.90f ||
+            hard_memory_result.retrieval_summary.gain_support <= 0.60f ||
+            hard_memory_result.retrieval_summary.epistemic_support <= 0.0f ||
+            hard_memory_result.retrieval_summary.user_support <= 0.0f) {
+            std::fprintf(stderr, "hard-memory query metadata was not parsed into typed retrieval summaries\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_self_model_state_info hard_memory_model_state = {};
+        llama_self_model_extension_info hard_memory_extension = {};
+        if (llama_self_state_model_extension_count(hard_memory_ctx) <= 0 ||
+            llama_self_state_get_model_state(hard_memory_ctx, &hard_memory_model_state) != 0 ||
+            !hard_memory_model_state.last_extension_trace.valid ||
+            hard_memory_model_state.last_extension_trace.promoted_count <= 0 ||
+            hard_memory_model_state.extension_summary.hard_memory_count <= 0 ||
+            hard_memory_model_state.extension_summary.allostatic_count != 0 ||
+            hard_memory_model_state.extension_summary.context_activation <= 0.0f ||
+            llama_self_state_get_model_extension(hard_memory_ctx, 0, &hard_memory_extension) != 0 ||
+            hard_memory_extension.source_tool_kind != LLAMA_TOOL_KIND_HARD_MEMORY_QUERY ||
+            (hard_memory_extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS) != 0) {
+            std::fprintf(stderr, "hard-memory query did not promote bounded non-allostatic self-model extensions\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
         llama_hard_memory_result last_result = {};
         if (llama_hard_memory_get_last_result(hard_memory_ctx, &last_result) != 0 ||
             last_result.result_count != hard_memory_result.result_count) {
@@ -814,9 +1010,28 @@ int main(int argc, char ** argv) {
             archive_trace.delta.total_delta < hard_memory.archival_delta_threshold ||
             archive_trace.delta.dimension_count <= 0 ||
             std::string(archive_trace.container_tag) != "vicuna-self-state" ||
-            std::string(archive_trace.content_excerpt).find("frustrating") == std::string::npos ||
+            archive_trace.primitive_count < 2 ||
+            std::string(archive_trace.content_excerpt).empty() ||
             mock_server.archive_calls.load() != 1) {
             std::fprintf(stderr, "hard-memory archival did not persist above-threshold delta context\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        bool saw_event_primitive = false;
+        bool saw_user_or_self_model_primitive = false;
+        for (int32_t i = 0; i < archive_trace.primitive_count; ++i) {
+            saw_event_primitive = saw_event_primitive ||
+                    archive_trace.primitives[i].kind == LLAMA_HARD_MEMORY_PRIMITIVE_EVENT_FRAGMENT;
+            saw_user_or_self_model_primitive = saw_user_or_self_model_primitive ||
+                    archive_trace.primitives[i].kind == LLAMA_HARD_MEMORY_PRIMITIVE_USER_MODEL ||
+                    archive_trace.primitives[i].kind == LLAMA_HARD_MEMORY_PRIMITIVE_SELF_MODEL_FRAGMENT;
+        }
+        if (!saw_event_primitive || !saw_user_or_self_model_primitive) {
+            std::fprintf(stderr, "hard-memory archival did not preserve typed primitive mix\n");
             llama_free(hard_memory_ctx);
             mock_server.stop();
             llama_free(ctx);
@@ -831,6 +1046,55 @@ int main(int argc, char ** argv) {
         if (archive_body.find("\"runtimeIdentity\":\"vicuna-tests\"") == std::string::npos ||
             archive_body.find("\"containerTag\":\"vicuna-self-state\"") == std::string::npos) {
             std::fprintf(stderr, "hard-memory archival did not preserve self-host routing metadata\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const json archive_payload = json::parse(archive_body);
+        if (!archive_payload.contains("memories") ||
+            !archive_payload["memories"].is_array() ||
+            archive_payload["memories"].size() < 2) {
+            std::fprintf(stderr, "hard-memory archival payload did not preserve primitive batch structure\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        bool saw_archived_event = false;
+        bool saw_archived_model = false;
+        bool saw_changed_registers = false;
+        bool saw_preference_tag = false;
+        bool saw_rhetoric_tag = false;
+        for (const auto & item : archive_payload["memories"]) {
+            if (!item.is_object()) {
+                continue;
+            }
+            const json metadata = item.value("metadata", json::object());
+            const std::string kind = metadata.value("kind", std::string());
+            saw_archived_event = saw_archived_event ||
+                    kind == "event_fragment";
+            saw_archived_model = saw_archived_model ||
+                    kind == "user_model" || kind == "self_model_fragment";
+            saw_changed_registers = saw_changed_registers ||
+                    (metadata.contains("changedRegisters") && metadata["changedRegisters"].is_array() && !metadata["changedRegisters"].empty());
+            if (kind == "user_model" && metadata.contains("tags") && metadata["tags"].is_array()) {
+                for (const auto & tag : metadata["tags"]) {
+                    if (!tag.is_string()) {
+                        continue;
+                    }
+                    saw_preference_tag = saw_preference_tag || tag.get<std::string>() == "preference";
+                    saw_rhetoric_tag = saw_rhetoric_tag || tag.get<std::string>() == "rhetoric";
+                }
+            }
+        }
+        if (!saw_archived_event || !saw_archived_model || !saw_changed_registers ||
+            !saw_preference_tag || !saw_rhetoric_tag) {
+            std::fprintf(stderr, "hard-memory archival payload did not include typed metadata-rich primitives\n");
             llama_free(hard_memory_ctx);
             mock_server.stop();
             llama_free(ctx);

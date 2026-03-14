@@ -46,6 +46,8 @@ private:
     llama_cognitive_dmn_runner_status dmn_runner = {};
     llama_active_loop_trace last_active_trace = {};
     llama_dmn_tick_trace last_dmn_trace = {};
+    llama_cognitive_plan_trace active_plan = {};
+    llama_cognitive_plan_trace dmn_plan = {};
     llama_favorable_state_profile last_favorable_profile = {};
     llama_counterfactual_trace last_counterfactual_trace = {};
     llama_remediation_plan last_remediation_plan = {};
@@ -62,4 +64,5 @@ private:
     int32_t next_tick_id = 1;
     int32_t next_tool_job_id = 1;
     int32_t next_command_id = 1;
+    int32_t next_plan_id = 1;
 };

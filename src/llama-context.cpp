@@ -1222,6 +1222,10 @@ bool llama_context::active_lora_get_stats(llama_active_lora_stats * out_stats) c
     return active_lora_manager && active_lora_manager->get_stats(out_stats);
 }
 
+bool llama_context::user_personality_lora_get_stats(llama_user_personality_lora_stats * out_stats) const {
+    return active_lora_manager && active_lora_manager->user_personality_get_stats(out_stats);
+}
+
 bool llama_context::past_lora_init(const llama_past_lora_params & params) {
     if (!active_lora_manager) {
         active_lora_manager = std::make_unique<llama_active_lora_manager>(*this);
@@ -1351,6 +1355,16 @@ bool llama_context::active_temporal_encoding_bias_apply(
             monotonic_ms);
 }
 
+bool llama_context::functional_lora_predict_activation(
+        const llama_functional_gating_observation & observation,
+        const llama_functional_activation_decision & policy_seed,
+        llama_functional_activation_decision * out_decision) {
+    return active_lora_manager && active_lora_manager->functional_predict_activation(
+            observation,
+            policy_seed,
+            out_decision);
+}
+
 bool llama_context::functional_lora_activate(const llama_functional_activation_decision & decision) {
     return active_lora_manager && active_lora_manager->functional_activate(decision);
 }
@@ -1389,6 +1403,41 @@ bool llama_context::functional_lora_apply_update(
             magnitude,
             event,
             features);
+}
+
+bool llama_context::user_simulation_override_begin() {
+    if (user_sim_override_active || !active_lora_manager) {
+        return false;
+    }
+
+    user_sim_saved_request_loras = request_loras ? std::make_unique<llama_adapter_lora_stack>(*request_loras) : nullptr;
+    user_sim_saved_runtime_loras = runtime_loras ? std::make_unique<llama_adapter_lora_stack>(*runtime_loras) : nullptr;
+    request_loras.reset();
+    runtime_loras = std::make_unique<llama_adapter_lora_stack>();
+    if (!active_lora_manager->user_personality_set_attached(true)) {
+        request_loras = std::move(user_sim_saved_request_loras);
+        runtime_loras = std::move(user_sim_saved_runtime_loras);
+        rebuild_lora_stack();
+        return false;
+    }
+    user_sim_override_active = true;
+    rebuild_lora_stack();
+    log_lora_stack();
+    return true;
+}
+
+bool llama_context::user_simulation_override_end() {
+    if (!user_sim_override_active) {
+        return false;
+    }
+
+    (void) active_lora_manager->user_personality_set_attached(false);
+    request_loras = std::move(user_sim_saved_request_loras);
+    runtime_loras = std::move(user_sim_saved_runtime_loras);
+    user_sim_override_active = false;
+    rebuild_lora_stack();
+    log_lora_stack();
+    return true;
 }
 
 void llama_context::attach_adapter_runtime(llama_adapter_lora * adapter, float scale, llama_adapter_lora_layer_role role) {
@@ -3446,6 +3495,12 @@ int32_t llama_active_lora_get_stats(
         const llama_context * ctx,
         llama_active_lora_stats * out_stats) {
     return ctx && ctx->active_lora_get_stats(out_stats) ? 0 : -1;
+}
+
+int32_t llama_user_personality_lora_get_stats(
+        const llama_context * ctx,
+        llama_user_personality_lora_stats * out_stats) {
+    return ctx && ctx->user_personality_lora_get_stats(out_stats) ? 0 : -1;
 }
 
 int32_t llama_past_lora_init(

@@ -9,6 +9,8 @@ add_library(${TARGET} STATIC
     server-task.h
     server-queue.cpp
     server-queue.h
+    server-bash-tool.cpp
+    server-bash-tool.h
     server-common.cpp
     server-common.h
     server-context.cpp

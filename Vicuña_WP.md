@@ -52,6 +52,14 @@ sliding attention window
 -> functional LoRA bank (operation-local procedural bias above temporal memory)
 ```
 
+The current runtime no longer treats active and DMN control as pure
+state-switching. Both paths now draft bounded plans on a shared
+planning/composition substrate, then execute the next step through the same
+command/tool interface. This planning mode is not a third rail; it is a mode of
+operation used by both active and DMN flows, and it has its own functional LoRA
+family that is updated through the same bounded online optimization path as the
+other functional families.
+
 The functional bank is not routed by a persistent prompt artifact. Its gains
 are now driven by a typed self-state gradient toward favorable self-state, with
 explicit online meta-updates after settled loop transactions. More broadly,
@@ -59,6 +67,14 @@ Adam is now used only where the runtime is actually updating weights or biases
 from self-state deltas: the functional gate, the runtime LoRA writer, and the
 temporal write-bias controller. The counterfactual ladder remains an explicit
 ranking process.
+
+That explicit self-state is not assumed to be complete. The current runtime now
+supports a bounded belief layer over incompletely rendered cares: a small
+residual state driven by forecast error, novelty, memory residue, and
+allostatic mismatch. The gate consumes only a fixed summary of that belief
+layer, not raw latent content. This gives Vicuña a limited form of
+partial-observation control without collapsing the architecture into opaque
+latent memory.
 
 ### 3.2 Loop split
 
@@ -136,6 +152,11 @@ Gaussian exploration, clips gains into `[0, 2]`, and is updated online with
 Adam after settled transactions. The same optimizer also conditions the
 underlying self-state-driven runtime LoRA writes, while discrete
 counterfactual-ablation proposals remain non-optimizer policy.
+Each functional family now also carries a separate bootstrap adapter with tiny
+random weights: the learned adapter itself still starts as a no-op, but invoked
+families receive a small signed stochastic perturbation that decays with usage
+toward a nonzero floor so early accidental procedural discoveries remain
+possible without conflating bootstrap exploration with learned state.
 
 ### 3.4 Extensibility
 
@@ -297,8 +318,44 @@ The current implementation direction expands this into a layered self-model:
 - typed profile families for goal progress, user outcome, epistemic condition,
   efficiency, recovery, strategy, and self-improvement readiness,
 - multi-timescale slices over those profiles,
-- and bounded forecasts plus prediction-error traces so later evaluators can
-  calibrate the self-model rather than reconstruct it from raw logs.
+- bounded forecasts plus prediction-error traces so later evaluators can
+  calibrate the self-model rather than reconstruct it from raw logs,
+- and a bounded extension registry that can hold runtime-discovered or
+  tool-authored additions without replacing the authored core.
+
+This extension layer is intentionally hybrid:
+
+- the authored self-model remains the stable prior or "genetic" core
+- hard-memory query may promote retrieved values into `MEMORY_CONTEXT`
+  extensions after a bounded counterfactual scoring step
+- tools may write `SCALAR_PARAM` extensions with optional desirable-state
+  metadata
+- hard-memory-derived extensions should usually not affect allostasis
+- tool-authored scalar extensions may affect allostasis only when they are true
+  internal regulation targets
+
+To keep the control story coherent, the self-state gradient is not replaced by a
+variable-length raw extension list. The runtime projects the extension registry
+into a bounded summary that can continue to modulate functional LoRA gain.
+
+The same bounded-control principle now applies to hard memory. Rather than
+archiving only undifferentiated text, the runtime stores typed memory
+primitives: event fragments, trajectories, outcomes, tool observations,
+user-model residue, and self-model fragments. This matters because the project
+is not trying to build a chat transcript graveyard; it is trying to build a
+durable substrate for self-maintenance and future inference.
+
+The architectural consequence is important:
+
+- hard memory now stores durable residue in typed categories
+- the self-model may selectively internalize retrieved residue as bounded
+  extensions
+- functional LoRA gain is biased by bounded retrieval summaries rather than raw
+  retrieved prose
+
+That is a better fit for biologically inspired control than either pure prompt
+memory or pure LoRA-only persistence, because it separates persistent residue,
+internal self-estimate, and online control.
 
 ### 5.2 What does not belong solely in the LoRA stack
 

@@ -89,12 +89,31 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    llama_user_personality_lora_stats user_stats = {};
+    if (llama_user_personality_lora_get_stats(ctx, &user_stats) != 0) {
+        fprintf(stderr, "failed to query user personality LoRA stats\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
     if (!stats.enabled || stats.selected_rank < 1 ||
         stats.optimizer_step_count != 0 ||
         stats.embedding_type != LLAMA_ACTIVE_LORA_EMBEDDING_HIDDEN_STATE ||
         stats.embedding_is_custom || stats.embedding_dim != (uint32_t) llama_model_n_embd_out(model) ||
         stats.optimizer_last_update_norm != 0.0f) {
         fprintf(stderr, "unexpected Active LoRA init stats\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+    if (!user_stats.enabled || user_stats.attached_for_simulation ||
+        user_stats.selected_rank < 1 ||
+        user_stats.updates_applied != 0 ||
+        user_stats.optimizer_step_count != 0 ||
+        user_stats.tokens_ingested != 0 ||
+        user_stats.confidence != 0.0f) {
+        fprintf(stderr, "unexpected user personality LoRA init stats\n");
         llama_free(ctx);
         llama_model_free(model);
         return 1;
@@ -117,12 +136,18 @@ int main(int argc, char ** argv) {
             config.default_gain < 0.999f ||
             config.default_gain > 1.001f ||
             config.exploration_noise_initial_std <= config.exploration_noise_min_std ||
+            config.bootstrap_perturbation_initial_std <= config.bootstrap_perturbation_min_std ||
+            config.bootstrap_perturbation_min_std <= 0.0f ||
+            config.bootstrap_weight_init_std <= 0.0f ||
             !state.compatible ||
             state.active_now ||
             state.current_gain != 0.0f ||
             state.predicted_gain < 0.999f ||
             state.predicted_gain > 1.001f ||
             state.last_noise != 0.0f ||
+            state.current_bootstrap_std != config.bootstrap_perturbation_initial_std ||
+            state.last_bootstrap_perturbation != 0.0f ||
+            state.activation_count != 0 ||
             state.last_meta_loss != 0.0f) {
             fprintf(stderr, "unexpected functional LoRA registry state for family %d\n", family);
             llama_free(ctx);
@@ -179,6 +204,16 @@ int main(int argc, char ** argv) {
         stats.gain_mean <= 0.0f || stats.gain_max <= 0.0f || stats.gain_max > params.gain_max + 1.0e-6f ||
         stats.optimizer_last_update_norm <= 0.0f) {
         fprintf(stderr, "unexpected Active LoRA ingest stats\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+    if (llama_user_personality_lora_get_stats(ctx, &user_stats) != 0 ||
+        user_stats.updates_applied != 0 ||
+        user_stats.tokens_ingested != 0 ||
+        user_stats.optimizer_step_count != 0 ||
+        user_stats.confidence != 0.0f) {
+        fprintf(stderr, "evicted-span ingest unexpectedly changed user personality LoRA\n");
         llama_free(ctx);
         llama_model_free(model);
         return 1;
