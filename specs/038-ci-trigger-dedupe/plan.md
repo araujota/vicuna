@@ -5,7 +5,7 @@
 
 ## Summary
 
-Remove `pull_request` triggers from duplicated validation workflows so branch updates run validation only through `push`, while preserving manual, scheduled, and PR-specific metadata automation.
+Remove `pull_request` triggers from duplicated validation workflows so branch updates run validation only through `push`, while preserving manual, scheduled, and PR-specific metadata automation. At the same time, make the main quality gates repository-wide and non-fail-fast so a single run reports the full blocking set.
 
 ## Technical Context
 
@@ -59,10 +59,12 @@ specs/038-ci-trigger-dedupe/
 
 1. Confirm the validation workflow scope and explicitly exclude PR-specific automation such as `labeler.yml`.
 2. Remove `pull_request` trigger blocks from the selected validation workflows without altering other trigger or job configuration.
-3. Re-scan workflow files to confirm that only the targeted workflows changed and that `workflow_dispatch` and `schedule` entries remain intact.
+3. Replace diff-scoped or fail-fast quality-gate behavior in `Vicuna CI` with repository-wide aggregated reporting.
+4. Re-scan workflow files to confirm that only the intended trigger and gate-behavior changes landed.
 
 ## Risks
 
 - Removing PR triggers from the wrong workflow would silently disable intended pull-request automation.
 - Partial edits could leave inconsistent indentation or malformed YAML.
 - Some checks will still appear on PRs indirectly through `push` runs on branch updates; that is expected and desired.
+- Repository-wide static analysis may surface pre-existing issues that were previously hidden by changed-file scoping.

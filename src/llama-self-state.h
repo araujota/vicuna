@@ -159,10 +159,10 @@ private:
     float run_contradiction_head(float analytic_score, const llama_self_state_feature_vector & features) const;
     float run_uncertainty_head(float analytic_score, const llama_self_state_feature_vector & features) const;
     float run_broadcast_head(float analytic_score, const llama_self_state_feature_vector & features) const;
-    float max_similarity(const std::vector<llama_self_sketch_surface> & surfaces, const std::array<float, 32> & sketch, bool unresolved_only) const;
+    static float max_similarity(const std::vector<llama_self_sketch_surface> & surfaces, const std::array<float, 32> & sketch, bool unresolved_only);
     void working_memory_stats(const std::array<float, 32> & sketch, float * out_top_similarity, float * out_variance) const;
     void memory_handle_stats(const std::array<float, 32> & sketch, float * out_top_similarity, float * out_variance) const;
-    void upsert_surface(std::vector<llama_self_sketch_surface> & surfaces, int32_t id, const std::array<float, 32> & sketch, float priority, bool unresolved);
+    void upsert_surface(std::vector<llama_self_sketch_surface> & surfaces, int32_t id, const std::array<float, 32> & sketch, float priority, bool unresolved) const;
     void admit_working_memory(const llama_self_state_event & event, const std::array<float, 32> & sketch, const llama_self_state_feature_vector & features);
     void update_reactivation_priorities(const std::array<float, 32> & sketch, float memory_write_pressure);
     void refresh_tool_surface(uint32_t source_mask);
@@ -188,7 +188,7 @@ private:
     bool validate_updater_program(const llama_self_updater_program & program) const;
     bool apply_register_update_rules(uint32_t phase_mask, const llama_self_state_event & event, const llama_self_state_feature_vector & features, uint32_t source_mask);
     float updater_feature_value(int32_t feature_id, const llama_self_state_event & event, const llama_self_state_feature_vector & features) const;
-    bool validate_model_extension_update(llama_self_model_extension_update * update) const;
+    static bool validate_model_extension_update(llama_self_model_extension_update * update);
 
     static const llama_self_register_definition * get_definition(int32_t register_id);
     static std::array<llama_self_register_definition, LLAMA_SELF_REGISTER_COUNT> build_definitions();

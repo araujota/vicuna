@@ -32,6 +32,19 @@ As a maintainer, I want PR-specific automation such as labeling to keep working 
 
 1. **Given** a workflow that exists to react to PR metadata events, **When** the CI dedupe change is applied, **Then** its PR trigger remains intact.
 
+### User Story 3 - Report full gate failure sets in one run (Priority: P2)
+
+As a maintainer, I want repository-quality and static-analysis gates to inspect the full codebase and report every detected failure in a single run so that I do not have to burn repeated pushes to discover issues one at a time.
+
+**Why this priority**: Fail-fast gate behavior slows remediation and obscures the real set of blocking issues.
+
+**Independent Test**: Inspect the workflow definitions and confirm the quality and static-analysis gates no longer scope themselves to changed files or stop at the first failing sub-check.
+
+**Acceptance Scenarios**:
+
+1. **Given** multiple lint or static-analysis failures exist at the same time, **When** the CI workflow runs, **Then** each gate reports the full set it evaluated before exiting non-zero.
+2. **Given** native and Python files outside the current diff contain violations, **When** the affected gate runs, **Then** it still evaluates them as part of the repository-wide scan.
+
 ### Edge Cases
 
 - Workflows with `workflow_dispatch` or `schedule` triggers must retain those triggers unchanged.
@@ -47,6 +60,8 @@ As a maintainer, I want PR-specific automation such as labeling to keep working 
 - **FR-003**: PR-specific metadata or governance workflows MUST retain their PR triggers.
 - **FR-004**: The implementation MUST be limited to workflow-trigger dedupe and MUST NOT change validation job contents, names, or required toolchains.
 - **FR-005**: The repository MUST record the intended workflow scope and operator-facing rationale in Spec Kit artifacts for this change.
+- **FR-006**: Repository quality gates in `Vicuna CI` MUST evaluate the full repository rather than only the changed-file subset.
+- **FR-007**: Repository quality and static-analysis gates MUST aggregate failures and exit only after every configured sub-check in that gate has run.
 
 ## Success Criteria *(mandatory)*
 
@@ -55,3 +70,4 @@ As a maintainer, I want PR-specific automation such as labeling to keep working 
 - **SC-001**: For validation workflows touched by this feature, the YAML no longer contains a `pull_request` trigger after implementation.
 - **SC-002**: PR check lists no longer show duplicated validation jobs caused by paired `push` and `pull_request` runs for the same branch update.
 - **SC-003**: PR-specific automation workflows outside the dedupe scope retain their PR trigger configuration unchanged.
+- **SC-004**: The `lint-type-quality` and `clang-tidy` jobs no longer depend on changed-file diff inventories to decide analysis scope.

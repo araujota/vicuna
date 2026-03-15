@@ -33,6 +33,18 @@
 
 - [x] T004 [US2] Re-check `/Users/tyleraraujo/vicuna/.github/workflows/labeler.yml` and any untouched PR automation workflow to confirm PR triggers were preserved
 
-## Phase 5: Polish
+## Phase 5: User Story 3 - Report full gate failure sets in one run (Priority: P2)
 
-- [x] T005 Update task completion state in `/Users/tyleraraujo/vicuna/specs/038-ci-trigger-dedupe/tasks.md` after validation
+**Goal**: Main quality gates evaluate the full repository and surface all failures in a single run.
+
+**Independent Test**: Inspect `Vicuna CI` and confirm quality jobs no longer scope to changed-file inventories or use fail-fast pytest invocation.
+
+### Implementation
+
+- [ ] T005 [US3] Update `/Users/tyleraraujo/vicuna/.github/workflows/vicuna-ci.yml` so `lint-type-quality` runs repository-wide pre-commit, flake8, pyright, clang-format, and lizard checks with aggregated exit reporting
+- [ ] T006 [US3] Update `/Users/tyleraraujo/vicuna/.github/workflows/vicuna-ci.yml` so `clang-tidy` runs across repository native sources and aggregates failures instead of stopping on the first changed-file violation
+- [ ] T007 [US3] Remove fail-fast pytest behavior from `/Users/tyleraraujo/vicuna/.github/workflows/vicuna-ci.yml`
+
+## Phase 6: Polish
+
+- [ ] T008 Update task completion state in `/Users/tyleraraujo/vicuna/specs/038-ci-trigger-dedupe/tasks.md` after validation

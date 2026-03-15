@@ -1,3 +1,4 @@
+#include "llama.h"
 #include "llama-self-state.h"
 
 #include "llama-context.h"
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -1473,7 +1475,7 @@ void llama_self_state::upsert_surface(
         int32_t id,
         const std::array<float, 32> & sketch,
         float priority,
-        bool unresolved) {
+        bool unresolved) const {
     auto it = std::find_if(surfaces.begin(), surfaces.end(), [id](const llama_self_sketch_surface & surface) {
         return surface.id == id;
     });
@@ -1561,7 +1563,7 @@ bool llama_self_state::upsert_memory_handle(
 bool llama_self_state::upsert_memory_handle_sketch(
         int32_t handle_id,
         int32_t kind,
-        const std::array<float, 32> & sketch,
+        const std::array<float, 32> & centroid,
         float priority,
         uint32_t member_count) {
     if (handle_id < 0 || !ensure_time_initialized()) {
@@ -1589,7 +1591,7 @@ bool llama_self_state::upsert_memory_handle_sketch(
     it->priority = clamp_unit(priority);
     it->last_update_monotonic_ms = datetime.monotonic_ms;
     it->member_count = std::max<uint32_t>(1, member_count);
-    it->centroid = sketch;
+    it->centroid = centroid;
 
     if (memory_handles.size() > LLAMA_SELF_MAX_MEMORY_HANDLES) {
         std::sort(memory_handles.begin(), memory_handles.end(), [](const llama_self_memory_handle & lhs, const llama_self_memory_handle & rhs) {
@@ -1734,7 +1736,7 @@ bool llama_self_state::get_model_extension(int32_t index, llama_self_model_exten
     return true;
 }
 
-bool llama_self_state::validate_model_extension_update(llama_self_model_extension_update * update) const {
+bool llama_self_state::validate_model_extension_update(llama_self_model_extension_update * update) {
     if (!update) {
         return false;
     }
@@ -1800,14 +1802,14 @@ void llama_self_state::refresh_model_extension_summary() {
     accumulate_model_extensions(model_extensions, neutral_context, false, &signal, &extension_summary);
 }
 
-bool llama_self_state::upsert_model_extension(const llama_self_model_extension_update & input) {
-    llama_self_model_extension_update update = input;
-    if (!validate_model_extension_update(&update)) {
+bool llama_self_state::upsert_model_extension(const llama_self_model_extension_update & update) {
+    llama_self_model_extension_update normalized = update;
+    if (!validate_model_extension_update(&normalized)) {
         return false;
     }
 
-    auto it = std::find_if(model_extensions.begin(), model_extensions.end(), [&update](const llama_self_model_extension_entry & extension) {
-        return std::strncmp(extension.key, update.key, sizeof(extension.key)) == 0;
+    auto it = std::find_if(model_extensions.begin(), model_extensions.end(), [&normalized](const llama_self_model_extension_entry & extension) {
+        return std::strncmp(extension.key, normalized.key, sizeof(extension.key)) == 0;
     });
 
     if (it == model_extensions.end()) {
@@ -1831,24 +1833,24 @@ bool llama_self_state::upsert_model_extension(const llama_self_model_extension_u
         }
     }
 
-    it->source = update.source;
-    it->source_tool_kind = update.source_tool_kind;
-    it->kind = update.kind;
-    it->domain = update.domain;
-    it->flags = update.flags;
-    it->value = update.value;
-    it->desired_value = update.desired_value;
-    it->confidence = update.confidence;
-    it->salience = update.salience;
-    it->gain_weight = update.gain_weight;
-    it->allostatic_weight = update.allostatic_weight;
+    it->source = normalized.source;
+    it->source_tool_kind = normalized.source_tool_kind;
+    it->kind = normalized.kind;
+    it->domain = normalized.domain;
+    it->flags = normalized.flags;
+    it->value = normalized.value;
+    it->desired_value = normalized.desired_value;
+    it->confidence = normalized.confidence;
+    it->salience = normalized.salience;
+    it->gain_weight = normalized.gain_weight;
+    it->allostatic_weight = normalized.allostatic_weight;
     it->last_update_monotonic_ms = datetime.monotonic_ms >= 0 ? datetime.monotonic_ms : current_monotonic_ms();
-    copy_bounded_cstr(it->key, update.key);
-    copy_bounded_cstr(it->label, update.label[0] != '\0' ? update.label : update.key);
-    copy_bounded_cstr(it->content, update.content);
-    const std::string sketch_source = update.content[0] != '\0' ?
-            read_bounded_cstr(update.content) :
-            (read_bounded_cstr(update.label) + " " + read_bounded_cstr(update.key));
+    copy_bounded_cstr(it->key, normalized.key);
+    copy_bounded_cstr(it->label, normalized.label[0] != '\0' ? normalized.label : normalized.key);
+    copy_bounded_cstr(it->content, normalized.content);
+    const std::string sketch_source = normalized.content[0] != '\0' ?
+            read_bounded_cstr(normalized.content) :
+            (read_bounded_cstr(normalized.label) + " " + read_bounded_cstr(normalized.key));
     it->sketch = build_text_sketch(sketch_source);
 
     refresh_model_extension_summary();
@@ -2424,7 +2426,7 @@ bool llama_self_state::evaluate_hypothetical_event(
 float llama_self_state::max_similarity(
         const std::vector<llama_self_sketch_surface> & surfaces,
         const std::array<float, 32> & sketch,
-        bool unresolved_only) const {
+        bool unresolved_only) {
     float best = 0.0f;
 
     for (const auto & surface : surfaces) {
@@ -2684,7 +2686,7 @@ bool llama_self_state::build_features(
 
     for (size_t i = 0; i < event.n_tokens; ++i) {
         unique_tokens.insert(event.tokens[i]);
-        const std::string raw_piece = vocab->token_to_piece(event.tokens[i]);
+        const std::string & raw_piece = vocab->token_to_piece(event.tokens[i]);
         const std::string piece = normalize_piece(raw_piece);
 
         if (contains_any(piece, negation_terms, sizeof(negation_terms)/sizeof(negation_terms[0]))) {
@@ -2812,8 +2814,12 @@ bool llama_self_state::build_features(
             updater_program.broadcast_goal_weight * features.goal_top_similarity) : 0.0f;
     features.broadcast_pressure_hint = counterfactual_channel ? 0.15f * broadcast_pressure_base : broadcast_pressure_base;
 
-    const float interruption_guard = channel_state == LLAMA_SELF_STATE_CHANNEL_DO_NOT_INTERRUPT ? 1.0f :
-            channel_state == LLAMA_SELF_STATE_CHANNEL_WAITING ? 0.55f : 0.20f;
+    float interruption_guard = 0.20f;
+    if (channel_state == LLAMA_SELF_STATE_CHANNEL_DO_NOT_INTERRUPT) {
+        interruption_guard = 1.0f;
+    } else if (channel_state == LLAMA_SELF_STATE_CHANNEL_WAITING) {
+        interruption_guard = 0.55f;
+    }
     const float broadcast_inhibition_base = postwrite ? clamp_unit(
             0.60f * interruption_guard +
             0.20f * (1.0f - features.broadcast_pressure_hint) +
@@ -2951,12 +2957,16 @@ void llama_self_state::update_reactivation_priorities(
 
 void llama_self_state::refresh_tool_surface(uint32_t source_mask) {
     const llama_self_tool_state_info info = build_tool_state_info(tool_jobs);
-    const float lifecycle_salience =
-            info.failed_jobs > 0 ? 1.0f :
-            info.running_jobs > 0 ? 0.92f :
-            info.pending_jobs > 0 ? 0.72f :
-            info.completed_jobs > 0 ? 0.38f :
-            decay_to_unit(datetime.delta_since_last_tool_event_ms, params.tool_salience_half_life_ms);
+    float lifecycle_salience = decay_to_unit(datetime.delta_since_last_tool_event_ms, params.tool_salience_half_life_ms);
+    if (info.failed_jobs > 0) {
+        lifecycle_salience = 1.0f;
+    } else if (info.running_jobs > 0) {
+        lifecycle_salience = 0.92f;
+    } else if (info.pending_jobs > 0) {
+        lifecycle_salience = 0.72f;
+    } else if (info.completed_jobs > 0) {
+        lifecycle_salience = 0.38f;
+    }
 
     update_scalar_register(LLAMA_SELF_REGISTER_TOOL_SALIENCE, lifecycle_salience, source_mask);
 }
@@ -3385,7 +3395,7 @@ void llama_self_state::update_evolution_uncertainty(
     const float target = clamp_unit(0.58f * time_pressure + 0.42f * drift_pressure);
     const float current = current_scalar_register(LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY);
 
-    float next = current;
+    float next;
     if (signed_progress > 0.05f || efficiency_advantage > 0.05f) {
         const float credit = clamp_unit(
                 0.65f * std::max(0.0f, signed_progress) +
