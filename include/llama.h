@@ -821,6 +821,7 @@ extern "C" {
         LLAMA_SELF_SOURCE_CHANNEL       = 1u << 5,
         LLAMA_SELF_SOURCE_EXTERNAL_TIME = 1u << 6,
         LLAMA_SELF_SOURCE_COUNTERFACTUAL = 1u << 7,
+        LLAMA_SELF_SOURCE_INTERNAL_ARTIFACT = 1u << 8,
     };
 
     enum llama_self_state_event_flags {
@@ -828,6 +829,19 @@ extern "C" {
         LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED = 1u << 1,
         LLAMA_SELF_STATE_EVENT_TOOL_FAILED    = 1u << 2,
         LLAMA_SELF_STATE_EVENT_EMIT_FOLLOWUP  = 1u << 3,
+        LLAMA_SELF_STATE_EVENT_INTERNAL_ARTIFACT = 1u << 4,
+        LLAMA_SELF_STATE_EVENT_CONTEXT_COMPACTED = 1u << 5,
+    };
+
+    enum llama_self_cognitive_artifact_kind {
+        LLAMA_SELF_COG_ARTIFACT_EXTERNAL_EVENT      = 0,
+        LLAMA_SELF_COG_ARTIFACT_ACTIVE_PLAN         = 1,
+        LLAMA_SELF_COG_ARTIFACT_ACTIVE_REFLECTION   = 2,
+        LLAMA_SELF_COG_ARTIFACT_DMN_PLAN            = 3,
+        LLAMA_SELF_COG_ARTIFACT_DMN_INTERNAL_WRITE  = 4,
+        LLAMA_SELF_COG_ARTIFACT_GOVERNANCE          = 5,
+        LLAMA_SELF_COG_ARTIFACT_FUNCTIONAL_UPDATE   = 6,
+        LLAMA_SELF_COG_ARTIFACT_CONTEXT_EVICTION    = 7,
     };
 
     enum llama_self_tool_job_status {
@@ -985,6 +999,26 @@ extern "C" {
         uint32_t flags;
         float    decoder_entropy;
         float    decoder_top_margin;
+        int32_t  artifact_kind = LLAMA_SELF_COG_ARTIFACT_EXTERNAL_EVENT;
+        int32_t  loop_origin = -1;
+        int32_t  phase = -1;
+        int32_t  source_id = -1;
+        int32_t  plan_id = -1;
+    };
+
+    struct llama_self_trace_item_info {
+        struct llama_self_state_time_point time_point;
+        int32_t  role;
+        int32_t  channel;
+        uint32_t flags;
+        float    decoder_entropy;
+        float    decoder_top_margin;
+        int32_t  artifact_kind;
+        int32_t  loop_origin;
+        int32_t  phase;
+        int32_t  source_id;
+        int32_t  plan_id;
+        int32_t  token_count;
     };
 
     struct llama_self_state_feature_vector {
@@ -1611,6 +1645,7 @@ extern "C" {
         LLAMA_HARD_MEMORY_QUERY_MAX_CHARS = 256,
         LLAMA_HARD_MEMORY_MAX_PRIMITIVES = 6,
         LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS = 4,
+        LLAMA_BASH_TOOL_POLICY_MAX_CHARS = 512,
         LLAMA_BASH_TOOL_PATH_MAX_CHARS = 256,
         LLAMA_BASH_TOOL_CWD_MAX_CHARS = 256,
         LLAMA_BASH_TOOL_COMMAND_MAX_CHARS = 512,
@@ -1804,11 +1839,19 @@ extern "C" {
         bool enabled;
         bool inherit_env;
         bool login_shell;
+        bool reject_shell_metacharacters;
         int32_t timeout_ms;
+        int32_t cpu_time_limit_secs;
+        int32_t max_child_processes;
+        int32_t max_open_files;
+        int32_t max_file_size_bytes;
         int32_t max_stdout_bytes;
         int32_t max_stderr_bytes;
         char bash_path[LLAMA_BASH_TOOL_PATH_MAX_CHARS];
         char working_directory[LLAMA_BASH_TOOL_CWD_MAX_CHARS];
+        char allowed_commands[LLAMA_BASH_TOOL_POLICY_MAX_CHARS];
+        char blocked_patterns[LLAMA_BASH_TOOL_POLICY_MAX_CHARS];
+        char allowed_env[LLAMA_BASH_TOOL_POLICY_MAX_CHARS];
     };
 
     struct llama_bash_tool_request {
@@ -1816,13 +1859,21 @@ extern "C" {
         int32_t origin;
         int32_t tool_job_id;
         int32_t timeout_ms;
+        int32_t cpu_time_limit_secs;
+        int32_t max_child_processes;
+        int32_t max_open_files;
+        int32_t max_file_size_bytes;
         int32_t max_stdout_bytes;
         int32_t max_stderr_bytes;
         bool inherit_env;
         bool login_shell;
+        bool reject_shell_metacharacters;
         bool command_ready;
         char bash_path[LLAMA_BASH_TOOL_PATH_MAX_CHARS];
         char working_directory[LLAMA_BASH_TOOL_CWD_MAX_CHARS];
+        char allowed_commands[LLAMA_BASH_TOOL_POLICY_MAX_CHARS];
+        char blocked_patterns[LLAMA_BASH_TOOL_POLICY_MAX_CHARS];
+        char allowed_env[LLAMA_BASH_TOOL_POLICY_MAX_CHARS];
         char intent_text[LLAMA_BASH_TOOL_INTENT_MAX_CHARS];
         char command_text[LLAMA_BASH_TOOL_COMMAND_MAX_CHARS];
     };
@@ -1840,6 +1891,19 @@ extern "C" {
         char stdout_text[LLAMA_BASH_TOOL_STDOUT_MAX_CHARS];
         char stderr_text[LLAMA_BASH_TOOL_STDERR_MAX_CHARS];
         char error_text[LLAMA_BASH_TOOL_ERROR_MAX_CHARS];
+    };
+
+    struct llama_cognitive_hard_memory_request {
+        int32_t command_id;
+        int32_t origin;
+        int32_t tool_job_id;
+        struct llama_hard_memory_query_request query;
+    };
+
+    struct llama_cognitive_hard_memory_result {
+        int32_t command_id;
+        int32_t tool_job_id;
+        struct llama_hard_memory_result result;
     };
 
     struct llama_favorable_dimension_target {
@@ -2428,6 +2492,10 @@ extern "C" {
             struct llama_context * ctx,
             const llama_token * tokens,
             size_t n_tokens);
+    LLAMA_API int32_t llama_active_lora_ingest_event(
+            struct llama_context * ctx,
+            const struct llama_self_state_event * event,
+            const struct llama_self_state_feature_vector * features);
 
     // Inspect Active LoRA state.
     LLAMA_API int32_t llama_active_lora_get_stats(
@@ -2579,6 +2647,11 @@ extern "C" {
             struct llama_context * ctx,
             const char * key);
     LLAMA_API int32_t llama_self_state_trace_count(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_trace_token_count(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_self_state_trace_get_item(
+            const struct llama_context * ctx,
+            int32_t index,
+            struct llama_self_trace_item_info * out_info);
     LLAMA_API int32_t llama_self_state_clear_trace(struct llama_context * ctx);
     LLAMA_API int32_t llama_self_state_replay_trace(struct llama_context * ctx, int32_t upto_count);
     LLAMA_API int32_t llama_self_state_replay_trace_on_channel(
@@ -2690,6 +2763,14 @@ extern "C" {
     LLAMA_API int32_t llama_cognitive_bash_tool_submit_result(
             struct llama_context * ctx,
             const struct llama_bash_tool_result * result,
+            struct llama_active_loop_trace * out_active_trace);
+    LLAMA_API int32_t llama_cognitive_hard_memory_get_request(
+            const struct llama_context * ctx,
+            int32_t command_id,
+            struct llama_cognitive_hard_memory_request * out_request);
+    LLAMA_API int32_t llama_cognitive_hard_memory_submit_result(
+            struct llama_context * ctx,
+            const struct llama_cognitive_hard_memory_result * result,
             struct llama_active_loop_trace * out_active_trace);
     LLAMA_API int32_t llama_cognitive_active_runner_get(
             const struct llama_context * ctx,

@@ -38,12 +38,20 @@ static int32_t find_request_index(
 llama_bash_tool_config llama_bash_tool_default_config(void) {
     llama_bash_tool_config config = {};
     config.enabled = false;
-    config.inherit_env = true;
+    config.inherit_env = false;
     config.login_shell = false;
+    config.reject_shell_metacharacters = true;
     config.timeout_ms = 5000;
+    config.cpu_time_limit_secs = 5;
+    config.max_child_processes = 8;
+    config.max_open_files = 32;
+    config.max_file_size_bytes = 1 << 20;
     config.max_stdout_bytes = LLAMA_BASH_TOOL_STDOUT_MAX_CHARS - 1;
     config.max_stderr_bytes = LLAMA_BASH_TOOL_STDERR_MAX_CHARS - 1;
     copy_bounded_cstr(config.bash_path, sizeof(config.bash_path), "/bin/bash");
+    copy_bounded_cstr(config.allowed_commands, sizeof(config.allowed_commands), "pwd,ls,find,rg,cat,head,tail,grep,git");
+    copy_bounded_cstr(config.blocked_patterns, sizeof(config.blocked_patterns), "rm -rf,:(){:|:&};:,mkfs,dd if=,chmod -R,chown -R,shutdown,reboot");
+    copy_bounded_cstr(config.allowed_env, sizeof(config.allowed_env), "PATH,HOME,LANG,LC_ALL,LC_CTYPE");
     return config;
 }
 
@@ -54,10 +62,17 @@ llama_bash_tool::llama_bash_tool() {
 bool llama_bash_tool::configure(const llama_bash_tool_config & next) {
     config = next;
     config.timeout_ms = std::max(100, config.timeout_ms);
+    config.cpu_time_limit_secs = std::max(1, config.cpu_time_limit_secs);
+    config.max_child_processes = std::max(1, config.max_child_processes);
+    config.max_open_files = std::max(4, config.max_open_files);
+    config.max_file_size_bytes = std::max(1024, config.max_file_size_bytes);
     config.max_stdout_bytes = std::max(1, std::min(config.max_stdout_bytes, LLAMA_BASH_TOOL_STDOUT_MAX_CHARS - 1));
     config.max_stderr_bytes = std::max(1, std::min(config.max_stderr_bytes, LLAMA_BASH_TOOL_STDERR_MAX_CHARS - 1));
     config.bash_path[LLAMA_BASH_TOOL_PATH_MAX_CHARS - 1] = '\0';
     config.working_directory[LLAMA_BASH_TOOL_CWD_MAX_CHARS - 1] = '\0';
+    config.allowed_commands[LLAMA_BASH_TOOL_POLICY_MAX_CHARS - 1] = '\0';
+    config.blocked_patterns[LLAMA_BASH_TOOL_POLICY_MAX_CHARS - 1] = '\0';
+    config.allowed_env[LLAMA_BASH_TOOL_POLICY_MAX_CHARS - 1] = '\0';
     return true;
 }
 
@@ -79,6 +94,9 @@ bool llama_bash_tool::set_request(const llama_bash_tool_request & request) {
         requests[index] = request;
         requests[index].bash_path[LLAMA_BASH_TOOL_PATH_MAX_CHARS - 1] = '\0';
         requests[index].working_directory[LLAMA_BASH_TOOL_CWD_MAX_CHARS - 1] = '\0';
+        requests[index].allowed_commands[LLAMA_BASH_TOOL_POLICY_MAX_CHARS - 1] = '\0';
+        requests[index].blocked_patterns[LLAMA_BASH_TOOL_POLICY_MAX_CHARS - 1] = '\0';
+        requests[index].allowed_env[LLAMA_BASH_TOOL_POLICY_MAX_CHARS - 1] = '\0';
         requests[index].intent_text[LLAMA_BASH_TOOL_INTENT_MAX_CHARS - 1] = '\0';
         requests[index].command_text[LLAMA_BASH_TOOL_COMMAND_MAX_CHARS - 1] = '\0';
         return true;
@@ -91,6 +109,9 @@ bool llama_bash_tool::set_request(const llama_bash_tool_request & request) {
     requests[request_count] = request;
     requests[request_count].bash_path[LLAMA_BASH_TOOL_PATH_MAX_CHARS - 1] = '\0';
     requests[request_count].working_directory[LLAMA_BASH_TOOL_CWD_MAX_CHARS - 1] = '\0';
+    requests[request_count].allowed_commands[LLAMA_BASH_TOOL_POLICY_MAX_CHARS - 1] = '\0';
+    requests[request_count].blocked_patterns[LLAMA_BASH_TOOL_POLICY_MAX_CHARS - 1] = '\0';
+    requests[request_count].allowed_env[LLAMA_BASH_TOOL_POLICY_MAX_CHARS - 1] = '\0';
     requests[request_count].intent_text[LLAMA_BASH_TOOL_INTENT_MAX_CHARS - 1] = '\0';
     requests[request_count].command_text[LLAMA_BASH_TOOL_COMMAND_MAX_CHARS - 1] = '\0';
     ++request_count;

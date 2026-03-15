@@ -540,6 +540,8 @@ To learn more about model quantization, [read this documentation](tools/quantize
 
 #### A lightweight, [OpenAI API](https://github.com/openai/openai-openapi) compatible, HTTP server for serving LLMs.
 
+- Client integrations should start with the [server endpoint catalog and calling guide](./tools/server/README.md#client-integration-guide), which documents every callable route, auth expectation, and serving profile.
+
 - <details open>
     <summary>Start a local HTTP server with default configuration on port 8080</summary>
 

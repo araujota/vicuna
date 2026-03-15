@@ -2,15 +2,20 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <string>
+#include <vector>
 
 #if !defined(_WIN32)
 #include <cerrno>
 #include <csignal>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -37,6 +42,118 @@ static void copy_bounded_text(char * dst, size_t dst_size, const std::string & s
 static int64_t monotonic_ms_now() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static std::string lower_ascii(std::string value) {
+    for (char & ch : value) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = (char) (ch - 'A' + 'a');
+        }
+    }
+    return value;
+}
+
+static std::string trim_ascii(const std::string & value) {
+    size_t begin = 0;
+    while (begin < value.size() && std::isspace((unsigned char) value[begin])) {
+        ++begin;
+    }
+    size_t end = value.size();
+    while (end > begin && std::isspace((unsigned char) value[end - 1])) {
+        --end;
+    }
+    return value.substr(begin, end - begin);
+}
+
+static std::vector<std::string> split_csv_lower(const char * text) {
+    std::vector<std::string> values;
+    if (!text) {
+        return values;
+    }
+
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        item = lower_ascii(trim_ascii(item));
+        if (!item.empty()) {
+            values.push_back(item);
+        }
+    }
+    return values;
+}
+
+static std::string first_command_token(const std::string & command_text) {
+    const std::string trimmed = trim_ascii(command_text);
+    if (trimmed.empty()) {
+        return {};
+    }
+
+    size_t end = 0;
+    while (end < trimmed.size() && !std::isspace((unsigned char) trimmed[end])) {
+        ++end;
+    }
+    std::string token = trimmed.substr(0, end);
+    const size_t slash = token.find_last_of('/');
+    if (slash != std::string::npos) {
+        token = token.substr(slash + 1);
+    }
+    return lower_ascii(token);
+}
+
+static bool command_contains_forbidden_meta(const std::string & command_text) {
+    static const char * const blocked_tokens[] = {
+        "&&", "||", ";", "|", ">", "<", "`", "$("
+    };
+    for (size_t i = 0; i < sizeof(blocked_tokens)/sizeof(blocked_tokens[0]); ++i) {
+        if (command_text.find(blocked_tokens[i]) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool validate_bash_request(
+        const llama_bash_tool_request & request,
+        std::string * out_error) {
+    const std::string command_text = trim_ascii(request.command_text);
+    if (command_text.empty()) {
+        if (out_error) {
+            *out_error = "bash tool request did not include a command";
+        }
+        return false;
+    }
+
+    const std::string lowered = lower_ascii(command_text);
+    const std::vector<std::string> blocked = split_csv_lower(request.blocked_patterns);
+    for (const std::string & pattern : blocked) {
+        if (!pattern.empty() && lowered.find(pattern) != std::string::npos) {
+            if (out_error) {
+                *out_error = "bash command blocked by production policy";
+            }
+            return false;
+        }
+    }
+
+    if (request.reject_shell_metacharacters && command_contains_forbidden_meta(command_text)) {
+        if (out_error) {
+            *out_error = "bash command contains disallowed shell metacharacters";
+        }
+        return false;
+    }
+
+    const std::vector<std::string> allowed = split_csv_lower(request.allowed_commands);
+    if (!allowed.empty()) {
+        const std::string head = first_command_token(command_text);
+        const bool found = std::find(allowed.begin(), allowed.end(), head) != allowed.end();
+        if (!found) {
+            if (out_error) {
+                *out_error = "bash command is not on the allowlist";
+            }
+            return false;
+        }
+    }
+
+    return true;
 }
 
 static void init_result(const llama_bash_tool_request & request, llama_bash_tool_result * out_result) {
@@ -128,6 +245,49 @@ static void write_child_error(int fd, const char * stage) {
     }
 }
 
+static void apply_rlimit(int resource, rlim_t soft_limit, rlim_t hard_limit) {
+    struct rlimit limit = {};
+    limit.rlim_cur = soft_limit;
+    limit.rlim_max = hard_limit;
+    (void) setrlimit(resource, &limit);
+}
+
+static void clear_environment_portable() {
+    if (!environ) {
+        return;
+    }
+
+    std::vector<std::string> keys;
+    for (char ** entry = environ; *entry != nullptr; ++entry) {
+        const std::string env_entry(*entry);
+        const size_t equals = env_entry.find('=');
+        if (equals != std::string::npos && equals > 0) {
+            keys.push_back(env_entry.substr(0, equals));
+        }
+    }
+
+    for (const std::string & key : keys) {
+        (void) unsetenv(key.c_str());
+    }
+}
+
+static void seed_allowed_env(const llama_bash_tool_request & request) {
+    clear_environment_portable();
+    const std::vector<std::string> allowed = split_csv_lower(request.allowed_env);
+    for (const std::string & key_lower : allowed) {
+        std::string lookup = key_lower;
+        for (char & ch : lookup) {
+            if (ch >= 'a' && ch <= 'z') {
+                ch = (char) (ch - 'a' + 'A');
+            }
+        }
+        const char * value = std::getenv(lookup.c_str());
+        if (value) {
+            (void) setenv(lookup.c_str(), value, 1);
+        }
+    }
+}
+
 #endif
 
 } // namespace
@@ -152,6 +312,14 @@ bool server_bash_tool_execute(
         out_result->launch_failed = true;
         out_result->exit_code = 127;
         copy_bounded_text(out_result->error_text, sizeof(out_result->error_text), "bash tool request did not include a bash path");
+        return true;
+    }
+
+    std::string validation_error;
+    if (!validate_bash_request(request, &validation_error)) {
+        out_result->launch_failed = true;
+        out_result->exit_code = 126;
+        copy_bounded_text(out_result->error_text, sizeof(out_result->error_text), validation_error);
         return true;
     }
 
@@ -222,6 +390,15 @@ bool server_bash_tool_execute(
             _exit(127);
         }
 
+        apply_rlimit(RLIMIT_CPU, (rlim_t) request.cpu_time_limit_secs, (rlim_t) request.cpu_time_limit_secs);
+        apply_rlimit(RLIMIT_NOFILE, (rlim_t) request.max_open_files, (rlim_t) request.max_open_files);
+#ifdef RLIMIT_NPROC
+        apply_rlimit(RLIMIT_NPROC, (rlim_t) request.max_child_processes, (rlim_t) request.max_child_processes);
+#endif
+#ifdef RLIMIT_FSIZE
+        apply_rlimit(RLIMIT_FSIZE, (rlim_t) request.max_file_size_bytes, (rlim_t) request.max_file_size_bytes);
+#endif
+
         const char * argv[] = {
             request.bash_path,
             request.login_shell ? "-lc" : "-c",
@@ -232,8 +409,8 @@ bool server_bash_tool_execute(
         if (request.inherit_env) {
             execve(request.bash_path, const_cast<char * const *>(argv), environ);
         } else {
-            char * const empty_env[] = { nullptr };
-            execve(request.bash_path, const_cast<char * const *>(argv), empty_env);
+            seed_allowed_env(request);
+            execve(request.bash_path, const_cast<char * const *>(argv), environ);
         }
 
         write_child_error(error_pipe[1], "execve");

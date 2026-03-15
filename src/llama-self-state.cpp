@@ -29,8 +29,9 @@ static constexpr size_t   LLAMA_SELF_MAX_GOALS = 16;
 static constexpr size_t   LLAMA_SELF_MAX_COMMITMENTS = 32;
 static constexpr size_t   LLAMA_SELF_MAX_MEMORY_HANDLES = 24;
 static constexpr size_t   LLAMA_SELF_MAX_TRACE_ITEMS = 256;
+static constexpr size_t   LLAMA_SELF_MAX_TRACE_TOKENS = 2048;
 static constexpr uint32_t LLAMA_SELF_TRACE_MAGIC = 0x4c535354u; // LSST
-static constexpr uint32_t LLAMA_SELF_TRACE_VERSION = 2;
+static constexpr uint32_t LLAMA_SELF_TRACE_VERSION = 3;
 static constexpr size_t   LLAMA_SELF_BELIEF_SIGNATURE_DIM = 4;
 
 static int64_t current_wall_clock_ms() {
@@ -717,6 +718,9 @@ static int32_t build_postwrite_hard_memory_primitives(
 
 static uint32_t source_mask_for_role(const llama_self_state_event & event) {
     uint32_t mask = 0;
+    if ((event.flags & LLAMA_SELF_STATE_EVENT_INTERNAL_ARTIFACT) != 0) {
+        mask |= LLAMA_SELF_SOURCE_INTERNAL_ARTIFACT;
+    }
     switch (event.role) {
         case LLAMA_SELF_STATE_EVENT_USER:   mask |= LLAMA_SELF_SOURCE_USER_EVENT; break;
         case LLAMA_SELF_STATE_EVENT_TOOL:   mask |= LLAMA_SELF_SOURCE_TOOL_EVENT; break;
@@ -727,6 +731,10 @@ static uint32_t source_mask_for_role(const llama_self_state_event & event) {
         mask |= LLAMA_SELF_SOURCE_COUNTERFACTUAL;
     }
     return mask;
+}
+
+static bool is_internal_artifact_event(const llama_self_state_event & event) {
+    return (event.flags & LLAMA_SELF_STATE_EVENT_INTERNAL_ARTIFACT) != 0;
 }
 
 static llama_self_tool_state_info build_tool_state_info(const std::vector<llama_self_tool_job> & tool_jobs) {
@@ -2013,8 +2021,37 @@ int32_t llama_self_state::trace_count() const {
     return (int32_t) trace_items.size();
 }
 
+int32_t llama_self_state::trace_token_count() const {
+    return (int32_t) trace_token_count_total;
+}
+
+bool llama_self_state::get_trace_item(int32_t index, llama_self_trace_item_info * out_info) const {
+    if (!out_info || index < 0 || (size_t) index >= trace_items.size()) {
+        return false;
+    }
+
+    const auto & item = trace_items[(size_t) index];
+    *out_info = {
+        /*.time_point =*/ item.time_point,
+        /*.role =*/ item.event.role,
+        /*.channel =*/ item.event.channel,
+        /*.flags =*/ item.event.flags,
+        /*.decoder_entropy =*/ item.event.decoder_entropy,
+        /*.decoder_top_margin =*/ item.event.decoder_top_margin,
+        /*.artifact_kind =*/ item.event.artifact_kind,
+        /*.loop_origin =*/ item.event.loop_origin,
+        /*.phase =*/ item.event.phase,
+        /*.source_id =*/ item.event.source_id,
+        /*.plan_id =*/ item.event.plan_id,
+        /*.token_count =*/ (int32_t) item.tokens.size(),
+    };
+    return true;
+}
+
 bool llama_self_state::clear_trace() {
     trace_items.clear();
+    compacted_trace_items.clear();
+    trace_token_count_total = 0;
     return true;
 }
 
@@ -2045,6 +2082,7 @@ size_t llama_self_state::trace_export_size() const {
         size += sizeof(int32_t);
         size += sizeof(uint32_t);
         size += sizeof(float) * 2;
+        size += sizeof(int32_t) * 5;
         size += sizeof(uint32_t);
         size += item.tokens.size() * sizeof(llama_token);
     }
@@ -2070,6 +2108,11 @@ bool llama_self_state::trace_export(void * dst, size_t size) const {
         append_bytes(buffer, item.event.flags);
         append_bytes(buffer, item.event.decoder_entropy);
         append_bytes(buffer, item.event.decoder_top_margin);
+        append_bytes(buffer, item.event.artifact_kind);
+        append_bytes(buffer, item.event.loop_origin);
+        append_bytes(buffer, item.event.phase);
+        append_bytes(buffer, item.event.source_id);
+        append_bytes(buffer, item.event.plan_id);
         append_bytes(buffer, (uint32_t) item.tokens.size());
         for (llama_token token : item.tokens) {
             append_bytes(buffer, token);
@@ -2098,7 +2141,7 @@ bool llama_self_state::trace_import(const void * src, size_t size, bool replace_
         !read_bytes(bytes, size, &cursor, &version) ||
         !read_bytes(bytes, size, &cursor, &count) ||
         magic != LLAMA_SELF_TRACE_MAGIC ||
-        (version != 1 && version != LLAMA_SELF_TRACE_VERSION)) {
+        (version != 1 && version != 2 && version != LLAMA_SELF_TRACE_VERSION)) {
         return false;
     }
 
@@ -2112,6 +2155,11 @@ bool llama_self_state::trace_import(const void * src, size_t size, bool replace_
         uint32_t flags = 0;
         float decoder_entropy = 0.0f;
         float decoder_top_margin = 0.0f;
+        int32_t artifact_kind = LLAMA_SELF_COG_ARTIFACT_EXTERNAL_EVENT;
+        int32_t loop_origin = -1;
+        int32_t phase = -1;
+        int32_t source_id = -1;
+        int32_t plan_id = -1;
         uint32_t n_tokens = 0;
 
         if (!read_bytes(bytes, size, &cursor, &time_point) ||
@@ -2120,6 +2168,11 @@ bool llama_self_state::trace_import(const void * src, size_t size, bool replace_
             !read_bytes(bytes, size, &cursor, &flags) ||
             !read_bytes(bytes, size, &cursor, &decoder_entropy) ||
             !read_bytes(bytes, size, &cursor, &decoder_top_margin) ||
+            (version >= 3 && !read_bytes(bytes, size, &cursor, &artifact_kind)) ||
+            (version >= 3 && !read_bytes(bytes, size, &cursor, &loop_origin)) ||
+            (version >= 3 && !read_bytes(bytes, size, &cursor, &phase)) ||
+            (version >= 3 && !read_bytes(bytes, size, &cursor, &source_id)) ||
+            (version >= 3 && !read_bytes(bytes, size, &cursor, &plan_id)) ||
             !read_bytes(bytes, size, &cursor, &n_tokens)) {
             return false;
         }
@@ -2141,6 +2194,11 @@ bool llama_self_state::trace_import(const void * src, size_t size, bool replace_
             /*.flags =*/ flags,
             /*.decoder_entropy =*/ decoder_entropy,
             /*.decoder_top_margin =*/ decoder_top_margin,
+            /*.artifact_kind =*/ artifact_kind,
+            /*.loop_origin =*/ loop_origin,
+            /*.phase =*/ phase,
+            /*.source_id =*/ source_id,
+            /*.plan_id =*/ plan_id,
         };
         imported.push_back(std::move(item));
     }
@@ -2153,11 +2211,19 @@ bool llama_self_state::trace_import(const void * src, size_t size, bool replace_
         trace_items = std::move(imported);
     } else {
         trace_items.insert(trace_items.end(), imported.begin(), imported.end());
-        if (trace_items.size() > LLAMA_SELF_MAX_TRACE_ITEMS) {
-            trace_items.erase(trace_items.begin(), trace_items.end() - LLAMA_SELF_MAX_TRACE_ITEMS);
-        }
     }
 
+    repair_trace_item_pointers(trace_items);
+    compacted_trace_items.clear();
+    trace_token_count_total = 0;
+    for (const auto & item : trace_items) {
+        trace_token_count_total += item.tokens.size();
+    }
+    while (trace_items.size() > LLAMA_SELF_MAX_TRACE_ITEMS ||
+           trace_token_count_total > LLAMA_SELF_MAX_TRACE_TOKENS) {
+        trace_token_count_total -= trace_items.front().tokens.size();
+        trace_items.erase(trace_items.begin());
+    }
     repair_trace_item_pointers(trace_items);
 
     return true;
@@ -2177,6 +2243,8 @@ void llama_self_state::reset_dynamic_state_preserve_static() {
     working_memory.clear();
     tool_jobs.clear();
     reactivation_priorities.clear();
+    compacted_trace_items.clear();
+    trace_token_count_total = 0;
     next_working_memory_event_id = 1;
     has_previous_event_sketch = false;
     previous_event_sketch = {};
@@ -2213,10 +2281,24 @@ void llama_self_state::append_trace(const llama_self_state_event & event) {
     item.event.tokens = item.tokens.data();
     item.event.n_tokens = item.tokens.size();
     trace_items.push_back(std::move(item));
+    trace_token_count_total += event.n_tokens;
 
-    if (trace_items.size() > LLAMA_SELF_MAX_TRACE_ITEMS) {
+    while (trace_items.size() > LLAMA_SELF_MAX_TRACE_ITEMS ||
+           trace_token_count_total > LLAMA_SELF_MAX_TRACE_TOKENS) {
+        trace_token_count_total -= trace_items.front().tokens.size();
+        compacted_trace_items.push_back(std::move(trace_items.front()));
         trace_items.erase(trace_items.begin());
     }
+    repair_trace_item_pointers(trace_items);
+    repair_trace_item_pointers(compacted_trace_items);
+}
+
+void llama_self_state::drain_compacted_trace_items(std::vector<llama_self_trace_item> & out_items) {
+    out_items.insert(
+            out_items.end(),
+            std::make_move_iterator(compacted_trace_items.begin()),
+            std::make_move_iterator(compacted_trace_items.end()));
+    compacted_trace_items.clear();
 }
 
 bool llama_self_state::replay_trace(const llama_vocab * vocab, int32_t upto_count, int32_t override_channel) {
@@ -2795,7 +2877,8 @@ bool llama_self_state::apply_postwrite(const llama_self_state_event & event, con
     if ((event.flags & LLAMA_SELF_STATE_EVENT_ADMITTED) != 0) {
         admit_working_memory(event, build_event_sketch(event), features);
 
-        if (event.channel != LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL) {
+        if (event.channel != LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL &&
+                !is_internal_artifact_event(event)) {
             if (event.role == LLAMA_SELF_STATE_EVENT_USER) {
                 (void) note_user_event();
                 (void) set_channel_state(LLAMA_SELF_STATE_CHANNEL_ACTIVE);
@@ -2808,7 +2891,8 @@ bool llama_self_state::apply_postwrite(const llama_self_state_event & event, con
         }
     }
 
-    if (event.channel != LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL) {
+    if (event.channel != LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL &&
+            !is_internal_artifact_event(event)) {
         update_social_state(event, features);
         update_expanded_model(event, features, source_mask);
     }
@@ -4021,6 +4105,14 @@ int32_t llama_context::self_state_trace_count() const {
     return self_state ? self_state->trace_count() : 0;
 }
 
+int32_t llama_context::self_state_trace_token_count() const {
+    return self_state ? self_state->trace_token_count() : 0;
+}
+
+bool llama_context::self_state_trace_get_item(int32_t index, llama_self_trace_item_info * out_info) const {
+    return self_state && self_state->get_trace_item(index, out_info);
+}
+
 bool llama_context::self_state_clear_trace() {
     return self_state && self_state->clear_trace();
 }
@@ -4109,6 +4201,14 @@ bool llama_context::self_state_apply_postwrite(
     if (!self_state->apply_postwrite(event, features)) {
         return false;
     }
+    std::vector<llama_self_trace_item> compacted;
+    self_state->drain_compacted_trace_items(compacted);
+    for (auto & item : compacted) {
+        if ((item.event.flags & LLAMA_SELF_STATE_EVENT_ADMITTED) == 0 || item.tokens.empty()) {
+            continue;
+        }
+        (void) active_lora_ingest(item.event, nullptr);
+    }
 
     if (!hard_memory) {
         return true;
@@ -4162,6 +4262,28 @@ bool llama_context::hard_memory_query(const llama_hard_memory_query_request & qu
         (void) self_state->promote_hard_memory_query(query, *out_result);
     }
     return ok;
+}
+
+bool llama_context::self_state_promote_hard_memory_query(
+        const llama_hard_memory_query_request & request,
+        const llama_hard_memory_result & result) {
+    return self_state && self_state->promote_hard_memory_query(request, result);
+}
+
+bool llama_context::hard_memory_set_request(const llama_cognitive_hard_memory_request & request) {
+    return hard_memory && hard_memory->set_request(request);
+}
+
+bool llama_context::hard_memory_get_request(int32_t command_id, llama_cognitive_hard_memory_request * out_request) const {
+    return hard_memory && hard_memory->get_request(command_id, out_request);
+}
+
+bool llama_context::hard_memory_clear_request(int32_t command_id) {
+    return hard_memory && hard_memory->clear_request(command_id);
+}
+
+bool llama_context::hard_memory_submit_result(const llama_hard_memory_result & result) {
+    return hard_memory && hard_memory->submit_result(result);
 }
 
 bool llama_context::hard_memory_archive_primitives(
@@ -4550,6 +4672,17 @@ int32_t llama_self_state_remove_model_extension(
 
 int32_t llama_self_state_trace_count(const struct llama_context * ctx) {
     return ctx ? ctx->self_state_trace_count() : -1;
+}
+
+int32_t llama_self_state_trace_token_count(const struct llama_context * ctx) {
+    return ctx ? ctx->self_state_trace_token_count() : -1;
+}
+
+int32_t llama_self_state_trace_get_item(
+        const struct llama_context * ctx,
+        int32_t index,
+        struct llama_self_trace_item_info * out_info) {
+    return ctx && out_info && ctx->self_state_trace_get_item(index, out_info) ? 0 : -1;
 }
 
 int32_t llama_self_state_clear_trace(struct llama_context * ctx) {

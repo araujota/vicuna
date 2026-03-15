@@ -1,5 +1,6 @@
 import pytest
 import requests
+import time
 from utils import *
 
 server = ServerPreset.tinyllama2()
@@ -16,6 +17,91 @@ def test_server_start_simple():
     server.start()
     res = server.make_request("GET", "/health")
     assert res.status_code == 200
+    assert res.body["status"] == "ok"
+    assert res.body["state"] == "ready"
+    assert "runtime_persistence" in res.body
+
+
+def test_server_health_exposes_runtime_observability():
+    global server
+    server.extra_env = {
+        "VICUNA_SELF_EMIT_STARTUP_TEXT": "health check proactive message",
+    }
+    server.start()
+    res = server.make_request("GET", "/health")
+    assert res.status_code == 200
+    assert res.body["waiting_active_tasks"] == 0
+    assert res.body["external_bash_pending"] == 0
+    assert res.body["external_hard_memory_pending"] == 0
+    assert res.body["runtime_persistence"]["enabled"] is False
+    assert res.body["proactive_mailbox"]["stored_responses"] == 1
+    assert res.body["proactive_mailbox"]["publish_total"] == 1
+    assert res.body["proactive_mailbox"]["live_stream_connected"] is False
+
+
+def test_server_metrics_exposes_external_runtime_counters():
+    global server
+    server.server_metrics = True
+    server.extra_env = {
+        "VICUNA_SELF_EMIT_STARTUP_TEXT": "metrics proactive message",
+    }
+    server.start()
+    res = server.make_request("GET", "/metrics")
+    assert res.status_code == 200
+    assert "llamacpp:external_bash_dispatch_total" in res.body
+    assert "llamacpp:external_hard_memory_dispatch_total" in res.body
+    assert "llamacpp:waiting_active_tasks" in res.body
+    assert "llamacpp:runtime_persistence_healthy" in res.body
+    assert "llamacpp:proactive_publish_total" in res.body
+    assert "llamacpp:proactive_responses" in res.body
+    assert "llamacpp:proactive_live_stream_connected" in res.body
+
+
+def test_runtime_snapshot_survives_restart(tmp_path):
+    global server
+    snapshot_path = tmp_path / "runtime-state.json"
+    server.extra_env = {
+        "VICUNA_RUNTIME_STATE_PATH": str(snapshot_path),
+        "VICUNA_SELF_EMIT_STARTUP_TEXT": "persisted proactive message",
+    }
+    server.api_surface = "openai"
+    server.start()
+    res = server.make_request("POST", "/v1/responses", data={
+        "model": server.model_alias,
+        "input": [
+            {"role": "user", "content": "Hello there"},
+        ],
+        "max_output_tokens": 8,
+        "temperature": 0.0,
+    })
+    assert res.status_code == 200
+
+    for _ in range(20):
+        if snapshot_path.exists():
+            break
+        time.sleep(0.25)
+    assert snapshot_path.exists()
+
+    server.stop()
+
+    server = ServerPreset.tinyllama2()
+    server.extra_env = {
+        "VICUNA_RUNTIME_STATE_PATH": str(snapshot_path),
+    }
+    server.api_surface = "openai"
+    server.start()
+    health = server.make_request("GET", "/health")
+    assert health.status_code == 200
+    assert health.body["runtime_persistence"]["enabled"] is True
+    assert health.body["runtime_persistence"]["restore_attempted"] is True
+    assert health.body["runtime_persistence"]["healthy"] is True
+    assert health.body["proactive_mailbox"]["stored_responses"] == 1
+    events = server.collect_named_sse_events(
+        "GET",
+        "/v1/responses/stream?after=0",
+        stop_when=lambda event_name, _: event_name == "response.completed",
+    )
+    assert events[-1][1]["response"]["output"][0]["content"][0]["text"] == "persisted proactive message"
 
 
 def test_server_props():

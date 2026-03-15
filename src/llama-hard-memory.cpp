@@ -26,6 +26,18 @@ static std::string rstrip_slash(std::string value) {
     return value;
 }
 
+static int32_t find_request_index(
+        const llama_cognitive_hard_memory_request * requests,
+        int32_t request_count,
+        int32_t command_id) {
+    for (int32_t i = 0; i < request_count; ++i) {
+        if (requests[i].command_id == command_id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 template<size_t N>
 static void copy_cstr(char (&dst)[N], const std::string & src) {
     std::memset(dst, 0, sizeof(dst));
@@ -429,6 +441,58 @@ bool llama_hard_memory::get_config(llama_hard_memory_config * out_config) const 
     return true;
 }
 
+bool llama_hard_memory::set_request(const llama_cognitive_hard_memory_request & request) {
+    if (request.command_id <= 0 || request.tool_job_id <= 0) {
+        return false;
+    }
+
+    const int32_t index = find_request_index(requests, request_count, request.command_id);
+    if (index >= 0) {
+        requests[index] = request;
+        requests[index].query.query[LLAMA_HARD_MEMORY_QUERY_MAX_CHARS - 1] = '\0';
+        requests[index].query.container_tag[LLAMA_HARD_MEMORY_MAX_TAG_CHARS - 1] = '\0';
+        return true;
+    }
+
+    if (request_count >= LLAMA_COGNITIVE_MAX_PENDING_COMMANDS) {
+        return false;
+    }
+
+    requests[request_count] = request;
+    requests[request_count].query.query[LLAMA_HARD_MEMORY_QUERY_MAX_CHARS - 1] = '\0';
+    requests[request_count].query.container_tag[LLAMA_HARD_MEMORY_MAX_TAG_CHARS - 1] = '\0';
+    ++request_count;
+    return true;
+}
+
+bool llama_hard_memory::get_request(int32_t command_id, llama_cognitive_hard_memory_request * out_request) const {
+    if (!out_request) {
+        return false;
+    }
+
+    const int32_t index = find_request_index(requests, request_count, command_id);
+    if (index < 0) {
+        return false;
+    }
+
+    *out_request = requests[index];
+    return true;
+}
+
+bool llama_hard_memory::clear_request(int32_t command_id) {
+    const int32_t index = find_request_index(requests, request_count, command_id);
+    if (index < 0) {
+        return false;
+    }
+
+    for (int32_t i = index + 1; i < request_count; ++i) {
+        requests[i - 1] = requests[i];
+    }
+    requests[request_count - 1] = {};
+    --request_count;
+    return true;
+}
+
 bool llama_hard_memory::query(const llama_hard_memory_query_request & request, llama_hard_memory_result * out_result) {
     llama_hard_memory_result result = {};
     init_result(result);
@@ -554,6 +618,15 @@ bool llama_hard_memory::query(const llama_hard_memory_query_request & request, l
     if (out_result) {
         *out_result = result;
     }
+    return true;
+}
+
+bool llama_hard_memory::submit_result(const llama_hard_memory_result & result) {
+    last_result = result;
+    last_result.effective_container_tag[LLAMA_HARD_MEMORY_MAX_TAG_CHARS - 1] = '\0';
+    last_result.profile_static[LLAMA_HARD_MEMORY_MAX_PROFILE_CHARS - 1] = '\0';
+    last_result.profile_dynamic[LLAMA_HARD_MEMORY_MAX_PROFILE_CHARS - 1] = '\0';
+    last_result.error[LLAMA_HARD_MEMORY_MAX_ERROR_CHARS - 1] = '\0';
     return true;
 }
 

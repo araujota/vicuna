@@ -323,7 +323,13 @@ static bool expect_functional_last_update(
         return false;
     }
     if (update.family != family || update.settle_microphase != expected_settle_microphase) {
-        std::fprintf(stderr, "%s: unexpected functional update metadata for family %d\n", label, family);
+        std::fprintf(stderr,
+                "%s: unexpected functional update metadata for family %d (got family=%d settle=%d expected_settle=%d)\n",
+                label,
+                family,
+                update.family,
+                update.settle_microphase,
+                expected_settle_microphase);
         return false;
     }
     if (update.adapter_optimizer_step == 0 || update.adapter_update_norm <= 0.0f) {
@@ -1180,18 +1186,33 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
+        const bool used_self_observation =
+                trace.functional_activation.top_family == LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION &&
+                trace.functional_activation.microphase == LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION;
+        const bool used_memory_audit =
+                trace.functional_activation.top_family == LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION &&
+                trace.functional_activation.microphase == LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT;
         if (trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_FINISH ||
             trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_INTERNAL_WRITE_READY ||
             !trace.observation.valid ||
-            trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION ||
-            trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION ||
+            (!used_self_observation && !used_memory_audit) ||
             trace.functional_activation.exploration_std <= 0.0f ||
             trace.functional_activation.gains[LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION] < 0.0f ||
             trace.functional_activation.gains[LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION] > 2.0f ||
             trace.functional_activation.predicted_gains[LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION] <= 0.0f ||
             trace.functional_activation.allostatic_distance < 0.0f ||
             trace.observation.status != LLAMA_SELF_TOOL_JOB_COMPLETED) {
-            std::fprintf(stderr, "internal-write DMN trace did not expose bounded loop observation state\n");
+            std::fprintf(stderr,
+                    "internal-write DMN trace mismatch phase=%d terminal=%d obs_valid=%d obs_status=%d top_family=%d microphase=%d exploration=%.3f predicted=%.3f allostatic=%.3f\n",
+                    trace.loop_state.phase,
+                    trace.loop_state.terminal_reason,
+                    trace.observation.valid ? 1 : 0,
+                    trace.observation.status,
+                    trace.functional_activation.top_family,
+                    trace.functional_activation.microphase,
+                    trace.functional_activation.exploration_std,
+                    trace.functional_activation.predicted_gains[LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION],
+                    trace.functional_activation.allostatic_distance);
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -1205,9 +1226,63 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
-        if (!expect_functional_last_update("dmn-self-observation-update", ctx, LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION, LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION, true) ||
-            !expect_functional_last_update("dmn-counterfactual-update", ctx, LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL, LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE) ||
+        if (!expect_functional_last_update(
+                    "dmn-self-observation-update",
+                    ctx,
+                    LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION,
+                    used_memory_audit ? LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT : LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION,
+                    !used_memory_audit) ||
+            (used_memory_audit &&
+             !expect_functional_last_update(
+                    "dmn-memory-compression-update",
+                    ctx,
+                    LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION,
+                    LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT)) ||
+            !expect_functional_last_update(
+                    "dmn-counterfactual-update",
+                    ctx,
+                    LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL,
+                    used_memory_audit ? LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION : LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE) ||
             !expect_functional_family_state("dmn-internal-write-functional-cleared", ctx, LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION, false)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        bool saw_active_plan_artifact = false;
+        bool saw_dmn_internal_artifact = false;
+        const int32_t trace_count = llama_self_state_trace_count(ctx);
+        if (trace_count <= 0 || llama_self_state_trace_token_count(ctx) <= 0) {
+            std::fprintf(stderr, "missing shared cognitive trace after DMN internal write\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        for (int32_t i = 0; i < trace_count; ++i) {
+            llama_self_trace_item_info item = {};
+            if (llama_self_state_trace_get_item(ctx, i, &item) != 0) {
+                std::fprintf(stderr, "failed to inspect cognitive trace item %d\n", i);
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+            if (item.artifact_kind == LLAMA_SELF_COG_ARTIFACT_ACTIVE_PLAN) {
+                saw_active_plan_artifact = true;
+            }
+            if (item.artifact_kind == LLAMA_SELF_COG_ARTIFACT_DMN_INTERNAL_WRITE) {
+                if (item.loop_origin != LLAMA_COG_COMMAND_ORIGIN_DMN ||
+                    item.channel != LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL ||
+                    item.token_count <= 0) {
+                    std::fprintf(stderr, "DMN internal artifact provenance was not preserved\n");
+                    llama_free(ctx);
+                    llama_model_free(model);
+                    return 1;
+                }
+                saw_dmn_internal_artifact = true;
+            }
+        }
+        if (!saw_active_plan_artifact || !saw_dmn_internal_artifact) {
+            std::fprintf(stderr, "shared cognitive trace did not retain both active and DMN artifacts\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;

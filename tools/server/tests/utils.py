@@ -11,6 +11,8 @@ from json import JSONDecodeError
 import sys
 import requests
 import time
+import urllib.request
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import (
     Any,
@@ -20,14 +22,19 @@ from typing import (
     Iterator,
     List,
     Literal,
+    Optional,
     Tuple,
     Set,
 )
 from re import RegexFlag
-import wget
+try:
+    import wget
+except ModuleNotFoundError:
+    wget = None
 
 
 DEFAULT_HTTP_TIMEOUT = 60
+TESTS_ROOT = Path(__file__).resolve().parent
 
 
 class ServerResponse:
@@ -103,6 +110,8 @@ class ServerProcess:
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     webui_mcp_proxy: bool = False
+    api_surface: str | None = None
+    extra_env: dict[str, str] | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -239,6 +248,8 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.webui_mcp_proxy:
             server_args.append("--webui-mcp-proxy")
+        if self.api_surface is not None:
+            server_args.extend(["--api-surface", self.api_surface])
 
         args = [str(arg) for arg in [server_path, *server_args]]
         print(f"tests: starting server with: {' '.join(args)}")
@@ -249,12 +260,19 @@ class ServerProcess:
             flags |= subprocess.CREATE_NEW_PROCESS_GROUP
             flags |= subprocess.CREATE_NO_WINDOW
 
+        proc_env = dict(os.environ)
+        if "LLAMA_CACHE" not in proc_env:
+            proc_env["LLAMA_CACHE"] = "tmp"
+        if self.extra_env:
+            proc_env.update(self.extra_env)
+
         self.process = subprocess.Popen(
             [str(arg) for arg in [server_path, *server_args]],
             creationflags=flags,
+            cwd=TESTS_ROOT,
             stdout=sys.stdout,
             stderr=sys.stdout,
-            env={**os.environ, "LLAMA_CACHE": "tmp"} if "LLAMA_CACHE" not in os.environ else None,
+            env=proc_env,
         )
         server_instances.add(self)
 
@@ -334,6 +352,8 @@ class ServerProcess:
         url = f"http://{self.server_host}:{self.server_port}{path}"
         if method == "POST":
             response = requests.post(url, headers=headers, json=data, stream=True)
+        elif method == "GET":
+            response = requests.get(url, headers=headers, stream=True)
         else:
             raise ValueError(f"Unimplemented method: {method}")
         if response.status_code != 200:
@@ -346,6 +366,91 @@ class ServerProcess:
                 data = json.loads(line[6:])
                 print("Partial response from server", json.dumps(data, indent=2))
                 yield data
+
+    def make_named_sse_request(
+        self,
+        method: str,
+        path: str,
+        data: dict | None = None,
+        headers: dict | None = None,
+    ) -> Iterator[Tuple[str, dict]]:
+        url = f"http://{self.server_host}:{self.server_port}{path}"
+        if method == "POST":
+            response = requests.post(url, headers=headers, json=data, stream=True)
+        elif method == "GET":
+            response = requests.get(url, headers=headers, stream=True)
+        else:
+            raise ValueError(f"Unimplemented method: {method}")
+        if response.status_code != 200:
+            try:
+                body = response.json()
+            except JSONDecodeError:
+                body = response.text
+            raise ServerError(response.status_code, body)
+
+        event_name: str | None = None
+        data_lines: list[str] = []
+        for line_bytes in response.iter_lines():
+            line = line_bytes.decode("utf-8")
+            if not line:
+                if event_name and data_lines:
+                    payload = json.loads("\n".join(data_lines))
+                    print(f"Named SSE from server [{event_name}]", json.dumps(payload, indent=2))
+                    yield event_name, payload
+                event_name = None
+                data_lines = []
+                continue
+            if line.startswith("event: "):
+                event_name = line[7:]
+            elif line.startswith("data: "):
+                data_lines.append(line[6:])
+
+    def collect_named_sse_events(
+        self,
+        method: str,
+        path: str,
+        data: dict | None = None,
+        headers: dict | None = None,
+        stop_when: Callable[[str, dict], bool] | None = None,
+    ) -> list[Tuple[str, dict]]:
+        url = f"http://{self.server_host}:{self.server_port}{path}"
+        if method == "POST":
+            response = requests.post(url, headers=headers, json=data, stream=True)
+        elif method == "GET":
+            response = requests.get(url, headers=headers, stream=True)
+        else:
+            raise ValueError(f"Unimplemented method: {method}")
+        if response.status_code != 200:
+            try:
+                body = response.json()
+            except JSONDecodeError:
+                body = response.text
+            response.close()
+            raise ServerError(response.status_code, body)
+
+        events: list[Tuple[str, dict]] = []
+        event_name: str | None = None
+        data_lines: list[str] = []
+        try:
+            for line_bytes in response.iter_lines():
+                line = line_bytes.decode("utf-8")
+                if not line:
+                    if event_name and data_lines:
+                        payload = json.loads("\n".join(data_lines))
+                        print(f"Named SSE from server [{event_name}]", json.dumps(payload, indent=2))
+                        events.append((event_name, payload))
+                        if stop_when and stop_when(event_name, payload):
+                            break
+                    event_name = None
+                    data_lines = []
+                    continue
+                if line.startswith("event: "):
+                    event_name = line[7:]
+                elif line.startswith("data: "):
+                    data_lines.append(line[6:])
+        finally:
+            response.close()
+        return events
 
     def make_any_request(
         self,
@@ -638,7 +743,10 @@ def download_file(url: str, output_file_path: str | None = None) -> str:
     output_file = f'./tmp/{file_name}' if output_file_path is None else output_file_path
     if not os.path.exists(output_file):
         print(f"Downloading {url} to {output_file}")
-        wget.download(url, out=output_file)
+        if wget is not None:
+            wget.download(url, out=output_file)
+        else:
+            urllib.request.urlretrieve(url, output_file)
         print(f"Done downloading to {output_file}")
     else:
         print(f"File already exists at {output_file}")

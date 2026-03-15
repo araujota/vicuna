@@ -700,6 +700,53 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const int32_t system_turns_before_internal = social_state.system_turn_count;
+    const std::vector<llama_token> internal_tokens = tokenize_or_die(vocab, "internal counterfactual planning artifact");
+    llama_self_state_event internal_event = {
+        /*.tokens =*/ internal_tokens.data(),
+        /*.n_tokens =*/ internal_tokens.size(),
+        /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
+        /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
+        /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED | LLAMA_SELF_STATE_EVENT_INTERNAL_ARTIFACT,
+        /*.decoder_entropy =*/ 0.0f,
+        /*.decoder_top_margin =*/ 1.0f,
+        /*.artifact_kind =*/ LLAMA_SELF_COG_ARTIFACT_DMN_INTERNAL_WRITE,
+        /*.loop_origin =*/ LLAMA_COG_COMMAND_ORIGIN_DMN,
+        /*.phase =*/ LLAMA_COG_LOOP_PHASE_OBSERVE,
+        /*.source_id =*/ 77,
+        /*.plan_id =*/ 88,
+    };
+    llama_self_state_feature_vector internal_pre = {};
+    llama_self_state_feature_vector internal_post = {};
+    if (llama_self_state_build_prewrite_features(ctx, &internal_event, &internal_pre) != 0 ||
+        llama_self_state_apply_prewrite(ctx, &internal_event, &internal_pre) != 0 ||
+        llama_self_state_build_postwrite_features(ctx, &internal_event, &internal_post) != 0 ||
+        llama_self_state_apply_postwrite(ctx, &internal_event, &internal_post) != 0 ||
+        llama_self_state_get_social_state(ctx, &social_state) != 0 ||
+        social_state.system_turn_count != system_turns_before_internal) {
+        std::fprintf(stderr, "internal cognitive artifact mutated social turn counters\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    llama_self_trace_item_info last_trace_item = {};
+    const int32_t trace_index = llama_self_state_trace_count(ctx) - 1;
+    if (llama_self_state_trace_token_count(ctx) <= 0 ||
+        trace_index < 0 ||
+        llama_self_state_trace_get_item(ctx, trace_index, &last_trace_item) != 0 ||
+        last_trace_item.artifact_kind != LLAMA_SELF_COG_ARTIFACT_DMN_INTERNAL_WRITE ||
+        last_trace_item.loop_origin != LLAMA_COG_COMMAND_ORIGIN_DMN ||
+        last_trace_item.phase != LLAMA_COG_LOOP_PHASE_OBSERVE ||
+        last_trace_item.source_id != 77 ||
+        last_trace_item.plan_id != 88 ||
+        last_trace_item.token_count != (int32_t) internal_tokens.size()) {
+        std::fprintf(stderr, "internal cognitive artifact trace metadata was not preserved\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
     const int32_t expected_trace_count = llama_self_state_trace_count(ctx);
     const int32_t expected_working_memory_count = llama_self_state_working_memory_count(ctx);
     if (expected_trace_count <= 0 ||
@@ -857,6 +904,9 @@ int main(int argc, char ** argv) {
 
     if (llama_self_state_trace_import(imported_ctx, trace_blob.data(), trace_blob.size(), true) != 0 ||
         llama_self_state_trace_count(imported_ctx) != expected_trace_count ||
+        llama_self_state_trace_get_item(imported_ctx, expected_trace_count - 1, &last_trace_item) != 0 ||
+        last_trace_item.artifact_kind != LLAMA_SELF_COG_ARTIFACT_DMN_INTERNAL_WRITE ||
+        last_trace_item.plan_id != 88 ||
         llama_self_state_replay_trace(imported_ctx, -1) != 0 ||
         llama_self_state_working_memory_count(imported_ctx) != expected_working_memory_count) {
         std::fprintf(stderr, "trace import/replay failed\n");
@@ -867,6 +917,190 @@ int main(int argc, char ** argv) {
     }
 
     llama_free(imported_ctx);
+
+    {
+        llama_context * compaction_ctx = llama_init_from_model(model, cparams);
+        if (!compaction_ctx) {
+            std::fprintf(stderr, "failed to create compaction context\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const llama_self_state_time_point compaction_time = {
+            /*.wall_clock_ms =*/ 1700000005000,
+            /*.monotonic_ms =*/ 5000,
+            /*.timezone_offset_minutes =*/ -360,
+        };
+        if (llama_self_state_set_time(compaction_ctx, compaction_time) != 0) {
+            std::fprintf(stderr, "failed to seed compaction context time\n");
+            llama_free(compaction_ctx);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const int iteration_count = 160;
+        for (int i = 0; i < iteration_count; ++i) {
+            std::vector<llama_token> tokens(48);
+            for (size_t token_idx = 0; token_idx < tokens.size(); ++token_idx) {
+                tokens[token_idx] = (llama_token) (100 + ((i * 53 + (int) token_idx) % 997));
+            }
+            llama_self_state_event artifact_event = {
+                /*.tokens =*/ tokens.data(),
+                /*.n_tokens =*/ tokens.size(),
+                /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
+                /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+                /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED | LLAMA_SELF_STATE_EVENT_INTERNAL_ARTIFACT,
+                /*.decoder_entropy =*/ 0.0f,
+                /*.decoder_top_margin =*/ 1.0f,
+                /*.artifact_kind =*/ LLAMA_SELF_COG_ARTIFACT_ACTIVE_PLAN,
+                /*.loop_origin =*/ LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                /*.phase =*/ LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE,
+                /*.source_id =*/ i,
+                /*.plan_id =*/ i,
+            };
+            llama_self_state_feature_vector pre = {};
+            llama_self_state_feature_vector post = {};
+            if (llama_self_state_build_prewrite_features(compaction_ctx, &artifact_event, &pre) != 0 ||
+                llama_self_state_apply_prewrite(compaction_ctx, &artifact_event, &pre) != 0 ||
+                llama_self_state_build_postwrite_features(compaction_ctx, &artifact_event, &post) != 0 ||
+                llama_self_state_apply_postwrite(compaction_ctx, &artifact_event, &post) != 0) {
+                std::fprintf(stderr, "failed to append compaction artifact\n");
+                llama_free(compaction_ctx);
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+        }
+
+        llama_self_trace_item_info first_compacted_item = {};
+        if (llama_self_state_trace_count(compaction_ctx) >= iteration_count ||
+            llama_self_state_trace_token_count(compaction_ctx) > 2048 ||
+            llama_self_state_trace_get_item(compaction_ctx, 0, &first_compacted_item) != 0 ||
+            first_compacted_item.source_id <= 0) {
+            std::fprintf(stderr, "shared cognitive trace compaction did not evict oldest artifacts first\n");
+            llama_free(compaction_ctx);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(compaction_ctx);
+    }
+
+    {
+        llama_self_model_extension_update persisted_extension = llama_self_model_extension_default_update();
+        persisted_extension.source = LLAMA_SELF_MODEL_EXTENSION_SOURCE_TOOL_HARD_MEMORY;
+        persisted_extension.source_tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_QUERY;
+        persisted_extension.kind = LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM;
+        persisted_extension.domain = LLAMA_SELF_MODEL_EXTENSION_DOMAIN_EPISTEMIC;
+        persisted_extension.flags = LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE | LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED;
+        persisted_extension.value = 0.72f;
+        persisted_extension.desired_value = 0.85f;
+        persisted_extension.confidence = 0.81f;
+        persisted_extension.salience = 0.66f;
+        persisted_extension.gain_weight = 0.40f;
+        std::snprintf(persisted_extension.key, sizeof(persisted_extension.key), "%s", "persistence.discovered_register");
+        std::snprintf(persisted_extension.label, sizeof(persisted_extension.label), "%s", "Discovered persistence register");
+        std::snprintf(persisted_extension.content, sizeof(persisted_extension.content), "%s", "Recovered from runtime snapshot");
+
+        llama_self_updater_program persisted_program = program;
+        persisted_program.repair_emit_threshold += 0.05f;
+        persisted_program.repair_admission_floor += 0.02f;
+
+        llama_bash_tool_config persisted_bash = llama_bash_tool_default_config();
+        persisted_bash.enabled = true;
+        persisted_bash.reject_shell_metacharacters = true;
+        persisted_bash.cpu_time_limit_secs = 4;
+        persisted_bash.max_child_processes = 4;
+        persisted_bash.max_open_files = 24;
+        persisted_bash.max_file_size_bytes = 4096;
+        std::snprintf(persisted_bash.allowed_commands, sizeof(persisted_bash.allowed_commands), "%s", "pwd,rg");
+        std::snprintf(persisted_bash.blocked_patterns, sizeof(persisted_bash.blocked_patterns), "%s", "rm -rf,:(){:|:&};:");
+
+        llama_hard_memory_config persisted_hard_memory = llama_hard_memory_default_config();
+        persisted_hard_memory.enabled = true;
+        persisted_hard_memory.timeout_ms = 4321;
+        persisted_hard_memory.max_results = 3;
+        persisted_hard_memory.query_threshold = 0.42f;
+        std::snprintf(persisted_hard_memory.base_url, sizeof(persisted_hard_memory.base_url), "%s", "http://127.0.0.1:9999");
+        std::snprintf(persisted_hard_memory.auth_token, sizeof(persisted_hard_memory.auth_token), "%s", "persist-token");
+        std::snprintf(persisted_hard_memory.container_tag, sizeof(persisted_hard_memory.container_tag), "%s", "persist-container");
+        std::snprintf(persisted_hard_memory.runtime_identity, sizeof(persisted_hard_memory.runtime_identity), "%s", "persist-runtime");
+
+        if (llama_self_state_set_updater_program(ctx, persisted_program) != 0 ||
+            llama_self_state_upsert_model_extension(ctx, persisted_extension) != 0 ||
+            llama_bash_tool_configure(ctx, persisted_bash) != 0 ||
+            llama_hard_memory_configure(ctx, persisted_hard_memory) != 0) {
+            std::fprintf(stderr, "failed to seed runtime persistence surfaces\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const size_t persisted_trace_size = llama_self_state_trace_export_size(ctx);
+        std::vector<uint8_t> persisted_trace(persisted_trace_size);
+        if (persisted_trace_size == 0 ||
+            llama_self_state_trace_export(ctx, persisted_trace.data(), persisted_trace.size()) != 0) {
+            std::fprintf(stderr, "failed to export persisted trace\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_context * restored_ctx = llama_init_from_model(model, cparams);
+        if (!restored_ctx) {
+            std::fprintf(stderr, "failed to create restored runtime context\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        if (llama_self_state_set_updater_program(restored_ctx, persisted_program) != 0 ||
+            llama_bash_tool_configure(restored_ctx, persisted_bash) != 0 ||
+            llama_hard_memory_configure(restored_ctx, persisted_hard_memory) != 0 ||
+            llama_self_state_trace_import(restored_ctx, persisted_trace.data(), persisted_trace.size(), true) != 0 ||
+            llama_self_state_replay_trace(restored_ctx, -1) != 0 ||
+            llama_self_state_upsert_model_extension(restored_ctx, persisted_extension) != 0) {
+            std::fprintf(stderr, "failed to replay runtime persistence snapshot\n");
+            llama_free(restored_ctx);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_self_updater_program restored_program = {};
+        llama_bash_tool_config restored_bash = {};
+        llama_hard_memory_config restored_hard_memory = {};
+        llama_self_model_extension_info restored_extension = {};
+        if (llama_self_state_get_updater_program(restored_ctx, &restored_program) != 0 ||
+            llama_bash_tool_get_config(restored_ctx, &restored_bash) != 0 ||
+            llama_hard_memory_get_config(restored_ctx, &restored_hard_memory) != 0 ||
+            llama_self_state_model_extension_count(restored_ctx) != 1 ||
+            llama_self_state_get_model_extension(restored_ctx, 0, &restored_extension) != 0 ||
+            restored_program.repair_emit_threshold != persisted_program.repair_emit_threshold ||
+            restored_program.repair_admission_floor != persisted_program.repair_admission_floor ||
+            !restored_bash.enabled ||
+            !restored_bash.reject_shell_metacharacters ||
+            restored_bash.cpu_time_limit_secs != persisted_bash.cpu_time_limit_secs ||
+            std::string(restored_bash.allowed_commands) != "pwd,rg" ||
+            !restored_hard_memory.enabled ||
+            restored_hard_memory.timeout_ms != persisted_hard_memory.timeout_ms ||
+            restored_hard_memory.max_results != persisted_hard_memory.max_results ||
+            std::string(restored_hard_memory.container_tag) != "persist-container" ||
+            std::string(restored_extension.key) != "persistence.discovered_register" ||
+            (restored_extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) == 0 ||
+            llama_self_state_trace_count(restored_ctx) != expected_trace_count) {
+            std::fprintf(stderr, "runtime persistence surfaces did not survive snapshot replay\n");
+            llama_free(restored_ctx);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(restored_ctx);
+    }
 
     {
         mock_supermemory_server mock_server;

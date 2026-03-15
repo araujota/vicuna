@@ -3491,6 +3491,13 @@ int32_t llama_active_lora_ingest(
     return ctx && ctx->active_lora_ingest(tokens, n_tokens) ? 0 : -1;
 }
 
+int32_t llama_active_lora_ingest_event(
+        llama_context * ctx,
+        const llama_self_state_event * event,
+        const llama_self_state_feature_vector * features) {
+    return ctx && event && ctx->active_lora_ingest(*event, features) ? 0 : -1;
+}
+
 int32_t llama_active_lora_get_stats(
         const llama_context * ctx,
         llama_active_lora_stats * out_stats) {

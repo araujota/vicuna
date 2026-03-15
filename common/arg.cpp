@@ -427,6 +427,16 @@ static bool parse_bool_value(const std::string & value) {
     }
 }
 
+static common_server_api_surface common_server_api_surface_from_str(const std::string & value) {
+    if (value == "default") {
+        return COMMON_SERVER_API_SURFACE_DEFAULT;
+    }
+    if (value == "openai") {
+        return COMMON_SERVER_API_SURFACE_OPENAI;
+    }
+    throw std::invalid_argument("invalid server API surface: expected one of {default, openai}");
+}
+
 //
 // CLI argument parsing functions
 //
@@ -892,6 +902,12 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         if (ctx_arg.params.completion) {
             common_params_print_completion(ctx_arg);
             exit(0);
+        }
+        if (ctx_arg.params.api_surface == COMMON_SERVER_API_SURFACE_OPENAI && ex == LLAMA_EXAMPLE_SERVER) {
+            ctx_arg.params.webui = false;
+            ctx_arg.params.webui_mcp_proxy = false;
+            ctx_arg.params.endpoint_slots = false;
+            ctx_arg.params.endpoint_props = false;
         }
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
@@ -2834,6 +2850,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.webui_config_json = read_file(value);
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_WEBUI_CONFIG_FILE"));
+    add_opt(common_arg(
+        {"--api-surface"}, "SURFACE",
+        string_format(
+            "server API surface profile. one of:\n"
+            "- default: expose the current mixed llama.cpp/Vicuña server surface\n"
+            "- openai: expose only canonical OpenAI-compatible `/v1/*` routes plus operational health/metrics\n"
+            "(default: %s)",
+            common_server_api_surface_to_str(params.api_surface)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.api_surface = common_server_api_surface_from_str(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_API_SURFACE"));
     add_opt(common_arg(
         {"--webui-mcp-proxy"},
         {"--no-webui-mcp-proxy"},

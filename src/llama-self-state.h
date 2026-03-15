@@ -127,6 +127,8 @@ public:
             const llama_hard_memory_query_request & request,
             const llama_hard_memory_result & result);
     int32_t trace_count() const;
+    int32_t trace_token_count() const;
+    bool get_trace_item(int32_t index, llama_self_trace_item_info * out_info) const;
     bool clear_trace();
     bool replay_trace(const llama_vocab * vocab, int32_t upto_count, int32_t override_channel);
     bool set_updater_program(const llama_self_updater_program & program);
@@ -145,6 +147,7 @@ public:
     bool build_postwrite_features(const llama_vocab * vocab, const llama_self_state_event & event, llama_self_state_feature_vector * out_features) const;
     bool apply_postwrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
     bool note_validated_progress(float signed_progress, float efficiency_advantage);
+    void drain_compacted_trace_items(std::vector<llama_self_trace_item> & out_items);
 
     static const char * register_name(int32_t register_id);
 
@@ -239,4 +242,6 @@ private:
     std::vector<llama_self_reactivation_info> reactivation_priorities;
     std::vector<llama_self_tool_job> tool_jobs;
     std::vector<llama_self_trace_item> trace_items;
+    std::vector<llama_self_trace_item> compacted_trace_items;
+    size_t trace_token_count_total = 0;
 };

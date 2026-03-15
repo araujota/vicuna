@@ -148,6 +148,7 @@ struct server_task {
     uint32_t foreground_flags = 0;
     llama_active_loop_trace active_trace = {};
     bool has_active_trace = false;
+    bool skip_active_loop_preflight = false;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -503,7 +504,20 @@ struct server_task_result_metrics : server_task_result {
     int n_idle_slots;
     int n_processing_slots;
     int n_tasks_deferred;
+    int n_waiting_active_tasks = 0;
+    int n_external_bash_pending = 0;
+    int n_external_hard_memory_pending = 0;
+    int n_proactive_responses = 0;
+    int n_proactive_live_events = 0;
     int64_t t_start;
+    int64_t runtime_last_persist_ms = 0;
+    int64_t runtime_last_restore_ms = 0;
+    int64_t proactive_last_publish_ms = 0;
+    bool runtime_persistence_enabled = false;
+    bool runtime_persistence_healthy = true;
+    bool runtime_restore_attempted = false;
+    bool runtime_restore_success = false;
+    bool proactive_live_stream_connected = false;
 
     // TODO: somehow reuse server_metrics in the future, instead of duplicating the fields
     uint64_t n_prompt_tokens_processed_total = 0;
@@ -521,6 +535,18 @@ struct server_task_result_metrics : server_task_result {
 
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
+    uint64_t n_external_bash_dispatch_total = 0;
+    uint64_t n_external_bash_complete_total = 0;
+    uint64_t n_external_bash_fail_total = 0;
+    uint64_t n_external_hard_memory_dispatch_total = 0;
+    uint64_t n_external_hard_memory_complete_total = 0;
+    uint64_t n_external_hard_memory_fail_total = 0;
+    uint64_t proactive_publish_total = 0;
+    uint64_t proactive_complete_total = 0;
+    uint64_t proactive_fail_total = 0;
+    uint64_t proactive_dropped_total = 0;
+    uint64_t runtime_persist_success_total = 0;
+    uint64_t runtime_persist_fail_total = 0;
 
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result

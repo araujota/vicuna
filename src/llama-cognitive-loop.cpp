@@ -1181,6 +1181,79 @@ std::string detokenize_text(const llama_vocab * vocab, const std::vector<llama_t
     return trim_ascii(vocab->detokenize(tokens, true));
 }
 
+bool emit_cognitive_artifact_tokens(
+        llama_context & ctx,
+        const std::vector<llama_token> & tokens,
+        int32_t channel,
+        int32_t artifact_kind,
+        int32_t loop_origin,
+        int32_t phase,
+        int32_t source_id,
+        int32_t plan_id,
+        llama_self_state_feature_vector * out_postwrite = nullptr,
+        uint32_t extra_flags = 0) {
+    if (tokens.empty()) {
+        return false;
+    }
+
+    llama_self_state_event event = {
+        /*.tokens =*/ tokens.data(),
+        /*.n_tokens =*/ tokens.size(),
+        /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
+        /*.channel =*/ channel,
+        /*.flags =*/ (uint32_t) (LLAMA_SELF_STATE_EVENT_ADMITTED |
+                LLAMA_SELF_STATE_EVENT_INTERNAL_ARTIFACT |
+                extra_flags),
+        /*.decoder_entropy =*/ 0.0f,
+        /*.decoder_top_margin =*/ 1.0f,
+        /*.artifact_kind =*/ artifact_kind,
+        /*.loop_origin =*/ loop_origin,
+        /*.phase =*/ phase,
+        /*.source_id =*/ source_id,
+        /*.plan_id =*/ plan_id,
+    };
+
+    llama_self_state_feature_vector pre = {};
+    llama_self_state_feature_vector post = {};
+    if (!ctx.self_state_build_prewrite_features(event, &pre) ||
+            !ctx.self_state_apply_prewrite(event, pre) ||
+            !ctx.self_state_build_postwrite_features(event, &post) ||
+            !ctx.self_state_apply_postwrite(event, post)) {
+        return false;
+    }
+
+    (void) ctx.active_lora_ingest(event, &post);
+    if (out_postwrite) {
+        *out_postwrite = post;
+    }
+    return true;
+}
+
+bool emit_cognitive_artifact_text(
+        llama_context & ctx,
+        const llama_vocab * vocab,
+        const std::string & text,
+        int32_t channel,
+        int32_t artifact_kind,
+        int32_t loop_origin,
+        int32_t phase,
+        int32_t source_id,
+        int32_t plan_id,
+        llama_self_state_feature_vector * out_postwrite = nullptr,
+        uint32_t extra_flags = 0) {
+    return emit_cognitive_artifact_tokens(
+            ctx,
+            tokenize_text(vocab, trim_ascii(text)),
+            channel,
+            artifact_kind,
+            loop_origin,
+            phase,
+            source_id,
+            plan_id,
+            out_postwrite,
+            extra_flags);
+}
+
 const char * verbosity_label(float value) {
     return value >= 0.62f ? "detailed" : "brief";
 }
@@ -1511,15 +1584,42 @@ void init_bash_request(
     request.origin = origin;
     request.tool_job_id = tool_job_id;
     request.timeout_ms = std::max(100, config.timeout_ms);
+    request.cpu_time_limit_secs = std::max(1, config.cpu_time_limit_secs);
+    request.max_child_processes = std::max(1, config.max_child_processes);
+    request.max_open_files = std::max(4, config.max_open_files);
+    request.max_file_size_bytes = std::max(1024, config.max_file_size_bytes);
     request.max_stdout_bytes = std::max(1, std::min(config.max_stdout_bytes, LLAMA_BASH_TOOL_STDOUT_MAX_CHARS - 1));
     request.max_stderr_bytes = std::max(1, std::min(config.max_stderr_bytes, LLAMA_BASH_TOOL_STDERR_MAX_CHARS - 1));
     request.inherit_env = config.inherit_env;
     request.login_shell = config.login_shell;
+    request.reject_shell_metacharacters = config.reject_shell_metacharacters;
     request.command_ready = !command_text.empty();
     set_bounded_cstr(request.bash_path, sizeof(request.bash_path), config.bash_path);
     set_bounded_cstr(request.working_directory, sizeof(request.working_directory), config.working_directory);
+    set_bounded_cstr(request.allowed_commands, sizeof(request.allowed_commands), config.allowed_commands);
+    set_bounded_cstr(request.blocked_patterns, sizeof(request.blocked_patterns), config.blocked_patterns);
+    set_bounded_cstr(request.allowed_env, sizeof(request.allowed_env), config.allowed_env);
     set_bounded_cstr(request.intent_text, sizeof(request.intent_text), intent_text.c_str());
     set_bounded_cstr(request.command_text, sizeof(request.command_text), command_text.c_str());
+}
+
+void init_hard_memory_request(
+        llama_cognitive_hard_memory_request & request,
+        int32_t command_id,
+        int32_t origin,
+        int32_t tool_job_id,
+        const std::string & query_text,
+        int32_t temporal_adapter_role) {
+    request = {};
+    request.command_id = command_id;
+    request.origin = origin;
+    request.tool_job_id = tool_job_id;
+    request.query.limit = 4;
+    request.query.threshold = 0.0f;
+    request.query.include_profile = true;
+    request.query.use_temporal_self_hint = temporal_adapter_role >= 0;
+    request.query.temporal_adapter_role = temporal_adapter_role;
+    set_bounded_cstr(request.query.query, sizeof(request.query.query), query_text.c_str());
 }
 
 std::string summarize_bash_result(const llama_bash_tool_result & result) {
@@ -1564,6 +1664,33 @@ std::string summarize_bash_result(const llama_bash_tool_result & result) {
     }
     if (result.truncated_stdout || result.truncated_stderr) {
         summary += " output_truncated=true.";
+    }
+
+    return summary;
+}
+
+std::string summarize_hard_memory_result(const llama_hard_memory_result & result) {
+    std::string summary;
+    if (!result.ok) {
+        summary = "hard memory query failed.";
+    } else if (result.result_count <= 0) {
+        summary = "hard memory query completed with no results.";
+    } else {
+        summary = "hard memory query completed successfully.";
+        summary += " results=" + std::to_string(result.result_count) + ".";
+    }
+
+    if (result.status_code > 0) {
+        summary += " status=" + std::to_string(result.status_code) + ".";
+    }
+    if (result.retrieval_summary.max_similarity > 0.0f) {
+        summary += " max_similarity=" + std::to_string(result.retrieval_summary.max_similarity) + ".";
+    }
+    if (result.error[0] != '\0') {
+        summary += " error: " + trim_ascii(result.error);
+    }
+    if (result.result_count > 0 && result.results[0].title[0] != '\0') {
+        summary += " top_hit: " + trim_ascii(result.results[0].title);
     }
 
     return summary;
@@ -2262,6 +2389,13 @@ bool llama_cognitive_loop::cognitive_command_complete(int32_t command_id, bool c
             dmn_runner.pending_command_id == command_id) {
         dmn_runner.pending_command_id = -1;
         dmn_runner.last_command_id = command_id;
+        if (command.kind == LLAMA_COG_COMMAND_EMIT_BACKGROUND && host_state.pending_dmn_emits > 0) {
+            int32_t emit_count = 1;
+            if (last_dmn_trace.tick_id == command.tick_id && last_dmn_trace.burst_count > 1) {
+                emit_count = last_dmn_trace.burst_count;
+            }
+            host_state.pending_dmn_emits = std::max(0, host_state.pending_dmn_emits - emit_count);
+        }
         if (command.kind == LLAMA_COG_COMMAND_INVOKE_TOOL) {
             dmn_runner.waiting_on_tool = !cancelled;
             dmn_runner.completed = cancelled;
@@ -2674,6 +2808,29 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     active_runner.current_plan_step = trace.plan.current_step_index;
     active_runner.planning_active = true;
 
+    {
+        std::ostringstream artifact;
+        artifact.setf(std::ios::fixed);
+        artifact.precision(3);
+        artifact << "active plan winner=" << active_action_name(trace.winner_action)
+                 << " score=" << trace.winner_score
+                 << " uncertainty=" << uncertainty
+                 << " answerability=" << answerability
+                 << " steps=" << trace.plan.step_count
+                 << " revision=" << trace.plan.revision_count
+                 << " tool_kind=" << proposed_tool_kind;
+        (void) emit_cognitive_artifact_text(
+                ctx,
+                vocab,
+                artifact.str(),
+                LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+                LLAMA_SELF_COG_ARTIFACT_ACTIVE_PLAN,
+                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE,
+                trace.episode_id,
+                trace.plan.plan_id);
+    }
+
     int32_t final_microphase =
             mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL ?
                     LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION :
@@ -2741,22 +2898,34 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 trace.loop_state.phase);
         active_runner.last_command_id = active_runner.pending_command_id > 0 ? active_runner.pending_command_id : active_runner.last_command_id;
         llama_bash_tool_config bash_config = {};
+        if (active_runner.pending_command_id > 0) {
+            const std::string intent = event_text(vocab, mutable_event);
             if (proposed_tool_kind == LLAMA_TOOL_KIND_BASH_CLI &&
-                    active_runner.pending_command_id > 0 &&
                     ctx.bash_tool_get_config(&bash_config)) {
-                const std::string intent = event_text(vocab, mutable_event);
                 activate_microphase(LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, tool_affinity);
                 const std::string command_text = infer_bash_command(intent);
                 llama_bash_tool_request request = {};
                 init_bash_request(
                         request,
                         bash_config,
-                    active_runner.pending_command_id,
-                    LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
-                    tool_job_id,
-                    intent,
-                    command_text);
-            (void) ctx.bash_tool_set_request(request);
+                        active_runner.pending_command_id,
+                        LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                        tool_job_id,
+                        intent,
+                        command_text);
+                (void) ctx.bash_tool_set_request(request);
+            } else if (proposed_tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
+                activate_microphase(LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, tool_affinity);
+                llama_cognitive_hard_memory_request request = {};
+                init_hard_memory_request(
+                        request,
+                        active_runner.pending_command_id,
+                        LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                        tool_job_id,
+                        intent,
+                        LLAMA_SERVING_LORA_LAYER_ACTIVE);
+                (void) ctx.hard_memory_set_request(request);
+            }
         }
         active_runner.plan_status = LLAMA_COG_PLAN_STATUS_WAITING_TOOL;
         active_runner.current_plan_step = trace.plan.current_step_index;
@@ -2850,6 +3019,28 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     const functional_delta_summary active_deltas =
             compute_functional_deltas(active_before_snapshot, active_after_snapshot);
 
+    {
+        std::ostringstream artifact;
+        artifact.setf(std::ios::fixed);
+        artifact.precision(3);
+        artifact << "active reflection winner=" << active_action_name(trace.winner_action)
+                 << " final_microphase=" << functional_microphase_name(final_microphase)
+                 << " tool_followup=" << (trace.tool_followup_expected ? 1 : 0)
+                 << " delta_favorable=" << active_deltas.delta_favorable
+                 << " delta_answerability=" << active_deltas.delta_answerability
+                 << " delta_recovery=" << active_deltas.delta_recovery;
+        (void) emit_cognitive_artifact_text(
+                ctx,
+                vocab,
+                artifact.str(),
+                LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+                LLAMA_SELF_COG_ARTIFACT_ACTIVE_REFLECTION,
+                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                final_microphase,
+                trace.episode_id,
+                trace.plan.plan_id);
+    }
+
     auto apply_family_update = [&](int32_t family,
                                    int32_t start_microphase,
                                    int32_t settle_microphase,
@@ -2890,6 +3081,15 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 clamp_unit(magnitude),
                 update_event,
                 feature_ptr);
+        (void) emit_cognitive_artifact_tokens(
+                ctx,
+                update_tokens,
+                LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
+                LLAMA_SELF_COG_ARTIFACT_FUNCTIONAL_UPDATE,
+                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                settle_microphase,
+                trace.episode_id,
+                trace.plan.plan_id);
     };
 
     if (tool_selection_episode_open && mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
@@ -3552,6 +3752,30 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     dmn_runner.plan_revision_count = trace.plan.revision_count;
     dmn_runner.current_plan_step = trace.plan.current_step_index;
     dmn_runner.planning_active = true;
+
+    {
+        std::ostringstream artifact;
+        artifact.setf(std::ios::fixed);
+        artifact.precision(3);
+        artifact << "dmn plan winner=" << dmn_action_name(trace.winner_action)
+                 << " score=" << trace.winner_score
+                 << " pressure_total=" << trace.pressure.total
+                 << " continuation=" << trace.pressure.continuation
+                 << " remediation=" << last_remediation_plan.action
+                 << " governance=" << last_governance_trace.outcome
+                 << " steps=" << trace.plan.step_count;
+        (void) emit_cognitive_artifact_text(
+                ctx,
+                llama_model_get_vocab(&ctx.get_model()),
+                artifact.str(),
+                LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
+                LLAMA_SELF_COG_ARTIFACT_DMN_PLAN,
+                LLAMA_COG_COMMAND_ORIGIN_DMN,
+                LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE,
+                trace.tick_id,
+                trace.plan.plan_id);
+    }
+
     if (compression_eligible) {
         activate_microphase(
                 LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION,
@@ -3597,23 +3821,25 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     }
 
     if (trace.winner_action == LLAMA_DMN_ACTION_INTERNAL_WRITE) {
-        const llama_self_state_event internal_event = {
-            /*.tokens =*/ nullptr,
-            /*.n_tokens =*/ 0,
-            /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
-            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
-            /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
-            /*.decoder_entropy =*/ 0.0f,
-            /*.decoder_top_margin =*/ 1.0f,
-        };
-        llama_self_state_feature_vector pre = {};
-        llama_self_state_feature_vector post = {};
-        if (ctx.self_state_build_prewrite_features(internal_event, &pre)) {
-            (void) ctx.self_state_apply_prewrite(internal_event, pre);
-        }
-        if (ctx.self_state_build_postwrite_features(internal_event, &post)) {
-            (void) ctx.self_state_apply_postwrite(internal_event, post);
-        }
+        std::ostringstream internal_summary;
+        internal_summary.setf(std::ios::fixed);
+        internal_summary.precision(3);
+        internal_summary << "dmn internal write contradiction=" << trace.pressure.contradiction
+                         << " uncertainty=" << trace.pressure.uncertainty
+                         << " continuation=" << trace.pressure.continuation
+                         << " remediation=" << last_remediation_plan.action
+                         << " governance=" << last_governance_trace.outcome
+                         << " divergence=" << trace.favorable_divergence;
+        (void) emit_cognitive_artifact_text(
+                ctx,
+                llama_model_get_vocab(&ctx.get_model()),
+                internal_summary.str(),
+                LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
+                LLAMA_SELF_COG_ARTIFACT_DMN_INTERNAL_WRITE,
+                LLAMA_COG_COMMAND_ORIGIN_DMN,
+                LLAMA_COG_LOOP_PHASE_OBSERVE,
+                trace.tick_id,
+                trace.plan.plan_id);
         activate_microphase(
                 compression_eligible ? LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT : LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION,
                 tool_affinity,
@@ -3714,19 +3940,30 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                     trace.loop_state.phase);
             dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
             llama_bash_tool_config bash_config = {};
-            if (trace.tool_kind == LLAMA_TOOL_KIND_BASH_CLI &&
-                    dmn_runner.pending_command_id > 0 &&
-                    ctx.bash_tool_get_config(&bash_config)) {
-                llama_bash_tool_request request = {};
-                init_bash_request(
-                        request,
-                        bash_config,
-                        dmn_runner.pending_command_id,
-                        LLAMA_COG_COMMAND_ORIGIN_DMN,
-                        trace.tool_job_id,
-                        "inspect repository and runtime state",
-                        "pwd && find . -maxdepth 3 -type f | sort | head -n 200");
-                (void) ctx.bash_tool_set_request(request);
+            if (dmn_runner.pending_command_id > 0) {
+                if (trace.tool_kind == LLAMA_TOOL_KIND_BASH_CLI &&
+                        ctx.bash_tool_get_config(&bash_config)) {
+                    llama_bash_tool_request request = {};
+                    init_bash_request(
+                            request,
+                            bash_config,
+                            dmn_runner.pending_command_id,
+                            LLAMA_COG_COMMAND_ORIGIN_DMN,
+                            trace.tool_job_id,
+                            "inspect repository and runtime state",
+                            "pwd && find . -maxdepth 3 -type f | sort | head -n 200");
+                    (void) ctx.bash_tool_set_request(request);
+                } else if (trace.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
+                    llama_cognitive_hard_memory_request request = {};
+                    init_hard_memory_request(
+                            request,
+                            dmn_runner.pending_command_id,
+                            LLAMA_COG_COMMAND_ORIGIN_DMN,
+                            trace.tool_job_id,
+                            "relevant hard memory for current runtime remediation and self-state",
+                            LLAMA_SERVING_LORA_LAYER_ACTIVE);
+                    (void) ctx.hard_memory_set_request(request);
+                }
             }
         } else if (should_emit_followup && dmn_runner.steps_taken < dmn_runner.max_steps) {
             trace.winner_action = LLAMA_DMN_ACTION_EMIT;
@@ -3828,23 +4065,38 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 trace.loop_state.phase);
         dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
         llama_bash_tool_config bash_config = {};
-        if (trace.tool_kind == LLAMA_TOOL_KIND_BASH_CLI &&
-                dmn_runner.pending_command_id > 0 &&
-                ctx.bash_tool_get_config(&bash_config)) {
-            activate_microphase(
-                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP,
-                    tool_affinity,
-                    clamp_unit((float) working_memory_count / 8.0f));
-            llama_bash_tool_request request = {};
-            init_bash_request(
-                    request,
-                    bash_config,
-                    dmn_runner.pending_command_id,
-                    LLAMA_COG_COMMAND_ORIGIN_DMN,
-                    trace.tool_job_id,
-                    "inspect repository and runtime state",
-                    "pwd && find . -maxdepth 3 -type f | sort | head -n 200");
-            (void) ctx.bash_tool_set_request(request);
+        if (dmn_runner.pending_command_id > 0) {
+            if (trace.tool_kind == LLAMA_TOOL_KIND_BASH_CLI &&
+                    ctx.bash_tool_get_config(&bash_config)) {
+                activate_microphase(
+                        LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP,
+                        tool_affinity,
+                        clamp_unit((float) working_memory_count / 8.0f));
+                llama_bash_tool_request request = {};
+                init_bash_request(
+                        request,
+                        bash_config,
+                        dmn_runner.pending_command_id,
+                        LLAMA_COG_COMMAND_ORIGIN_DMN,
+                        trace.tool_job_id,
+                        "inspect repository and runtime state",
+                        "pwd && find . -maxdepth 3 -type f | sort | head -n 200");
+                (void) ctx.bash_tool_set_request(request);
+            } else if (trace.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
+                activate_microphase(
+                        LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP,
+                        tool_affinity,
+                        clamp_unit((float) working_memory_count / 8.0f));
+                llama_cognitive_hard_memory_request request = {};
+                init_hard_memory_request(
+                        request,
+                        dmn_runner.pending_command_id,
+                        LLAMA_COG_COMMAND_ORIGIN_DMN,
+                        trace.tool_job_id,
+                        "relevant hard memory for runtime remediation and self-state",
+                        LLAMA_SERVING_LORA_LAYER_ACTIVE);
+                (void) ctx.hard_memory_set_request(request);
+            }
         }
     } else if (trace.winner_action == LLAMA_DMN_ACTION_EMIT) {
         activate_microphase(
@@ -4022,6 +4274,15 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 clamp_unit(magnitude),
                 update_event,
                 feature_ptr);
+        (void) emit_cognitive_artifact_tokens(
+                ctx,
+                update_tokens,
+                LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
+                LLAMA_SELF_COG_ARTIFACT_FUNCTIONAL_UPDATE,
+                LLAMA_COG_COMMAND_ORIGIN_DMN,
+                settle_microphase,
+                trace.tick_id,
+                trace.plan.plan_id);
     };
 
     {
@@ -4308,6 +4569,53 @@ bool llama_cognitive_loop::cognitive_bash_tool_submit_result(
     return apply_tool_event_only(ctx, tool_event);
 }
 
+bool llama_cognitive_loop::cognitive_hard_memory_submit_result(
+        const llama_cognitive_hard_memory_result & result,
+        llama_active_loop_trace * out_active_trace) {
+    llama_cognitive_hard_memory_request request = {};
+    if (!ctx.cognitive_hard_memory_get_request(result.command_id, &request)) {
+        return false;
+    }
+
+    const int32_t tool_status =
+            (result.result.ok && result.result.status_code < 500) ?
+                    LLAMA_SELF_TOOL_JOB_COMPLETED :
+                    LLAMA_SELF_TOOL_JOB_FAILED;
+    (void) ctx.self_state_upsert_tool_job(result.tool_job_id, tool_status, 1.0f);
+
+    if (!ctx.hard_memory_submit_result(result.result)) {
+        return false;
+    }
+    (void) ctx.self_state_promote_hard_memory_query(request.query, result.result);
+    if (!ctx.hard_memory_clear_request(result.command_id)) {
+        return false;
+    }
+    if (!ctx.cognitive_command_complete(result.command_id, false)) {
+        return false;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(&ctx.get_model());
+    const std::string summary = summarize_hard_memory_result(result.result);
+    const std::vector<llama_token> tokens = tokenize_text(vocab, summary);
+    const llama_self_state_event tool_event = {
+        /*.tokens =*/ tokens.empty() ? nullptr : tokens.data(),
+        /*.n_tokens =*/ tokens.size(),
+        /*.role =*/ LLAMA_SELF_STATE_EVENT_TOOL,
+        /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+        /*.flags =*/ tool_status == LLAMA_SELF_TOOL_JOB_COMPLETED ?
+                LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED :
+                LLAMA_SELF_STATE_EVENT_TOOL_FAILED,
+        /*.decoder_entropy =*/ 0.0f,
+        /*.decoder_top_margin =*/ 1.0f,
+    };
+
+    if (request.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+        return active_loop_process(tool_event, out_active_trace);
+    }
+
+    return apply_tool_event_only(ctx, tool_event);
+}
+
 int32_t llama_context::cognitive_tool_spec_count() const {
     return cognitive_loop ? cognitive_loop->cognitive_tool_spec_count() : 0;
 }
@@ -4338,6 +4646,14 @@ bool llama_context::cognitive_command_complete(int32_t command_id, bool cancelle
 
 bool llama_context::cognitive_bash_tool_submit_result(const llama_bash_tool_result & result, llama_active_loop_trace * out_active_trace) {
     return cognitive_loop && cognitive_loop->cognitive_bash_tool_submit_result(result, out_active_trace);
+}
+
+bool llama_context::cognitive_hard_memory_get_request(int32_t command_id, llama_cognitive_hard_memory_request * out_request) const {
+    return hard_memory_get_request(command_id, out_request);
+}
+
+bool llama_context::cognitive_hard_memory_submit_result(const llama_cognitive_hard_memory_result & result, llama_active_loop_trace * out_active_trace) {
+    return cognitive_loop && cognitive_loop->cognitive_hard_memory_submit_result(result, out_active_trace);
 }
 
 bool llama_context::cognitive_active_runner_get(llama_cognitive_active_runner_status * out_status) const {
@@ -4443,6 +4759,20 @@ int32_t llama_cognitive_bash_tool_submit_result(
         const struct llama_bash_tool_result * result,
         struct llama_active_loop_trace * out_active_trace) {
     return ctx && result && ctx->cognitive_bash_tool_submit_result(*result, out_active_trace) ? 0 : -1;
+}
+
+int32_t llama_cognitive_hard_memory_get_request(
+        const struct llama_context * ctx,
+        int32_t command_id,
+        struct llama_cognitive_hard_memory_request * out_request) {
+    return ctx && out_request && ctx->cognitive_hard_memory_get_request(command_id, out_request) ? 0 : -1;
+}
+
+int32_t llama_cognitive_hard_memory_submit_result(
+        struct llama_context * ctx,
+        const struct llama_cognitive_hard_memory_result * result,
+        struct llama_active_loop_trace * out_active_trace) {
+    return ctx && result && ctx->cognitive_hard_memory_submit_result(*result, out_active_trace) ? 0 : -1;
 }
 
 int32_t llama_cognitive_active_runner_get(

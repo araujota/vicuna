@@ -193,6 +193,8 @@ struct llama_context {
     bool self_state_upsert_model_extension(const llama_self_model_extension_update & update);
     bool self_state_remove_model_extension(const char * key);
     int32_t self_state_trace_count() const;
+    int32_t self_state_trace_token_count() const;
+    bool self_state_trace_get_item(int32_t index, llama_self_trace_item_info * out_info) const;
     bool self_state_clear_trace();
     bool self_state_replay_trace(int32_t upto_count);
     bool self_state_replay_trace_on_channel(int32_t upto_count, int32_t replay_channel);
@@ -212,6 +214,9 @@ struct llama_context {
     bool self_state_build_postwrite_features(const llama_self_state_event & event, llama_self_state_feature_vector * out_features) const;
     bool self_state_apply_postwrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
     bool self_state_note_validated_progress(float signed_progress, float efficiency_advantage);
+    bool self_state_promote_hard_memory_query(
+            const llama_hard_memory_query_request & request,
+            const llama_hard_memory_result & result);
     bool hard_memory_configure(const llama_hard_memory_config & config);
     bool hard_memory_get_config(llama_hard_memory_config * out_config) const;
     bool hard_memory_query(const llama_hard_memory_query_request & query, llama_hard_memory_result * out_result);
@@ -219,6 +224,10 @@ struct llama_context {
             const llama_hard_memory_primitive * primitives,
             int32_t primitive_count,
             const llama_self_state_delta_summary * delta_summary = nullptr);
+    bool hard_memory_set_request(const llama_cognitive_hard_memory_request & request);
+    bool hard_memory_get_request(int32_t command_id, llama_cognitive_hard_memory_request * out_request) const;
+    bool hard_memory_clear_request(int32_t command_id);
+    bool hard_memory_submit_result(const llama_hard_memory_result & result);
     bool hard_memory_get_last_result(llama_hard_memory_result * out_result) const;
     bool hard_memory_get_last_archive_trace(llama_hard_memory_archive_trace * out_trace) const;
     bool bash_tool_configure(const llama_bash_tool_config & config);
@@ -229,6 +238,8 @@ struct llama_context {
     bool bash_tool_get_last_result(llama_bash_tool_result * out_result) const;
     bool cognitive_bash_tool_get_request(int32_t command_id, llama_bash_tool_request * out_request) const;
     bool cognitive_bash_tool_submit_result(const llama_bash_tool_result & result, llama_active_loop_trace * out_active_trace);
+    bool cognitive_hard_memory_get_request(int32_t command_id, llama_cognitive_hard_memory_request * out_request) const;
+    bool cognitive_hard_memory_submit_result(const llama_cognitive_hard_memory_result & result, llama_active_loop_trace * out_active_trace);
     int32_t cognitive_tool_spec_count() const;
     bool cognitive_tool_spec_get(int32_t index, llama_cognitive_tool_spec * out_spec) const;
     bool cognitive_tool_spec_set(const llama_cognitive_tool_spec * specs, int32_t count);
