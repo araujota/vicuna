@@ -1,19 +1,44 @@
 #include "llama-context.h"
 
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+#include "ggml-opt.h"
+#include "ggml.h"
+#include "llama.h"
 #include "llama-active-lora.h"
+#include "llama-adapter.h"
 #include "llama-arch.h"
-#include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-bash-tool.h"
+#include "llama-cognitive-loop.h"
+#include "llama-cparams.h"
+#include "llama-graph.h"
+#include "llama-hard-memory.h"
+#include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-sampler.h"
+#include "llama-self-state.h"
 
+#include <algorithm>
+#include <array>
+#include <cassert>
 #include <cinttypes>
+#include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <limits>
+#include <map>
+#include <memory>
+#include <set>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 //
 // llama_context
@@ -24,11 +49,18 @@ llama_context::llama_context(
               llama_context_params params) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
-    loras(std::make_unique<llama_adapter_loras>()),
+    request_loras(std::make_unique<llama_adapter_lora_stack>()),
+    runtime_loras(std::make_unique<llama_adapter_lora_stack>()),
+    loras(std::make_unique<llama_adapter_lora_stack>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    self_state = std::make_unique<llama_self_state>();
+    cognitive_loop = std::make_unique<llama_cognitive_loop>(*this);
+    hard_memory = std::make_unique<llama_hard_memory>();
+    bash_tool = std::make_unique<llama_bash_tool>();
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -56,9 +88,13 @@ llama_context::llama_context(
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
 
-    cparams.n_ctx_orig_yarn  = params.yarn_orig_ctx    != 0 ? params.yarn_orig_ctx    :
-                               hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
-                                                              hparams.n_ctx_train;
+    if (params.yarn_orig_ctx != 0) {
+        cparams.n_ctx_orig_yarn = params.yarn_orig_ctx;
+    } else if (hparams.n_ctx_orig_yarn != 0) {
+        cparams.n_ctx_orig_yarn = hparams.n_ctx_orig_yarn;
+    } else {
+        cparams.n_ctx_orig_yarn = hparams.n_ctx_train;
+    }
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
@@ -1056,47 +1092,91 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 }
 
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
-    LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
+    LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, reinterpret_cast<const void *>(adapters));
 
     if (adapters_lora_are_same(adapters, n_adapters, scales)) {
         return;
     }
 
-    loras.reset(new llama_adapter_loras());
+    request_loras = std::make_unique<llama_adapter_lora_stack>();
 
     for (size_t i = 0; i < n_adapters; i ++) {
         if (scales[i] != 0.0f) {
-            loras->insert({adapters[i], scales[i]});
+            request_loras->push_back({
+                /*.adapter     =*/ adapters[i],
+                /*.scale       =*/ scales[i],
+                /*.precedence  =*/ llama_adapter_lora_layer_precedence(LLAMA_ADAPTER_LORA_LAYER_REQUEST) + (int32_t) request_loras->size(),
+                /*.role        =*/ LLAMA_ADAPTER_LORA_LAYER_REQUEST,
+            });
         }
     }
 
-    sched_need_reserve = true;
+    rebuild_lora_stack();
+    log_lora_stack();
 }
 
-bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
-    LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
+bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, const float * scales) {
+    LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, reinterpret_cast<const void *>(adapters));
 
-    // Adapters with a zero scale are never added to `loras`, so also ignore them for the comparison.
-    size_t n_non_zero = 0;
+    size_t idx_non_zero = 0;
 
     for (size_t i = 0; i < n_adapters; i ++) {
         if (scales[i] == 0.0f) {
             continue;
         }
-        n_non_zero++;
 
-        auto it = loras->find(adapters[i]);
+        if (!request_loras || idx_non_zero >= request_loras->size()) {
+            return false;
+        }
 
-        if (it == loras->end() || it->second != scales[i]) {
+        const auto & cur = (*request_loras)[idx_non_zero++];
+        const float scale = scales[i];
+        const float scale_tol = 1e-6f * std::max({1.0f, std::fabs(cur.scale), std::fabs(scale)});
+        if (cur.adapter != adapters[i] || std::fabs(cur.scale - scale) > scale_tol) {
             return false;
         }
     }
 
-    if (n_non_zero != loras->size()) {
+    if (request_loras && idx_non_zero != request_loras->size()) {
         return false;
     }
 
     return true;
+}
+
+void llama_context::rebuild_lora_stack() {
+    if (!loras) {
+        loras = std::make_unique<llama_adapter_lora_stack>();
+    }
+
+    loras->clear();
+
+    if (request_loras) {
+        loras->insert(loras->end(), request_loras->begin(), request_loras->end());
+    }
+    if (runtime_loras) {
+        loras->insert(loras->end(), runtime_loras->begin(), runtime_loras->end());
+    }
+
+    std::stable_sort(loras->begin(), loras->end(), [](const auto & lhs, const auto & rhs) {
+        return lhs.precedence < rhs.precedence;
+    });
+
+    ++lora_stack_version;
+    sched_need_reserve = true;
+}
+
+void llama_context::log_lora_stack() const {
+    if (!loras || loras->empty()) {
+        LLAMA_LOG_DEBUG("%s: effective serving stack is empty\n", __func__);
+        return;
+    }
+
+    for (size_t i = 0; i < loras->size(); ++i) {
+        const auto & layer = (*loras)[i];
+        LLAMA_LOG_DEBUG("%s: layer[%zu] role=%s precedence=%d scale=%.4f adapter=%p\n",
+                __func__, i, llama_adapter_lora_layer_role_name(layer.role), layer.precedence, layer.scale, (void *) layer.adapter);
+    }
 }
 
 bool llama_context::set_adapter_cvec(
@@ -1128,8 +1208,24 @@ bool llama_context::active_lora_ingest(const llama_token * tokens, size_t n_toke
     return active_lora_manager && active_lora_manager->ingest(tokens, n_tokens);
 }
 
+bool llama_context::active_lora_ingest(const llama_self_state_event & event, const llama_self_state_feature_vector * features) {
+    return active_lora_manager && active_lora_manager->ingest(event, features);
+}
+
+bool llama_context::active_lora_remediate(const llama_token * tokens, size_t n_tokens, float budget_scale) {
+    return active_lora_manager && active_lora_manager->remediate(tokens, n_tokens, budget_scale);
+}
+
+bool llama_context::active_lora_remediate(const llama_self_state_event & event, float budget_scale, const llama_self_state_feature_vector * features) {
+    return active_lora_manager && active_lora_manager->remediate(event, budget_scale, features);
+}
+
 bool llama_context::active_lora_get_stats(llama_active_lora_stats * out_stats) const {
     return active_lora_manager && active_lora_manager->get_stats(out_stats);
+}
+
+bool llama_context::user_personality_lora_get_stats(llama_user_personality_lora_stats * out_stats) const {
+    return active_lora_manager && active_lora_manager->user_personality_get_stats(out_stats);
 }
 
 bool llama_context::past_lora_init(const llama_past_lora_params & params) {
@@ -1141,29 +1237,247 @@ bool llama_context::past_lora_init(const llama_past_lora_params & params) {
 }
 
 bool llama_context::past_lora_tick(uint64_t now_us) {
-    return active_lora_manager && active_lora_manager->tick_past(now_us);
+    if (!active_lora_manager || !active_lora_manager->tick_past(now_us)) {
+        return false;
+    }
+
+    if (self_state) {
+        llama_past_lora_stats past_stats = {};
+        if (active_lora_manager->get_past_stats(&past_stats)) {
+            for (int bucket = 0; bucket < LLAMA_MEMORY_LORA_BUCKET_COUNT; ++bucket) {
+                const auto & stats = past_stats.buckets[bucket];
+                if (!stats.populated && stats.version == 0 && stats.effective_scale <= 0.0f) {
+                    continue;
+                }
+
+                std::array<float, 32> sketch = {};
+                const float values[] = {
+                    (float) bucket,
+                    (float) stats.version,
+                    stats.base_scale,
+                    stats.effective_scale,
+                    stats.gain_mean,
+                    stats.gain_max,
+                    stats.populated ? 1.0f : 0.0f,
+                };
+                for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+                    const size_t dim = ((size_t) bucket * 7 + i * 5) % sketch.size();
+                    sketch[dim] += values[i];
+                }
+
+                float norm = 0.0f;
+                for (float value : sketch) {
+                    norm += value * value;
+                }
+                norm = std::sqrt(norm);
+                if (norm > 0.0f) {
+                    for (float & value : sketch) {
+                        value /= norm;
+                    }
+                }
+
+                const float priority = std::min(1.0f, std::max(0.0f,
+                        0.60f * stats.effective_scale +
+                        0.20f * (stats.populated ? 1.0f : 0.0f) +
+                        0.20f * std::min(1.0f, stats.gain_max)));
+                (void) self_state->upsert_memory_handle_sketch(
+                        1000 + bucket,
+                        LLAMA_SELF_MEMORY_HANDLE_FROZEN_BUCKET,
+                        sketch,
+                        priority,
+                        std::max<uint32_t>(1, stats.version));
+            }
+        }
+    }
+
+    return true;
 }
 
 bool llama_context::past_lora_get_stats(llama_past_lora_stats * out_stats) const {
     return active_lora_manager && active_lora_manager->get_past_stats(out_stats);
 }
 
-void llama_context::attach_adapter_runtime(llama_adapter_lora * adapter, float scale) {
-    if (!loras) {
-        loras = std::make_unique<llama_adapter_loras>();
+int32_t llama_context::serving_lora_stack_count() const {
+    return loras ? (int32_t) loras->size() : 0;
+}
+
+bool llama_context::serving_lora_stack_layer(int32_t i, llama_serving_lora_layer_info * out_info) const {
+    if (!out_info || !loras || i < 0 || (size_t) i >= loras->size()) {
+        return false;
     }
 
-    (*loras)[adapter] = scale;
-    sched_need_reserve = true;
+    const auto & layer = (*loras)[i];
+    *out_info = {
+        /*.scale      =*/ layer.scale,
+        /*.precedence =*/ layer.precedence,
+        /*.role       =*/ (int32_t) layer.role,
+    };
+    return true;
+}
+
+int32_t llama_context::functional_lora_family_count() const {
+    return active_lora_manager ? active_lora_manager->functional_family_count() : 0;
+}
+
+bool llama_context::functional_lora_family_config_get(int32_t family, llama_functional_lora_family_config * out_config) const {
+    return active_lora_manager && active_lora_manager->functional_family_config_get(family, out_config);
+}
+
+bool llama_context::functional_lora_family_state_get(int32_t family, llama_functional_lora_family_state * out_state) const {
+    return active_lora_manager && active_lora_manager->functional_family_state_get(family, out_state);
+}
+
+bool llama_context::functional_lora_get_last_trace(llama_functional_lora_trace * out_trace) const {
+    return active_lora_manager && active_lora_manager->functional_get_last_trace(out_trace);
+}
+
+bool llama_context::functional_lora_get_last_update(int32_t family, llama_functional_lora_update_info * out_update) const {
+    return active_lora_manager && active_lora_manager->functional_get_last_update(family, out_update);
+}
+
+bool llama_context::functional_lora_set_ablation(const llama_functional_lora_ablation_config & config) {
+    return active_lora_manager && active_lora_manager->functional_set_ablation(config);
+}
+
+bool llama_context::functional_lora_get_ablation(llama_functional_lora_ablation_config * out_config) const {
+    return active_lora_manager && active_lora_manager->functional_get_ablation(out_config);
+}
+
+bool llama_context::active_temporal_encoding_bias_get(llama_active_temporal_encoding_bias * out_bias) const {
+    return active_lora_manager && active_lora_manager->temporal_encoding_bias_get(out_bias);
+}
+
+bool llama_context::active_temporal_encoding_bias_apply(
+        float signed_advantage,
+        float efficiency_advantage,
+        int64_t monotonic_ms) {
+    return active_lora_manager && active_lora_manager->temporal_encoding_bias_apply(
+            signed_advantage,
+            efficiency_advantage,
+            monotonic_ms);
+}
+
+bool llama_context::functional_lora_predict_activation(
+        const llama_functional_gating_observation & observation,
+        const llama_functional_activation_decision & policy_seed,
+        llama_functional_activation_decision * out_decision) {
+    return active_lora_manager && active_lora_manager->functional_predict_activation(
+            observation,
+            policy_seed,
+            out_decision);
+}
+
+bool llama_context::functional_lora_activate(const llama_functional_activation_decision & decision) {
+    return active_lora_manager && active_lora_manager->functional_activate(decision);
+}
+
+bool llama_context::functional_lora_note_command_complete(int32_t origin) {
+    return active_lora_manager && active_lora_manager->functional_note_command_complete(origin);
+}
+
+bool llama_context::functional_lora_apply_update(
+        int32_t family,
+        int32_t loop_origin,
+        int32_t start_microphase,
+        int32_t settle_microphase,
+        const llama_functional_outcome_snapshot & before,
+        const llama_functional_outcome_snapshot & after,
+        int32_t selected_tool_kind,
+        int32_t candidate_count,
+        const float * metrics,
+        size_t metric_count,
+        float signed_outcome,
+        float magnitude,
+        const llama_self_state_event & event,
+        const llama_self_state_feature_vector * features) {
+    return active_lora_manager && active_lora_manager->functional_apply_update(
+            family,
+            loop_origin,
+            start_microphase,
+            settle_microphase,
+            before,
+            after,
+            selected_tool_kind,
+            candidate_count,
+            metrics,
+            metric_count,
+            signed_outcome,
+            magnitude,
+            event,
+            features);
+}
+
+bool llama_context::user_simulation_override_begin() {
+    if (user_sim_override_active || !active_lora_manager) {
+        return false;
+    }
+
+    user_sim_saved_request_loras = request_loras ? std::make_unique<llama_adapter_lora_stack>(*request_loras) : nullptr;
+    user_sim_saved_runtime_loras = runtime_loras ? std::make_unique<llama_adapter_lora_stack>(*runtime_loras) : nullptr;
+    request_loras.reset();
+    runtime_loras = std::make_unique<llama_adapter_lora_stack>();
+    if (!active_lora_manager->user_personality_set_attached(true)) {
+        request_loras = std::move(user_sim_saved_request_loras);
+        runtime_loras = std::move(user_sim_saved_runtime_loras);
+        rebuild_lora_stack();
+        return false;
+    }
+    user_sim_override_active = true;
+    rebuild_lora_stack();
+    log_lora_stack();
+    return true;
+}
+
+bool llama_context::user_simulation_override_end() {
+    if (!user_sim_override_active) {
+        return false;
+    }
+
+    (void) active_lora_manager->user_personality_set_attached(false);
+    request_loras = std::move(user_sim_saved_request_loras);
+    runtime_loras = std::move(user_sim_saved_runtime_loras);
+    user_sim_override_active = false;
+    rebuild_lora_stack();
+    log_lora_stack();
+    return true;
+}
+
+void llama_context::attach_adapter_runtime(llama_adapter_lora * adapter, float scale, llama_adapter_lora_layer_role role) {
+    if (!runtime_loras) {
+        runtime_loras = std::make_unique<llama_adapter_lora_stack>();
+    }
+
+    auto it = std::find_if(runtime_loras->begin(), runtime_loras->end(), [&](const auto & layer) {
+        return layer.adapter == adapter;
+    });
+    if (it == runtime_loras->end()) {
+        runtime_loras->push_back({
+            /*.adapter     =*/ adapter,
+            /*.scale       =*/ scale,
+            /*.precedence  =*/ llama_adapter_lora_layer_precedence(role),
+            /*.role        =*/ role,
+        });
+    } else {
+        it->scale = scale;
+        it->precedence = llama_adapter_lora_layer_precedence(role);
+        it->role = role;
+    }
+
+    rebuild_lora_stack();
+    log_lora_stack();
 }
 
 void llama_context::detach_adapter_runtime(llama_adapter_lora * adapter) {
-    if (!loras) {
+    if (!runtime_loras) {
         return;
     }
 
-    loras->erase(adapter);
-    sched_need_reserve = true;
+    runtime_loras->erase(std::remove_if(runtime_loras->begin(), runtime_loras->end(), [&](const auto & layer) {
+        return layer.adapter == adapter;
+    }), runtime_loras->end());
+
+    rebuild_lora_stack();
+    log_lora_stack();
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -1174,7 +1488,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     auto * res = gf_res_prev.get();
-    auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
@@ -1192,7 +1505,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        auto * gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1327,8 +1640,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
                     GGML_ASSERT(embd.data != nullptr);
                     const uint32_t n_embd_out = hparams.n_embd_out();
 
-                    GGML_ASSERT(n_tokens*n_embd_out <= (int64_t) embd.size);
-                    ggml_backend_tensor_get_async(backend_embd, t_embd, embd.data, 0, n_tokens*n_embd_out*sizeof(float));
+                    const int64_t embd_elem_count = static_cast<int64_t>(n_tokens) * static_cast<int64_t>(n_embd_out);
+                    GGML_ASSERT(embd_elem_count >= 0 && embd_elem_count <= static_cast<int64_t>(embd.size));
+                    const size_t embd_nbytes = static_cast<size_t>(embd_elem_count) * sizeof(float);
+                    ggml_backend_tensor_get_async(backend_embd, t_embd, embd.data, 0, embd_nbytes);
                 } break;
             case LLAMA_POOLING_TYPE_MEAN:
             case LLAMA_POOLING_TYPE_CLS:
@@ -1964,7 +2279,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         offset += sampling.sampled.size * sizeof(llama_token);
 
         sampling.candidates = {(llama_token *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
-        offset += sampling.candidates.size * sizeof(llama_token);
 
         // The count vectors keep track of the actual number of logits/probs/candidates
         // copied from the backend for each output row.
@@ -2145,6 +2459,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.lora_stack_version =*/ lora_stack_version,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3180,10 +3495,23 @@ int32_t llama_active_lora_ingest(
     return ctx && ctx->active_lora_ingest(tokens, n_tokens) ? 0 : -1;
 }
 
+int32_t llama_active_lora_ingest_event(
+        llama_context * ctx,
+        const llama_self_state_event * event,
+        const llama_self_state_feature_vector * features) {
+    return ctx && event && ctx->active_lora_ingest(*event, features) ? 0 : -1;
+}
+
 int32_t llama_active_lora_get_stats(
         const llama_context * ctx,
         llama_active_lora_stats * out_stats) {
     return ctx && ctx->active_lora_get_stats(out_stats) ? 0 : -1;
+}
+
+int32_t llama_user_personality_lora_get_stats(
+        const llama_context * ctx,
+        llama_user_personality_lora_stats * out_stats) {
+    return ctx && ctx->user_personality_lora_get_stats(out_stats) ? 0 : -1;
 }
 
 int32_t llama_past_lora_init(
@@ -3202,6 +3530,66 @@ int32_t llama_past_lora_get_stats(
         const llama_context * ctx,
         llama_past_lora_stats * out_stats) {
     return ctx && ctx->past_lora_get_stats(out_stats) ? 0 : -1;
+}
+
+int32_t llama_serving_lora_stack_count(const llama_context * ctx) {
+    return ctx ? ctx->serving_lora_stack_count() : -1;
+}
+
+int32_t llama_serving_lora_stack_layer(
+        const llama_context * ctx,
+        int32_t i,
+        llama_serving_lora_layer_info * out_info) {
+    return ctx && ctx->serving_lora_stack_layer(i, out_info) ? 0 : -1;
+}
+
+int32_t llama_functional_lora_family_count(const llama_context * ctx) {
+    return ctx ? ctx->functional_lora_family_count() : -1;
+}
+
+int32_t llama_functional_lora_family_config_get(
+        const llama_context * ctx,
+        int32_t family,
+        llama_functional_lora_family_config * out_config) {
+    return ctx && ctx->functional_lora_family_config_get(family, out_config) ? 0 : -1;
+}
+
+int32_t llama_functional_lora_family_state_get(
+        const llama_context * ctx,
+        int32_t family,
+        llama_functional_lora_family_state * out_state) {
+    return ctx && ctx->functional_lora_family_state_get(family, out_state) ? 0 : -1;
+}
+
+int32_t llama_functional_lora_get_last_trace(
+        const llama_context * ctx,
+        llama_functional_lora_trace * out_trace) {
+    return ctx && ctx->functional_lora_get_last_trace(out_trace) ? 0 : -1;
+}
+
+int32_t llama_functional_lora_get_last_update(
+        const llama_context * ctx,
+        int32_t family,
+        llama_functional_lora_update_info * out_update) {
+    return ctx && ctx->functional_lora_get_last_update(family, out_update) ? 0 : -1;
+}
+
+int32_t llama_functional_lora_set_ablation(
+        llama_context * ctx,
+        llama_functional_lora_ablation_config config) {
+    return ctx && ctx->functional_lora_set_ablation(config) ? 0 : -1;
+}
+
+int32_t llama_functional_lora_get_ablation(
+        const llama_context * ctx,
+        llama_functional_lora_ablation_config * out_config) {
+    return ctx && ctx->functional_lora_get_ablation(out_config) ? 0 : -1;
+}
+
+int32_t llama_active_temporal_encoding_bias_get(
+        const llama_context * ctx,
+        llama_active_temporal_encoding_bias * out_bias) {
+    return ctx && ctx->active_temporal_encoding_bias_get(out_bias) ? 0 : -1;
 }
 
 //
@@ -3550,15 +3938,22 @@ void llama_memory_breakdown_print(const struct llama_context * ctx) {
             }
         }
 
-        size_t free, total;
+        size_t free = 0;
+        size_t total = 0;
         ggml_backend_dev_memory(dev, &free, &total);
 
         const size_t self = mb.model + mb.context + mb.compute;
         const size_t unaccounted = total - self - free;
 
+        std::string device_label = "  - ";
+        device_label += name;
+        device_label += " (";
+        device_label += desc;
+        device_label += ")";
+
         table_data.push_back({
             template_gpu,
-            "  - " + name + " (" + desc + ")",
+            device_label,
             std::to_string(total / MiB),
             std::to_string(free / MiB),
             std::to_string(self / MiB),

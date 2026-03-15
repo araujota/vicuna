@@ -1,11 +1,16 @@
 #include "server-context.h"
+#include "server-bash-tool.h"
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
 
+#include "chat.h"
+#include "base64.hpp"
 #include "common.h"
+#include "ggml.h"
 #include "llama.h"
+#include "llama-cpp.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -13,10 +18,37 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <cctype>
 #include <cinttypes>
-#include <memory>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <deque>
+#include <exception>
 #include <filesystem>
+#include <functional>
+#include <fstream>
+#include <iomanip>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
+
+#include "../../src/llama-hard-memory.h"
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -31,12 +63,42 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+struct self_state_token_view {
+    llama_tokens owned_tokens;
+    const llama_token * data = nullptr;
+    size_t size = 0;
+};
+
+static self_state_token_view make_self_state_token_view(const server_tokens & tokens) {
+    self_state_token_view view;
+    if (!tokens.has_mtmd) {
+        const llama_tokens & text_tokens = tokens.get_text_tokens();
+        view.data = text_tokens.empty() ? nullptr : text_tokens.data();
+        view.size = text_tokens.size();
+        return view;
+    }
+
+    // Active-loop/self-state ingestion is text-native. For multimodal prompts,
+    // preserve the textual thread while excluding media placeholders.
+    view.owned_tokens.reserve(tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const llama_token token = tokens[i];
+        if (token != LLAMA_TOKEN_NULL) {
+            view.owned_tokens.push_back(token);
+        }
+    }
+    view.data = view.owned_tokens.empty() ? nullptr : view.owned_tokens.data();
+    view.size = view.owned_tokens.size();
+    return view;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
     SLOT_STATE_WAIT_OTHER, // after assigning a task, but waiting for parent slot to process prompt
     SLOT_STATE_STARTED,    // after assigning a task and about to process prompt
     SLOT_STATE_PROCESSING_PROMPT,
+    SLOT_STATE_REPLAYING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
 };
@@ -100,9 +162,10 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+    std::unique_ptr<server_tokens> replay_tokens;
 
     void prompt_save(server_prompt_cache & prompt_cache) const {
-        GGML_ASSERT(prompt.data.size() == 0);
+        GGML_ASSERT(prompt.data.empty());
 
         const size_t cur_size = llama_state_seq_get_size_ext(ctx, id, 0);
 
@@ -135,6 +198,7 @@ struct server_slot {
 
         llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
         prompt.tokens.clear();
+        replay_tokens.reset();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -188,6 +252,7 @@ struct server_slot {
 
         task_prev = std::move(task);
         task.reset();
+        replay_tokens.reset();
 
         llama_set_sampler(ctx, id, nullptr);
 
@@ -217,6 +282,18 @@ struct server_slot {
 
         SLT_INF(*this, "init sampler, took %0.2f ms, tokens: text = %d, total = %d\n",
                 (ggml_time_us() - t_start) / 1000.0, n_text, (int) prompt.tokens.size());
+    }
+
+    bool is_replaying_prompt() const {
+        return replay_tokens != nullptr;
+    }
+
+    const server_tokens & input_tokens_ref() const {
+        return replay_tokens ? *replay_tokens : task->tokens;
+    }
+
+    int input_tokens_count() const {
+        return replay_tokens ? (int) replay_tokens->size() : task->n_tokens();
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
@@ -517,6 +594,614 @@ struct server_metrics {
     }
 };
 
+enum vicuna_external_work_kind {
+    VICUNA_EXTERNAL_WORK_BASH = 0,
+    VICUNA_EXTERNAL_WORK_HARD_MEMORY = 1,
+};
+
+struct vicuna_external_work_item {
+    int32_t command_id = -1;
+    int32_t origin = -1;
+    int32_t tool_kind = LLAMA_TOOL_KIND_NONE;
+    vicuna_external_work_kind kind = VICUNA_EXTERNAL_WORK_BASH;
+    llama_bash_tool_request bash_request = {};
+    llama_cognitive_hard_memory_request hard_memory_request = {};
+    llama_hard_memory_config hard_memory_config = {};
+    int64_t enqueued_ms = 0;
+};
+
+struct vicuna_external_work_result {
+    int32_t command_id = -1;
+    int32_t origin = -1;
+    int32_t tool_kind = LLAMA_TOOL_KIND_NONE;
+    vicuna_external_work_kind kind = VICUNA_EXTERNAL_WORK_BASH;
+    llama_bash_tool_result bash_result = {};
+    llama_cognitive_hard_memory_result hard_memory_result = {};
+    int64_t completed_ms = 0;
+};
+
+struct vicuna_external_work_queue {
+    mutable std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<vicuna_external_work_item> pending;
+    std::deque<vicuna_external_work_result> completed;
+    std::unordered_set<int32_t> inflight_ids;
+    bool stop = false;
+};
+
+struct vicuna_runtime_persistence_state {
+    bool enabled = false;
+    bool healthy = true;
+    bool restore_attempted = false;
+    bool restore_success = false;
+    uint64_t persist_success_total = 0;
+    uint64_t persist_fail_total = 0;
+    int64_t last_persist_ms = 0;
+    int64_t last_restore_ms = 0;
+    std::string snapshot_path;
+    std::string last_error;
+};
+
+struct vicuna_external_observability {
+    uint64_t bash_dispatch_total = 0;
+    uint64_t bash_complete_total = 0;
+    uint64_t bash_fail_total = 0;
+    uint64_t hard_memory_dispatch_total = 0;
+    uint64_t hard_memory_complete_total = 0;
+    uint64_t hard_memory_fail_total = 0;
+};
+
+struct vicuna_mailbox_event {
+    uint64_t sequence_number = 0;
+    std::string response_id;
+    json event;
+};
+
+struct vicuna_stored_response {
+    std::string response_id;
+    json response = json::object();
+    std::vector<vicuna_mailbox_event> events;
+    int64_t created_ms = 0;
+    int64_t completed_ms = 0;
+};
+
+struct vicuna_proactive_mailbox {
+    mutable std::mutex mutex;
+    std::condition_variable cv;
+    size_t max_responses = 64;
+    uint64_t next_sequence_number = 1;
+    std::deque<std::string> response_order;
+    std::unordered_map<std::string, vicuna_stored_response> responses;
+    std::deque<vicuna_mailbox_event> live_events;
+    bool live_stream_connected = false;
+    uint64_t publish_total = 0;
+    uint64_t complete_total = 0;
+    uint64_t fail_total = 0;
+    uint64_t dropped_total = 0;
+    int64_t last_publish_ms = 0;
+};
+
+struct vicuna_mailbox_snapshot {
+    size_t max_responses = 64;
+    uint64_t next_sequence_number = 1;
+    std::deque<std::string> response_order;
+    std::unordered_map<std::string, vicuna_stored_response> responses;
+    std::deque<vicuna_mailbox_event> live_events;
+    bool live_stream_connected = false;
+    uint64_t publish_total = 0;
+    uint64_t complete_total = 0;
+    uint64_t fail_total = 0;
+    uint64_t dropped_total = 0;
+    int64_t last_publish_ms = 0;
+};
+
+static std::string bounded_cstr_to_string(const char * value) {
+    return value ? std::string(value) : std::string();
+}
+
+static bool parse_env_flag(const char * value, bool fallback) {
+    if (!value) {
+        return fallback;
+    }
+    return std::atoi(value) != 0;
+}
+
+static bool request_param_truthy(const std::string & value) {
+    if (value.empty()) {
+        return false;
+    }
+
+    std::string normalized = value;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+        return (char) std::tolower(ch);
+    });
+    return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
+}
+
+static uint64_t parse_uint64_param(const std::string & value, uint64_t fallback = 0) {
+    if (value.empty()) {
+        return fallback;
+    }
+    try {
+        return std::stoull(value);
+    } catch (...) {
+        return fallback;
+    }
+}
+
+static std::string trim_ascii_copy(const std::string & value) {
+    size_t begin = 0;
+    size_t end = value.size();
+    while (begin < end && std::isspace((unsigned char) value[begin])) {
+        ++begin;
+    }
+    while (end > begin && std::isspace((unsigned char) value[end - 1])) {
+        --end;
+    }
+    return value.substr(begin, end - begin);
+}
+
+static std::string proactive_mailbox_message(
+        const llama_dmn_tick_trace & dmn_trace,
+        const llama_remediation_plan & remediation,
+        const llama_governance_trace & governance,
+        float directness_preference,
+        float verbosity_preference) {
+    const bool terse = directness_preference >= 0.60f && verbosity_preference <= 0.45f;
+    const std::string repair_message = trim_ascii_copy(bounded_cstr_to_string(governance.repair_message));
+    if (!repair_message.empty()) {
+        return repair_message;
+    }
+
+    auto concise_or_full = [terse](const std::string & concise, const std::string & full) {
+        return terse ? concise : full;
+    };
+
+    if (governance.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR || dmn_trace.pressure.repair >= 0.45f) {
+        return concise_or_full(
+                "I may need to correct course before I continue.",
+                "I may need to correct course. I am reassessing before I continue.");
+    }
+
+    if (remediation.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO) {
+        switch (remediation.tool_kind == LLAMA_TOOL_KIND_NONE ? dmn_trace.tool_kind : remediation.tool_kind) {
+            case LLAMA_TOOL_KIND_HARD_MEMORY_QUERY:
+                return concise_or_full(
+                        "I am checking related context before I continue.",
+                        "I am checking related context before I continue so I do not miss something important.");
+            case LLAMA_TOOL_KIND_BASH_CLI:
+                return concise_or_full(
+                        "I am inspecting the runtime state before I continue.",
+                        "I am inspecting the runtime state before I continue so I can verify the next step.");
+            default:
+                return concise_or_full(
+                        "I am checking one more thing before I continue.",
+                        "I am checking one more thing before I continue so I can answer more reliably.");
+        }
+    }
+
+    if (remediation.action == LLAMA_REMEDIATION_ACTION_ACTIVE_LORA_UPDATE) {
+        return concise_or_full(
+                "I am adjusting my approach before I continue.",
+                "I am adjusting my approach before I continue so the next message is more useful.");
+    }
+
+    if (dmn_trace.pressure.uncertainty >= 0.45f) {
+        return concise_or_full(
+                "I want to verify a detail before I continue.",
+                "I want to verify a detail before I continue rather than guess.");
+    }
+
+    if (dmn_trace.pressure.continuation >= 0.55f) {
+        return concise_or_full(
+                "I have a follow-up that should help.",
+                "I have a short follow-up that should help before we move on.");
+    }
+
+    return concise_or_full(
+            "I have a brief update before we continue.",
+            "I have a brief update before we continue.");
+}
+
+static json build_proactive_response_object(
+        const std::string & response_id,
+        const std::string & message_id,
+        const std::string & model_name,
+        const std::string & text,
+        std::time_t created_at) {
+    const json content_part = {
+        {"type",        "output_text"},
+        {"annotations", json::array()},
+        {"logprobs",    json::array()},
+        {"text",        text},
+    };
+    return json {
+        {"id",           response_id},
+        {"object",       "response"},
+        {"created_at",   created_at},
+        {"completed_at", created_at},
+        {"model",        model_name},
+        {"status",       "completed"},
+        {"output", json::array({
+            json {
+                {"type",    "message"},
+                {"status",  "completed"},
+                {"id",      message_id},
+                {"role",    "assistant"},
+                {"content", json::array({content_part})},
+            }
+        })},
+        {"usage", json {
+            {"input_tokens",  0},
+            {"output_tokens", 0},
+            {"total_tokens",  0},
+        }},
+    };
+}
+
+static std::vector<json> build_proactive_response_events(
+        const std::string & response_id,
+        const std::string & message_id,
+        const std::string & text,
+        const json & response_object) {
+    const json partial_response = {
+        {"id",         response_id},
+        {"object",     "response"},
+        {"created_at", response_object.at("created_at")},
+        {"status",     "in_progress"},
+    };
+    const json added_item = {
+        {"type",    "message"},
+        {"status",  "in_progress"},
+        {"id",      message_id},
+        {"role",    "assistant"},
+        {"content", json::array()},
+    };
+    const json content_part = {
+        {"type",        "output_text"},
+        {"annotations", json::array()},
+        {"logprobs",    json::array()},
+        {"text",        text},
+    };
+
+    return {
+        json {
+            {"event", "response.created"},
+            {"data", {
+                {"type", "response.created"},
+                {"response", partial_response},
+            }},
+        },
+        json {
+            {"event", "response.in_progress"},
+            {"data", {
+                {"type", "response.in_progress"},
+                {"response", partial_response},
+            }},
+        },
+        json {
+            {"event", "response.output_item.added"},
+            {"data", {
+                {"type",         "response.output_item.added"},
+                {"output_index", 0},
+                {"item",         added_item},
+            }},
+        },
+        json {
+            {"event", "response.content_part.added"},
+            {"data", {
+                {"type",          "response.content_part.added"},
+                {"item_id",       message_id},
+                {"output_index",  0},
+                {"content_index", 0},
+                {"part", json {
+                    {"type", "output_text"},
+                    {"text", ""},
+                }},
+            }},
+        },
+        json {
+            {"event", "response.output_text.delta"},
+            {"data", {
+                {"type",          "response.output_text.delta"},
+                {"item_id",       message_id},
+                {"output_index",  0},
+                {"content_index", 0},
+                {"delta",         text},
+            }},
+        },
+        json {
+            {"event", "response.output_text.done"},
+            {"data", {
+                {"type",          "response.output_text.done"},
+                {"item_id",       message_id},
+                {"output_index",  0},
+                {"content_index", 0},
+                {"text",          text},
+            }},
+        },
+        json {
+            {"event", "response.content_part.done"},
+            {"data", {
+                {"type",          "response.content_part.done"},
+                {"item_id",       message_id},
+                {"output_index",  0},
+                {"content_index", 0},
+                {"part",          content_part},
+            }},
+        },
+        json {
+            {"event", "response.output_item.done"},
+            {"data", {
+                {"type",         "response.output_item.done"},
+                {"output_index", 0},
+                {"item", json {
+                    {"type",    "message"},
+                    {"status",  "completed"},
+                    {"id",      message_id},
+                    {"role",    "assistant"},
+                    {"content", json::array({content_part})},
+                }},
+            }},
+        },
+        json {
+            {"event", "response.completed"},
+            {"data", {
+                {"type",     "response.completed"},
+                {"response", response_object},
+            }},
+        },
+    };
+}
+
+static vicuna_mailbox_snapshot proactive_mailbox_snapshot_copy(const vicuna_proactive_mailbox & mailbox) {
+    std::lock_guard<std::mutex> lock(mailbox.mutex);
+
+    vicuna_mailbox_snapshot snapshot = {};
+    snapshot.max_responses = mailbox.max_responses;
+    snapshot.next_sequence_number = mailbox.next_sequence_number;
+    snapshot.response_order = mailbox.response_order;
+    snapshot.responses = mailbox.responses;
+    snapshot.live_events = mailbox.live_events;
+    snapshot.live_stream_connected = mailbox.live_stream_connected;
+    snapshot.publish_total = mailbox.publish_total;
+    snapshot.complete_total = mailbox.complete_total;
+    snapshot.fail_total = mailbox.fail_total;
+    snapshot.dropped_total = mailbox.dropped_total;
+    snapshot.last_publish_ms = mailbox.last_publish_ms;
+    return snapshot;
+}
+
+static json proactive_mailbox_to_json(const vicuna_proactive_mailbox & mailbox) {
+    const vicuna_mailbox_snapshot snapshot = proactive_mailbox_snapshot_copy(mailbox);
+
+    json responses = json::array();
+    for (const std::string & response_id : snapshot.response_order) {
+        auto it = snapshot.responses.find(response_id);
+        if (it == snapshot.responses.end()) {
+            continue;
+        }
+
+        json response_events = json::array();
+        for (const auto & stored_event : it->second.events) {
+            response_events.push_back({
+                {"sequence_number", stored_event.sequence_number},
+                {"event",           stored_event.event},
+            });
+        }
+
+        responses.push_back({
+            {"response_id",   it->second.response_id},
+            {"created_ms",    it->second.created_ms},
+            {"completed_ms",  it->second.completed_ms},
+            {"response",      it->second.response},
+            {"events",        response_events},
+        });
+    }
+
+    return json {
+        {"max_responses",         snapshot.max_responses},
+        {"next_sequence_number",  snapshot.next_sequence_number},
+        {"live_stream_connected", false},
+        {"publish_total",         snapshot.publish_total},
+        {"complete_total",        snapshot.complete_total},
+        {"fail_total",            snapshot.fail_total},
+        {"dropped_total",         snapshot.dropped_total},
+        {"last_publish_ms",       snapshot.last_publish_ms},
+        {"responses",             responses},
+    };
+}
+
+static bool proactive_mailbox_from_json(const json & data, vicuna_proactive_mailbox * out_mailbox) {
+    if (!out_mailbox || !data.is_object()) {
+        return false;
+    }
+
+    vicuna_mailbox_snapshot restored = {};
+    restored.max_responses = std::max<size_t>(1, json_value(data, "max_responses", restored.max_responses));
+    restored.next_sequence_number = json_value(data, "next_sequence_number", restored.next_sequence_number);
+    restored.publish_total = json_value(data, "publish_total", restored.publish_total);
+    restored.complete_total = json_value(data, "complete_total", restored.complete_total);
+    restored.fail_total = json_value(data, "fail_total", restored.fail_total);
+    restored.dropped_total = json_value(data, "dropped_total", restored.dropped_total);
+    restored.last_publish_ms = json_value(data, "last_publish_ms", restored.last_publish_ms);
+
+    if (data.contains("responses") && data.at("responses").is_array()) {
+        for (const auto & entry : data.at("responses")) {
+            const std::string response_id = json_value(entry, "response_id", std::string());
+            if (response_id.empty() || !entry.contains("response") || !entry.at("response").is_object()) {
+                continue;
+            }
+
+            vicuna_stored_response stored = {};
+            stored.response_id = response_id;
+            stored.created_ms = json_value(entry, "created_ms", int64_t(0));
+            stored.completed_ms = json_value(entry, "completed_ms", int64_t(0));
+            stored.response = entry.at("response");
+
+            if (entry.contains("events") && entry.at("events").is_array()) {
+                for (const auto & event_entry : entry.at("events")) {
+                    if (!event_entry.contains("event")) {
+                        continue;
+                    }
+                    vicuna_mailbox_event stored_event = {};
+                    stored_event.sequence_number = json_value(event_entry, "sequence_number", uint64_t(0));
+                    stored_event.response_id = response_id;
+                    stored_event.event = event_entry.at("event");
+                    restored.live_events.push_back(stored_event);
+                    stored.events.push_back(std::move(stored_event));
+                }
+            }
+
+            restored.response_order.push_back(response_id);
+            restored.responses.emplace(response_id, std::move(stored));
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(out_mailbox->mutex);
+        out_mailbox->max_responses = restored.max_responses;
+        out_mailbox->next_sequence_number = restored.next_sequence_number;
+        out_mailbox->response_order = std::move(restored.response_order);
+        out_mailbox->responses = std::move(restored.responses);
+        out_mailbox->live_events = std::move(restored.live_events);
+        out_mailbox->live_stream_connected = false;
+        out_mailbox->publish_total = restored.publish_total;
+        out_mailbox->complete_total = restored.complete_total;
+        out_mailbox->fail_total = restored.fail_total;
+        out_mailbox->dropped_total = restored.dropped_total;
+        out_mailbox->last_publish_ms = restored.last_publish_ms;
+    }
+    out_mailbox->cv.notify_all();
+    return true;
+}
+
+static json bash_tool_config_to_json(const llama_bash_tool_config & config) {
+    return json {
+        {"enabled", config.enabled},
+        {"inherit_env", config.inherit_env},
+        {"login_shell", config.login_shell},
+        {"reject_shell_metacharacters", config.reject_shell_metacharacters},
+        {"timeout_ms", config.timeout_ms},
+        {"cpu_time_limit_secs", config.cpu_time_limit_secs},
+        {"max_child_processes", config.max_child_processes},
+        {"max_open_files", config.max_open_files},
+        {"max_file_size_bytes", config.max_file_size_bytes},
+        {"max_stdout_bytes", config.max_stdout_bytes},
+        {"max_stderr_bytes", config.max_stderr_bytes},
+        {"bash_path", bounded_cstr_to_string(config.bash_path)},
+        {"working_directory", bounded_cstr_to_string(config.working_directory)},
+        {"allowed_commands", bounded_cstr_to_string(config.allowed_commands)},
+        {"blocked_patterns", bounded_cstr_to_string(config.blocked_patterns)},
+        {"allowed_env", bounded_cstr_to_string(config.allowed_env)},
+    };
+}
+
+static bool bash_tool_config_from_json(const json & data, llama_bash_tool_config * out_config) {
+    if (!out_config || !data.is_object()) {
+        return false;
+    }
+
+    *out_config = llama_bash_tool_default_config();
+    out_config->enabled = json_value(data, "enabled", out_config->enabled);
+    out_config->inherit_env = json_value(data, "inherit_env", out_config->inherit_env);
+    out_config->login_shell = json_value(data, "login_shell", out_config->login_shell);
+    out_config->reject_shell_metacharacters = json_value(data, "reject_shell_metacharacters", out_config->reject_shell_metacharacters);
+    out_config->timeout_ms = json_value(data, "timeout_ms", out_config->timeout_ms);
+    out_config->cpu_time_limit_secs = json_value(data, "cpu_time_limit_secs", out_config->cpu_time_limit_secs);
+    out_config->max_child_processes = json_value(data, "max_child_processes", out_config->max_child_processes);
+    out_config->max_open_files = json_value(data, "max_open_files", out_config->max_open_files);
+    out_config->max_file_size_bytes = json_value(data, "max_file_size_bytes", out_config->max_file_size_bytes);
+    out_config->max_stdout_bytes = json_value(data, "max_stdout_bytes", out_config->max_stdout_bytes);
+    out_config->max_stderr_bytes = json_value(data, "max_stderr_bytes", out_config->max_stderr_bytes);
+    std::snprintf(out_config->bash_path, sizeof(out_config->bash_path), "%s", json_value(data, "bash_path", std::string(out_config->bash_path)).c_str());
+    std::snprintf(out_config->working_directory, sizeof(out_config->working_directory), "%s", json_value(data, "working_directory", std::string(out_config->working_directory)).c_str());
+    std::snprintf(out_config->allowed_commands, sizeof(out_config->allowed_commands), "%s", json_value(data, "allowed_commands", std::string(out_config->allowed_commands)).c_str());
+    std::snprintf(out_config->blocked_patterns, sizeof(out_config->blocked_patterns), "%s", json_value(data, "blocked_patterns", std::string(out_config->blocked_patterns)).c_str());
+    std::snprintf(out_config->allowed_env, sizeof(out_config->allowed_env), "%s", json_value(data, "allowed_env", std::string(out_config->allowed_env)).c_str());
+    return true;
+}
+
+static json hard_memory_config_to_json(const llama_hard_memory_config & config) {
+    return json {
+        {"enabled", config.enabled},
+        {"archive_enabled", config.archive_enabled},
+        {"include_profile_by_default", config.include_profile_by_default},
+        {"archive_counterfactual_events", config.archive_counterfactual_events},
+        {"timeout_ms", config.timeout_ms},
+        {"max_results", config.max_results},
+        {"query_threshold", config.query_threshold},
+        {"archival_delta_threshold", config.archival_delta_threshold},
+        {"base_url", bounded_cstr_to_string(config.base_url)},
+        {"auth_token", bounded_cstr_to_string(config.auth_token)},
+        {"container_tag", bounded_cstr_to_string(config.container_tag)},
+        {"runtime_identity", bounded_cstr_to_string(config.runtime_identity)},
+    };
+}
+
+static bool hard_memory_config_from_json(const json & data, llama_hard_memory_config * out_config) {
+    if (!out_config || !data.is_object()) {
+        return false;
+    }
+
+    *out_config = llama_hard_memory_default_config();
+    out_config->enabled = json_value(data, "enabled", out_config->enabled);
+    out_config->archive_enabled = json_value(data, "archive_enabled", out_config->archive_enabled);
+    out_config->include_profile_by_default = json_value(data, "include_profile_by_default", out_config->include_profile_by_default);
+    out_config->archive_counterfactual_events = json_value(data, "archive_counterfactual_events", out_config->archive_counterfactual_events);
+    out_config->timeout_ms = json_value(data, "timeout_ms", out_config->timeout_ms);
+    out_config->max_results = json_value(data, "max_results", out_config->max_results);
+    out_config->query_threshold = json_value(data, "query_threshold", out_config->query_threshold);
+    out_config->archival_delta_threshold = json_value(data, "archival_delta_threshold", out_config->archival_delta_threshold);
+    std::snprintf(out_config->base_url, sizeof(out_config->base_url), "%s", json_value(data, "base_url", std::string(out_config->base_url)).c_str());
+    std::snprintf(out_config->auth_token, sizeof(out_config->auth_token), "%s", json_value(data, "auth_token", std::string(out_config->auth_token)).c_str());
+    std::snprintf(out_config->container_tag, sizeof(out_config->container_tag), "%s", json_value(data, "container_tag", std::string(out_config->container_tag)).c_str());
+    std::snprintf(out_config->runtime_identity, sizeof(out_config->runtime_identity), "%s", json_value(data, "runtime_identity", std::string(out_config->runtime_identity)).c_str());
+    return true;
+}
+
+static json model_extension_info_to_json(const llama_self_model_extension_info & info) {
+    return json {
+        {"source", info.source},
+        {"source_tool_kind", info.source_tool_kind},
+        {"kind", info.kind},
+        {"domain", info.domain},
+        {"flags", info.flags},
+        {"value", info.value},
+        {"desired_value", info.desired_value},
+        {"confidence", info.confidence},
+        {"salience", info.salience},
+        {"gain_weight", info.gain_weight},
+        {"allostatic_weight", info.allostatic_weight},
+        {"key", bounded_cstr_to_string(info.key)},
+        {"label", bounded_cstr_to_string(info.label)},
+        {"content", bounded_cstr_to_string(info.content)},
+    };
+}
+
+static bool model_extension_update_from_json(const json & data, llama_self_model_extension_update * out_update) {
+    if (!out_update || !data.is_object()) {
+        return false;
+    }
+
+    *out_update = llama_self_model_extension_default_update();
+    out_update->source = json_value(data, "source", out_update->source);
+    out_update->source_tool_kind = json_value(data, "source_tool_kind", out_update->source_tool_kind);
+    out_update->kind = json_value(data, "kind", out_update->kind);
+    out_update->domain = json_value(data, "domain", out_update->domain);
+    out_update->flags = json_value(data, "flags", out_update->flags);
+    out_update->value = json_value(data, "value", out_update->value);
+    out_update->desired_value = json_value(data, "desired_value", out_update->desired_value);
+    out_update->confidence = json_value(data, "confidence", out_update->confidence);
+    out_update->salience = json_value(data, "salience", out_update->salience);
+    out_update->gain_weight = json_value(data, "gain_weight", out_update->gain_weight);
+    out_update->allostatic_weight = json_value(data, "allostatic_weight", out_update->allostatic_weight);
+    std::snprintf(out_update->key, sizeof(out_update->key), "%s", json_value(data, "key", std::string(out_update->key)).c_str());
+    std::snprintf(out_update->label, sizeof(out_update->label), "%s", json_value(data, "label", std::string(out_update->label)).c_str());
+    std::snprintf(out_update->content, sizeof(out_update->content), "%s", json_value(data, "content", std::string(out_update->content)).c_str());
+    return true;
+}
+
 
 //
 // server_context_impl (private implementation)
@@ -524,6 +1209,7 @@ struct server_metrics {
 
 struct server_context_impl {
     friend struct server_context;
+    friend struct server_routes;
 
 public:
     // only use these pointers outside of this class:
@@ -585,12 +1271,327 @@ private:
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
 
+    server_state state = SERVER_STATE_LOADING_MODEL;
     bool sleeping = false;
+    vicuna_external_work_queue bash_work;
+    vicuna_external_work_queue hard_memory_work;
+    std::thread bash_worker;
+    std::thread hard_memory_worker;
+    mutable std::mutex runtime_state_mutex;
+    std::unordered_map<int32_t, server_task> waiting_active_tasks;
+    vicuna_runtime_persistence_state runtime_persistence;
+    vicuna_external_observability external_observability;
+    mutable vicuna_proactive_mailbox proactive_mailbox;
+    bool runtime_state_dirty = false;
+
+    static int32_t count_pending_external_work(const vicuna_external_work_queue & queue) {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        return (int32_t) (queue.pending.size() + queue.inflight_ids.size());
+    }
+
+    bool has_waiting_active_tasks() const {
+        std::lock_guard<std::mutex> lock(runtime_state_mutex);
+        return !waiting_active_tasks.empty();
+    }
+
+    void mark_runtime_state_dirty(const char * reason) {
+        std::lock_guard<std::mutex> lock(runtime_state_mutex);
+        runtime_state_dirty = true;
+        if (reason && reason[0] != '\0') {
+            SRV_DBG("runtime state dirty: %s\n", reason);
+        }
+    }
+
+    void post_next_response_task() {
+        server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
+        task.id = queue_tasks.get_new_id();
+        queue_tasks.post(std::move(task), true);
+    }
+
+    static void proactive_mailbox_rebuild_live_events_locked(vicuna_proactive_mailbox & mailbox) {
+        mailbox.live_events.clear();
+        for (const std::string & response_id : mailbox.response_order) {
+            auto it = mailbox.responses.find(response_id);
+            if (it == mailbox.responses.end()) {
+                continue;
+            }
+            for (const auto & event : it->second.events) {
+                mailbox.live_events.push_back(event);
+            }
+        }
+    }
+
+    static void proactive_mailbox_prune_locked(vicuna_proactive_mailbox & mailbox) {
+        bool pruned = false;
+        while (mailbox.response_order.size() > mailbox.max_responses) {
+            const std::string response_id = mailbox.response_order.front();
+            mailbox.response_order.pop_front();
+            if (mailbox.responses.erase(response_id) > 0) {
+                mailbox.dropped_total++;
+                pruned = true;
+                SRV_INF("proactive mailbox evicted response=%s\n", response_id.c_str());
+            }
+        }
+        if (pruned) {
+            proactive_mailbox_rebuild_live_events_locked(mailbox);
+        }
+    }
+
+    bool proactive_mailbox_publish(
+            const std::string & text,
+            const char * source,
+            std::string * out_response_id = nullptr) const {
+        const std::string trimmed = trim_ascii_copy(text);
+        if (trimmed.empty()) {
+            return false;
+        }
+
+        const std::string response_id = "resp_" + random_string();
+        const std::string message_id = "msg_" + random_string();
+        const std::time_t now_seconds = std::time(nullptr);
+        const int64_t now_ms = ggml_time_ms();
+
+        vicuna_stored_response stored = {};
+        stored.response_id = response_id;
+        stored.created_ms = now_ms;
+        stored.completed_ms = now_ms;
+        stored.response = build_proactive_response_object(
+                response_id,
+                message_id,
+                model_name.empty() ? "vicuna" : model_name,
+                trimmed,
+                now_seconds);
+
+        std::vector<json> events = build_proactive_response_events(
+                response_id,
+                message_id,
+                trimmed,
+                stored.response);
+
+        {
+            std::lock_guard<std::mutex> lock(proactive_mailbox.mutex);
+            for (const auto & event : events) {
+                vicuna_mailbox_event stored_event = {};
+                stored_event.sequence_number = proactive_mailbox.next_sequence_number++;
+                stored_event.response_id = response_id;
+                stored_event.event = event;
+                proactive_mailbox.live_events.push_back(stored_event);
+                stored.events.push_back(std::move(stored_event));
+            }
+            proactive_mailbox.responses[response_id] = stored;
+            proactive_mailbox.response_order.push_back(response_id);
+            proactive_mailbox.publish_total++;
+            proactive_mailbox.complete_total++;
+            proactive_mailbox.last_publish_ms = now_ms;
+            proactive_mailbox_prune_locked(proactive_mailbox);
+        }
+
+        proactive_mailbox.cv.notify_all();
+        if (out_response_id) {
+            *out_response_id = response_id;
+        }
+        SRV_INF("proactive mailbox published response=%s source=%s\n",
+                response_id.c_str(),
+                source ? source : "unknown");
+        return true;
+    }
+
+    bool proactive_mailbox_get_response(const std::string & response_id, json * out_response) const {
+        std::lock_guard<std::mutex> lock(proactive_mailbox.mutex);
+        auto it = proactive_mailbox.responses.find(response_id);
+        if (it == proactive_mailbox.responses.end()) {
+            return false;
+        }
+        if (out_response) {
+            *out_response = it->second.response;
+        }
+        return true;
+    }
+
+    bool proactive_mailbox_get_response_events(
+            const std::string & response_id,
+            uint64_t after_sequence,
+            std::vector<json> * out_events) const {
+        std::lock_guard<std::mutex> lock(proactive_mailbox.mutex);
+        auto it = proactive_mailbox.responses.find(response_id);
+        if (it == proactive_mailbox.responses.end()) {
+            return false;
+        }
+        if (!out_events) {
+            return true;
+        }
+        out_events->clear();
+        for (const auto & event : it->second.events) {
+            if (event.sequence_number > after_sequence) {
+                out_events->push_back(event.event);
+            }
+        }
+        return true;
+    }
+
+    std::vector<json> proactive_mailbox_collect_live_events(uint64_t after_sequence, uint64_t * out_last_sequence) const {
+        std::lock_guard<std::mutex> lock(proactive_mailbox.mutex);
+        std::vector<json> events;
+        uint64_t last_sequence = after_sequence;
+        for (const auto & event : proactive_mailbox.live_events) {
+            if (event.sequence_number <= after_sequence) {
+                continue;
+            }
+            events.push_back(event.event);
+            last_sequence = event.sequence_number;
+        }
+        if (out_last_sequence) {
+            *out_last_sequence = last_sequence;
+        }
+        return events;
+    }
+
+    void proactive_mailbox_wait_for_live_events(uint64_t after_sequence, const std::function<bool()> & should_stop) const {
+        std::unique_lock<std::mutex> lock(proactive_mailbox.mutex);
+        proactive_mailbox.cv.wait_for(
+                lock,
+                std::chrono::milliseconds(250),
+                [&]() {
+                    return should_stop() ||
+                           !proactive_mailbox.live_stream_connected ||
+                           (!proactive_mailbox.live_events.empty() &&
+                            proactive_mailbox.live_events.back().sequence_number > after_sequence);
+                });
+    }
+
+    bool proactive_mailbox_connect_live_stream() const {
+        std::lock_guard<std::mutex> lock(proactive_mailbox.mutex);
+        if (proactive_mailbox.live_stream_connected) {
+            return false;
+        }
+        proactive_mailbox.live_stream_connected = true;
+        SRV_INF("%s", "proactive mailbox live stream attached\n");
+        return true;
+    }
+
+    void proactive_mailbox_disconnect_live_stream() const {
+        bool disconnected = false;
+        {
+            std::lock_guard<std::mutex> lock(proactive_mailbox.mutex);
+            if (proactive_mailbox.live_stream_connected) {
+                proactive_mailbox.live_stream_connected = false;
+                disconnected = true;
+            }
+        }
+        if (disconnected) {
+            proactive_mailbox.cv.notify_all();
+            SRV_INF("%s", "proactive mailbox live stream detached\n");
+        }
+    }
+
+    void proactive_mailbox_reset_live_stream() {
+        {
+            std::lock_guard<std::mutex> lock(proactive_mailbox.mutex);
+            proactive_mailbox.live_stream_connected = false;
+        }
+        proactive_mailbox.cv.notify_all();
+    }
+
+    json build_proactive_mailbox_health_json() const {
+        const vicuna_mailbox_snapshot snapshot = proactive_mailbox_snapshot_copy(proactive_mailbox);
+        return {
+            {"stored_responses", (int) snapshot.response_order.size()},
+            {"stored_live_events", (int) snapshot.live_events.size()},
+            {"live_stream_connected", snapshot.live_stream_connected},
+            {"publish_total", snapshot.publish_total},
+            {"complete_total", snapshot.complete_total},
+            {"fail_total", snapshot.fail_total},
+            {"dropped_total", snapshot.dropped_total},
+            {"last_publish_ms", snapshot.last_publish_ms},
+        };
+    }
+
+    bool dispatch_pending_self_emit_commands(int32_t origin_filter) {
+        if (!ctx) {
+            return false;
+        }
+
+        bool published = false;
+        const int32_t command_count = llama_cognitive_command_count(ctx);
+        for (int32_t i = 0; i < command_count; ++i) {
+            llama_cognitive_command command = {};
+            if (llama_cognitive_command_get(ctx, i, &command) != 0) {
+                continue;
+            }
+            if (command.kind != LLAMA_COG_COMMAND_EMIT_BACKGROUND ||
+                command.status != LLAMA_COG_COMMAND_STATUS_PENDING) {
+                continue;
+            }
+            if (origin_filter >= 0 && command.origin != origin_filter) {
+                continue;
+            }
+            if (llama_cognitive_command_ack(ctx, command.command_id) != 0) {
+                SRV_WRN("failed to ack proactive emit command %d\n", command.command_id);
+                continue;
+            }
+
+            llama_dmn_tick_trace dmn_trace = {};
+            llama_remediation_plan remediation = {};
+            llama_governance_trace governance = {};
+            llama_self_model_state_info model_state = {};
+            (void) llama_dmn_get_last_trace(ctx, &dmn_trace);
+            (void) llama_remediation_get_last_plan(ctx, &remediation);
+            (void) llama_governance_get_last_trace(ctx, &governance);
+            (void) llama_self_state_get_model_state(ctx, &model_state);
+
+            float directness_preference = 0.5f;
+            float verbosity_preference = 0.5f;
+            if (model_state.horizon_count > 0) {
+                const auto & preference = model_state.horizons[(size_t) LLAMA_SELF_HORIZON_INSTANT].user_preference;
+                directness_preference = preference.directness_preference;
+                verbosity_preference = preference.verbosity_preference;
+            }
+
+            const std::string message = proactive_mailbox_message(
+                    dmn_trace,
+                    remediation,
+                    governance,
+                    directness_preference,
+                    verbosity_preference);
+            if (!proactive_mailbox_publish(message, "dmn")) {
+                {
+                    std::lock_guard<std::mutex> lock(proactive_mailbox.mutex);
+                    proactive_mailbox.fail_total++;
+                }
+                SRV_WRN("proactive emit command %d produced an empty message\n", command.command_id);
+            } else {
+                published = true;
+                mark_runtime_state_dirty("proactive-self-emit");
+            }
+
+            if (llama_cognitive_command_complete(ctx, command.command_id, false) != 0) {
+                SRV_WRN("failed to complete proactive emit command %d\n", command.command_id);
+            }
+        }
+
+        return published;
+    }
+
+    void inject_startup_self_emit_from_env() {
+        const char * startup_text = std::getenv("VICUNA_SELF_EMIT_STARTUP_TEXT");
+        if (!startup_text || startup_text[0] == '\0') {
+            return;
+        }
+        if (proactive_mailbox_publish(startup_text, "startup")) {
+            mark_runtime_state_dirty("startup-self-emit");
+        }
+    }
 
     void destroy() {
+        if (ctx) {
+            (void) persist_runtime_state("destroy");
+        }
+        proactive_mailbox_reset_live_stream();
+        stop_external_workers();
         llama_init.reset();
         ctx = nullptr;
         model = nullptr;
+        state = SERVER_STATE_LOADING_MODEL;
 
         mtmd_free(mctx);
         mctx = nullptr;
@@ -602,6 +1603,94 @@ private:
         }
 
         llama_batch_free(batch);
+    }
+
+    static void run_external_worker(
+            vicuna_external_work_queue * queue,
+            vicuna_external_work_kind kind,
+            server_queue * task_queue) {
+        GGML_ASSERT(queue != nullptr);
+        GGML_ASSERT(task_queue != nullptr);
+        while (true) {
+            vicuna_external_work_item work = {};
+            {
+                std::unique_lock<std::mutex> lock(queue->mutex);
+                queue->cv.wait(lock, [&]() {
+                    return queue->stop || !queue->pending.empty();
+                });
+                if (queue->stop && queue->pending.empty()) {
+                    return;
+                }
+                work = queue->pending.front();
+                queue->pending.pop_front();
+            }
+
+            vicuna_external_work_result result = {};
+            result.command_id = work.command_id;
+            result.origin = work.origin;
+            result.tool_kind = work.tool_kind;
+            result.kind = kind;
+
+            if (kind == VICUNA_EXTERNAL_WORK_BASH) {
+                (void) server_bash_tool_execute(work.bash_request, &result.bash_result);
+            } else {
+                llama_hard_memory helper;
+                (void) helper.configure(work.hard_memory_config);
+                result.hard_memory_result.command_id = work.command_id;
+                result.hard_memory_result.tool_job_id = work.hard_memory_request.tool_job_id;
+                (void) helper.query(work.hard_memory_request.query, &result.hard_memory_result.result);
+            }
+            result.completed_ms = ggml_time_ms();
+
+            {
+                std::lock_guard<std::mutex> lock(queue->mutex);
+                queue->inflight_ids.erase(work.command_id);
+                queue->completed.push_back(std::move(result));
+            }
+            server_task wake_task(SERVER_TASK_TYPE_NEXT_RESPONSE);
+            wake_task.id = task_queue->get_new_id();
+            task_queue->post(std::move(wake_task), true);
+        }
+    }
+
+    void start_external_workers() {
+        stop_external_workers();
+        {
+            std::lock_guard<std::mutex> lock(bash_work.mutex);
+            bash_work.stop = false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(hard_memory_work.mutex);
+            hard_memory_work.stop = false;
+        }
+        bash_worker = std::thread(&server_context_impl::run_external_worker, &bash_work, VICUNA_EXTERNAL_WORK_BASH, &queue_tasks);
+        hard_memory_worker = std::thread(&server_context_impl::run_external_worker, &hard_memory_work, VICUNA_EXTERNAL_WORK_HARD_MEMORY, &queue_tasks);
+    }
+
+    void stop_external_workers() {
+        {
+            std::lock_guard<std::mutex> lock(bash_work.mutex);
+            bash_work.stop = true;
+            bash_work.pending.clear();
+            bash_work.completed.clear();
+            bash_work.inflight_ids.clear();
+        }
+        bash_work.cv.notify_all();
+        if (bash_worker.joinable()) {
+            bash_worker.join();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(hard_memory_work.mutex);
+            hard_memory_work.stop = true;
+            hard_memory_work.pending.clear();
+            hard_memory_work.completed.clear();
+            hard_memory_work.inflight_ids.clear();
+        }
+        hard_memory_work.cv.notify_all();
+        if (hard_memory_worker.joinable()) {
+            hard_memory_worker.join();
+        }
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -618,6 +1707,465 @@ private:
         sleeping = new_state;
     }
 
+    bool persist_runtime_state(const char * reason) {
+        std::string snapshot_path;
+        {
+            std::lock_guard<std::mutex> lock(runtime_state_mutex);
+            if (!runtime_persistence.enabled || runtime_persistence.snapshot_path.empty() || !runtime_state_dirty) {
+                return true;
+            }
+            snapshot_path = runtime_persistence.snapshot_path;
+        }
+
+        if (!ctx) {
+            return false;
+        }
+
+        try {
+            json snapshot = json::object();
+            snapshot["version"] = 2;
+            snapshot["saved_at_unix_ms"] = ggml_time_ms();
+            snapshot["reason"] = reason ? reason : "";
+
+            llama_bash_tool_config bash_config = llama_bash_tool_default_config();
+            llama_hard_memory_config hard_memory_config = llama_hard_memory_default_config();
+            llama_self_updater_program updater = llama_self_state_default_updater_program();
+            const size_t trace_size = llama_self_state_trace_export_size(ctx);
+            std::vector<uint8_t> trace_blob(trace_size);
+
+            if (llama_bash_tool_get_config(ctx, &bash_config) != 0 ||
+                llama_hard_memory_get_config(ctx, &hard_memory_config) != 0 ||
+                llama_self_state_get_updater_program(ctx, &updater) != 0 ||
+                (trace_size > 0 && llama_self_state_trace_export(ctx, trace_blob.data(), trace_blob.size()) != 0)) {
+                throw std::runtime_error("failed to gather runtime state for persistence");
+            }
+
+            snapshot["bash_tool_config"] = bash_tool_config_to_json(bash_config);
+            snapshot["hard_memory_config"] = hard_memory_config_to_json(hard_memory_config);
+            snapshot["self_state_updater_program_b64"] = base64::encode((const char *) &updater, sizeof(updater));
+            snapshot["self_state_trace_b64"] = base64::encode((const char *) trace_blob.data(), trace_blob.size());
+            snapshot["proactive_mailbox"] = proactive_mailbox_to_json(proactive_mailbox);
+
+            json extensions = json::array();
+            const int32_t extension_count = llama_self_state_model_extension_count(ctx);
+            for (int32_t i = 0; i < extension_count; ++i) {
+                llama_self_model_extension_info info = {};
+                if (llama_self_state_get_model_extension(ctx, i, &info) == 0) {
+                    extensions.push_back(model_extension_info_to_json(info));
+                }
+            }
+            snapshot["model_extensions"] = std::move(extensions);
+
+            const std::filesystem::path target_path(snapshot_path);
+            if (!target_path.parent_path().empty()) {
+                std::filesystem::create_directories(target_path.parent_path());
+            }
+            const std::filesystem::path tmp_path = target_path.string() + ".tmp";
+            {
+                std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+                if (!out) {
+                    throw std::runtime_error("failed to open temporary runtime snapshot");
+                }
+                out << snapshot.dump(2);
+                out.flush();
+                if (!out) {
+                    throw std::runtime_error("failed to flush runtime snapshot");
+                }
+            }
+            if (std::filesystem::exists(target_path)) {
+                std::filesystem::remove(target_path);
+            }
+            std::filesystem::rename(tmp_path, target_path);
+
+            {
+                std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                runtime_state_dirty = false;
+                runtime_persistence.healthy = true;
+                runtime_persistence.last_error.clear();
+                runtime_persistence.last_persist_ms = ggml_time_ms();
+                runtime_persistence.persist_success_total++;
+            }
+            SRV_INF("runtime snapshot persisted: path=%s reason=%s\n", snapshot_path.c_str(), reason ? reason : "unspecified");
+            return true;
+        } catch (const std::exception & err) {
+            std::lock_guard<std::mutex> lock(runtime_state_mutex);
+            runtime_persistence.healthy = false;
+            runtime_persistence.last_error = err.what();
+            runtime_persistence.last_persist_ms = ggml_time_ms();
+            runtime_persistence.persist_fail_total++;
+            SRV_ERR("runtime snapshot persist failed: %s\n", err.what());
+            return false;
+        }
+    }
+
+    bool restore_runtime_state() {
+        std::string snapshot_path;
+        {
+            std::lock_guard<std::mutex> lock(runtime_state_mutex);
+            if (!runtime_persistence.enabled || runtime_persistence.snapshot_path.empty()) {
+                return true;
+            }
+            snapshot_path = runtime_persistence.snapshot_path;
+            runtime_persistence.restore_attempted = true;
+        }
+
+        if (!std::filesystem::exists(snapshot_path)) {
+            std::lock_guard<std::mutex> lock(runtime_state_mutex);
+            runtime_persistence.restore_success = false;
+            runtime_persistence.healthy = true;
+            runtime_persistence.last_error.clear();
+            runtime_persistence.last_restore_ms = ggml_time_ms();
+            return true;
+        }
+
+        try {
+            std::ifstream in(snapshot_path, std::ios::binary);
+            if (!in) {
+                throw std::runtime_error("failed to open runtime snapshot");
+            }
+            std::stringstream buffer;
+            buffer << in.rdbuf();
+            const json snapshot = json::parse(buffer.str());
+            const int snapshot_version = json_value(snapshot, "version", 0);
+            if (snapshot_version != 1 && snapshot_version != 2) {
+                throw std::runtime_error("unsupported runtime snapshot version");
+            }
+
+            llama_bash_tool_config bash_config = llama_bash_tool_default_config();
+            llama_hard_memory_config hard_memory_config = llama_hard_memory_default_config();
+            if (!bash_tool_config_from_json(snapshot.at("bash_tool_config"), &bash_config) ||
+                !hard_memory_config_from_json(snapshot.at("hard_memory_config"), &hard_memory_config) ||
+                llama_bash_tool_configure(ctx, &bash_config) != 0 ||
+                llama_hard_memory_configure(ctx, hard_memory_config) != 0) {
+                throw std::runtime_error("failed to restore runtime tool configuration");
+            }
+
+            const std::string updater_blob = base64::decode(snapshot.at("self_state_updater_program_b64").get<std::string>());
+            if (updater_blob.size() != sizeof(llama_self_updater_program)) {
+                throw std::runtime_error("invalid updater program snapshot payload");
+            }
+            llama_self_updater_program updater = {};
+            std::memcpy(&updater, updater_blob.data(), sizeof(updater));
+            if (llama_self_state_set_updater_program(ctx, updater) != 0) {
+                throw std::runtime_error("failed to restore self-state updater program");
+            }
+
+            const std::string trace_blob = base64::decode(snapshot.at("self_state_trace_b64").get<std::string>());
+            if (!trace_blob.empty()) {
+                if (llama_self_state_trace_import(ctx, trace_blob.data(), trace_blob.size(), true) != 0) {
+                    throw std::runtime_error("failed to import self-state trace");
+                }
+                const int32_t trace_count = llama_self_state_trace_count(ctx);
+                if (trace_count > 0 && llama_self_state_replay_trace(ctx, trace_count) != 0) {
+                    throw std::runtime_error("failed to replay restored self-state trace");
+                }
+            }
+
+            if (snapshot.contains("model_extensions") && snapshot.at("model_extensions").is_array()) {
+                for (const auto & entry : snapshot.at("model_extensions")) {
+                    llama_self_model_extension_update update = llama_self_model_extension_default_update();
+                    if (!model_extension_update_from_json(entry, &update) ||
+                        llama_self_state_upsert_model_extension(ctx, update) != 0) {
+                        throw std::runtime_error("failed to restore model extension");
+                    }
+                }
+            }
+
+            if (snapshot_version >= 2 && snapshot.contains("proactive_mailbox")) {
+                if (!proactive_mailbox_from_json(snapshot.at("proactive_mailbox"), &proactive_mailbox)) {
+                    throw std::runtime_error("failed to restore proactive mailbox");
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                runtime_state_dirty = false;
+                runtime_persistence.healthy = true;
+                runtime_persistence.restore_success = true;
+                runtime_persistence.last_error.clear();
+                runtime_persistence.last_restore_ms = ggml_time_ms();
+            }
+            SRV_INF("runtime snapshot restored: path=%s\n", snapshot_path.c_str());
+            return true;
+        } catch (const std::exception & err) {
+            std::lock_guard<std::mutex> lock(runtime_state_mutex);
+            runtime_persistence.healthy = false;
+            runtime_persistence.restore_success = false;
+            runtime_persistence.last_error = err.what();
+            runtime_persistence.last_restore_ms = ggml_time_ms();
+            SRV_ERR("runtime snapshot restore failed: %s\n", err.what());
+            return false;
+        }
+    }
+
+    bool enqueue_external_work(
+            vicuna_external_work_queue & queue,
+            vicuna_external_work_item && work) {
+        {
+            std::lock_guard<std::mutex> lock(queue.mutex);
+            if (queue.stop) {
+                return false;
+            }
+            if (queue.inflight_ids.find(work.command_id) != queue.inflight_ids.end()) {
+                return true;
+            }
+            queue.inflight_ids.insert(work.command_id);
+            queue.pending.push_back(std::move(work));
+        }
+        queue.cv.notify_one();
+        return true;
+    }
+
+    bool active_runner_waiting_on_tool(int32_t * out_command_id, int32_t * out_tool_kind) const {
+        if (!ctx) {
+            return false;
+        }
+
+        llama_cognitive_active_runner_status runner = {};
+        if (llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
+            !runner.active ||
+            !runner.waiting_on_tool ||
+            runner.pending_command_id <= 0) {
+            return false;
+        }
+
+        for (int32_t i = 0, n = llama_cognitive_command_count(ctx); i < n; ++i) {
+            llama_cognitive_command command = {};
+            if (llama_cognitive_command_get(ctx, i, &command) != 0) {
+                continue;
+            }
+            if (command.command_id == runner.pending_command_id &&
+                (command.status == LLAMA_COG_COMMAND_STATUS_PENDING || command.status == LLAMA_COG_COMMAND_STATUS_ACKED)) {
+                if (out_command_id) {
+                    *out_command_id = command.command_id;
+                }
+                if (out_tool_kind) {
+                    *out_tool_kind = command.tool_kind;
+                }
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool dispatch_pending_tool_commands(int32_t origin_filter) {
+        if (!ctx) {
+            return false;
+        }
+
+        bool dispatched = false;
+        const int32_t command_count = llama_cognitive_command_count(ctx);
+        for (int32_t i = 0; i < command_count; ++i) {
+            llama_cognitive_command command = {};
+            if (llama_cognitive_command_get(ctx, i, &command) != 0) {
+                continue;
+            }
+            if (command.kind != LLAMA_COG_COMMAND_INVOKE_TOOL ||
+                command.status != LLAMA_COG_COMMAND_STATUS_PENDING ||
+                (command.tool_kind != LLAMA_TOOL_KIND_BASH_CLI && command.tool_kind != LLAMA_TOOL_KIND_HARD_MEMORY_QUERY)) {
+                continue;
+            }
+            if (origin_filter >= 0 && command.origin != origin_filter) {
+                continue;
+            }
+            if (llama_cognitive_command_ack(ctx, command.command_id) != 0) {
+                SRV_WRN("failed to ack tool command %d\n", command.command_id);
+                continue;
+            }
+
+            if (command.tool_kind == LLAMA_TOOL_KIND_BASH_CLI) {
+                llama_bash_tool_request request = {};
+                if (llama_cognitive_bash_tool_get_request(ctx, command.command_id, &request) != 0) {
+                    SRV_WRN("bash tool command %d did not have a pending request\n", command.command_id);
+                    (void) llama_cognitive_command_complete(ctx, command.command_id, true);
+                    continue;
+                }
+
+                llama_bash_tool_config config = llama_bash_tool_default_config();
+                (void) llama_bash_tool_get_config(ctx, &config);
+                if (!config.enabled || !request.command_ready || request.command_text[0] == '\0') {
+                    llama_bash_tool_result result = {};
+                    result.command_id = request.command_id;
+                    result.tool_job_id = request.tool_job_id;
+                    result.launch_failed = true;
+                    result.exit_code = 127;
+                    std::snprintf(result.error_text, sizeof(result.error_text), "%s",
+                            !config.enabled ? "bash tool is disabled" : "bash tool request did not include a command");
+                    if (llama_cognitive_bash_tool_submit_result(ctx, &result, nullptr) == 0) {
+                        mark_runtime_state_dirty("bash-tool-immediate-result");
+                    }
+                    continue;
+                }
+
+                vicuna_external_work_item work = {};
+                work.command_id = command.command_id;
+                work.origin = command.origin;
+                work.tool_kind = command.tool_kind;
+                work.kind = VICUNA_EXTERNAL_WORK_BASH;
+                work.bash_request = request;
+                work.enqueued_ms = ggml_time_ms();
+                if (enqueue_external_work(bash_work, std::move(work))) {
+                    std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                    external_observability.bash_dispatch_total++;
+                    dispatched = true;
+                    SRV_INF("queued bash tool command %d origin=%d job=%d\n",
+                            command.command_id,
+                            command.origin,
+                            request.tool_job_id);
+                }
+            } else {
+                llama_cognitive_hard_memory_request request = {};
+                if (llama_cognitive_hard_memory_get_request(ctx, command.command_id, &request) != 0) {
+                    SRV_WRN("hard-memory command %d did not have a pending request\n", command.command_id);
+                    (void) llama_cognitive_command_complete(ctx, command.command_id, true);
+                    continue;
+                }
+
+                llama_hard_memory_config config = llama_hard_memory_default_config();
+                (void) llama_hard_memory_get_config(ctx, &config);
+                if (!config.enabled || request.query.query[0] == '\0') {
+                    llama_cognitive_hard_memory_result result = {};
+                    result.command_id = request.command_id;
+                    result.tool_job_id = request.tool_job_id;
+                    result.result.ok = false;
+                    result.result.tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_QUERY;
+                    result.result.status_code = !config.enabled ? 503 : 400;
+                    std::snprintf(result.result.error, sizeof(result.result.error), "%s",
+                            !config.enabled ? "hard memory is disabled" : "hard memory request did not include a query");
+                    if (llama_cognitive_hard_memory_submit_result(ctx, &result, nullptr) == 0) {
+                        mark_runtime_state_dirty("hard-memory-immediate-result");
+                    }
+                    continue;
+                }
+
+                vicuna_external_work_item work = {};
+                work.command_id = command.command_id;
+                work.origin = command.origin;
+                work.tool_kind = command.tool_kind;
+                work.kind = VICUNA_EXTERNAL_WORK_HARD_MEMORY;
+                work.hard_memory_request = request;
+                work.hard_memory_config = config;
+                work.enqueued_ms = ggml_time_ms();
+                if (enqueue_external_work(hard_memory_work, std::move(work))) {
+                    std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                    external_observability.hard_memory_dispatch_total++;
+                    dispatched = true;
+                    SRV_INF("queued hard-memory command %d origin=%d job=%d query=\"%s\"\n",
+                            command.command_id,
+                            command.origin,
+                            request.tool_job_id,
+                            request.query.query);
+                }
+            }
+        }
+
+        return dispatched;
+    }
+
+    bool drain_completed_external_work(int32_t origin_filter) {
+        if (!ctx) {
+            return false;
+        }
+
+        bool drained = false;
+        auto drain_queue = [&](vicuna_external_work_queue & queue, vicuna_external_work_kind kind) {
+            while (true) {
+                vicuna_external_work_result result = {};
+                {
+                    std::lock_guard<std::mutex> lock(queue.mutex);
+                    if (queue.completed.empty()) {
+                        break;
+                    }
+                    result = queue.completed.front();
+                    queue.completed.pop_front();
+                }
+                if (origin_filter >= 0 && result.origin != origin_filter) {
+                    std::lock_guard<std::mutex> lock(queue.mutex);
+                    queue.completed.push_back(std::move(result));
+                    break;
+                }
+
+                drained = true;
+                llama_active_loop_trace active_trace = {};
+                bool ok = false;
+                if (kind == VICUNA_EXTERNAL_WORK_BASH) {
+                    ok = llama_cognitive_bash_tool_submit_result(
+                            ctx,
+                            &result.bash_result,
+                            result.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE ? &active_trace : nullptr) == 0;
+                    std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                    external_observability.bash_complete_total++;
+                    if (!ok || result.bash_result.launch_failed || result.bash_result.exit_code != 0 || result.bash_result.timed_out) {
+                        external_observability.bash_fail_total++;
+                    }
+                } else {
+                    ok = llama_cognitive_hard_memory_submit_result(
+                            ctx,
+                            &result.hard_memory_result,
+                            result.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE ? &active_trace : nullptr) == 0;
+                    std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                    external_observability.hard_memory_complete_total++;
+                    if (!ok || !result.hard_memory_result.result.ok) {
+                        external_observability.hard_memory_fail_total++;
+                    }
+                }
+
+                if (!ok) {
+                    SRV_WRN("failed to submit external work result for command %d kind=%d\n",
+                            result.command_id,
+                            (int) kind);
+                    continue;
+                }
+
+                mark_runtime_state_dirty(kind == VICUNA_EXTERNAL_WORK_BASH ? "bash-tool-result" : "hard-memory-result");
+
+                if (result.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+                    server_task resumed_task;
+                    bool found_task = false;
+                    {
+                        std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                        auto it = waiting_active_tasks.find(result.command_id);
+                        if (it != waiting_active_tasks.end()) {
+                            resumed_task = std::move(it->second);
+                            waiting_active_tasks.erase(it);
+                            found_task = true;
+                        }
+                    }
+                    if (found_task) {
+                        resumed_task.active_trace = active_trace;
+                        resumed_task.has_active_trace = true;
+                        resumed_task.skip_active_loop_preflight = true;
+                        queue_tasks.post(std::move(resumed_task), true);
+                    } else {
+                        SRV_WRN("missing waiting active task for command %d\n", result.command_id);
+                    }
+                }
+
+                if (kind == VICUNA_EXTERNAL_WORK_BASH) {
+                    SRV_INF("bash tool command %d origin=%d exit=%d signal=%d timeout=%d launch_failed=%d\n",
+                            result.command_id,
+                            result.origin,
+                            result.bash_result.exit_code,
+                            result.bash_result.term_signal,
+                            result.bash_result.timed_out ? 1 : 0,
+                            result.bash_result.launch_failed ? 1 : 0);
+                } else {
+                    SRV_INF("hard-memory command %d origin=%d ok=%d status=%d count=%d\n",
+                            result.command_id,
+                            result.origin,
+                            result.hard_memory_result.result.ok ? 1 : 0,
+                            result.hard_memory_result.result.status_code,
+                            result.hard_memory_result.result.result_count);
+                }
+            }
+        };
+
+        drain_queue(bash_work, VICUNA_EXTERNAL_WORK_BASH);
+        drain_queue(hard_memory_work, VICUNA_EXTERNAL_WORK_HARD_MEMORY);
+        return drained;
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(const common_params & params) {
@@ -626,6 +2174,19 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+        state = SERVER_STATE_LOADING_MODEL;
+        {
+            std::lock_guard<std::mutex> lock(runtime_state_mutex);
+            waiting_active_tasks.clear();
+            runtime_state_dirty = false;
+            runtime_persistence.enabled = false;
+            runtime_persistence.healthy = true;
+            runtime_persistence.restore_attempted = false;
+            runtime_persistence.restore_success = false;
+            runtime_persistence.snapshot_path.clear();
+            runtime_persistence.last_error.clear();
+        }
+        proactive_mailbox_reset_live_stream();
 
         llama_init = common_init_from_params(params_base);
 
@@ -754,6 +2315,155 @@ private:
             }
         }
 
+        {
+            const char * runtime_state_path = getenv("VICUNA_RUNTIME_STATE_PATH");
+            if (runtime_state_path && runtime_state_path[0] != '\0') {
+                std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                runtime_persistence.enabled = true;
+                runtime_persistence.snapshot_path = runtime_state_path;
+                SRV_INF("runtime persistence enabled: path=%s\n", runtime_state_path);
+            }
+        }
+
+        {
+            const char * hard_memory_url = getenv("VICUNA_HARD_MEMORY_URL");
+            const char * hard_memory_token = getenv("VICUNA_HARD_MEMORY_TOKEN");
+            const char * hard_memory_tag = getenv("VICUNA_HARD_MEMORY_CONTAINER_TAG");
+            const char * hard_memory_runtime = getenv("VICUNA_HARD_MEMORY_RUNTIME_ID");
+            const char * hard_memory_threshold = getenv("VICUNA_HARD_MEMORY_ARCHIVAL_DELTA_THRESHOLD");
+            const char * hard_memory_query_threshold = getenv("VICUNA_HARD_MEMORY_QUERY_THRESHOLD");
+            const char * hard_memory_timeout = getenv("VICUNA_HARD_MEMORY_TIMEOUT_MS");
+            const char * hard_memory_results = getenv("VICUNA_HARD_MEMORY_MAX_RESULTS");
+
+            if (hard_memory_url && hard_memory_token) {
+                llama_hard_memory_config hard_memory = llama_hard_memory_default_config();
+                hard_memory.enabled = true;
+                std::snprintf(hard_memory.base_url, sizeof(hard_memory.base_url), "%s", hard_memory_url);
+                std::snprintf(hard_memory.auth_token, sizeof(hard_memory.auth_token), "%s", hard_memory_token);
+                if (hard_memory_tag) {
+                    std::snprintf(hard_memory.container_tag, sizeof(hard_memory.container_tag), "%s", hard_memory_tag);
+                }
+                if (hard_memory_runtime) {
+                    std::snprintf(hard_memory.runtime_identity, sizeof(hard_memory.runtime_identity), "%s", hard_memory_runtime);
+                } else {
+                    std::snprintf(hard_memory.runtime_identity, sizeof(hard_memory.runtime_identity), "%s", "vicuna-server");
+                }
+                if (hard_memory_threshold) {
+                    hard_memory.archival_delta_threshold = std::max(0.0f, (float) std::atof(hard_memory_threshold));
+                }
+                if (hard_memory_query_threshold) {
+                    hard_memory.query_threshold = std::max(0.0f, (float) std::atof(hard_memory_query_threshold));
+                }
+                if (hard_memory_timeout) {
+                    hard_memory.timeout_ms = std::max(100, std::atoi(hard_memory_timeout));
+                }
+                if (hard_memory_results) {
+                    hard_memory.max_results = std::max(1, std::atoi(hard_memory_results));
+                }
+
+                if (llama_hard_memory_configure(ctx, hard_memory) == 0) {
+                    SRV_INF("hard memory enabled: url=%s container=%s runtime=%s\n",
+                            hard_memory.base_url,
+                            hard_memory.container_tag,
+                            hard_memory.runtime_identity);
+                } else {
+                    SRV_WRN("%s\n", "failed to configure hard memory");
+                }
+            }
+        }
+
+        {
+            llama_bash_tool_config bash_tool = llama_bash_tool_default_config();
+            const char * bash_enabled = getenv("VICUNA_BASH_TOOL_ENABLED");
+            const char * bash_path = getenv("VICUNA_BASH_TOOL_PATH");
+            const char * bash_workdir = getenv("VICUNA_BASH_TOOL_WORKDIR");
+            const char * bash_timeout = getenv("VICUNA_BASH_TOOL_TIMEOUT_MS");
+            const char * bash_stdout = getenv("VICUNA_BASH_TOOL_MAX_STDOUT_BYTES");
+            const char * bash_stderr = getenv("VICUNA_BASH_TOOL_MAX_STDERR_BYTES");
+            const char * bash_login = getenv("VICUNA_BASH_TOOL_LOGIN_SHELL");
+            const char * bash_inherit_env = getenv("VICUNA_BASH_TOOL_INHERIT_ENV");
+            const char * bash_allowed_commands = getenv("VICUNA_BASH_TOOL_ALLOWED_COMMANDS");
+            const char * bash_blocked_patterns = getenv("VICUNA_BASH_TOOL_BLOCKED_PATTERNS");
+            const char * bash_allowed_env = getenv("VICUNA_BASH_TOOL_ALLOWED_ENV");
+            const char * bash_reject_meta = getenv("VICUNA_BASH_TOOL_REJECT_SHELL_METACHARACTERS");
+            const char * bash_cpu_secs = getenv("VICUNA_BASH_TOOL_CPU_TIME_LIMIT_SECS");
+            const char * bash_max_children = getenv("VICUNA_BASH_TOOL_MAX_CHILD_PROCESSES");
+            const char * bash_max_open_files = getenv("VICUNA_BASH_TOOL_MAX_OPEN_FILES");
+            const char * bash_max_file_size = getenv("VICUNA_BASH_TOOL_MAX_FILE_SIZE_BYTES");
+
+            if (bash_enabled) {
+                bash_tool.enabled = atoi(bash_enabled) != 0;
+            }
+            if (bash_path) {
+                std::snprintf(bash_tool.bash_path, sizeof(bash_tool.bash_path), "%s", bash_path);
+            }
+            if (bash_workdir) {
+                std::snprintf(bash_tool.working_directory, sizeof(bash_tool.working_directory), "%s", bash_workdir);
+            }
+            if (bash_timeout) {
+                bash_tool.timeout_ms = std::max(100, atoi(bash_timeout));
+            }
+            if (bash_stdout) {
+                bash_tool.max_stdout_bytes = std::max(1, atoi(bash_stdout));
+            }
+            if (bash_stderr) {
+                bash_tool.max_stderr_bytes = std::max(1, atoi(bash_stderr));
+            }
+            if (bash_login) {
+                bash_tool.login_shell = atoi(bash_login) != 0;
+            }
+            if (bash_inherit_env) {
+                bash_tool.inherit_env = atoi(bash_inherit_env) != 0;
+            }
+            if (bash_allowed_commands) {
+                std::snprintf(bash_tool.allowed_commands, sizeof(bash_tool.allowed_commands), "%s", bash_allowed_commands);
+            }
+            if (bash_blocked_patterns) {
+                std::snprintf(bash_tool.blocked_patterns, sizeof(bash_tool.blocked_patterns), "%s", bash_blocked_patterns);
+            }
+            if (bash_allowed_env) {
+                std::snprintf(bash_tool.allowed_env, sizeof(bash_tool.allowed_env), "%s", bash_allowed_env);
+            }
+            if (bash_reject_meta) {
+                bash_tool.reject_shell_metacharacters = parse_env_flag(bash_reject_meta, bash_tool.reject_shell_metacharacters);
+            }
+            if (bash_cpu_secs) {
+                bash_tool.cpu_time_limit_secs = std::max(1, atoi(bash_cpu_secs));
+            }
+            if (bash_max_children) {
+                bash_tool.max_child_processes = std::max(1, atoi(bash_max_children));
+            }
+            if (bash_max_open_files) {
+                bash_tool.max_open_files = std::max(3, atoi(bash_max_open_files));
+            }
+            if (bash_max_file_size) {
+                bash_tool.max_file_size_bytes = std::max(1024, atoi(bash_max_file_size));
+            }
+
+            if (llama_bash_tool_configure(ctx, &bash_tool) == 0) {
+                if (bash_tool.enabled) {
+                    SRV_INF("bash tool enabled: bash=%s cwd=%s timeout_ms=%d stdout=%d stderr=%d login=%d inherit_env=%d reject_meta=%d cpu_s=%d max_children=%d max_open_files=%d max_file_size=%d allow=%s block=%s env=%s\n",
+                            bash_tool.bash_path,
+                            bash_tool.working_directory[0] ? bash_tool.working_directory : ".",
+                            bash_tool.timeout_ms,
+                            bash_tool.max_stdout_bytes,
+                            bash_tool.max_stderr_bytes,
+                            bash_tool.login_shell ? 1 : 0,
+                            bash_tool.inherit_env ? 1 : 0,
+                            bash_tool.reject_shell_metacharacters ? 1 : 0,
+                            bash_tool.cpu_time_limit_secs,
+                            bash_tool.max_child_processes,
+                            bash_tool.max_open_files,
+                            bash_tool.max_file_size_bytes,
+                            bash_tool.allowed_commands,
+                            bash_tool.blocked_patterns,
+                            bash_tool.allowed_env);
+                }
+            } else {
+                SRV_WRN("%s\n", "failed to configure bash tool");
+            }
+        }
+
         if (llama_model_n_swa(model) == 0) {
             if (params_base.swa_full) {
                 params_base.swa_full = false;
@@ -862,10 +2572,17 @@ private:
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
 
+        if (!restore_runtime_state()) {
+            SRV_WRN("%s", "runtime restore failed; health will report degraded persistence\n");
+        }
+        inject_startup_self_emit_from_env();
+        state = SERVER_STATE_READY;
+
         if (!is_resume) {
             return init();
         }
 
+        start_external_workers();
         return true;
     }
 
@@ -887,6 +2604,7 @@ private:
         });
 
         metrics.init();
+        start_external_workers();
 
         // populate webui settings
         {
@@ -937,6 +2655,49 @@ private:
         }
 
         return true;
+    }
+
+    json build_health_json() const {
+        json health = {
+            {"status", "ok"},
+            {"state", state == SERVER_STATE_READY ? "ready" : "loading"},
+            {"sleeping", sleeping},
+            {"waiting_active_tasks", 0},
+            {"external_bash_pending", count_pending_external_work(bash_work)},
+            {"external_hard_memory_pending", count_pending_external_work(hard_memory_work)},
+            {"proactive_mailbox", build_proactive_mailbox_health_json()},
+            {"runtime_persistence", {
+                {"enabled", false},
+                {"healthy", true},
+                {"restore_attempted", false},
+                {"restore_success", false},
+                {"last_persist_ms", 0},
+                {"last_restore_ms", 0},
+                {"path", ""},
+                {"last_error", ""},
+            }},
+        };
+
+        {
+            std::lock_guard<std::mutex> lock(runtime_state_mutex);
+            health["waiting_active_tasks"] = waiting_active_tasks.size();
+            health["proactive_mailbox"] = build_proactive_mailbox_health_json();
+            health["runtime_persistence"] = {
+                {"enabled", runtime_persistence.enabled},
+                {"healthy", runtime_persistence.healthy},
+                {"restore_attempted", runtime_persistence.restore_attempted},
+                {"restore_success", runtime_persistence.restore_success},
+                {"last_persist_ms", runtime_persistence.last_persist_ms},
+                {"last_restore_ms", runtime_persistence.last_restore_ms},
+                {"path", runtime_persistence.snapshot_path},
+                {"last_error", runtime_persistence.last_error},
+            };
+            if (runtime_persistence.enabled && !runtime_persistence.healthy) {
+                health["status"] = "degraded";
+            }
+        }
+
+        return health;
     }
 
     server_slot * get_slot_by_id(int id_slot) {
@@ -1031,7 +2792,7 @@ private:
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
             // don't update the cache if the slot's context is empty
-            update_cache = update_cache && tokens.size() > 0;
+            update_cache = update_cache && !tokens.empty();
 
             if (update_cache) {
                 SRV_WRN("%s", "updating prompt cache\n");
@@ -1170,6 +2931,44 @@ private:
         }
 
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
+
+        {
+            const auto loop_tokens = make_self_state_token_view(task.tokens);
+            const llama_self_state_event loop_event = {
+                /*.tokens =*/ loop_tokens.data,
+                /*.n_tokens =*/ loop_tokens.size,
+                /*.role =*/ task.foreground_role,
+                /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+                /*.flags =*/ task.foreground_flags,
+                /*.decoder_entropy =*/ 0.0f,
+                /*.decoder_top_margin =*/ 1.0f,
+            };
+            if (!task.skip_active_loop_preflight) {
+                task.has_active_trace = llama_active_loop_process(ctx, &loop_event, &task.active_trace) == 0;
+            }
+            if (task.has_active_trace) {
+                SLT_INF(slot, "active loop episode %d winner=%d score=%.3f deferred_background=%d\n",
+                        task.active_trace.episode_id,
+                        task.active_trace.winner_action,
+                        task.active_trace.winner_score,
+                        task.active_trace.deferred_background ? 1 : 0);
+                llama_cognitive_active_runner_status runner = {};
+                llama_cognitive_command command = {};
+                if (llama_cognitive_active_runner_get(ctx, &runner) == 0 && runner.pending_command_id > 0) {
+                    for (int32_t i = 0, n = llama_cognitive_command_count(ctx); i < n; ++i) {
+                        if (llama_cognitive_command_get(ctx, i, &command) == 0 &&
+                                command.command_id == runner.pending_command_id) {
+                            SLT_INF(slot, "active runner episode %d command=%d kind=%d status=%d\n",
+                                    runner.episode_id,
+                                    command.command_id,
+                                    command.kind,
+                                    command.status);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         // initialize samplers
         if (task.need_sampling()) {
@@ -1494,7 +3293,7 @@ private:
         }
         res->timings         = slot.get_timings();
         res->prompt          = slot.task->tokens.detokenize(ctx, true);
-        res->response_fields = std::move(slot.task->params.response_fields);
+        res->response_fields = slot.task->params.response_fields;
 
         res->truncated           = slot.truncated;
         res->n_decoded           = slot.n_decoded;
@@ -1529,6 +3328,11 @@ private:
         }
 
         res->generation_params = slot.task->params; // copy the parameters
+
+        if (slot.task->has_active_trace && slot.n_sent_text > 0) {
+            (void) llama_active_loop_note_emit(ctx, slot.task->active_trace.episode_id, slot.n_sent_text);
+            mark_runtime_state_dirty("active-loop-emit");
+        }
 
         queue_results.send(std::move(res));
     }
@@ -1704,6 +3508,38 @@ private:
                         }
                     }
 
+                    if (!task.skip_active_loop_preflight && !task.is_child()) {
+                        const auto loop_tokens = make_self_state_token_view(task.tokens);
+                        const llama_self_state_event loop_event = {
+                            /*.tokens =*/ loop_tokens.data,
+                            /*.n_tokens =*/ loop_tokens.size,
+                            /*.role =*/ task.foreground_role,
+                            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+                            /*.flags =*/ task.foreground_flags,
+                            /*.decoder_entropy =*/ 0.0f,
+                            /*.decoder_top_margin =*/ 1.0f,
+                        };
+                        task.has_active_trace = llama_active_loop_process(ctx, &loop_event, &task.active_trace) == 0;
+                        task.skip_active_loop_preflight = true;
+                        if (task.has_active_trace) {
+                            mark_runtime_state_dirty("active-loop-preflight");
+                            (void) dispatch_pending_tool_commands(LLAMA_COG_COMMAND_ORIGIN_ACTIVE);
+                            (void) llama_active_loop_get_last_trace(ctx, &task.active_trace);
+
+                            int32_t pending_command_id = -1;
+                            int32_t pending_tool_kind = LLAMA_TOOL_KIND_NONE;
+                            if (active_runner_waiting_on_tool(&pending_command_id, &pending_tool_kind)) {
+                                std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                                waiting_active_tasks[pending_command_id] = std::move(task);
+                                SRV_INF("parked active task for external tool: command=%d tool=%d waiting=%zu\n",
+                                        pending_command_id,
+                                        pending_tool_kind,
+                                        waiting_active_tasks.size());
+                                break;
+                            }
+                        }
+                    }
+
                     const int id_slot = task.id_slot;
                     const int id_task = task.id;
 
@@ -1803,6 +3639,37 @@ private:
 
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
+                    res->n_external_bash_pending = count_pending_external_work(bash_work);
+                    res->n_external_hard_memory_pending = count_pending_external_work(hard_memory_work);
+
+                    const vicuna_mailbox_snapshot mailbox_snapshot = proactive_mailbox_snapshot_copy(proactive_mailbox);
+                    res->n_proactive_responses = (int) mailbox_snapshot.response_order.size();
+                    res->n_proactive_live_events = (int) mailbox_snapshot.live_events.size();
+                    res->proactive_live_stream_connected = mailbox_snapshot.live_stream_connected;
+                    res->proactive_publish_total = mailbox_snapshot.publish_total;
+                    res->proactive_complete_total = mailbox_snapshot.complete_total;
+                    res->proactive_fail_total = mailbox_snapshot.fail_total;
+                    res->proactive_dropped_total = mailbox_snapshot.dropped_total;
+                    res->proactive_last_publish_ms = mailbox_snapshot.last_publish_ms;
+
+                    {
+                        std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                        res->n_waiting_active_tasks = (int) waiting_active_tasks.size();
+                        res->runtime_persistence_enabled = runtime_persistence.enabled;
+                        res->runtime_persistence_healthy = runtime_persistence.healthy;
+                        res->runtime_restore_attempted = runtime_persistence.restore_attempted;
+                        res->runtime_restore_success = runtime_persistence.restore_success;
+                        res->runtime_last_persist_ms = runtime_persistence.last_persist_ms;
+                        res->runtime_last_restore_ms = runtime_persistence.last_restore_ms;
+                        res->runtime_persist_success_total = runtime_persistence.persist_success_total;
+                        res->runtime_persist_fail_total = runtime_persistence.persist_fail_total;
+                        res->n_external_bash_dispatch_total = external_observability.bash_dispatch_total;
+                        res->n_external_bash_complete_total = external_observability.bash_complete_total;
+                        res->n_external_bash_fail_total = external_observability.bash_fail_total;
+                        res->n_external_hard_memory_dispatch_total = external_observability.hard_memory_dispatch_total;
+                        res->n_external_hard_memory_complete_total = external_observability.hard_memory_complete_total;
+                        res->n_external_hard_memory_fail_total = external_observability.hard_memory_fail_total;
+                    }
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -1852,7 +3719,9 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (!check_no_mtmd(task.id)) break;
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
@@ -1934,7 +3803,7 @@ private:
                     res->id = task.id;
                     for (size_t i = 0; i < loras.size(); ++i) {
                         auto & lora = loras[i];
-                        std::string alora_invocation_string = "";
+                        std::string alora_invocation_string;
                         const uint64_t n_alora_tokens = llama_adapter_get_alora_n_invocation_tokens(lora.ptr);
                         llama_tokens alora_invocation_tokens;
                         if (n_alora_tokens) {
@@ -1968,8 +3837,11 @@ private:
         }
     }
 
+    // Legacy dispatcher remains monolithic while server task semantics are being untangled.
+    // NOLINTNEXTLINE(readability-function-size)
     void update_slots() {
         (void) llama_past_lora_tick(ctx, ggml_time_us());
+        (void) drain_completed_external_work(-1);
 
         // check if all slots are idle
         {
@@ -1983,11 +3855,45 @@ private:
             }
 
             if (all_idle) {
+                llama_dmn_tick_trace dmn_trace = {};
+                if (llama_dmn_tick(ctx, ggml_time_us(), &dmn_trace) == 0 && dmn_trace.admitted) {
+                    SRV_INF("dmn tick %d winner=%d score=%.3f burst=%d\n",
+                            dmn_trace.tick_id,
+                            dmn_trace.winner_action,
+                            dmn_trace.winner_score,
+                            dmn_trace.burst_count);
+                    llama_cognitive_dmn_runner_status runner = {};
+                    llama_cognitive_command command = {};
+                    if (llama_cognitive_dmn_runner_get(ctx, &runner) == 0 && runner.pending_command_id > 0) {
+                        for (int32_t i = 0, n = llama_cognitive_command_count(ctx); i < n; ++i) {
+                            if (llama_cognitive_command_get(ctx, i, &command) == 0 &&
+                                    command.command_id == runner.pending_command_id) {
+                                SRV_INF("dmn runner tick %d command=%d kind=%d status=%d\n",
+                                        runner.tick_id,
+                                        command.command_id,
+                                        command.kind,
+                                        command.status);
+                                break;
+                            }
+                        }
+                    }
+                    mark_runtime_state_dirty("dmn-tick");
+                }
+                (void) dispatch_pending_self_emit_commands(-1);
+                (void) dispatch_pending_tool_commands(-1);
+                (void) drain_completed_external_work(-1);
+                if (!has_waiting_active_tasks() &&
+                    count_pending_external_work(bash_work) == 0 &&
+                    count_pending_external_work(hard_memory_work) == 0) {
+                    (void) persist_runtime_state("idle");
+                }
                 SRV_INF("%s", "all slots are idle\n");
 
                 return;
             }
         }
+
+        (void) llama_dmn_defer(ctx, ggml_time_us(), nullptr);
 
         {
             SRV_DBG("%s", "posting NEXT_RESPONSE\n");
@@ -2036,6 +3942,7 @@ private:
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
                 llama_tokens evicted_tokens;
+                llama_tokens compacted_tokens;
                 {
                     const llama_tokens & prompt_tokens = slot.prompt.tokens.get_text_tokens();
                     if (n_discard > 0 && prompt_tokens.size() >= static_cast<size_t>(n_keep + n_discard)) {
@@ -2043,31 +3950,87 @@ private:
                                 prompt_tokens.begin() + n_keep,
                                 prompt_tokens.begin() + n_keep + n_discard);
                     }
+
+                    compacted_tokens = prompt_tokens;
+                    for (size_t i = n_keep + n_discard; i < compacted_tokens.size(); i++) {
+                        compacted_tokens[i - n_discard] = compacted_tokens[i];
+                    }
+                    compacted_tokens.resize(slot.prompt.tokens.size() - n_discard);
                 }
 
-                llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
-                llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+                llama_active_lora_stats active_before = {};
+                bool have_active_before = llama_active_lora_get_stats(ctx, &active_before) == 0;
+                bool active_weights_changed = false;
 
                 if (!evicted_tokens.empty()) {
-                    if (llama_active_lora_ingest(ctx, evicted_tokens.data(), evicted_tokens.size()) != 0) {
+                    llama_self_state_event evicted_event = {
+                        /*.tokens =*/ evicted_tokens.data(),
+                        /*.n_tokens =*/ evicted_tokens.size(),
+                        /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
+                        /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+                        /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED |
+                                LLAMA_SELF_STATE_EVENT_INTERNAL_ARTIFACT |
+                                LLAMA_SELF_STATE_EVENT_CONTEXT_COMPACTED,
+                        /*.decoder_entropy =*/ 0.0f,
+                        /*.decoder_top_margin =*/ 1.0f,
+                        /*.artifact_kind =*/ LLAMA_SELF_COG_ARTIFACT_CONTEXT_EVICTION,
+                        /*.loop_origin =*/ LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                        /*.phase =*/ LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION,
+                        /*.source_id =*/ slot.id,
+                        /*.plan_id =*/ -1,
+                    };
+                    llama_self_state_feature_vector evicted_pre = {};
+                    llama_self_state_feature_vector evicted_post = {};
+                    const bool have_self_state_event =
+                            llama_self_state_build_prewrite_features(ctx, &evicted_event, &evicted_pre) == 0 &&
+                            llama_self_state_apply_prewrite(ctx, &evicted_event, &evicted_pre) == 0 &&
+                            llama_self_state_build_postwrite_features(ctx, &evicted_event, &evicted_post) == 0 &&
+                            llama_self_state_apply_postwrite(ctx, &evicted_event, &evicted_post) == 0;
+                    if ((have_self_state_event &&
+                            llama_active_lora_ingest_event(ctx, &evicted_event, &evicted_post) != 0) ||
+                        (!have_self_state_event &&
+                            llama_active_lora_ingest(ctx, evicted_tokens.data(), evicted_tokens.size()) != 0)) {
                         SLT_WRN(slot, "%s\n", "Active LoRA ingestion failed for evicted span");
+                    } else if (have_active_before) {
+                        llama_active_lora_stats active_after = {};
+                        if (llama_active_lora_get_stats(ctx, &active_after) == 0) {
+                            active_weights_changed = active_after.updates_applied > active_before.updates_applied;
+                        }
                     }
                 }
 
-                // add generated tokens to cache
-                // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
-                {
-                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                const bool schedule_strict_replay = active_weights_changed && !compacted_tokens.empty();
 
-                    llama_tokens new_tokens = slot.prompt.tokens.get_text_tokens(); // copy
-                    for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
-                        new_tokens[i - n_discard] = new_tokens[i];
-                    }
+                if (schedule_strict_replay) {
+                    SLT_WRN(slot, "strict KV replay scheduled after Active LoRA update, replay_tokens = %zu\n", compacted_tokens.size());
 
-                    new_tokens.resize(slot.prompt.tokens.size() - n_discard);
-
+                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, -1, -1);
                     slot.prompt.tokens.clear();
-                    slot.prompt.tokens.insert(new_tokens);
+                    slot.prompt.checkpoints.clear();
+                    slot.replay_tokens = std::make_unique<server_tokens>(compacted_tokens, false);
+                    slot.state = SLOT_STATE_REPLAYING_PROMPT;
+                    slot.i_batch = -1;
+                    slot.i_batch_dft.clear();
+                    slot.drafted.clear();
+                    slot.n_prompt_tokens_cache = 0;
+                    slot.n_prompt_tokens_processed = 0;
+
+                    if (slot.can_speculate()) {
+                        common_speculative_begin(slot.spec, compacted_tokens);
+                    }
+                } else {
+                    llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
+                    llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+
+                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                    slot.prompt.tokens.clear();
+                    slot.prompt.tokens.insert(compacted_tokens);
+
+                    if (active_weights_changed && compacted_tokens.empty()) {
+                        SLT_WRN(slot, "%s\n", "strict KV replay skipped because no retained tokens remain");
+                    } else if (!active_weights_changed) {
+                        SLT_DBG(slot, "%s\n", "strict KV replay skipped because Active LoRA weights did not change");
+                    }
                 }
 
                 slot.truncated = true;
@@ -2181,21 +4144,30 @@ private:
                 }
 
                 // this slot still has a prompt to be processed
-                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
-                    const auto & input_tokens = slot.task->tokens;
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_REPLAYING_PROMPT) {
+                    const bool is_replay = slot.is_replaying_prompt();
+                    const auto & input_tokens = slot.input_tokens_ref();
+                    const int n_input_tokens = slot.input_tokens_count();
 
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.n_tokens;
 
                     // TODO: maybe move branch to outside of this loop in the future
-                    if (slot.state == SLOT_STATE_STARTED) {
-                        slot.t_start_process_prompt = ggml_time_us();
-                        slot.t_start_generation = 0;
-
+                    if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_REPLAYING_PROMPT) {
+                        int n_past = 0;
+                        if (slot.state == SLOT_STATE_STARTED) {
+                            slot.t_start_process_prompt = ggml_time_us();
+                            slot.t_start_generation = 0;
+                        }
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
-                        SLT_INF(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
-                                slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
+                        if (is_replay) {
+                            SLT_INF(slot, "strict KV replay started, n_ctx_slot = %d, replay_tokens = %d\n",
+                                    slot.n_ctx, n_input_tokens);
+                        } else {
+                            SLT_INF(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
+                                    slot.n_ctx, slot.task->params.n_keep, n_input_tokens);
+                        }
 
                         // print prompt tokens (for debugging)
                         /*if (1) {
@@ -2209,9 +4181,6 @@ private:
                                 SLT_DBG(slot, "prompt token %3d: %6d '%s'\n", i, input_tokens[i], common_token_to_piece(ctx, input_tokens[i]).c_str());
                             }
                         }*/
-
-                        // keep track how many tokens we can reuse from the previous state
-                        int n_past = 0;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -2232,39 +4201,39 @@ private:
                         }
 
                         if (!slot.can_split()) {
-                            if (slot.task->n_tokens() > n_ubatch) {
+                            if (n_input_tokens > n_ubatch) {
                                 send_error(slot,
                                            string_format(
                                                "input (%d tokens) is too large to process. increase the physical batch "
                                                "size (current batch size: %d)",
-                                               slot.task->n_tokens(), n_ubatch),
+                                               n_input_tokens, n_ubatch),
                                            ERROR_TYPE_SERVER);
                                 slot.release();
                                 continue;
                             }
 
-                            if (slot.task->n_tokens() > slot.n_ctx) {
+                            if (n_input_tokens > slot.n_ctx) {
                                 send_error(
                                     slot,
                                     string_format(
                                         "input (%d tokens) is larger than the max context size (%d tokens). skipping",
-                                        slot.task->n_tokens(), slot.n_ctx),
+                                        n_input_tokens, slot.n_ctx),
                                     ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 continue;
                             }
                         } else {
-                            if (slot.task->n_tokens() >= slot.n_ctx) {
+                            if (n_input_tokens >= slot.n_ctx) {
                                 send_error(slot,
                                            string_format("request (%d tokens) exceeds the available context size (%d "
                                                          "tokens), try increasing it",
-                                                         slot.task->n_tokens(), slot.n_ctx),
+                                                         n_input_tokens, slot.n_ctx),
                                            ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 continue;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            if (!is_replay && slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -2357,7 +4326,7 @@ private:
                                 // this is useful for debugging prompt caching
                                 if (slots_debug) {
                                     const int np0 = std::max<int>(n_past - 4, 0);
-                                    const int np1 = std::min<int>(n_past + 6, std::min(slot.prompt.tokens.size(), slot.task->tokens.size()));
+                                    const int np1 = std::min<int>(n_past + 6, std::min(slot.prompt.tokens.size(), input_tokens.size()));
 
                                     std::stringstream ss0;
                                     std::stringstream ss1;
@@ -2382,7 +4351,7 @@ private:
                                         }
 
                                         {
-                                            const auto token = slot.task->tokens[i];
+                                            const auto token = input_tokens[i];
                                             const auto piece = token != LLAMA_TOKEN_NULL ? common_token_to_piece(ctx, token) : "[mtmd]";
                                             ss1 << piece;
                                             st1 << std::setw(8) << token;
@@ -2403,7 +4372,7 @@ private:
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
-                                        [&, func_name = __func__](const auto & cur) {
+                                        [&, func_name = "update_slots"](const auto & cur) {
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
@@ -2432,7 +4401,6 @@ private:
                                     if (do_reset) {
                                         SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                        pos_next = 0;
                                         n_past = 0;
                                     }
                                 }
@@ -2453,8 +4421,8 @@ private:
                         }
 
                         // [TAG_PROMPT_LOGITS]
-                        if (n_past == slot.task->n_tokens() && n_past > 0) {
-                            SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
+                        if (n_past == n_input_tokens && n_past > 0) {
+                            SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, n_input_tokens);
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
@@ -2466,14 +4434,14 @@ private:
 
                         // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
-                        if (slot.task->params.stream && slot.task->params.return_progress) {
+                        if (!is_replay && slot.task->params.stream && slot.task->params.return_progress) {
                             send_partial_response(slot, {}, true);
                         }
                     }
 
                     if (!slot.can_split()) {
                         // cannot fit the prompt in the current batch - will try next iter
-                        if (batch.n_tokens + slot.task->n_tokens() > n_batch) {
+                        if (batch.n_tokens + n_input_tokens > n_batch) {
                             continue;
                         }
                     }
@@ -2495,7 +4463,7 @@ private:
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
 
                     // check if we should process the image
-                    if (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
+                    if (!is_replay && slot.prompt.n_tokens() < n_input_tokens && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
                         size_t n_tokens_out = 0;
                         int32_t res = input_tokens.process_chunk(ctx, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
@@ -2532,7 +4500,7 @@ private:
                     }
 
                     // make checkpoints only for completion tasks
-                    do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
+                    do_checkpoint = do_checkpoint && !is_replay && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
 
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
                     // checkpoints are created only if:
@@ -2547,7 +4515,7 @@ private:
                             );
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
+                    while (slot.prompt.n_tokens() < n_input_tokens && batch.n_tokens < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -2583,7 +4551,7 @@ private:
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
                                 const int n_last = std::min(n_batch, offset);
-                                if (do_checkpoint && slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                if (do_checkpoint && n_input_tokens == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
                                     break;
                                 }
@@ -2598,21 +4566,24 @@ private:
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
 
                     // entire prompt has been processed
-                    if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
-                        slot.state = SLOT_STATE_DONE_PROMPT;
-
+                    if (slot.prompt.n_tokens() == n_input_tokens) {
                         GGML_ASSERT(batch.n_tokens > 0);
-
-                        // extract the logits only for the last token
                         batch.logits[batch.n_tokens - 1] = true;
+                        slot.i_batch = batch.n_tokens - 1;
 
-                        slot.n_decoded = 0;
-                        slot.i_batch   = batch.n_tokens - 1;
-
-                        slot.init_sampler();
-                        SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
+                        if (is_replay) {
+                            slot.init_sampler();
+                            slot.replay_tokens.reset();
+                            slot.state = SLOT_STATE_GENERATING;
+                            SLT_INF(slot, "strict KV replay done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
+                        } else {
+                            slot.state = SLOT_STATE_DONE_PROMPT;
+                            slot.n_decoded = 0;
+                            slot.init_sampler();
+                            SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
+                        }
                     } else {
-                        if (slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
+                        if (n_input_tokens < slot.prompt.n_tokens() + n_ubatch) {
                             // near the end of the prompt
                             do_checkpoint = do_checkpoint && true;
                         } else {
@@ -2633,7 +4604,7 @@ private:
                             }
                         }
 
-                        SLT_INF(slot, "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f\n", slot.prompt.n_tokens(), batch.n_tokens, (float) slot.prompt.n_tokens() / slot.task->n_tokens());
+                        SLT_INF(slot, "prompt processing progress, n_tokens = %d, batch.n_tokens = %d, progress = %f\n", slot.prompt.n_tokens(), batch.n_tokens, (float) slot.prompt.n_tokens() / std::max(1, n_input_tokens));
                     }
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), slot.id);
@@ -2855,7 +4826,7 @@ private:
                     continue; // continue loop of slots
                 }
 
-                if (slot.i_batch_dft.size() > 0) {
+                if (!slot.i_batch_dft.empty()) {
                     continue; // sample using speculative decoding
                 }
 
@@ -2976,15 +4947,18 @@ private:
 server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 bool server_context::load_model(const common_params & params) {
     return impl->load_model(params);
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 void server_context::terminate() {
     impl->queue_tasks.terminate();
 }
@@ -2993,6 +4967,7 @@ llama_context * server_context::get_llama_context() const {
     return impl->ctx;
 }
 
+// NOLINTNEXTLINE(readability-make-member-function-const)
 server_response_reader server_context::get_response_reader() {
     return impl->get_response_reader();
 }
@@ -3110,6 +5085,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->slot_n_ctx,
                     data);
+            task.foreground_role = classify_foreground_role(data);
+            if (task.foreground_role == LLAMA_SELF_STATE_EVENT_TOOL) {
+                task.foreground_flags |= LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED;
+            }
             task.id_slot = json_value(data, "id_slot", -1);
 
             // OAI-compat
@@ -3141,30 +5120,31 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         auto all_results = rd.wait_for_all(req.should_stop);
         if (all_results.is_terminated) {
             return res; // connection is closed
-        } else if (all_results.error) {
+        }
+        if (all_results.error) {
             res->error(all_results.error->to_json());
             return res;
+        }
+
+        json arr = json::array();
+        for (auto & res : all_results.results) {
+            GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
+            arr.push_back(res->to_json());
+        }
+        GGML_ASSERT(!arr.empty() && "empty results");
+        if (arr.size() == 1) {
+            // if single request, return single object instead of array
+            res->ok(arr[0]);
+        } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
+            // if multiple results in OAI format, we need to re-format them
+            json & choices = arr[0]["choices"];
+            for (size_t i = 1; i < arr.size(); i++) {
+                choices.push_back(std::move(arr[i]["choices"][0]));
+            }
+            res->ok(arr[0]);
         } else {
-            json arr = json::array();
-            for (auto & res : all_results.results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(res.get()) != nullptr);
-                arr.push_back(res->to_json());
-            }
-            GGML_ASSERT(!arr.empty() && "empty results");
-            if (arr.size() == 1) {
-                // if single request, return single object instead of array
-                res->ok(arr[0]);
-            } else if (res_type == TASK_RESPONSE_TYPE_OAI_CHAT || res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
-                // if multiple results in OAI format, we need to re-format them
-                json & choices = arr[0]["choices"];
-                for (size_t i = 1; i < arr.size(); i++) {
-                    choices.push_back(std::move(arr[i]["choices"][0]));
-                }
-                res->ok(arr[0]);
-            } else {
-                // multi-results, non-OAI compat
-                res->ok(arr);
-            }
+            // multi-results, non-OAI compat
+            res->ok(arr);
         }
     } else {
         // in streaming mode, the first error must be treated as non-stream response
@@ -3205,14 +5185,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         {"event", "error"},
                         {"data", res_json},
                     });
-                } else {
-                    return format_oai_sse(json {{ "error", res_json }});
                 }
+                return format_oai_sse(json {{ "error", res_json }});
             };
 
             try {
                 if (req.should_stop()) {
-                    SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
+                    LOG_DBG("srv  %12.*s: %s", 12, "stream_next", "stopping streaming due to should_stop condition\n");
                     return false; // should_stop condition met
                 }
 
@@ -3238,14 +5217,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             output = "data: [DONE]\n\n";
                             break;
                     }
-                    SRV_DBG("%s", "all results received, terminating stream\n");
+                    LOG_DBG("srv  %12.*s: %s", 12, "stream_next", "all results received, terminating stream\n");
                     return false; // no more data, terminate
                 }
 
                 // receive subsequent results
                 auto result = rd.next(req.should_stop);
                 if (result == nullptr) {
-                    SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
+                    LOG_DBG("srv  %12.*s: %s", 12, "stream_next", "stopping streaming due to should_stop condition\n");
                     GGML_ASSERT(req.should_stop());
                     return false; // should_stop condition met
                 }
@@ -3254,21 +5233,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 if (result->is_error()) {
                     json res_json = result->to_json();
                     output = format_error(res_type, res_json);
-                    SRV_DBG("%s", "error received during streaming, terminating stream\n");
+                    LOG_DBG("srv  %12.*s: %s", 12, "stream_next", "error received during streaming, terminating stream\n");
                     return false; // terminate on error
+                }
+                GGML_ASSERT(
+                    dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
+                    || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
+                );
+                json res_json = result->to_json();
+                if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                    output = format_anthropic_sse(res_json);
+                } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                    output = format_oai_resp_sse(res_json);
                 } else {
-                    GGML_ASSERT(
-                        dynamic_cast<server_task_result_cmpl_partial*>(result.get()) != nullptr
-                        || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
-                    );
-                    json res_json = result->to_json();
-                    if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-                        output = format_anthropic_sse(res_json);
-                    } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-                        output = format_oai_resp_sse(res_json);
-                    } else {
-                        output = format_oai_sse(res_json);
-                    }
+                    output = format_oai_sse(res_json);
                 }
 
                 // has next data, continue
@@ -3312,7 +5290,7 @@ void server_routes::init_routes() {
         bool ctx_server; // do NOT delete this line
         GGML_UNUSED(ctx_server);
 
-        res->ok({{"status", "ok"}});
+        res->ok(this->ctx_server.build_health_json());
         return res;
     };
 
@@ -3344,7 +5322,7 @@ void server_routes::init_routes() {
         }
 
         // TODO: get rid of this dynamic_cast
-        auto res_task = dynamic_cast<server_task_result_metrics*>(result.get());
+        auto * res_task = dynamic_cast<server_task_result_metrics*>(result.get());
         GGML_ASSERT(res_task != nullptr);
 
         // metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
@@ -3352,19 +5330,19 @@ void server_routes::init_routes() {
             {"counter", {{
                     {"name",  "prompt_tokens_total"},
                     {"help",  "Number of prompt tokens processed."},
-                    {"value",  (uint64_t) res_task->n_prompt_tokens_processed_total}
+                    {"value",  res_task->n_prompt_tokens_processed_total}
             }, {
                     {"name",  "prompt_seconds_total"},
                     {"help",  "Prompt process time"},
-                    {"value",  (uint64_t) res_task->t_prompt_processing_total / 1.e3}
+                    {"value",  res_task->t_prompt_processing_total / 1.e3}
             }, {
                     {"name",  "tokens_predicted_total"},
                     {"help",  "Number of generation tokens processed."},
-                    {"value",  (uint64_t) res_task->n_tokens_predicted_total}
+                    {"value",  res_task->n_tokens_predicted_total}
             }, {
                     {"name",  "tokens_predicted_seconds_total"},
                     {"help",  "Predict process time"},
-                    {"value",  (uint64_t) res_task->t_tokens_generation_total / 1.e3}
+                    {"value",  res_task->t_tokens_generation_total / 1.e3}
             }, {
                     {"name",  "n_decode_total"},
                     {"help",  "Total number of llama_decode() calls"},
@@ -3377,6 +5355,54 @@ void server_routes::init_routes() {
                     {"name",  "n_busy_slots_per_decode"},
                     {"help",  "Average number of busy slots per llama_decode() call"},
                     {"value",  (float) res_task->n_busy_slots_total / std::max((float) res_task->n_decode_total, 1.f)}
+            }, {
+                    {"name",  "external_bash_dispatch_total"},
+                    {"help",  "Total number of bash tool commands dispatched to async workers."},
+                    {"value",  res_task->n_external_bash_dispatch_total}
+            }, {
+                    {"name",  "external_bash_complete_total"},
+                    {"help",  "Total number of bash tool commands completed."},
+                    {"value",  res_task->n_external_bash_complete_total}
+            }, {
+                    {"name",  "external_bash_fail_total"},
+                    {"help",  "Total number of bash tool commands that failed or were rejected."},
+                    {"value",  res_task->n_external_bash_fail_total}
+            }, {
+                    {"name",  "external_hard_memory_dispatch_total"},
+                    {"help",  "Total number of hard-memory queries dispatched to async workers."},
+                    {"value",  res_task->n_external_hard_memory_dispatch_total}
+            }, {
+                    {"name",  "external_hard_memory_complete_total"},
+                    {"help",  "Total number of hard-memory queries completed."},
+                    {"value",  res_task->n_external_hard_memory_complete_total}
+            }, {
+                    {"name",  "external_hard_memory_fail_total"},
+                    {"help",  "Total number of hard-memory queries that failed."},
+                    {"value",  res_task->n_external_hard_memory_fail_total}
+            }, {
+                    {"name",  "runtime_persist_success_total"},
+                    {"help",  "Total number of successful runtime snapshot writes."},
+                    {"value",  res_task->runtime_persist_success_total}
+            }, {
+                    {"name",  "runtime_persist_fail_total"},
+                    {"help",  "Total number of failed runtime snapshot writes."},
+                    {"value",  res_task->runtime_persist_fail_total}
+            }, {
+                    {"name",  "proactive_publish_total"},
+                    {"help",  "Total number of proactive self-emits published to the OpenAI mailbox."},
+                    {"value",  res_task->proactive_publish_total}
+            }, {
+                    {"name",  "proactive_complete_total"},
+                    {"help",  "Total number of proactive self-emits completed and retained."},
+                    {"value",  res_task->proactive_complete_total}
+            }, {
+                    {"name",  "proactive_fail_total"},
+                    {"help",  "Total number of proactive self-emits that failed to publish."},
+                    {"value",  res_task->proactive_fail_total}
+            }, {
+                    {"name",  "proactive_dropped_total"},
+                    {"help",  "Total number of proactive responses evicted from retention."},
+                    {"value",  res_task->proactive_dropped_total}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},
@@ -3389,11 +5415,47 @@ void server_routes::init_routes() {
             },{
                     {"name",  "requests_processing"},
                     {"help",  "Number of requests processing."},
-                    {"value",  (uint64_t) res_task->n_processing_slots}
+                    {"value",  res_task->n_processing_slots}
             },{
                     {"name",  "requests_deferred"},
                     {"help",  "Number of requests deferred."},
-                    {"value",  (uint64_t) res_task->n_tasks_deferred}
+                    {"value",  res_task->n_tasks_deferred}
+            },{
+                    {"name",  "waiting_active_tasks"},
+                    {"help",  "Number of active-loop tasks parked awaiting external tool completion."},
+                    {"value",  res_task->n_waiting_active_tasks}
+            },{
+                    {"name",  "external_bash_pending"},
+                    {"help",  "Number of pending or running bash tool jobs."},
+                    {"value",  res_task->n_external_bash_pending}
+            },{
+                    {"name",  "external_hard_memory_pending"},
+                    {"help",  "Number of pending or running hard-memory jobs."},
+                    {"value",  res_task->n_external_hard_memory_pending}
+            },{
+                    {"name",  "runtime_persistence_enabled"},
+                    {"help",  "Whether runtime persistence is enabled."},
+                    {"value",  res_task->runtime_persistence_enabled ? 1 : 0}
+            },{
+                    {"name",  "runtime_persistence_healthy"},
+                    {"help",  "Whether runtime persistence is currently healthy."},
+                    {"value",  res_task->runtime_persistence_healthy ? 1 : 0}
+            },{
+                    {"name",  "runtime_restore_success"},
+                    {"help",  "Whether the most recent runtime restore succeeded."},
+                    {"value",  res_task->runtime_restore_success ? 1 : 0}
+            },{
+                    {"name",  "proactive_responses"},
+                    {"help",  "Number of retained proactive responses."},
+                    {"value",  res_task->n_proactive_responses}
+            },{
+                    {"name",  "proactive_live_events"},
+                    {"help",  "Number of retained proactive mailbox events."},
+                    {"value",  res_task->n_proactive_live_events}
+            },{
+                    {"name",  "proactive_live_stream_connected"},
+                    {"help",  "Whether the single-client proactive live stream is attached."},
+                    {"value",  res_task->proactive_live_stream_connected ? 1 : 0}
             }}}
         };
 
@@ -3527,6 +5589,7 @@ void server_routes::init_routes() {
             { "endpoint_slots",              params.endpoint_slots },
             { "endpoint_props",              params.endpoint_props },
             { "endpoint_metrics",            params.endpoint_metrics },
+            { "api_surface",                 common_server_api_surface_to_str(params.api_surface) },
             { "webui",                       params.webui },
             { "webui_settings",              meta->json_webui_settings },
             { "chat_template",               tmpl_default },
@@ -3641,7 +5704,7 @@ void server_routes::init_routes() {
 
         std::string prompt = json_value(data, "prompt", std::string());
         std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, false, true);
-        SRV_DBG("creating infill tasks, n_prompts = %d\n", (int) tokenized_prompts.size());
+        LOG_DBG("srv  %12.*s: creating infill tasks, n_prompts = %d\n", 12, "post_infill", (int) tokenized_prompts.size());
         data["prompt"] = format_prompt_infill(
             ctx_server.vocab,
             data.at("input_prefix"),
@@ -3707,8 +5770,8 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = convert_responses_to_chatcmpl(json::parse(req.body));
-        SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
+        LOG_DBG("srv  %12.*s: %s\n", 12, "post_responses", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
+        LOG_DBG("srv  %12.*s: converted request: %s\n", 12, "post_responses", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -3721,12 +5784,93 @@ void server_routes::init_routes() {
             TASK_RESPONSE_TYPE_OAI_RESP);
     };
 
+    this->get_response_oai = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        const std::string response_id = req.get_param("response_id");
+        if (response_id.empty()) {
+            res->error(format_error_response("missing response id", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        if (request_param_truthy(req.get_param("stream"))) {
+            std::vector<json> events;
+            if (!ctx_server.proactive_mailbox_get_response_events(
+                        response_id,
+                        parse_uint64_param(req.get_param("after"), 0),
+                        &events)) {
+                res->status = 404;
+                res->error(format_error_response("response not found", ERROR_TYPE_NOT_FOUND));
+                return res;
+            }
+            res->status = 200;
+            res->content_type = "text/event-stream";
+            res->data = format_oai_resp_sse(events);
+            SRV_INF("replayed proactive response stream response=%s events=%zu\n",
+                    response_id.c_str(),
+                    events.size());
+            return res;
+        }
+
+        json response;
+        if (!ctx_server.proactive_mailbox_get_response(response_id, &response)) {
+            res->status = 404;
+            res->error(format_error_response("response not found", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        res->ok(response);
+        return res;
+    };
+
+    this->get_self_emit_stream_oai = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (!ctx_server.proactive_mailbox_connect_live_stream()) {
+            json err = format_error_response(
+                    "proactive live stream already connected for this instance",
+                    ERROR_TYPE_INVALID_REQUEST);
+            err["code"] = 409;
+            err["type"] = "conflict_error";
+            res->error(err);
+            return res;
+        }
+
+        res->status = 200;
+        res->content_type = "text/event-stream";
+        uint64_t last_sequence = parse_uint64_param(req.get_param("after"), 0);
+        std::vector<json> initial_events = ctx_server.proactive_mailbox_collect_live_events(last_sequence, &last_sequence);
+        res->data = format_oai_resp_sse(initial_events);
+        res->next = [res_this = res.get(), last_sequence, &req, ctx_this = &this->ctx_server](std::string & output) mutable -> bool {
+            if (req.should_stop()) {
+                ctx_this->proactive_mailbox_disconnect_live_stream();
+                return false;
+            }
+
+            if (!res_this->data.empty()) {
+                output = std::move(res_this->data);
+                res_this->data.clear();
+                return true;
+            }
+
+            while (!req.should_stop()) {
+                std::vector<json> events = ctx_this->proactive_mailbox_collect_live_events(last_sequence, &last_sequence);
+                if (!events.empty()) {
+                    output = format_oai_resp_sse(events);
+                    return true;
+                }
+                ctx_this->proactive_mailbox_wait_for_live_events(last_sequence, req.should_stop);
+            }
+
+            ctx_this->proactive_mailbox_disconnect_live_stream();
+            return false;
+        };
+        return res;
+    };
+
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = convert_anthropic_to_oai(json::parse(req.body));
-        SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
+        LOG_DBG("srv  %12.*s: %s\n", 12, "anth_messages", "Request converted: Anthropic -> OpenAI Chat Completions");
+        LOG_DBG("srv  %12.*s: converted request: %s\n", 12, "anth_messages", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -3743,8 +5887,8 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = convert_anthropic_to_oai(json::parse(req.body));
-        SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
+        LOG_DBG("srv  %12.*s: %s\n", 12, "anth_count", "Request converted: Anthropic -> OpenAI Chat Completions");
+        LOG_DBG("srv  %12.*s: converted request: %s\n", 12, "anth_count", body.dump().c_str());
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -3945,14 +6089,14 @@ void server_routes::init_routes() {
         // collect results
         if (all_results.is_terminated) {
             return res; // connection is closed
-        } else if (all_results.error) {
+        }
+        if (all_results.error) {
             res->error(all_results.error->to_json());
             return res;
-        } else {
-            for (auto & res : all_results.results) {
-                GGML_ASSERT(dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr);
-                responses.push_back(res->to_json());
-            }
+        }
+        for (auto & res : all_results.results) {
+            GGML_ASSERT(dynamic_cast<server_task_result_rerank*>(res.get()) != nullptr);
+            responses.push_back(res->to_json());
         }
 
         // write JSON response
@@ -4211,14 +6355,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
     // collect results
     if (all_results.is_terminated) {
         return res; // connection is closed
-    } else if (all_results.error) {
+    }
+    if (all_results.error) {
         res->error(all_results.error->to_json());
         return res;
-    } else {
-        for (auto & res : all_results.results) {
-            GGML_ASSERT(dynamic_cast<server_task_result_embd*>(res.get()) != nullptr);
-            responses.push_back(res->to_json());
-        }
+    }
+    for (auto & res : all_results.results) {
+        GGML_ASSERT(dynamic_cast<server_task_result_embd*>(res.get()) != nullptr);
+        responses.push_back(res->to_json());
     }
 
     // write JSON response

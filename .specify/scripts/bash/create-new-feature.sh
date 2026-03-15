@@ -153,10 +153,6 @@ check_existing_branches() {
     fi
 
     # Return next number
-    if ! [[ "$max_num" =~ ^[0-9]+$ ]]; then
-        max_num=0
-    fi
-
     echo $((max_num + 1))
 }
 

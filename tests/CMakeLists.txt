@@ -191,7 +191,22 @@ endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
-llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if (Python3_Interpreter_FOUND)
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c "import jinja2"
+        RESULT_VARIABLE LLAMA_TEST_JINJA2_IMPORT_RESULT
+        OUTPUT_QUIET
+        ERROR_QUIET
+    )
+endif()
+
+if (Python3_Interpreter_FOUND AND LLAMA_TEST_JINJA2_IMPORT_RESULT EQUAL 0)
+    llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
+else()
+    message(STATUS "Skipping test-jinja-py: Python jinja2 is unavailable")
+endif()
+
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
@@ -243,6 +258,13 @@ llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-active-lora.cpp       LABEL "model" ARGS "${MODEL_DEST}")
 set_tests_properties(test-active-lora PROPERTIES FIXTURES_REQUIRED test-download-model)
+llama_build_and_test(test-self-state.cpp        LABEL "model" ARGS "${MODEL_DEST}")
+set_tests_properties(test-self-state PROPERTIES FIXTURES_REQUIRED test-download-model)
+llama_build_and_test(test-cognitive-loop.cpp    LABEL "model" ARGS "${MODEL_DEST}")
+set_tests_properties(test-cognitive-loop PROPERTIES FIXTURES_REQUIRED test-download-model)
+llama_build_and_test(test-serving-lora-stack.cpp LABEL "model" ARGS "${MODEL_DEST}")
+target_include_directories(test-serving-lora-stack PRIVATE ${PROJECT_SOURCE_DIR}/src)
+set_tests_properties(test-serving-lora-stack PROPERTIES FIXTURES_REQUIRED test-download-model)
 llama_build_and_test(test-past-lora.cpp         LABEL "model" ARGS "${MODEL_DEST}")
 set_tests_properties(test-past-lora PROPERTIES FIXTURES_REQUIRED test-download-model)
 
@@ -283,6 +305,7 @@ endif()
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
+set_target_properties(${TEST_TARGET} PROPERTIES LINKER_LANGUAGE CXX)
 
 llama_build_and_test(test-alloc.cpp)
 target_include_directories(test-alloc PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)

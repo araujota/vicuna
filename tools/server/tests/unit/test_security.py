@@ -62,6 +62,86 @@ def test_correct_api_key_anthropic_header():
     assert "content" in res.body
 
 
+def test_openai_surface_only_exposes_canonical_routes():
+    global server
+    server.api_surface = "openai"
+    server.start()
+
+    headers = {
+        "Authorization": f"Bearer {TEST_API_KEY}",
+    }
+
+    for path in ["/", "/completion", "/chat/completions", "/api/chat", "/apply-template", "/tokenize", "/slots", "/models"]:
+        res = server.make_request("GET" if path in {"/", "/slots", "/models"} else "POST", path, data={}, headers=headers)
+        assert res.status_code == 404
+
+    res = server.make_request("GET", "/health")
+    assert res.status_code == 200
+    assert "error" not in res.body
+
+
+def test_openai_surface_requires_bearer_auth_for_models_and_chat():
+    global server
+    server.api_surface = "openai"
+    server.start()
+
+    res = server.make_request("GET", "/v1/models")
+    assert res.status_code == 401
+    assert res.body["error"]["type"] == "authentication_error"
+
+    res = server.make_request("POST", "/v1/chat/completions", data={
+        "model": server.model_alias,
+        "messages": [
+            {"role": "user", "content": "ping"},
+        ],
+    })
+    assert res.status_code == 401
+    assert res.body["error"]["type"] == "authentication_error"
+
+    res = server.make_request("GET", "/v1/models", headers={
+        "Authorization": f"Bearer {TEST_API_KEY}",
+    })
+    assert res.status_code == 200
+    assert "error" not in res.body
+
+
+def test_openai_surface_rejects_non_bearer_auth_headers():
+    global server
+    server.api_surface = "openai"
+    server.start()
+
+    res = server.make_request("POST", "/v1/chat/completions", data={
+        "model": server.model_alias,
+        "messages": [
+            {"role": "user", "content": "ping"},
+        ],
+    }, headers={
+        "X-Api-Key": TEST_API_KEY,
+    })
+    assert res.status_code == 401
+    assert res.body["error"]["type"] == "authentication_error"
+
+
+def test_openai_surface_sets_request_id_headers():
+    global server
+    server.api_surface = "openai"
+    server.start()
+
+    res = server.make_request("POST", "/v1/chat/completions", data={
+        "model": server.model_alias,
+        "messages": [
+            {"role": "user", "content": "ping"},
+        ],
+        "max_tokens": 8,
+    }, headers={
+        "Authorization": f"Bearer {TEST_API_KEY}",
+        "X-Client-Request-Id": "client.trace.123",
+    })
+    assert res.status_code == 200
+    assert res.headers["x-request-id"].startswith("req_")
+    assert res.headers["x-client-request-id"] == "client.trace.123"
+
+
 def test_openai_library_correct_api_key():
     global server
     server.start()

@@ -23,6 +23,123 @@ For the full list of features, please refer to [server's changelog](https://gith
 
 ## Usage
 
+### OpenAI Production Surface
+
+For production HTTP deployments that should present a clean OpenAI-compatible contract, run the server with the `openai` API surface:
+
+```bash
+llama-server \
+  --model /path/to/model.gguf \
+  --api-surface openai \
+  --api-key "$VICUNA_API_KEY"
+```
+
+This profile keeps the public contract intentionally small:
+
+* canonical OpenAI-compatible routes only: `/v1/models`, `/v1/completions`, `/v1/chat/completions`, `/v1/responses`, and `/v1/embeddings`
+* operational endpoints remain available at `/health`, `/v1/health`, and `/metrics`
+* legacy aliases, the Web UI, tokenization/template helpers, slot management, LoRA hotswap, and router operator endpoints are intentionally not exposed
+* when API keys are configured, OpenAI-mode requests must authenticate with `Authorization: Bearer ...`
+* every response includes `x-request-id`; `X-Client-Request-Id` is echoed back as `x-client-request-id` when provided
+
+### Unified Cognitive Artifact Tape
+
+Vicuña now treats foreground interaction, DMN cognition, and prompt-context eviction as one bounded internal artifact tape rather than three separate memory paths.
+
+What this means operationally:
+
+* DMN planning, DMN internal writes, active planning/reflection summaries, functional-update summaries, and server context-shift evictions are all recorded as token-bearing internal artifacts in the same retained trace.
+* The shared tape is bounded by both item count and token count. When it overflows, the oldest artifacts are compacted first regardless of whether they came from active mode, DMN mode, or prompt eviction.
+* Compacted artifacts are not silently dropped. They are forwarded into the existing Active LoRA memory-learning path.
+* Internal artifacts remain internal. They do not count as user turns, assistant emits, or social-turn state, and they do not recursively rewrite the expanded self-model as if they were new external evidence.
+* Because the tape is part of self-state trace persistence, restart/replay restores the same shared cognitive history and DMN resumes from the updated post-foreground state instead of a stale private branch.
+
+This is the runtime sense in which active engagement and DMN now form one train of thought in two modes: one shared self-state, one shared artifact tape, one shared compaction policy.
+
+### Client Integration Guide
+
+All routes below are relative to the server base URL. If you launch the server with `--api-prefix /proxy`, prepend that prefix to every path in this section.
+
+Common client rules:
+
+* Send `Content-Type: application/json` on POST requests unless a section says otherwise.
+* When API keys are configured, the default surface accepts `Authorization: Bearer ...` and `X-Api-Key: ...` on protected routes.
+* When `--api-surface openai` is configured, only `Authorization: Bearer ...` is accepted on protected `/v1/*` routes; `X-Api-Key` is rejected.
+* Every response includes `x-request-id`. If you send `X-Client-Request-Id`, the server echoes it back as `x-client-request-id`.
+* Streaming endpoints use Server-Sent Events when `stream: true`.
+* In router mode, POST routes choose the backend model from the JSON `model` field. GET routes that need a model use the `model=` query parameter.
+
+Auth shorthand used in the tables below:
+
+* `Public`: reachable without auth even when API keys are configured
+* `Protected`: requires auth when API keys are configured
+* `Bearer only`: requires `Authorization: Bearer ...` when API keys are configured
+
+#### Operational And Base Routes
+
+| Method | Path | Surface | Auth when keys enabled | Purpose | Notes |
+| ------ | ---- | ------- | ---------------------- | ------- | ----- |
+| `GET` | `/` | default only | `Public` | Web UI or static front end root | Disabled in `openai` profile |
+| `GET` | `/health` | default, openai, router | `Public` | Machine-readable readiness and runtime health | Alias: `/v1/health` |
+| `GET` | `/v1/health` | default, openai, router | `Public` | Same health payload as `/health` | Prefer `/health` for ops if you do not need `/v1` namespacing |
+| `GET` | `/metrics` | default, openai, router | `Protected` | Prometheus metrics | Must start server with `--metrics` |
+
+#### Canonical OpenAI-Compatible Routes
+
+| Method | Path | Surface | Auth when keys enabled | Purpose | Notes |
+| ------ | ---- | ------- | ---------------------- | ------- | ----- |
+| `GET` | `/v1/models` | default, openai, router | `Public` on default/router, `Bearer only` on openai | Model metadata | In router mode this returns router model inventory/status |
+| `POST` | `/v1/completions` | default, openai, router | `Protected` on default/router, `Bearer only` on openai | OpenAI text completions | Default-only alias: `/completion`, `/completions` |
+| `POST` | `/v1/chat/completions` | default, openai, router | `Protected` on default/router, `Bearer only` on openai | OpenAI chat completions | Default-only aliases: `/chat/completions`, `/api/chat` |
+| `POST` | `/v1/responses` | default, openai, router | `Protected` on default/router, `Bearer only` on openai | OpenAI Responses API | Default-only alias: `/responses` |
+| `GET` | `/v1/responses/:response_id` | default, openai | `Protected` on default, `Bearer only` on openai | Retrieve a retained proactive self-emit response | `?stream=true` replays retained `response.*` SSE events |
+| `GET` | `/v1/responses/stream` | default, openai | `Protected` on default, `Bearer only` on openai | Live SSE stream of proactive self-emits | Single client per instance for now; optional `?after=<sequence>` replay cursor |
+| `POST` | `/v1/embeddings` | default, openai, router | `Protected` on default/router, `Bearer only` on openai | OpenAI embeddings | Requires embedding-capable model/pooling |
+
+#### Default-Surface Legacy, Utility, And Compatibility Routes
+
+| Method | Path | Surface | Auth when keys enabled | Purpose | Notes |
+| ------ | ---- | ------- | ---------------------- | ------- | ----- |
+| `GET` | `/props` | default, router | `Protected` | Read server properties and model capabilities | Router mode requires `?model=` for model-specific props |
+| `POST` | `/props` | default, router | `Protected` | Mutate global server properties | Requires `--props` |
+| `POST` | `/api/show` | default, router | `Protected` | Ollama-style model/property surface | Default-only compatibility endpoint |
+| `GET` | `/models` | default, router | `Public` | Model list | In single-model mode this is a non-OAI model listing alias; in router mode this is the router inventory endpoint |
+| `GET` | `/api/tags` | default, router | `Public` | Ollama-style model tags list | Same model listing family as `/models` |
+| `POST` | `/completion` | default, router | `Protected` | Native completion endpoint | Same handler family as `/completions` |
+| `POST` | `/completions` | default, router | `Protected` | Native completion endpoint alias | Same request shape as `/completion` |
+| `POST` | `/chat/completions` | default, router | `Protected` | Chat-completions alias | Same handler as `/v1/chat/completions` |
+| `POST` | `/api/chat` | default, router | `Protected` | Ollama-style chat alias | Same handler as `/v1/chat/completions` |
+| `POST` | `/responses` | default, router | `Protected` | Responses alias | Same handler as `/v1/responses` |
+| `POST` | `/v1/messages` | default, router | `Protected` | Anthropic-compatible Messages API | Tool use requires `--jinja` |
+| `POST` | `/v1/messages/count_tokens` | default, router | `Protected` | Anthropic token counting | Same request family as `/v1/messages` |
+| `POST` | `/infill` | default, router | `Protected` | Code infill endpoint | Not exposed in `openai` profile |
+| `POST` | `/embedding` | default, router | `Protected` | Legacy embedding endpoint | Alias family of `/embeddings` |
+| `POST` | `/embeddings` | default, router | `Protected` | Non-OAI embeddings endpoint | Distinct response shape from `/v1/embeddings` |
+| `POST` | `/rerank` | default, router | `Protected` | Reranking endpoint | Alias family of `/reranking`, `/v1/rerank`, `/v1/reranking` |
+| `POST` | `/reranking` | default, router | `Protected` | Reranking endpoint alias | Same request/response family as `/rerank` |
+| `POST` | `/v1/rerank` | default, router | `Protected` | Reranking endpoint alias | Still default-surface only |
+| `POST` | `/v1/reranking` | default, router | `Protected` | Reranking endpoint alias | Still default-surface only |
+| `POST` | `/tokenize` | default, router | `Protected` | Convert text/messages to token IDs | Utility endpoint, not part of OpenAI surface |
+| `POST` | `/detokenize` | default, router | `Protected` | Convert token IDs back to text | Utility endpoint |
+| `POST` | `/apply-template` | default, router | `Protected` | Apply chat template without generation | Useful for client-side prompt debugging |
+| `GET` | `/lora-adapters` | default, router | `Protected` | Inspect loaded LoRA adapter scales | Requires adapters loaded at startup |
+| `POST` | `/lora-adapters` | default, router | `Protected` | Set global LoRA adapter scales | Per-request LoRA settings can still override |
+| `GET` | `/slots` | default, router | `Protected` | Inspect slot state | Must not be disabled with `--no-slots` |
+| `POST` | `/slots/{id_slot}?action=save` | default, router | `Protected` | Save slot prompt cache | Requires `--slot-save-path` |
+| `POST` | `/slots/{id_slot}?action=restore` | default, router | `Protected` | Restore slot prompt cache | Requires `--slot-save-path` |
+| `POST` | `/slots/{id_slot}?action=erase` | default, router | `Protected` | Erase slot prompt cache | Same route, `action=erase` |
+
+#### Router-Only And Experimental Routes
+
+| Method | Path | Surface | Auth when keys enabled | Purpose | Notes |
+| ------ | ---- | ------- | ---------------------- | ------- | ----- |
+| `POST` | `/models/load` | router + default surface only | `Protected` | Load a model into router-managed backend pool | Not exposed in `openai` profile |
+| `POST` | `/models/unload` | router + default surface only | `Protected` | Unload a model from router-managed backend pool | Not exposed in `openai` profile |
+| `GET` | `/cors-proxy` | default only | `Protected` | Experimental Web UI MCP CORS proxy | Requires `--webui-mcp-proxy`; do not expose to untrusted clients |
+| `POST` | `/cors-proxy` | default only | `Protected` | Experimental Web UI MCP CORS proxy | Same caveat as GET |
+
+The detailed sections below keep the request and response examples for each endpoint family. Use the tables above as the authoritative route inventory and profile/auth summary.
+
 <!-- HELP_START -->
 
 <!-- IMPORTANT: The list below is auto-generated by llama-gen-docs; do NOT modify it manually -->
@@ -353,9 +470,9 @@ curl --request POST \
 
 ## API Endpoints
 
-### GET `/health`: Returns health check result
+### GET `/health` and `/v1/health`: Returns health check result
 
-This endpoint is public (no API key check). `/v1/health` also works.
+These endpoints are public (no API key check), including in the `openai` profile.
 
 **Response format**
 
@@ -1118,7 +1235,11 @@ To know the `id` of the adapter, use GET `/lora-adapters`
 
 Returns information about the loaded model. See [OpenAI Models API documentation](https://platform.openai.com/docs/api-reference/models).
 
+When API keys are configured, this endpoint stays public on the default surface but becomes Bearer-authenticated in the `openai` profile.
+
 The returned list always has one single element. The `meta` field can be `null` (for example, while the model is still loading).
+
+In router mode, this endpoint returns the router's model inventory and status rather than the single loaded-model view shown below.
 
 By default, model `id` field is the path to model file, specified via `-m`. You can set a custom value for model `id` field via `--alias` argument. For example, `--alias gpt-4o-mini`.
 
@@ -1324,6 +1445,37 @@ curl http://localhost:8080/v1/responses \
 ```
 
 This endpoint works by converting Responses request into Chat Completions request.
+
+### GET `/v1/responses/:response_id`: retained proactive response retrieval
+
+This route returns a stored OpenAI `response` object for a proactive self-emit generated by the runtime. It is intended for the single connected client to retrieve or replay unsolicited assistant updates in a standard OpenAI object shape.
+
+Use `?stream=true` to replay the retained `response.*` SSE events for that response instead of receiving the final JSON object.
+
+*Examples:*
+
+```shell
+curl http://localhost:8080/v1/responses/resp_123 \
+  -H "Authorization: Bearer no-key"
+```
+
+```shell
+curl http://localhost:8080/v1/responses/resp_123?stream=true \
+  -H "Authorization: Bearer no-key"
+```
+
+### GET `/v1/responses/stream`: live proactive self-emit stream
+
+This route exposes unsolicited runtime self-emits as standard OpenAI Responses SSE events (`response.created`, `response.output_text.delta`, `response.completed`, and related events). For now, each server instance allows only one live subscriber at a time because the runtime assumes a single client per instance.
+
+If the client reconnects, it can pass `?after=<sequence>` to receive any retained mailbox events with a sequence number greater than the supplied value before the stream blocks waiting for new proactive emits.
+
+*Example:*
+
+```shell
+curl http://localhost:8080/v1/responses/stream?after=0 \
+  -H "Authorization: Bearer no-key"
+```
 
 
 ### POST `/v1/embeddings`: OpenAI-compatible embeddings API
@@ -1582,6 +1734,8 @@ By default, the model will be loaded automatically if it's not loaded. To disabl
 
 ### GET `/models`: List available models
 
+This route is available on the default surface only. In router mode it is the primary model inventory endpoint. In single-model mode it is a non-OAI alias family for model metadata.
+
 Listing all models in cache. The model metadata will also include a field to indicate the status of the model:
 
 ```json
@@ -1634,6 +1788,8 @@ The `status` object can be:
 
 ### POST `/models/load`: Load a model
 
+This route is available only in router mode on the default surface. It is intentionally not exposed in the `openai` profile.
+
 Load a model
 
 Payload:
@@ -1656,6 +1812,8 @@ Response:
 
 ### POST `/models/unload`: Unload a model
 
+This route is available only in router mode on the default surface. It is intentionally not exposed in the `openai` profile.
+
 Unload a model
 
 Payload:
@@ -1677,6 +1835,8 @@ Response:
 ## API errors
 
 `llama-server` returns errors in the same format as OAI: https://github.com/openai/openai-openapi
+
+All error responses also include `x-request-id` for log correlation. If the client sends `X-Client-Request-Id`, the echoed `x-client-request-id` header can be used to join client-side and server-side traces.
 
 Example of an error:
 

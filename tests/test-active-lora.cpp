@@ -2,6 +2,7 @@
 #include "llama.h"
 
 #include <cstdlib>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -88,10 +89,91 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    llama_user_personality_lora_stats user_stats = {};
+    if (llama_user_personality_lora_get_stats(ctx, &user_stats) != 0) {
+        fprintf(stderr, "failed to query user personality LoRA stats\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
     if (!stats.enabled || stats.selected_rank < 1 ||
-        stats.embedding_type != LLAMA_ACTIVE_LORA_EMBEDDING_HASH ||
-        stats.embedding_is_custom || stats.embedding_dim != 64) {
+        stats.optimizer_step_count != 0 ||
+        stats.embedding_type != LLAMA_ACTIVE_LORA_EMBEDDING_HIDDEN_STATE ||
+        stats.embedding_is_custom || stats.embedding_dim != (uint32_t) llama_model_n_embd_out(model) ||
+        stats.optimizer_last_update_norm != 0.0f) {
         fprintf(stderr, "unexpected Active LoRA init stats\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+    if (!user_stats.enabled || user_stats.attached_for_simulation ||
+        user_stats.selected_rank < 1 ||
+        user_stats.updates_applied != 0 ||
+        user_stats.optimizer_step_count != 0 ||
+        user_stats.tokens_ingested != 0 ||
+        user_stats.confidence != 0.0f) {
+        fprintf(stderr, "unexpected user personality LoRA init stats\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    if (llama_functional_lora_family_count(ctx) != LLAMA_FUNCTIONAL_LORA_COUNT) {
+        fprintf(stderr, "unexpected functional LoRA family count\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+    for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+        llama_functional_lora_family_config config = {};
+        llama_functional_lora_family_state state = {};
+        if (llama_functional_lora_family_config_get(ctx, family, &config) != 0 ||
+            llama_functional_lora_family_state_get(ctx, family, &state) != 0 ||
+            !config.enabled ||
+            config.gain_clip_min != 0.0f ||
+            config.gain_clip_max != 2.0f ||
+            config.default_gain < 0.999f ||
+            config.default_gain > 1.001f ||
+            config.exploration_noise_initial_std <= config.exploration_noise_min_std ||
+            config.bootstrap_perturbation_initial_std <= config.bootstrap_perturbation_min_std ||
+            config.bootstrap_perturbation_min_std <= 0.0f ||
+            config.bootstrap_weight_init_std <= 0.0f ||
+            !state.compatible ||
+            state.active_now ||
+            state.current_gain != 0.0f ||
+            state.predicted_gain < 0.999f ||
+            state.predicted_gain > 1.001f ||
+            state.last_noise != 0.0f ||
+            state.current_bootstrap_std != config.bootstrap_perturbation_initial_std ||
+            state.last_bootstrap_perturbation != 0.0f ||
+            state.activation_count != 0 ||
+            state.last_meta_loss != 0.0f) {
+            fprintf(stderr, "unexpected functional LoRA registry state for family %d\n", family);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+    }
+    llama_functional_lora_trace functional_trace = {};
+    if (llama_functional_lora_get_last_trace(ctx, &functional_trace) != 0 ||
+        functional_trace.last_activation.microphase != 0) {
+        fprintf(stderr, "unexpected default functional LoRA trace\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+    llama_active_temporal_encoding_bias temporal_bias = {};
+    if (llama_active_temporal_encoding_bias_get(ctx, &temporal_bias) != 0 ||
+        temporal_bias.reward_bias != 0.0f ||
+        temporal_bias.dampening_bias != 0.0f ||
+        temporal_bias.effective_write_scale < 0.999f ||
+        temporal_bias.effective_write_scale > 1.001f ||
+        temporal_bias.last_update_norm != 0.0f ||
+        temporal_bias.adam_step != 0 ||
+        temporal_bias.applied_update_count != 0 ||
+        temporal_bias.last_update_monotonic_ms != 0) {
+        fprintf(stderr, "unexpected default temporal encoding bias\n");
         llama_free(ctx);
         llama_model_free(model);
         return 1;
@@ -118,9 +200,20 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (stats.updates_applied < 1 || stats.tokens_ingested < tokens.size() || !stats.rollover_ready ||
-        stats.gain_mean <= 0.0f || stats.gain_max <= 0.0f || stats.gain_max > params.gain_max + 1.0e-6f) {
+    if (stats.updates_applied < 1 || stats.optimizer_step_count < 1 || stats.tokens_ingested < tokens.size() || !stats.rollover_ready ||
+        stats.gain_mean <= 0.0f || stats.gain_max <= 0.0f || stats.gain_max > params.gain_max + 1.0e-6f ||
+        stats.optimizer_last_update_norm <= 0.0f) {
         fprintf(stderr, "unexpected Active LoRA ingest stats\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+    if (llama_user_personality_lora_get_stats(ctx, &user_stats) != 0 ||
+        user_stats.updates_applied != 0 ||
+        user_stats.tokens_ingested != 0 ||
+        user_stats.optimizer_step_count != 0 ||
+        user_stats.confidence != 0.0f) {
+        fprintf(stderr, "evicted-span ingest unexpectedly changed user personality LoRA\n");
         llama_free(ctx);
         llama_model_free(model);
         return 1;
@@ -163,9 +256,49 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    llama_context * ctx_hash = llama_init_from_model(model, cparams);
+    if (!ctx_hash) {
+        fprintf(stderr, "failed to create explicit hash context\n");
+        llama_free(ctx_pool);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    llama_active_lora_params hash_params = llama_active_lora_default_params();
+    hash_params.enabled = true;
+    hash_params.host_memory_ratio = 1.0f;
+    hash_params.device_memory_ratio = 1.0f;
+    hash_params.min_rank = 1;
+    hash_params.max_rank = 2;
+    hash_params.embedding_dim = 64;
+    hash_params.embedding_type = LLAMA_ACTIVE_LORA_EMBEDDING_HASH;
+
+    if (llama_active_lora_init(ctx_hash, hash_params) != 0) {
+        fprintf(stderr, "failed to initialize explicit-hash Active LoRA\n");
+        llama_free(ctx_hash);
+        llama_free(ctx_pool);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    llama_active_lora_stats hash_stats = {};
+    if (llama_active_lora_get_stats(ctx_hash, &hash_stats) != 0 ||
+        hash_stats.embedding_type != LLAMA_ACTIVE_LORA_EMBEDDING_HASH ||
+        hash_stats.embedding_is_custom || hash_stats.embedding_dim != 64) {
+        fprintf(stderr, "unexpected explicit-hash Active LoRA stats\n");
+        llama_free(ctx_hash);
+        llama_free(ctx_pool);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
     llama_context * ctx_custom = llama_init_from_model(model, cparams);
     if (!ctx_custom) {
         fprintf(stderr, "failed to create callback context\n");
+        llama_free(ctx_hash);
         llama_free(ctx_pool);
         llama_free(ctx);
         llama_model_free(model);
@@ -185,6 +318,7 @@ int main(int argc, char ** argv) {
     if (llama_active_lora_init(ctx_custom, custom_params) != 0) {
         fprintf(stderr, "failed to initialize callback Active LoRA\n");
         llama_free(ctx_custom);
+        llama_free(ctx_hash);
         llama_free(ctx_pool);
         llama_free(ctx);
         llama_model_free(model);
@@ -196,6 +330,7 @@ int main(int argc, char ** argv) {
         !custom_stats.embedding_is_custom || custom_stats.embedding_dim != 16) {
         fprintf(stderr, "unexpected callback Active LoRA stats\n");
         llama_free(ctx_custom);
+        llama_free(ctx_hash);
         llama_free(ctx_pool);
         llama_free(ctx);
         llama_model_free(model);
@@ -205,6 +340,7 @@ int main(int argc, char ** argv) {
     if (llama_active_lora_ingest(ctx_custom, tokens.data(), tokens.size()) != 0) {
         fprintf(stderr, "failed to ingest with callback Active LoRA\n");
         llama_free(ctx_custom);
+        llama_free(ctx_hash);
         llama_free(ctx_pool);
         llama_free(ctx);
         llama_model_free(model);
@@ -214,6 +350,28 @@ int main(int argc, char ** argv) {
     if (llama_active_lora_get_stats(ctx_custom, &custom_stats) != 0 || custom_stats.updates_applied < 1) {
         fprintf(stderr, "unexpected callback Active LoRA ingest stats\n");
         llama_free(ctx_custom);
+        llama_free(ctx_hash);
+        llama_free(ctx_pool);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    const uint32_t updates_before_redundant = stats.updates_applied;
+    if (llama_active_lora_ingest(ctx, tokens.data(), tokens.size()) != 0) {
+        fprintf(stderr, "failed to ingest redundant Active LoRA span\n");
+        llama_free(ctx_custom);
+        llama_free(ctx_hash);
+        llama_free(ctx_pool);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    if (llama_active_lora_get_stats(ctx, &stats) != 0 || stats.updates_applied != updates_before_redundant) {
+        fprintf(stderr, "redundant Active LoRA span unexpectedly changed weights\n");
+        llama_free(ctx_custom);
+        llama_free(ctx_hash);
         llama_free(ctx_pool);
         llama_free(ctx);
         llama_model_free(model);
@@ -221,6 +379,7 @@ int main(int argc, char ** argv) {
     }
 
     llama_free(ctx_custom);
+    llama_free(ctx_hash);
     llama_free(ctx_pool);
     llama_free(ctx);
     llama_model_free(model);

@@ -57,6 +57,26 @@ json format_error_response(const std::string & message, const enum error_type ty
     };
 }
 
+int32_t classify_foreground_role(const json & body) {
+    if (!body.contains("messages") || !body.at("messages").is_array()) {
+        return LLAMA_SELF_STATE_EVENT_USER;
+    }
+
+    const json & messages = body.at("messages");
+    for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+        const std::string role = json_value(*it, "role", std::string());
+        if (role == "assistant" || role == "system" || role.empty()) {
+            continue;
+        }
+        if (role == "tool" || role == "function") {
+            return LLAMA_SELF_STATE_EVENT_TOOL;
+        }
+        return LLAMA_SELF_STATE_EVENT_USER;
+    }
+
+    return LLAMA_SELF_STATE_EVENT_USER;
+}
+
 //
 // random string / id
 //

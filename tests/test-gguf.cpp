@@ -146,7 +146,7 @@ static std::vector<std::pair<enum gguf_type, enum gguf_type>> get_kv_types(std::
             continue;
         }
 
-        kv_types.push_back(std::make_pair(type, gguf_type(-1)));
+        kv_types.push_back(std::make_pair(type, GGUF_TYPE_COUNT));
     }
     std::shuffle(kv_types.begin(), kv_types.end(), rng);
 

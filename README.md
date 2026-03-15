@@ -69,6 +69,172 @@ range of hardware - locally and in the cloud.
 
 The `llama.cpp` project is the main playground for developing new features for the [ggml](https://github.com/ggml-org/ggml) library.
 
+## Vicuña Self-Model Extensions
+
+Vicuña keeps its authored self-model as the fixed core, then layers a bounded
+self-model extension registry on top of it. This keeps a stable "genetic" prior
+while still allowing runtime discovery and tool-authored self-representations.
+
+The extension rules are explicit:
+
+- hard-memory query results may be counterfactually promoted into
+  `MEMORY_CONTEXT` self-model extensions
+- those hard-memory-derived extensions bias gain control, but do not become
+  allostatic objectives by default
+- tools and hosts may add `SCALAR_PARAM` self-model extensions through
+  `llama_self_state_upsert_model_extension()`
+- tool-authored scalar parameters may declare a desired state and participate in
+  allostasis, but only when that desired state is a real internal objective
+
+To make tool-authored self-model additions accurate:
+
+- use a stable `key` so repeat writes update the same extension instead of
+  creating duplicates
+- choose the narrowest correct domain:
+  `GOAL_PROGRESS`, `USER_OUTCOME`, `EPISTEMIC`, `EFFICIENCY`, `RECOVERY`,
+  `STRATEGY`, or `SELF_IMPROVEMENT`
+- keep `value`, `confidence`, `salience`, and weights normalized to `[0, 1]`
+- set `HAS_DESIRED_STATE` and `AFFECT_ALLOSTASIS` only for genuine internal
+  regulation targets
+- do not turn retrieved memory fragments into allostatic objectives by default
+- prefer the typed API over relying on tool text alone; the host should capture
+  structured tool findings and upsert them directly
+
+The bare-minimum shipped tools follow this split:
+
+- hard-memory query auto-promotes bounded non-allostatic memory-context
+  extensions
+- the CLI wrapper can be extended by the host to write typed self-model
+  extensions after command completion
+
+## Vicuña Hard Memory
+
+Vicuña now treats hard memory as a typed long-horizon substrate instead of a
+single free-form archive bucket. The runtime emits bounded memory primitives so
+retrieval can cooperate with both self-model state and functional LoRA gain.
+
+The primitive vocabulary is:
+
+- `EVENT_FRAGMENT`: salient local perturbations or observations
+- `TRAJECTORY`: action traces, plans, or multi-step tool episodes
+- `OUTCOME`: result summaries, success/failure residue, and counterfactual
+  consequences
+- `TOOL_OBSERVATION`: bounded tool output worth preserving as durable evidence
+- `USER_MODEL`: user-specific preference or relationship residue
+- `SELF_MODEL_FRAGMENT`: durable control-state or self-estimate residue
+
+The default runtime writes a bounded mix of these:
+
+- self-state postwrite events archive event fragments plus user-model and
+  self-model fragments when the state shift is large enough
+- active-loop transactions archive trajectories, outcomes, and tool
+  observations
+- DMN and counterfactual paths archive trajectories, outcomes, and
+  self-model fragments
+
+Retrieval is also typed. Hard-memory hits are summarized into bounded support
+signals such as similarity, importance, gain support, and domain support. Those
+signals feed the functional gating MLP so retrieval can bias LoRA gain without
+turning the gating path into an unbounded text heuristic. Retrieved memories may
+also be promoted into non-allostatic `MEMORY_CONTEXT` self-model extensions when
+the runtime judges that representing them inside the self-model improves future
+control.
+
+Guidance for extending the tool system:
+
+- the bare minimum shipped tools remain the hard-memory query path and the CLI
+  wrapper
+- new tools should emit typed outcomes in host code rather than relying on raw
+  text alone
+- archive tool residue with `llama_hard_memory_archive_primitives()` when the
+  result should persist as durable memory
+- write self-model changes with `llama_self_state_upsert_model_extension()`
+  only when the tool learned something that belongs in the self-model
+- memory-like recovered facts should usually become `TOOL_OBSERVATION`,
+  `OUTCOME`, or non-allostatic `MEMORY_CONTEXT`, not a new allostatic target
+
+This split is intentional: hard memory stores durable residue, the self-model
+stores bounded internal state, and the functional LoRA stack consumes typed
+summaries of both.
+
+The self-state is also now treated as incomplete by design. Vicuña keeps the
+explicit register bank and self-model as the authoritative observed state, but
+adds a bounded belief layer over residual hidden pressure. In production this
+means the functional gate can become more cautious, more exploratory, more
+tool-seeking, or more self-observational when forecast error and allostatic
+residue suggest that the current self-model is missing something important.
+These latent concern slots are not durable ontology by default; they stay
+bounded, inspectable, and only surface promotion candidates for explicit
+self-model extensions when the pattern is stable and repeatedly useful.
+
+Functional LoRAs also now have an explicit bootstrap stage. A newly created
+functional family still begins as a no-op learned adapter, but a second tiny
+bootstrap adapter injects a small signed stochastic perturbation whenever that
+family is actually invoked. That perturbation decays as the family accrues
+usage, but it never reaches zero, so the runtime can still occasionally
+discover useful procedural bias after the early stage without pretending the
+learned adapter itself was born nonzero.
+
+## Vicuña User Model
+
+The current user model now has three cooperating layers instead of one coarse
+relationship estimate:
+
+- hard memory stores durable `USER_MODEL` primitives for preference residue,
+  rhetorical patterns, and outcome history
+- self-state projects that residue into bounded user-preference registers such
+  as directness, verbosity, structure, autonomy, clarification demand, and
+  disagreement sensitivity
+- a fixed-size user-personality LoRA is updated only from admitted user-message
+  residue and is reserved for DMN counterfactual simulation
+
+This split is deliberate. Hard memory is where long-horizon user facts and
+interaction traces accumulate. Self-state is where the runtime keeps the small,
+typed summary that should directly influence gain control and allostatic
+judgment. The user-personality LoRA is where rhetorical style is stored as a
+continuous substrate rather than as explicit prose.
+
+The current leverage hierarchy is:
+
+- add durable user facts and repeated preferences to hard memory
+- keep only the highest-value control summary in self-state registers
+- use the user-personality LoRA only to simulate likely user replies under
+  counterfactual conditions
+
+The DMN user-simulation path is intentionally constrained:
+
+- the runtime drafts a counterfactual assistant message
+- all temporal/runtime memory LoRAs are ablated
+- only the base model plus the user-personality LoRA are used to decode a
+  bounded simulated user reply
+- that simulated reply is replayed on the counterfactual self-state channel and
+  scored by the resulting self-state shift
+
+This gives Vicuña a crude user-response simulator without letting the simulated
+user inherit the system's temporal self-biases.
+
+## Vicuña Planning And Composition
+
+Vicuña no longer treats active and DMN control as pure state switching. Both
+loops now draft bounded plans on the same planning/composition substrate, then
+execute the next step through the existing command queue and tool interfaces.
+
+The plan surface is explicit and typed:
+
+- each active episode or DMN tick emits a bounded plan trace with step kinds,
+  step status, plan status, revision count, and terminal reason
+- tool use is modeled as `INVOKE_TOOL -> OBSERVE_TOOL` rather than as an
+  immediate branch with implicit follow-up
+- DMN internal-write paths can compose follow-on tool or emit steps in the same
+  bounded plan object
+- loop phases remain for runtime bookkeeping, but the semantic control object is
+  now the plan
+
+Planning/composition also has its own functional LoRA family. The runtime
+activates that family during plan draft, plan revision, and plan composition
+microphases, and settles it with the same bounded Adam-backed update path used
+by the other functional families.
+
 <details>
 <summary>Models</summary>
 
@@ -373,6 +539,8 @@ To learn more about model quantization, [read this documentation](tools/quantize
 ## [`llama-server`](tools/server)
 
 #### A lightweight, [OpenAI API](https://github.com/openai/openai-openapi) compatible, HTTP server for serving LLMs.
+
+- Client integrations should start with the [server endpoint catalog and calling guide](./tools/server/README.md#client-integration-guide), which documents every callable route, auth expectation, and serving profile.
 
 - <details open>
     <summary>Start a local HTTP server with default configuration on port 8080</summary>

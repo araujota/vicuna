@@ -4,9 +4,13 @@
 
 #include <cpp-httplib/httplib.h>
 
+#include <atomic>
+#include <chrono>
+#include <cctype>
 #include <functional>
 #include <string>
 #include <thread>
+#include <unordered_set>
 
 // auto generated files (see README.md for details)
 #include "index.html.gz.hpp"
@@ -27,6 +31,41 @@ server_http_context::server_http_context()
 
 server_http_context::~server_http_context() = default;
 
+static std::string generate_request_id() {
+    static std::atomic<uint64_t> counter = 0;
+    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const uint64_t seq = counter.fetch_add(1, std::memory_order_relaxed);
+    return "req_" + std::to_string(now) + "_" + std::to_string(seq);
+}
+
+static std::string sanitize_client_request_id(const std::string & value) {
+    if (value.empty() || value.size() > 128) {
+        return "";
+    }
+
+    for (unsigned char ch : value) {
+        if (!std::isalnum(ch) && ch != '-' && ch != '_' && ch != '.') {
+            return "";
+        }
+    }
+
+    return value;
+}
+
+static std::string strip_path_prefix(const std::string & path, const std::string & path_prefix) {
+    if (path_prefix.empty() || path.rfind(path_prefix, 0) != 0) {
+        return path;
+    }
+
+    std::string stripped = path.substr(path_prefix.size());
+    if (stripped.empty()) {
+        return "/";
+    }
+
+    return stripped;
+}
+
 static void log_server_request(const httplib::Request & req, const httplib::Response & res) {
     // skip logging requests that are regularly sent, to avoid log spam
     if (req.path == "/health"
@@ -41,7 +80,13 @@ static void log_server_request(const httplib::Request & req, const httplib::Resp
 
     // reminder: this function is not covered by httplib's exception handler; if someone does more complicated stuff, think about wrapping it in try-catch
 
-    SRV_INF("done request: %s %s %s %d\n", req.method.c_str(), req.path.c_str(), req.remote_addr.c_str(), res.status);
+    const std::string request_id = res.get_header_value("x-request-id");
+    SRV_INF("done request: %s %s %s %d %s\n",
+            req.method.c_str(),
+            req.path.c_str(),
+            req.remote_addr.c_str(),
+            res.status,
+            request_id.empty() ? "-" : request_id.c_str());
 
     SRV_DBG("request:  %s\n", req.body.c_str());
     SRV_DBG("response: %s\n", res.body.c_str());
@@ -123,14 +168,22 @@ bool server_http_context::init(const common_params & params) {
     // Middlewares
     //
 
-    auto middleware_validate_api_key = [api_keys = params.api_keys](const httplib::Request & req, httplib::Response & res) {
-        static const std::unordered_set<std::string> public_endpoints = {
-            "/health",
-            "/v1/health",
-            "/models",
-            "/v1/models",
-            "/api/tags"
-        };
+    const bool openai_surface = params.api_surface == COMMON_SERVER_API_SURFACE_OPENAI;
+
+    auto middleware_validate_api_key = [api_keys = params.api_keys, openai_surface, api_path_prefix = path_prefix](const httplib::Request & req, httplib::Response & res) {
+        const std::unordered_set<std::string> public_endpoints = openai_surface
+            ? std::unordered_set<std::string>({
+                "/health",
+                "/v1/health",
+            })
+            : std::unordered_set<std::string>({
+                "/health",
+                "/v1/health",
+                "/models",
+                "/v1/models",
+                "/api/tags",
+            });
+        const std::string request_path = strip_path_prefix(req.path, api_path_prefix);
 
         // If API key is not set, skip validation
         if (api_keys.empty()) {
@@ -138,21 +191,41 @@ bool server_http_context::init(const common_params & params) {
         }
 
         // If path is public or is static file, skip validation
-        if (public_endpoints.find(req.path) != public_endpoints.end() || req.path == "/") {
+        if (public_endpoints.find(request_path) != public_endpoints.end() || (!openai_surface && request_path == "/")) {
             return true;
         }
 
-        // Check for API key in the Authorization header
-        std::string req_api_key = req.get_header_value("Authorization");
-        if (req_api_key.empty()) {
-            // retry with anthropic header
-            req_api_key = req.get_header_value("X-Api-Key");
-        }
+        std::string req_api_key;
+        const std::string auth_header = req.get_header_value("Authorization");
+        const std::string prefix = "Bearer ";
 
-        // remove the "Bearer " prefix if needed
-        std::string prefix = "Bearer ";
-        if (req_api_key.substr(0, prefix.size()) == prefix) {
-            req_api_key = req_api_key.substr(prefix.size());
+        if (openai_surface) {
+            if (auth_header.rfind(prefix, 0) != 0 || auth_header.size() <= prefix.size()) {
+                res.status = 401;
+                res.set_content(
+                    safe_json_to_str(json {
+                        {"error", {
+                            {"message", "Invalid API Key"},
+                            {"type", "authentication_error"},
+                            {"code", 401}
+                        }}
+                    }),
+                    "application/json; charset=utf-8"
+                );
+
+                LOG_WRN("Unauthorized: missing bearer token\n");
+                return false;
+            }
+            req_api_key = auth_header.substr(prefix.size());
+        } else {
+            req_api_key = auth_header;
+            if (req_api_key.empty()) {
+                // anthropic compatibility for the default mixed surface
+                req_api_key = req.get_header_value("X-Api-Key");
+            }
+            if (req_api_key.rfind(prefix, 0) == 0) {
+                req_api_key = req_api_key.substr(prefix.size());
+            }
         }
 
         // validate the API key
@@ -178,11 +251,12 @@ bool server_http_context::init(const common_params & params) {
         return false;
     };
 
-    auto middleware_server_state = [this](const httplib::Request & req, httplib::Response & res) {
+    auto middleware_server_state = [this, api_path_prefix = path_prefix](const httplib::Request & req, httplib::Response & res) {
         bool ready = is_ready.load();
         if (!ready) {
-            auto tmp = string_split<std::string>(req.path, '.');
-            if (req.path == "/" || tmp.back() == "html") {
+            const std::string request_path = strip_path_prefix(req.path, api_path_prefix);
+            auto tmp = string_split<std::string>(request_path, '.');
+            if (request_path == "/" || tmp.back() == "html") {
                 res.status = 503;
                 res.set_content(reinterpret_cast<const char*>(loading_html), loading_html_len, "text/html; charset=utf-8");
             } else {
@@ -207,7 +281,13 @@ bool server_http_context::init(const common_params & params) {
 
     // register server middlewares
     srv->set_pre_routing_handler([middleware_validate_api_key, middleware_server_state](const httplib::Request & req, httplib::Response & res) {
+        res.set_header("x-request-id", generate_request_id());
+        const std::string client_request_id = sanitize_client_request_id(req.get_header_value("X-Client-Request-Id"));
+        if (!client_request_id.empty()) {
+            res.set_header("x-client-request-id", client_request_id);
+        }
         res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
+        res.set_header("Access-Control-Expose-Headers", "x-request-id, x-client-request-id");
         // If this is OPTIONS request, skip validation because browsers don't include Authorization header
         if (req.method == "OPTIONS") {
             res.set_header("Access-Control-Allow-Credentials", "true");
@@ -416,4 +496,3 @@ void server_http_context::post(const std::string & path, const server_http_conte
         process_handler_response(std::move(request), response, res);
     });
 }
-

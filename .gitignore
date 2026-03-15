@@ -133,6 +133,11 @@ poetry.toml
 /run-spec.sh
 /.ccache/
 
+# Spec Kit artifacts
+/specs/
+/.specify/
+/tools/supermemory-selfhost/workdir/
+
 # IDE
 /*.code-workspace
 /.windsurf/

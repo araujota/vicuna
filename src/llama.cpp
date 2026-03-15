@@ -784,8 +784,8 @@ struct llama_active_lora_params llama_active_lora_default_params() {
         /*.weight_decay               =*/ 0.0f,
         /*.gain_max                   =*/ 1.0f,
         /*.gain_decay                 =*/ 0.05f,
-        /*.embedding_dim              =*/ 64,
-        /*.embedding_type             =*/ LLAMA_ACTIVE_LORA_EMBEDDING_HASH,
+        /*.embedding_dim              =*/ 0,
+        /*.embedding_type             =*/ LLAMA_ACTIVE_LORA_EMBEDDING_HIDDEN_STATE,
         /*.embedding_callback         =*/ nullptr,
         /*.embedding_callback_user_data =*/ nullptr,
     };

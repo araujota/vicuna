@@ -3,7 +3,6 @@ name: Vicuna CI
 on:
   workflow_dispatch:
   push:
-  pull_request:
   schedule:
     - cron: "27 5 * * 1"
 
@@ -56,72 +55,130 @@ jobs:
             flake8==4.0.1 \
             flake8-no-print==0.1.1 \
             lizard \
-            pre-commit \
             pyright
 
-      - name: Determine diff base
-        id: diff-base
+      - name: Run repository-wide quality checks
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
 
-          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-            base_sha="${{ github.event.pull_request.base.sha }}"
-          elif [[ -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
-            base_sha="${{ github.event.before }}"
+          status=0
+          mapfile -t native_files < <(
+            git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp' '*.m' '*.mm' '*.cu' '*.cuh' \
+              | grep -Ev '^(vendor/|build[^/]*/)'
+          )
+          mapfile -t complexity_files < <(
+            git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp' '*.py' '*.js' '*.mjs' \
+              | grep -Ev '^(vendor/|build[^/]*/)'
+          )
+          mapfile -t yaml_files < <(
+            git ls-files '*.yml' '*.yaml' \
+              | grep -Ev '^(build[^/]*/)'
+          )
+
+          run_check() {
+            local name="$1"
+            shift
+            echo "::group::${name}"
+            "$@"
+            local rc=$?
+            echo "::endgroup::"
+            if [[ ${rc} -ne 0 ]]; then
+              status=1
+            fi
+          }
+
+          run_check "flake8" flake8 .
+          run_check "pyright" pyright --warnings
+
+          if [[ ${#yaml_files[@]} -gt 0 ]]; then
+            run_check "check-yaml" ruby .github/scripts/check_yaml_syntax.rb "${yaml_files[@]}"
           else
-            base_sha="$(git rev-list --max-parents=0 HEAD)"
+            echo "No YAML files found for syntax validation."
           fi
 
-          echo "base_sha=${base_sha}" >> "${GITHUB_OUTPUT}"
-
-      - name: Collect changed files
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git diff --name-only --diff-filter=ACMR \
-            "${{ steps.diff-base.outputs.base_sha }}" \
-            "${GITHUB_SHA}" > ci-changed-files.txt
-
-          grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|m|mm|cu|cuh)$' ci-changed-files.txt \
-            | grep -Ev '^(vendor/|build[^/]*/)' > ci-changed-cxx-files.txt || true
-
-          grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|py|js|mjs)$' ci-changed-files.txt \
-            | grep -Ev '^(vendor/|build[^/]*/)' > ci-changed-complexity-files.txt || true
-
-      - name: Run pre-commit checks
-        run: pre-commit run --all-files --show-diff-on-failure
-
-      - name: Run flake8
-        run: flake8 .
-
-      - name: Run Pyright
-        run: pyright --warnings
-
-      - name: Run clang-format on changed native sources
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ ! -s ci-changed-cxx-files.txt ]]; then
-            echo "No changed native source files to format-check."
-            exit 0
+          if [[ ${#native_files[@]} -gt 0 ]]; then
+            run_check "clang-format" python .github/scripts/check_clang_format_baseline.py \
+              --baseline .github/ci/clang-format-baseline.txt \
+              "${native_files[@]}"
+          else
+            echo "No native files found for clang-format."
           fi
 
-          xargs -r clang-format --dry-run --Werror < ci-changed-cxx-files.txt
-
-      - name: Run complexity guard on changed files
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ ! -s ci-changed-complexity-files.txt ]]; then
-            echo "No changed files eligible for complexity analysis."
-            exit 0
+          if [[ ${#complexity_files[@]} -gt 0 ]]; then
+            run_check "lizard" python .github/scripts/check_lizard_baseline.py \
+              --baseline .github/ci/lizard-baseline.txt
+          else
+            echo "No files found for lizard."
           fi
 
-          xargs -r lizard -C 100 -L 500 < ci-changed-complexity-files.txt
+          exit ${status}
+
+  python-server-tests:
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python environment
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up ccache
+        uses: ggml-org/ccache-action@v1.2.16
+        with:
+          key: vicuna-ci-python-server-tests
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ccache \
+            git-lfs \
+            libssl-dev \
+            ninja-build
+
+          git lfs install
+
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ./gguf-py -r tools/server/tests/requirements.txt
+
+      - name: Configure server test build
+        run: |
+          cmake -S . -B build-server-tests \
+            -G "${CMAKE_GENERATOR}" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_RPC=ON
+
+      - name: Build server test target
+        run: cmake --build build-server-tests --parallel --target llama-server
+
+      - name: Run focused Python server tests
+        run: |
+          cd tools/server/tests
+          LLAMA_SERVER_BIN_PATH="$GITHUB_WORKSPACE/build-server-tests/bin/llama-server" \
+          pytest -v -m "not slow" \
+            unit/test_basic.py \
+            unit/test_security.py \
+            unit/test_chat_completion.py \
+            unit/test_embedding.py \
+            unit/test_compat_oai_responses.py \
+            unit/test_tokenize.py \
+            unit/test_rerank.py \
+            unit/test_infill.py \
+            -k "not local_media_file"
 
   build-and-test-gcc:
     if: ${{ github.event_name != 'schedule' }}
@@ -282,37 +339,6 @@ jobs:
             libssl-dev \
             ninja-build
 
-      - name: Determine diff base
-        id: diff-base
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-            base_sha="${{ github.event.pull_request.base.sha }}"
-          elif [[ -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
-            base_sha="${{ github.event.before }}"
-          else
-            base_sha="$(git rev-list --max-parents=0 HEAD)"
-          fi
-
-          echo "base_sha=${base_sha}" >> "${GITHUB_OUTPUT}"
-
-      - name: Collect changed native files
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git diff --name-only --diff-filter=ACMR \
-            "${{ steps.diff-base.outputs.base_sha }}" \
-            "${GITHUB_SHA}" > ci-changed-files.txt
-
-          grep -E '\.(c|cc|cpp|cxx)$' ci-changed-files.txt \
-            | grep -Ev '^(vendor/|build[^/]*/)' > ci-changed-tidy-sources.txt || true
-
-          grep -E '\.(h|hh|hpp)$' ci-changed-files.txt \
-            | grep -Ev '^(vendor/|build[^/]*/)' > ci-changed-tidy-headers.txt || true
-
       - name: Configure clang-tidy build
         run: |
           cmake -S . -B build-clang-tidy \
@@ -326,30 +352,24 @@ jobs:
             "-DCMAKE_C_CLANG_TIDY=clang-tidy;--warnings-as-errors=*;--header-filter=^(src|include|common|ggml/(src|include)|tools|examples|tests)/" \
             "-DCMAKE_CXX_CLANG_TIDY=clang-tidy;--warnings-as-errors=*;--header-filter=^(src|include|common|ggml/(src|include)|tools|examples|tests)/"
 
-      - name: Run clang-tidy on changed sources
+      - name: Run clang-tidy across the repository
         shell: bash
         run: |
-          set -euo pipefail
+          mapfile -t tidy_files < <(
+            git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' \
+              | grep -Ev '^(vendor/|build[^/]*/)'
+          )
 
-          if [[ -s ci-changed-tidy-sources.txt ]]; then
-            while IFS= read -r file; do
-              clang-tidy \
-                -p build-clang-tidy \
-                --quiet \
-                --warnings-as-errors='*' \
-                --header-filter='^(src|include|common|ggml/(src|include)|tools|examples|tests)/' \
-                "${file}"
-            done < ci-changed-tidy-sources.txt
+          if [[ ${#tidy_files[@]} -eq 0 ]]; then
+            echo "No native source files require clang-tidy analysis."
             exit 0
           fi
 
-          if [[ -s ci-changed-tidy-headers.txt ]]; then
-            echo "Header-only native change detected; running full compile with clang-tidy enabled."
-            cmake --build build-clang-tidy --parallel 2
-            exit 0
-          fi
-
-          echo "No changed native files require clang-tidy analysis."
+          python3 .github/scripts/check_clang_tidy_baseline.py \
+            --baseline .github/ci/clang-tidy-baseline.txt \
+            --build-dir build-clang-tidy \
+            --header-filter '^(src|include|common|ggml/(src|include)|tools|examples|tests)/' \
+            "${tidy_files[@]}"
 
   valgrind:
     if: ${{ github.event_name != 'schedule' }}

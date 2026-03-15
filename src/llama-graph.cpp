@@ -904,13 +904,13 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
     for (const auto & lora : *loras) {
-        llama_adapter_lora_weight * lw = lora.first->get_weight(w);
+        llama_adapter_lora_weight * lw = lora.adapter->get_weight(w);
         if (lw == nullptr) {
             continue;
         }
 
-        const float adapter_scale = lora.second;
-        const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
+        const float adapter_scale = lora.scale;
+        const float scale = lw->get_scale(lora.adapter->alpha, adapter_scale);
 
         ggml_tensor * ab_cur = ggml_mul_mat(
                 ctx0, lw->b,
@@ -930,14 +930,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
     for (const auto & lora : *loras) {
-        llama_adapter_lora_weight * lw = lora.first->get_weight(w);
+        llama_adapter_lora_weight * lw = lora.adapter->get_weight(w);
         if (lw == nullptr) {
             continue;
         }
 
-        const float alpha = lora.first->alpha;
+        const float alpha = lora.adapter->alpha;
         const float rank  = (float) lw->b->ne[0];
-        const float scale = alpha ? lora.second * alpha / rank : lora.second;
+        const float scale = alpha ? lora.scale * alpha / rank : lora.scale;
 
         ggml_tensor * ab_cur = ggml_mul_mat_id(
                 ctx0, lw->b,
@@ -1529,13 +1529,13 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {
-            llama_adapter_lora_weight * lw = lora.first->get_weight(tok_embd);
+            llama_adapter_lora_weight * lw = lora.adapter->get_weight(tok_embd);
             if (lw == nullptr) {
                 continue;
             }
 
-            const float adapter_scale = lora.second;
-            const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
+            const float adapter_scale = lora.scale;
+            const float scale = lw->get_scale(lora.adapter->alpha, adapter_scale);
 
             ggml_tensor * inpL_delta = ggml_scale(ctx0, ggml_mul_mat(
                         ctx0, lw->b, // non-transposed lora_b

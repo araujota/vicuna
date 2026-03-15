@@ -6,11 +6,6 @@ on:
             - 'docs/ops.md'
             - 'docs/ops/**'
             - 'scripts/create_ops_docs.py'
-    pull_request:
-        paths:
-            - 'docs/ops.md'
-            - 'docs/ops/**'
-            - 'scripts/create_ops_docs.py'
 
 jobs:
     update-ops-docs:

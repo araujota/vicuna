@@ -137,6 +137,19 @@ enum common_conversation_mode {
     COMMON_CONVERSATION_MODE_AUTO     = 2,
 };
 
+enum common_server_api_surface {
+    COMMON_SERVER_API_SURFACE_DEFAULT = 0,
+    COMMON_SERVER_API_SURFACE_OPENAI  = 1,
+};
+
+static inline const char * common_server_api_surface_to_str(enum common_server_api_surface surface) {
+    switch (surface) {
+        case COMMON_SERVER_API_SURFACE_OPENAI: return "openai";
+        case COMMON_SERVER_API_SURFACE_DEFAULT:
+        default:                               return "default";
+    }
+}
+
 enum common_grammar_trigger_type {
     COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN,
     COMMON_GRAMMAR_TRIGGER_TYPE_WORD,
@@ -532,6 +545,7 @@ struct common_params {
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
+    common_server_api_surface api_surface = COMMON_SERVER_API_SURFACE_DEFAULT;
     std::string chat_template = "";                                                                         // NOLINT
     bool use_jinja = true;                                                                                  // NOLINT
     bool enable_chat_template = true;

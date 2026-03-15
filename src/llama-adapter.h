@@ -4,6 +4,7 @@
 
 #include "ggml-cpp.h"
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -40,6 +41,32 @@ private:
 };
 
 using llama_adapter_cvec_ptr = std::shared_ptr<llama_adapter_cvec>;
+
+enum llama_adapter_lora_layer_role : int32_t {
+    LLAMA_ADAPTER_LORA_LAYER_REQUEST = 0,
+    LLAMA_ADAPTER_LORA_LAYER_ALL_TIME,
+    LLAMA_ADAPTER_LORA_LAYER_PAST_YEAR,
+    LLAMA_ADAPTER_LORA_LAYER_PAST_QUARTER,
+    LLAMA_ADAPTER_LORA_LAYER_PAST_MONTH,
+    LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK,
+    LLAMA_ADAPTER_LORA_LAYER_ACTIVE,
+    LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_TOOL_SELECTION,
+    LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_PLANNING_COMPOSITION,
+    LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_COUNTERFACTUAL,
+    LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_MEMORY_COMPRESSION,
+    LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_SELF_OBSERVATION,
+    LLAMA_ADAPTER_LORA_LAYER_USER_PERSONALITY,
+};
+
+struct llama_adapter_lora_entry {
+    llama_adapter_lora * adapter = nullptr;
+    float scale = 0.0f;
+    int32_t precedence = 0;
+    llama_adapter_lora_layer_role role = LLAMA_ADAPTER_LORA_LAYER_REQUEST;
+};
+
+using llama_adapter_lora_stack = std::vector<llama_adapter_lora_entry>;
+using llama_adapter_lora_stack_ptr = std::unique_ptr<llama_adapter_lora_stack>;
 
 //
 // llama_adapter_lora
@@ -88,11 +115,11 @@ struct llama_adapter_lora {
     }
 };
 
-using llama_adapter_loras = std::unordered_map<llama_adapter_lora *, float>;
-using llama_adapter_loras_ptr = std::unique_ptr<llama_adapter_loras>;
-
 bool llama_adapter_lora_init_runtime(
         llama_model & model,
         llama_adapter_lora & adapter,
         const std::vector<std::pair<ggml_tensor *, uint32_t>> & targets,
         const std::string & name_prefix);
+
+int32_t llama_adapter_lora_layer_precedence(llama_adapter_lora_layer_role role);
+const char * llama_adapter_lora_layer_role_name(llama_adapter_lora_layer_role role);

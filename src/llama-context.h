@@ -15,6 +15,11 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_active_lora_manager;
+class llama_self_state;
+class llama_cognitive_loop;
+class llama_hard_memory;
+class llama_bash_tool;
+struct llama_functional_gating_observation;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -108,7 +113,7 @@ struct llama_context {
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
-    bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+    bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, const float * scales);
 
     bool set_adapter_cvec(
             const float * data,
@@ -119,12 +124,147 @@ struct llama_context {
 
     bool active_lora_init(const llama_active_lora_params & params);
     bool active_lora_ingest(const llama_token * tokens, size_t n_tokens);
+    bool active_lora_ingest(const llama_self_state_event & event, const llama_self_state_feature_vector * features = nullptr);
+    bool active_lora_remediate(const llama_token * tokens, size_t n_tokens, float budget_scale);
+    bool active_lora_remediate(const llama_self_state_event & event, float budget_scale, const llama_self_state_feature_vector * features = nullptr);
     bool active_lora_get_stats(llama_active_lora_stats * out_stats) const;
+    bool user_personality_lora_get_stats(llama_user_personality_lora_stats * out_stats) const;
     bool past_lora_init(const llama_past_lora_params & params);
     bool past_lora_tick(uint64_t now_us);
     bool past_lora_get_stats(llama_past_lora_stats * out_stats) const;
+    int32_t serving_lora_stack_count() const;
+    bool serving_lora_stack_layer(int32_t i, llama_serving_lora_layer_info * out_info) const;
+    int32_t functional_lora_family_count() const;
+    bool functional_lora_family_config_get(int32_t family, llama_functional_lora_family_config * out_config) const;
+    bool functional_lora_family_state_get(int32_t family, llama_functional_lora_family_state * out_state) const;
+    bool functional_lora_get_last_trace(llama_functional_lora_trace * out_trace) const;
+    bool functional_lora_get_last_update(int32_t family, llama_functional_lora_update_info * out_update) const;
+    bool functional_lora_set_ablation(const llama_functional_lora_ablation_config & config);
+    bool functional_lora_get_ablation(llama_functional_lora_ablation_config * out_config) const;
+    bool active_temporal_encoding_bias_get(llama_active_temporal_encoding_bias * out_bias) const;
+    bool active_temporal_encoding_bias_apply(float signed_advantage, float efficiency_advantage, int64_t monotonic_ms);
+    bool functional_lora_predict_activation(
+            const llama_functional_gating_observation & observation,
+            const llama_functional_activation_decision & policy_seed,
+            llama_functional_activation_decision * out_decision);
+    bool functional_lora_activate(const llama_functional_activation_decision & decision);
+    bool functional_lora_note_command_complete(int32_t origin);
+    bool functional_lora_apply_update(
+            int32_t family,
+            int32_t loop_origin,
+            int32_t start_microphase,
+            int32_t settle_microphase,
+            const llama_functional_outcome_snapshot & before,
+            const llama_functional_outcome_snapshot & after,
+            int32_t selected_tool_kind,
+            int32_t candidate_count,
+            const float * metrics,
+            size_t metric_count,
+            float signed_outcome,
+            float magnitude,
+            const llama_self_state_event & event,
+            const llama_self_state_feature_vector * features);
+    bool self_state_refresh_time();
+    bool self_state_set_time(const llama_self_state_time_point & time_point);
+    bool self_state_get_datetime(llama_self_state_datetime * out_info) const;
+    bool self_state_configure(const llama_self_state_params & params);
+    int32_t self_state_register_count() const;
+    bool self_state_get_register(int32_t register_id, llama_self_register_info * out_info) const;
+    bool self_state_set_channel_state(int32_t channel_state);
+    bool self_state_note_user_event();
+    bool self_state_note_tool_event();
+    bool self_state_note_emit_event();
+    bool self_state_set_identity(const llama_token * tokens, size_t n_tokens);
+    bool self_state_upsert_goal(int32_t goal_id, const llama_token * tokens, size_t n_tokens, float priority);
+    bool self_state_upsert_commitment(int32_t commitment_id, const llama_token * tokens, size_t n_tokens, float priority, bool unresolved);
+    int32_t self_state_goal_count() const;
+    int32_t self_state_commitment_count() const;
+    int32_t self_state_working_memory_count() const;
+    bool self_state_upsert_memory_handle(int32_t handle_id, int32_t kind, const llama_token * tokens, size_t n_tokens, float priority);
+    int32_t self_state_memory_handle_count() const;
+    int32_t self_state_reactivation_count() const;
+    bool self_state_get_reactivation(int32_t index, llama_self_reactivation_info * out_info) const;
+    bool self_state_upsert_tool_job(int32_t job_id, int32_t status, float importance);
+    bool self_state_get_tool_state(llama_self_tool_state_info * out_info) const;
+    bool self_state_get_social_state(llama_self_social_state_info * out_info) const;
+    bool self_state_get_model_state(llama_self_model_state_info * out_info) const;
+    int32_t self_state_model_extension_count() const;
+    bool self_state_get_model_extension(int32_t index, llama_self_model_extension_info * out_info) const;
+    bool self_state_upsert_model_extension(const llama_self_model_extension_update & update);
+    bool self_state_remove_model_extension(const char * key);
+    int32_t self_state_trace_count() const;
+    int32_t self_state_trace_token_count() const;
+    bool self_state_trace_get_item(int32_t index, llama_self_trace_item_info * out_info) const;
+    bool self_state_clear_trace();
+    bool self_state_replay_trace(int32_t upto_count);
+    bool self_state_replay_trace_on_channel(int32_t upto_count, int32_t replay_channel);
+    bool self_state_set_updater_program(const llama_self_updater_program & program);
+    bool self_state_get_updater_program(llama_self_updater_program * out_program) const;
+    size_t self_state_trace_export_size() const;
+    bool self_state_trace_export(void * dst, size_t size) const;
+    bool self_state_trace_import(const void * src, size_t size, bool replace_existing);
+    bool self_state_evaluate_counterfactual(const llama_self_updater_program & program, int32_t upto_count, llama_self_counterfactual_result * out_result) const;
+    bool self_state_evaluate_counterfactual_on_channel(const llama_self_updater_program & program, int32_t upto_count, int32_t replay_channel, llama_self_counterfactual_result * out_result) const;
+    bool self_state_evaluate_hypothetical_event(
+            const llama_self_state_event & event,
+            llama_self_state_delta_summary * out_delta,
+            llama_self_model_state_info * out_model_state) const;
+    bool self_state_build_prewrite_features(const llama_self_state_event & event, llama_self_state_feature_vector * out_features) const;
+    bool self_state_apply_prewrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
+    bool self_state_build_postwrite_features(const llama_self_state_event & event, llama_self_state_feature_vector * out_features) const;
+    bool self_state_apply_postwrite(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
+    bool self_state_note_validated_progress(float signed_progress, float efficiency_advantage);
+    bool self_state_promote_hard_memory_query(
+            const llama_hard_memory_query_request & request,
+            const llama_hard_memory_result & result);
+    bool hard_memory_configure(const llama_hard_memory_config & config);
+    bool hard_memory_get_config(llama_hard_memory_config * out_config) const;
+    bool hard_memory_query(const llama_hard_memory_query_request & query, llama_hard_memory_result * out_result);
+    bool hard_memory_archive_primitives(
+            const llama_hard_memory_primitive * primitives,
+            int32_t primitive_count,
+            const llama_self_state_delta_summary * delta_summary = nullptr);
+    bool hard_memory_set_request(const llama_cognitive_hard_memory_request & request);
+    bool hard_memory_get_request(int32_t command_id, llama_cognitive_hard_memory_request * out_request) const;
+    bool hard_memory_clear_request(int32_t command_id);
+    bool hard_memory_submit_result(const llama_hard_memory_result & result);
+    bool hard_memory_get_last_result(llama_hard_memory_result * out_result) const;
+    bool hard_memory_get_last_archive_trace(llama_hard_memory_archive_trace * out_trace) const;
+    bool bash_tool_configure(const llama_bash_tool_config & config);
+    bool bash_tool_get_config(llama_bash_tool_config * out_config) const;
+    bool bash_tool_set_request(const llama_bash_tool_request & request);
+    bool bash_tool_clear_request(int32_t command_id);
+    bool bash_tool_submit_result(const llama_bash_tool_result & result);
+    bool bash_tool_get_last_result(llama_bash_tool_result * out_result) const;
+    bool cognitive_bash_tool_get_request(int32_t command_id, llama_bash_tool_request * out_request) const;
+    bool cognitive_bash_tool_submit_result(const llama_bash_tool_result & result, llama_active_loop_trace * out_active_trace);
+    bool cognitive_hard_memory_get_request(int32_t command_id, llama_cognitive_hard_memory_request * out_request) const;
+    bool cognitive_hard_memory_submit_result(const llama_cognitive_hard_memory_result & result, llama_active_loop_trace * out_active_trace);
+    int32_t cognitive_tool_spec_count() const;
+    bool cognitive_tool_spec_get(int32_t index, llama_cognitive_tool_spec * out_spec) const;
+    bool cognitive_tool_spec_set(const llama_cognitive_tool_spec * specs, int32_t count);
+    int32_t cognitive_command_count() const;
+    bool cognitive_command_get(int32_t index, llama_cognitive_command * out_command) const;
+    bool cognitive_command_ack(int32_t command_id);
+    bool cognitive_command_complete(int32_t command_id, bool cancelled);
+    bool cognitive_active_runner_get(llama_cognitive_active_runner_status * out_status) const;
+    bool cognitive_dmn_runner_get(llama_cognitive_dmn_runner_status * out_status) const;
+    bool active_loop_process(const llama_self_state_event & event, llama_active_loop_trace * out_trace);
+    bool active_loop_note_emit(int32_t episode_id, size_t emitted_text_bytes);
+    bool active_loop_get_last_trace(llama_active_loop_trace * out_trace) const;
+    bool dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_trace);
+    bool dmn_defer(uint64_t now_us, llama_dmn_tick_trace * out_trace);
+    bool dmn_get_last_trace(llama_dmn_tick_trace * out_trace) const;
+    bool cognitive_host_state(llama_cognitive_host_state * out_state) const;
+    bool favorable_state_get(llama_favorable_state_profile * out_profile) const;
+    bool counterfactual_get_last_trace(llama_counterfactual_trace * out_trace) const;
+    bool remediation_get_last_plan(llama_remediation_plan * out_plan) const;
+    bool governance_get_last_trace(llama_governance_trace * out_trace) const;
+    bool temporal_self_improvement_get_last(llama_temporal_self_improvement_trace * out_trace) const;
+    bool user_simulation_override_begin();
+    bool user_simulation_override_end();
 
-    void attach_adapter_runtime(llama_adapter_lora * adapter, float scale);
+    void attach_adapter_runtime(llama_adapter_lora * adapter, float scale, llama_adapter_lora_layer_role role);
     void detach_adapter_runtime(llama_adapter_lora * adapter);
 
     // process a single ubatch with a specific graph type
@@ -248,6 +388,9 @@ public:
 private:
     friend class llama_active_lora_manager;
 
+    void rebuild_lora_stack();
+    void log_lora_stack() const;
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -271,8 +414,14 @@ private:
 
     llama_cparams cparams;
 
-    llama_adapter_cvec_ptr  cvec;
-    llama_adapter_loras_ptr loras;
+    llama_adapter_cvec_ptr        cvec;
+    llama_adapter_lora_stack_ptr  request_loras;
+    llama_adapter_lora_stack_ptr  runtime_loras;
+    llama_adapter_lora_stack_ptr  loras;
+    uint64_t                      lora_stack_version = 0;
+    llama_adapter_lora_stack_ptr  user_sim_saved_request_loras;
+    llama_adapter_lora_stack_ptr  user_sim_saved_runtime_loras;
+    bool                          user_sim_override_active = false;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
@@ -333,6 +482,10 @@ private:
     ggml_opt_context_t opt_ctx = nullptr;
 
     std::unique_ptr<llama_active_lora_manager> active_lora_manager;
+    std::unique_ptr<llama_self_state> self_state;
+    std::unique_ptr<llama_cognitive_loop> cognitive_loop;
+    std::unique_ptr<llama_hard_memory> hard_memory;
+    std::unique_ptr<llama_bash_tool> bash_tool;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

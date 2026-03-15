@@ -84,6 +84,8 @@ struct server_grammar_trigger {
 
 json format_error_response(const std::string & message, const enum error_type type);
 
+int32_t classify_foreground_role(const json & body);
+
 //
 // random string / id
 //
