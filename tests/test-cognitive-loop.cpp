@@ -2,6 +2,7 @@
 #include "llama.h"
 
 #include <array>
+#include <cmath>
 #include <cinttypes>
 #include <cstring>
 #include <cstdint>

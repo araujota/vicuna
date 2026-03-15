@@ -55,7 +55,6 @@ jobs:
             flake8==4.0.1 \
             flake8-no-print==0.1.1 \
             lizard \
-            pre-commit \
             pyright
 
       - name: Run repository-wide quality checks
@@ -72,6 +71,10 @@ jobs:
             git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp' '*.py' '*.js' '*.mjs' \
               | grep -Ev '^(vendor/|build[^/]*/)'
           )
+          mapfile -t yaml_files < <(
+            git ls-files '*.yml' '*.yaml' \
+              | grep -Ev '^(build[^/]*/)'
+          )
 
           run_check() {
             local name="$1"
@@ -85,9 +88,28 @@ jobs:
             fi
           }
 
-          run_check "pre-commit" pre-commit run --all-files --show-diff-on-failure
           run_check "flake8" flake8 .
           run_check "pyright" pyright --warnings
+
+          if [[ ${#yaml_files[@]} -gt 0 ]]; then
+            run_check "check-yaml" python - "${yaml_files[@]}" <<'PY'
+import sys
+import yaml
+
+failed = False
+for path in sys.argv[1:]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            yaml.safe_load(handle)
+    except Exception as exc:
+        failed = True
+        print(f"{path}: {exc}")
+
+sys.exit(1 if failed else 0)
+PY
+          else
+            echo "No YAML files found for syntax validation."
+          fi
 
           if [[ ${#native_files[@]} -gt 0 ]]; then
             run_check "clang-format" clang-format --dry-run --Werror "${native_files[@]}"
