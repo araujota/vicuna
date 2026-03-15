@@ -1,12 +1,7 @@
 name: Python Type-Check
 
 on:
-  push:
-    paths:
-      - '.github/workflows/python-type-check.yml'
-      - 'pyrightconfig.json'
-      - '**.py'
-      - '**/requirements*.txt'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
