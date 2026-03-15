@@ -241,7 +241,20 @@ static void write_child_error(int fd, const char * stage) {
     char buffer[LLAMA_BASH_TOOL_ERROR_MAX_CHARS] = {};
     const int len = std::snprintf(buffer, sizeof(buffer), "%s: %s", stage, std::strerror(errno));
     if (len > 0) {
-        (void) write(fd, buffer, (size_t) std::min<int>(len, sizeof(buffer) - 1));
+        size_t remaining = (size_t) std::min<int>(len, sizeof(buffer) - 1);
+        const char * cursor = buffer;
+        while (remaining > 0) {
+            const ssize_t written = write(fd, cursor, remaining);
+            if (written > 0) {
+                cursor += (size_t) written;
+                remaining -= (size_t) written;
+                continue;
+            }
+            if (written < 0 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
     }
 }
 

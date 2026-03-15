@@ -50,6 +50,9 @@
 
 #ifdef __cplusplus
 extern "C" {
+#    define LLAMA_CPP_MEMBER_INIT(value) = value
+#else
+#    define LLAMA_CPP_MEMBER_INIT(value)
 #endif
 
     //
@@ -999,11 +1002,11 @@ extern "C" {
         uint32_t flags;
         float    decoder_entropy;
         float    decoder_top_margin;
-        int32_t  artifact_kind = LLAMA_SELF_COG_ARTIFACT_EXTERNAL_EVENT;
-        int32_t  loop_origin = -1;
-        int32_t  phase = -1;
-        int32_t  source_id = -1;
-        int32_t  plan_id = -1;
+        int32_t  artifact_kind LLAMA_CPP_MEMBER_INIT(LLAMA_SELF_COG_ARTIFACT_EXTERNAL_EVENT);
+        int32_t  loop_origin LLAMA_CPP_MEMBER_INIT(-1);
+        int32_t  phase LLAMA_CPP_MEMBER_INIT(-1);
+        int32_t  source_id LLAMA_CPP_MEMBER_INIT(-1);
+        int32_t  plan_id LLAMA_CPP_MEMBER_INIT(-1);
     };
 
     struct llama_self_trace_item_info {
@@ -3698,5 +3701,7 @@ extern "C" {
 #ifdef __cplusplus
 }
 #endif
+
+#undef LLAMA_CPP_MEMBER_INIT
 
 #endif // LLAMA_H

@@ -41,10 +41,11 @@
 
 ### Implementation
 
-- [ ] T005 [US3] Update `/Users/tyleraraujo/vicuna/.github/workflows/vicuna-ci.yml` so `lint-type-quality` runs repository-wide pre-commit, flake8, pyright, clang-format, and lizard checks with aggregated exit reporting
-- [ ] T006 [US3] Update `/Users/tyleraraujo/vicuna/.github/workflows/vicuna-ci.yml` so `clang-tidy` runs across repository native sources and aggregates failures instead of stopping on the first changed-file violation
-- [ ] T007 [US3] Remove fail-fast pytest behavior from `/Users/tyleraraujo/vicuna/.github/workflows/vicuna-ci.yml`
+- [x] T005 [US3] Update `/Users/tyleraraujo/vicuna/.github/workflows/vicuna-ci.yml` so `lint-type-quality` runs repository-wide pre-commit, flake8, pyright, clang-format, and lizard checks with aggregated exit reporting
+- [x] T006 [US3] Update `/Users/tyleraraujo/vicuna/.github/workflows/vicuna-ci.yml` so `clang-tidy` runs across repository native sources and aggregates failures instead of stopping on the first changed-file violation
+- [x] T007 [US3] Remove fail-fast pytest behavior from `/Users/tyleraraujo/vicuna/.github/workflows/vicuna-ci.yml`
+- [x] T008 [US3] Add a checked-in repository-wide complexity baseline in `/Users/tyleraraujo/vicuna/.github/ci/lizard-baseline.txt` and compare future `lizard` results against it via `/Users/tyleraraujo/vicuna/.github/scripts/check_lizard_baseline.py`
 
 ## Phase 6: Polish
 
-- [ ] T008 Update task completion state in `/Users/tyleraraujo/vicuna/specs/038-ci-trigger-dedupe/tasks.md` after validation
+- [x] T009 Update task completion state in `/Users/tyleraraujo/vicuna/specs/038-ci-trigger-dedupe/tasks.md` after validation

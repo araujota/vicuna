@@ -62,6 +62,7 @@ As a maintainer, I want repository-quality and static-analysis gates to inspect 
 - **FR-005**: The repository MUST record the intended workflow scope and operator-facing rationale in Spec Kit artifacts for this change.
 - **FR-006**: Repository quality gates in `Vicuna CI` MUST evaluate the full repository rather than only the changed-file subset.
 - **FR-007**: Repository quality and static-analysis gates MUST aggregate failures and exit only after every configured sub-check in that gate has run.
+- **FR-008**: Full-repository gates that would otherwise fail on pre-existing repository-wide debt MUST use an explicit checked-in baseline so CI blocks only on newly introduced or regressed findings while still reporting the full current result set.
 
 ## Success Criteria *(mandatory)*
 
@@ -71,3 +72,4 @@ As a maintainer, I want repository-quality and static-analysis gates to inspect 
 - **SC-002**: PR check lists no longer show duplicated validation jobs caused by paired `push` and `pull_request` runs for the same branch update.
 - **SC-003**: PR-specific automation workflows outside the dedupe scope retain their PR trigger configuration unchanged.
 - **SC-004**: The `lint-type-quality` and `clang-tidy` jobs no longer depend on changed-file diff inventories to decide analysis scope.
+- **SC-005**: Repository-wide quality gates that preserve legacy debt visibility do so through checked-in baseline artifacts rather than hidden ignores or silent pass-through behavior.

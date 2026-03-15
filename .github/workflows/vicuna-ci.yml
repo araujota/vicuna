@@ -96,7 +96,8 @@ jobs:
           fi
 
           if [[ ${#complexity_files[@]} -gt 0 ]]; then
-            run_check "lizard" lizard -C 100 -L 500 "${complexity_files[@]}"
+            run_check "lizard" python .github/scripts/check_lizard_baseline.py \
+              --baseline .github/ci/lizard-baseline.txt
           else
             echo "No files found for lizard."
           fi
