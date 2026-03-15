@@ -63,6 +63,8 @@ As a maintainer, I want repository-quality and static-analysis gates to inspect 
 - **FR-006**: Repository quality gates in `Vicuna CI` MUST evaluate the full repository rather than only the changed-file subset.
 - **FR-007**: Repository quality and static-analysis gates MUST aggregate failures and exit only after every configured sub-check in that gate has run.
 - **FR-008**: Full-repository gates that would otherwise fail on pre-existing repository-wide debt MUST use an explicit checked-in baseline so CI blocks only on newly introduced or regressed findings while still reporting the full current result set.
+- **FR-009**: Independent CI jobs MUST continue running even when another repository-wide gate fails so one push reports the full gate result set.
+- **FR-010**: Sanitizer builds MUST remain link-correct for mixed C/C++ test targets so repository-wide sanitizer coverage can complete on Linux.
 
 ## Success Criteria *(mandatory)*
 
@@ -73,3 +75,5 @@ As a maintainer, I want repository-quality and static-analysis gates to inspect 
 - **SC-003**: PR-specific automation workflows outside the dedupe scope retain their PR trigger configuration unchanged.
 - **SC-004**: The `lint-type-quality` and `clang-tidy` jobs no longer depend on changed-file diff inventories to decide analysis scope.
 - **SC-005**: Repository-wide quality gates that preserve legacy debt visibility do so through checked-in baseline artifacts rather than hidden ignores or silent pass-through behavior.
+- **SC-006**: `python-server-tests` is no longer skipped solely because `lint-type-quality` fails.
+- **SC-007**: The Linux Clang sanitizer build completes linking for `test-c` and proceeds into the test suite.

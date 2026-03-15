@@ -98,7 +98,9 @@ jobs:
           fi
 
           if [[ ${#native_files[@]} -gt 0 ]]; then
-            run_check "clang-format" clang-format --dry-run --Werror "${native_files[@]}"
+            run_check "clang-format" python .github/scripts/check_clang_format_baseline.py \
+              --baseline .github/ci/clang-format-baseline.txt \
+              "${native_files[@]}"
           else
             echo "No native files found for clang-format."
           fi
@@ -115,7 +117,6 @@ jobs:
   python-server-tests:
     if: ${{ github.event_name != 'schedule' }}
     runs-on: ubuntu-24.04
-    needs: lint-type-quality
 
     steps:
       - name: Check out source repository
@@ -354,8 +355,6 @@ jobs:
       - name: Run clang-tidy across the repository
         shell: bash
         run: |
-          set +e
-
           mapfile -t tidy_files < <(
             git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' \
               | grep -Ev '^(vendor/|build[^/]*/)'
@@ -366,23 +365,11 @@ jobs:
             exit 0
           fi
 
-          status=0
-          for file in "${tidy_files[@]}"; do
-            echo "::group::clang-tidy ${file}"
-            clang-tidy \
-              -p build-clang-tidy \
-              --quiet \
-              --warnings-as-errors='*' \
-              --header-filter='^(src|include|common|ggml/(src|include)|tools|examples|tests)/' \
-              "${file}"
-            rc=$?
-            echo "::endgroup::"
-            if [[ ${rc} -ne 0 ]]; then
-              status=1
-            fi
-          done
-
-          exit ${status}
+          python3 .github/scripts/check_clang_tidy_baseline.py \
+            --baseline .github/ci/clang-tidy-baseline.txt \
+            --build-dir build-clang-tidy \
+            --header-filter '^(src|include|common|ggml/(src|include)|tools|examples|tests)/' \
+            "${tidy_files[@]}"
 
   valgrind:
     if: ${{ github.event_name != 'schedule' }}

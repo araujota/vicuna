@@ -60,7 +60,9 @@ specs/038-ci-trigger-dedupe/
 1. Confirm the validation workflow scope and explicitly exclude PR-specific automation such as `labeler.yml`.
 2. Remove `pull_request` trigger blocks from the selected validation workflows without altering other trigger or job configuration.
 3. Replace diff-scoped or fail-fast quality-gate behavior in `Vicuna CI` with repository-wide aggregated reporting.
-4. Re-scan workflow files to confirm that only the intended trigger and gate-behavior changes landed.
+4. Add explicit baselines for inherited clang-format and clang-tidy debt so repository-wide scans remain informative without permanently red-lighting on upstream drift.
+5. Remove unnecessary inter-job dependencies that suppress independent gate reporting, and repair sanitizer linking for mixed-language tests.
+6. Re-scan workflow files and CI results to confirm that only the intended trigger and gate-behavior changes landed.
 
 ## Risks
 
@@ -68,3 +70,4 @@ specs/038-ci-trigger-dedupe/
 - Partial edits could leave inconsistent indentation or malformed YAML.
 - Some checks will still appear on PRs indirectly through `push` runs on branch updates; that is expected and desired.
 - Repository-wide static analysis may surface pre-existing issues that were previously hidden by changed-file scoping.
+- Baseline files can become stale if tool versions or repository layout change; they must therefore stay explicit, inspectable, and version-controlled.

@@ -45,6 +45,10 @@
 - [x] T006 [US3] Update `/Users/tyleraraujo/vicuna/.github/workflows/vicuna-ci.yml` so `clang-tidy` runs across repository native sources and aggregates failures instead of stopping on the first changed-file violation
 - [x] T007 [US3] Remove fail-fast pytest behavior from `/Users/tyleraraujo/vicuna/.github/workflows/vicuna-ci.yml`
 - [x] T008 [US3] Add a checked-in repository-wide complexity baseline in `/Users/tyleraraujo/vicuna/.github/ci/lizard-baseline.txt` and compare future `lizard` results against it via `/Users/tyleraraujo/vicuna/.github/scripts/check_lizard_baseline.py`
+- [ ] T010 [US3] Add a checked-in repository-wide clang-format baseline in `/Users/tyleraraujo/vicuna/.github/ci/clang-format-baseline.txt` and compare future full-tree formatting drift via `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_format_baseline.py`
+- [ ] T011 [US3] Add a checked-in repository-wide clang-tidy baseline in `/Users/tyleraraujo/vicuna/.github/ci/clang-tidy-baseline.txt` and compare future full-tree diagnostics via `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_tidy_baseline.py`
+- [ ] T012 [US3] Remove the lint dependency from `/Users/tyleraraujo/vicuna/.github/workflows/vicuna-ci.yml` so `python-server-tests` always reports in the same push run
+- [ ] T013 [US3] Repair mixed C/C++ sanitizer linking for `/Users/tyleraraujo/vicuna/tests/test-c.c` in `/Users/tyleraraujo/vicuna/tests/CMakeLists.txt`
 
 ## Phase 6: Polish
 
