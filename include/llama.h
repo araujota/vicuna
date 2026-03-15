@@ -483,6 +483,26 @@ extern "C" {
         LLAMA_FUNCTIONAL_HOLD_TOKENS = 3,
     };
 
+    enum llama_functional_snapshot_source {
+        LLAMA_FUNCTIONAL_SNAPSHOT_SOURCE_WEEKLY_ARCHIVE = 0,
+        LLAMA_FUNCTIONAL_SNAPSHOT_SOURCE_PERSIST_RESTORE = 1,
+        LLAMA_FUNCTIONAL_SNAPSHOT_SOURCE_MANUAL_RESEED = 2,
+    };
+
+    enum llama_functional_bias_proposal_family {
+        LLAMA_FUNCTIONAL_BIAS_PROPOSAL_LOCAL = 0,
+        LLAMA_FUNCTIONAL_BIAS_PROPOSAL_HISTORICAL = 1,
+        LLAMA_FUNCTIONAL_BIAS_PROPOSAL_ORTHOGONAL = 2,
+    };
+
+    enum llama_functional_replay_mode {
+        LLAMA_FUNCTIONAL_REPLAY_MODE_NONE = 0,
+        LLAMA_FUNCTIONAL_REPLAY_MODE_CURRENT = 1,
+        LLAMA_FUNCTIONAL_REPLAY_MODE_ARCHIVED = 2,
+        LLAMA_FUNCTIONAL_REPLAY_MODE_LOCAL_PERTURBED = 3,
+        LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL = 4,
+    };
+
     enum llama_functional_route_reason_flags {
         LLAMA_FUNCTIONAL_ROUTE_REASON_UNCERTAINTY = 1u << 0,
         LLAMA_FUNCTIONAL_ROUTE_REASON_TOOL_AFFINITY = 1u << 1,
@@ -717,6 +737,63 @@ extern "C" {
         struct llama_functional_activation_decision last_activation;
         struct llama_functional_hold_state holds[LLAMA_FUNCTIONAL_LORA_COUNT];
         struct llama_functional_lora_family_state family_state[LLAMA_FUNCTIONAL_LORA_COUNT];
+    };
+
+    struct llama_functional_lora_snapshot_info {
+        bool valid;
+        int32_t family;
+        int32_t slot;
+        int32_t source;
+        uint64_t snapshot_id;
+        uint64_t captured_at_us;
+        uint64_t expires_at_us;
+        uint64_t source_update_count;
+        float self_state_gradient_norm;
+        float robustness_score;
+        float last_signed_outcome;
+        float dominant_direction_cosine;
+    };
+
+    struct llama_functional_lora_snapshot_archive {
+        int32_t family;
+        uint32_t count;
+        uint64_t last_capture_us;
+        uint64_t next_capture_due_us;
+        struct llama_functional_lora_snapshot_info items[4];
+    };
+
+    struct llama_functional_snapshot_maintenance_trace {
+        bool ran;
+        bool captured_any;
+        uint64_t now_us;
+        uint64_t next_due_us;
+        uint32_t expired_count;
+        uint32_t captured_count;
+        uint64_t captured_family_mask;
+    };
+
+    struct llama_functional_lora_replay_override {
+        bool active;
+        int32_t family;
+        int32_t replay_mode;
+        int32_t snapshot_slot;
+        float replay_gain;
+        float perturbation_scale;
+        float cosine_limit;
+        bool disable_bootstrap;
+    };
+
+    struct llama_functional_lora_differential_update {
+        bool valid;
+        int32_t family;
+        int32_t proposal_family;
+        int32_t source_snapshot_slot;
+        float signed_score_delta;
+        float magnitude;
+        float lora_difference_norm;
+        float applied_update_norm;
+        float robustness_score;
+        uint64_t adapter_optimizer_step;
     };
 
     struct llama_functional_lora_ablation_config {
@@ -1611,8 +1688,11 @@ extern "C" {
         LLAMA_COUNTERFACTUAL_FAMILY_TOOL_CHOICE     = 3,
         LLAMA_COUNTERFACTUAL_FAMILY_TIMING_SHIFT    = 4,
         LLAMA_COUNTERFACTUAL_FAMILY_LORA_ABLATION   = 5,
-        LLAMA_COUNTERFACTUAL_FAMILY_SENSITIVITY     = 6,
-        LLAMA_COUNTERFACTUAL_FAMILY_UPDATER_POLICY  = 7,
+        LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_LOCAL = 6,
+        LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_HISTORY = 7,
+        LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_ORTHOGONAL = 8,
+        LLAMA_COUNTERFACTUAL_FAMILY_SENSITIVITY     = 9,
+        LLAMA_COUNTERFACTUAL_FAMILY_UPDATER_POLICY  = 10,
     };
 
     enum llama_remediation_action {
@@ -1629,6 +1709,7 @@ extern "C" {
     };
 
     enum {
+        LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY = 4,
         LLAMA_ACTIVE_LOOP_MAX_CANDIDATES = 4,
         LLAMA_DMN_MAX_CANDIDATES = 4,
         LLAMA_DMN_MAX_REACTIVATION_TARGETS = 4,
@@ -1932,8 +2013,18 @@ extern "C" {
         int32_t family;
         int32_t risk_tier;
         int32_t subject_id;
+        int32_t functional_family;
+        int32_t proposal_family;
+        int32_t replay_mode;
+        int32_t snapshot_slot;
         float expected_improvement;
         float confidence;
+        float fragility_penalty;
+        float concentration_penalty;
+        float robustness_score;
+        float orthogonality;
+        float realized_score;
+        float signed_advantage_vs_current;
     };
 
     struct llama_user_simulation_trace {
@@ -2546,12 +2637,54 @@ extern "C" {
             const struct llama_context * ctx,
             int32_t family,
             struct llama_functional_lora_update_info * out_update);
+    LLAMA_API int32_t llama_functional_lora_snapshot_archive_get(
+            const struct llama_context * ctx,
+            int32_t family,
+            struct llama_functional_lora_snapshot_archive * out_archive);
+    LLAMA_API int32_t llama_functional_lora_snapshot_info_get(
+            const struct llama_context * ctx,
+            int32_t family,
+            int32_t slot,
+            struct llama_functional_lora_snapshot_info * out_info);
+    LLAMA_API int32_t llama_functional_lora_get_last_snapshot_maintenance(
+            const struct llama_context * ctx,
+            struct llama_functional_snapshot_maintenance_trace * out_trace);
     LLAMA_API int32_t llama_functional_lora_set_ablation(
             struct llama_context * ctx,
             struct llama_functional_lora_ablation_config config);
     LLAMA_API int32_t llama_functional_lora_get_ablation(
             const struct llama_context * ctx,
             struct llama_functional_lora_ablation_config * out_config);
+    LLAMA_API int32_t llama_functional_lora_replay_override_begin(
+            struct llama_context * ctx,
+            struct llama_functional_lora_replay_override config);
+    LLAMA_API int32_t llama_functional_lora_replay_override_end(
+            struct llama_context * ctx,
+            int32_t family);
+    LLAMA_API int32_t llama_functional_lora_get_last_differential_update(
+            const struct llama_context * ctx,
+            int32_t family,
+            struct llama_functional_lora_differential_update * out_update);
+    LLAMA_API size_t llama_functional_lora_snapshot_blob_size(
+            const struct llama_context * ctx,
+            int32_t family,
+            int32_t slot);
+    LLAMA_API int32_t llama_functional_lora_snapshot_blob_export(
+            const struct llama_context * ctx,
+            int32_t family,
+            int32_t slot,
+            void * dst,
+            size_t size);
+    LLAMA_API int32_t llama_functional_lora_snapshot_blob_import(
+            struct llama_context * ctx,
+            int32_t family,
+            int32_t slot,
+            struct llama_functional_lora_snapshot_info info,
+            const void * src,
+            size_t size);
+    LLAMA_API int32_t llama_functional_lora_snapshot_maintain(
+            struct llama_context * ctx,
+            uint64_t now_us);
     LLAMA_API int32_t llama_active_temporal_encoding_bias_get(
             const struct llama_context * ctx,
             struct llama_active_temporal_encoding_bias * out_bias);

@@ -128,8 +128,10 @@ int main(int argc, char ** argv) {
     for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
         llama_functional_lora_family_config config = {};
         llama_functional_lora_family_state state = {};
+        llama_functional_lora_snapshot_archive archive = {};
         if (llama_functional_lora_family_config_get(ctx, family, &config) != 0 ||
             llama_functional_lora_family_state_get(ctx, family, &state) != 0 ||
+            llama_functional_lora_snapshot_archive_get(ctx, family, &archive) != 0 ||
             !config.enabled ||
             config.gain_clip_min != 0.0f ||
             config.gain_clip_max != 2.0f ||
@@ -148,7 +150,8 @@ int main(int argc, char ** argv) {
             state.current_bootstrap_std != config.bootstrap_perturbation_initial_std ||
             state.last_bootstrap_perturbation != 0.0f ||
             state.activation_count != 0 ||
-            state.last_meta_loss != 0.0f) {
+            state.last_meta_loss != 0.0f ||
+            archive.count != 0) {
             fprintf(stderr, "unexpected functional LoRA registry state for family %d\n", family);
             llama_free(ctx);
             llama_model_free(model);
@@ -370,6 +373,94 @@ int main(int argc, char ** argv) {
 
     if (llama_active_lora_get_stats(ctx, &stats) != 0 || stats.updates_applied != updates_before_redundant) {
         fprintf(stderr, "redundant Active LoRA span unexpectedly changed weights\n");
+        llama_free(ctx_custom);
+        llama_free(ctx_hash);
+        llama_free(ctx_pool);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    const uint64_t one_week_us = 7ull * 24ull * 60ull * 60ull * 1000000ull;
+    if (llama_functional_lora_snapshot_maintain(ctx, 1) != 0 ||
+        llama_functional_lora_snapshot_maintain(ctx, one_week_us + 1) != 0) {
+        fprintf(stderr, "failed to run functional snapshot maintenance\n");
+        llama_free(ctx_custom);
+        llama_free(ctx_hash);
+        llama_free(ctx_pool);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    llama_functional_snapshot_maintenance_trace maintenance = {};
+    if (llama_functional_lora_get_last_snapshot_maintenance(ctx, &maintenance) != 0 ||
+        !maintenance.ran ||
+        !maintenance.captured_any ||
+        maintenance.captured_count != (uint32_t) LLAMA_FUNCTIONAL_LORA_COUNT) {
+        fprintf(stderr, "unexpected functional snapshot maintenance trace\n");
+        llama_free(ctx_custom);
+        llama_free(ctx_hash);
+        llama_free(ctx_pool);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+        llama_functional_lora_snapshot_archive archive = {};
+        if (llama_functional_lora_snapshot_archive_get(ctx, family, &archive) != 0 ||
+            archive.count != 1 ||
+            archive.family != family ||
+            archive.last_capture_us != one_week_us + 1 ||
+            archive.next_capture_due_us <= archive.last_capture_us ||
+            !archive.items[0].valid) {
+            fprintf(stderr, "unexpected functional snapshot archive contents for family %d\n", family);
+            llama_free(ctx_custom);
+            llama_free(ctx_hash);
+            llama_free(ctx_pool);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+    }
+
+    llama_functional_lora_snapshot_info snapshot_info = {};
+    const int32_t snapshot_family = LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL;
+    if (llama_functional_lora_snapshot_info_get(ctx, snapshot_family, 0, &snapshot_info) != 0 ||
+        !snapshot_info.valid) {
+        fprintf(stderr, "failed to retrieve functional snapshot info\n");
+        llama_free(ctx_custom);
+        llama_free(ctx_hash);
+        llama_free(ctx_pool);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    const size_t snapshot_blob_size = llama_functional_lora_snapshot_blob_size(ctx, snapshot_family, 0);
+    std::vector<uint8_t> snapshot_blob(snapshot_blob_size);
+    if (snapshot_blob_size == 0 ||
+        llama_functional_lora_snapshot_blob_export(ctx, snapshot_family, 0, snapshot_blob.data(), snapshot_blob.size()) != 0 ||
+        llama_functional_lora_snapshot_blob_import(ctx_pool, snapshot_family, 0, snapshot_info, snapshot_blob.data(), snapshot_blob.size()) != 0) {
+        fprintf(stderr, "failed to roundtrip functional snapshot blob\n");
+        llama_free(ctx_custom);
+        llama_free(ctx_hash);
+        llama_free(ctx_pool);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    llama_functional_lora_snapshot_archive imported_archive = {};
+    llama_functional_lora_snapshot_info imported_info = {};
+    if (llama_functional_lora_snapshot_archive_get(ctx_pool, snapshot_family, &imported_archive) != 0 ||
+        llama_functional_lora_snapshot_info_get(ctx_pool, snapshot_family, 0, &imported_info) != 0 ||
+        imported_archive.count != 1 ||
+        !imported_info.valid ||
+        imported_info.snapshot_id != snapshot_info.snapshot_id ||
+        imported_info.captured_at_us != snapshot_info.captured_at_us) {
+        fprintf(stderr, "functional snapshot blob import did not restore metadata\n");
         llama_free(ctx_custom);
         llama_free(ctx_hash);
         llama_free(ctx_pool);

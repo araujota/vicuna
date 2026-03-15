@@ -1723,7 +1723,7 @@ private:
 
         try {
             json snapshot = json::object();
-            snapshot["version"] = 2;
+            snapshot["version"] = 3;
             snapshot["saved_at_unix_ms"] = ggml_time_ms();
             snapshot["reason"] = reason ? reason : "";
 
@@ -1755,6 +1755,56 @@ private:
                 }
             }
             snapshot["model_extensions"] = std::move(extensions);
+
+            json functional_snapshots = json::array();
+            for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+                llama_functional_lora_snapshot_archive archive = {};
+                if (llama_functional_lora_snapshot_archive_get(ctx, family, &archive) != 0) {
+                    throw std::runtime_error("failed to query functional snapshot archive");
+                }
+                json family_entry = json::object();
+                family_entry["family"] = family;
+                family_entry["count"] = archive.count;
+                family_entry["last_capture_us"] = archive.last_capture_us;
+                family_entry["next_capture_due_us"] = archive.next_capture_due_us;
+                json items = json::array();
+                for (int32_t slot = 0; slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++slot) {
+                    llama_functional_lora_snapshot_info info = {};
+                    if (llama_functional_lora_snapshot_info_get(ctx, family, slot, &info) != 0) {
+                        throw std::runtime_error("failed to query functional snapshot info");
+                    }
+                    if (!info.valid) {
+                        continue;
+                    }
+                    const size_t blob_size = llama_functional_lora_snapshot_blob_size(ctx, family, slot);
+                    if (blob_size == 0) {
+                        throw std::runtime_error("functional snapshot archive reported empty blob");
+                    }
+                    std::vector<uint8_t> blob(blob_size);
+                    if (llama_functional_lora_snapshot_blob_export(ctx, family, slot, blob.data(), blob.size()) != 0) {
+                        throw std::runtime_error("failed to export functional snapshot blob");
+                    }
+
+                    json item = json::object();
+                    item["valid"] = info.valid;
+                    item["family"] = info.family;
+                    item["slot"] = info.slot;
+                    item["source"] = info.source;
+                    item["snapshot_id"] = info.snapshot_id;
+                    item["captured_at_us"] = info.captured_at_us;
+                    item["expires_at_us"] = info.expires_at_us;
+                    item["source_update_count"] = info.source_update_count;
+                    item["self_state_gradient_norm"] = info.self_state_gradient_norm;
+                    item["robustness_score"] = info.robustness_score;
+                    item["last_signed_outcome"] = info.last_signed_outcome;
+                    item["dominant_direction_cosine"] = info.dominant_direction_cosine;
+                    item["blob_b64"] = base64::encode((const char *) blob.data(), blob.size());
+                    items.push_back(std::move(item));
+                }
+                family_entry["items"] = std::move(items);
+                functional_snapshots.push_back(std::move(family_entry));
+            }
+            snapshot["functional_snapshots"] = std::move(functional_snapshots);
 
             const std::filesystem::path target_path(snapshot_path);
             if (!target_path.parent_path().empty()) {
@@ -1827,7 +1877,7 @@ private:
             buffer << in.rdbuf();
             const json snapshot = json::parse(buffer.str());
             const int snapshot_version = json_value(snapshot, "version", 0);
-            if (snapshot_version != 1 && snapshot_version != 2) {
+            if (snapshot_version != 1 && snapshot_version != 2 && snapshot_version != 3) {
                 throw std::runtime_error("unsupported runtime snapshot version");
             }
 
@@ -1874,6 +1924,65 @@ private:
             if (snapshot_version >= 2 && snapshot.contains("proactive_mailbox")) {
                 if (!proactive_mailbox_from_json(snapshot.at("proactive_mailbox"), &proactive_mailbox)) {
                     throw std::runtime_error("failed to restore proactive mailbox");
+                }
+            }
+
+            if (snapshot_version >= 3 && snapshot.contains("functional_snapshots")) {
+                const auto & families = snapshot.at("functional_snapshots");
+                if (!families.is_array()) {
+                    throw std::runtime_error("invalid functional snapshot archive payload");
+                }
+                for (const auto & family_entry : families) {
+                    if (!family_entry.is_object()) {
+                        throw std::runtime_error("invalid functional snapshot archive entry");
+                    }
+                    const int32_t family = json_value(family_entry, "family", -1);
+                    if (family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+                        throw std::runtime_error("invalid functional snapshot family");
+                    }
+                    if (!family_entry.contains("items") || !family_entry.at("items").is_array()) {
+                        throw std::runtime_error("invalid functional snapshot item list");
+                    }
+                    for (const auto & item : family_entry.at("items")) {
+                        if (!item.is_object()) {
+                            throw std::runtime_error("invalid functional snapshot item");
+                        }
+                        llama_functional_lora_snapshot_info info = {};
+                        info.valid = json_value(item, "valid", false);
+                        info.family = json_value(item, "family", family);
+                        info.slot = json_value(item, "slot", -1);
+                        info.source = json_value(item, "source", 0);
+                        info.snapshot_id = json_value(item, "snapshot_id", (uint64_t) 0);
+                        info.captured_at_us = json_value(item, "captured_at_us", (uint64_t) 0);
+                        info.expires_at_us = json_value(item, "expires_at_us", (uint64_t) 0);
+                        info.source_update_count = json_value(item, "source_update_count", (uint64_t) 0);
+                        info.self_state_gradient_norm = json_value(item, "self_state_gradient_norm", 0.0f);
+                        info.robustness_score = json_value(item, "robustness_score", 0.0f);
+                        info.last_signed_outcome = json_value(item, "last_signed_outcome", 0.0f);
+                        info.dominant_direction_cosine = json_value(item, "dominant_direction_cosine", 0.0f);
+                        if (!info.valid) {
+                            continue;
+                        }
+                        if (info.family != family ||
+                                info.slot < 0 ||
+                                info.slot >= LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY ||
+                                !item.contains("blob_b64")) {
+                            throw std::runtime_error("functional snapshot metadata mismatch");
+                        }
+                        const std::string blob = base64::decode(item.at("blob_b64").get<std::string>());
+                        if (blob.empty()) {
+                            throw std::runtime_error("functional snapshot blob missing");
+                        }
+                        if (llama_functional_lora_snapshot_blob_import(
+                                    ctx,
+                                    family,
+                                    info.slot,
+                                    info,
+                                    blob.data(),
+                                    blob.size()) != 0) {
+                            throw std::runtime_error("failed to restore functional snapshot blob");
+                        }
+                    }
                 }
             }
 

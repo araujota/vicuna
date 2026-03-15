@@ -419,6 +419,81 @@ float sample_bounded_gaussian(std::mt19937_64 & rng, float stddev) {
     return clamp_range(dist(rng), -3.0f * stddev, 3.0f * stddev);
 }
 
+constexpr uint64_t FUNCTIONAL_SNAPSHOT_PERIOD_US = 7ull * 24ull * 60ull * 60ull * 1000000ull;
+constexpr uint64_t FUNCTIONAL_SNAPSHOT_RETENTION_US = 31ull * 24ull * 60ull * 60ull * 1000000ull;
+constexpr size_t FUNCTIONAL_DIRECTION_SKETCH_DIMS = 32;
+
+struct functional_snapshot_runtime {
+    llama_functional_lora_snapshot_info info = {};
+    std::unique_ptr<llama_adapter_lora> adapter;
+};
+
+float vector_cosine_similarity(const std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS> & a,
+                               const std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS> & b) {
+    float dot = 0.0f;
+    float norm_a = 0.0f;
+    float norm_b = 0.0f;
+    for (size_t i = 0; i < FUNCTIONAL_DIRECTION_SKETCH_DIMS; ++i) {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    if (norm_a <= DIRECTION_EPS || norm_b <= DIRECTION_EPS) {
+        return 0.0f;
+    }
+    return dot / (std::sqrt(norm_a) * std::sqrt(norm_b));
+}
+
+void normalize_array(std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS> & values) {
+    float norm = 0.0f;
+    for (float value : values) {
+        norm += value * value;
+    }
+    norm = std::sqrt(norm);
+    if (norm <= DIRECTION_EPS) {
+        return;
+    }
+    for (float & value : values) {
+        value /= norm;
+    }
+}
+
+std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS> project_adapter_signature(const llama_adapter_lora & adapter) {
+    std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS> signature = {};
+    size_t cursor = 0;
+    for (const auto & it : adapter.ab_map) {
+        const auto & weight = it.second;
+        const size_t size_a = weight.a->ne[0] * weight.a->ne[1];
+        const size_t size_b = weight.b->ne[0] * weight.b->ne[1];
+        std::vector<float> data_a(size_a, 0.0f);
+        std::vector<float> data_b(size_b, 0.0f);
+        ggml_backend_tensor_get(weight.a, data_a.data(), 0, data_a.size() * sizeof(float));
+        ggml_backend_tensor_get(weight.b, data_b.data(), 0, data_b.size() * sizeof(float));
+        for (float value : data_a) {
+            signature[cursor % FUNCTIONAL_DIRECTION_SKETCH_DIMS] += value;
+            cursor += 1;
+        }
+        for (float value : data_b) {
+            signature[cursor % FUNCTIONAL_DIRECTION_SKETCH_DIMS] += value;
+            cursor += 1;
+        }
+        signature[cursor % FUNCTIONAL_DIRECTION_SKETCH_DIMS] += weight.gain;
+        cursor += 1;
+    }
+    normalize_array(signature);
+    return signature;
+}
+
+void blend_toward_signature(std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS> & dominant,
+                            const std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS> & update,
+                            float mix) {
+    const float clamped_mix = clamp_unit(mix);
+    for (size_t i = 0; i < FUNCTIONAL_DIRECTION_SKETCH_DIMS; ++i) {
+        dominant[i] = (1.0f - clamped_mix) * dominant[i] + clamped_mix * update[i];
+    }
+    normalize_array(dominant);
+}
+
 class active_lora_embedder {
 public:
     virtual ~active_lora_embedder() = default;
@@ -1286,9 +1361,18 @@ struct llama_active_lora_manager::impl {
     std::array<job_runtime, PAST_BUCKET_COUNT> jobs = {};
     std::array<std::unique_ptr<llama_adapter_lora>, LLAMA_FUNCTIONAL_LORA_COUNT> functional_adapters = {};
     std::array<std::unique_ptr<llama_adapter_lora>, LLAMA_FUNCTIONAL_LORA_COUNT> functional_bootstrap_adapters = {};
+    std::array<std::unique_ptr<llama_adapter_lora>, LLAMA_FUNCTIONAL_LORA_COUNT> functional_replay_adapters = {};
     std::array<llama_functional_lora_family_config, LLAMA_FUNCTIONAL_LORA_COUNT> functional_configs = {};
     std::array<llama_functional_lora_family_state, LLAMA_FUNCTIONAL_LORA_COUNT> functional_states = {};
     std::array<llama_functional_lora_update_info, LLAMA_FUNCTIONAL_LORA_COUNT> functional_updates = {};
+    std::array<llama_functional_lora_differential_update, LLAMA_FUNCTIONAL_LORA_COUNT> functional_differential_updates = {};
+    std::array<llama_functional_lora_snapshot_archive, LLAMA_FUNCTIONAL_LORA_COUNT> functional_snapshot_archives = {};
+    std::array<std::array<functional_snapshot_runtime, LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY>, LLAMA_FUNCTIONAL_LORA_COUNT> functional_snapshots = {};
+    std::array<llama_functional_lora_replay_override, LLAMA_FUNCTIONAL_LORA_COUNT> functional_replay_overrides = {};
+    std::array<std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS>, LLAMA_FUNCTIONAL_LORA_COUNT> functional_dominant_directions = {};
+    std::array<std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS>, LLAMA_FUNCTIONAL_LORA_COUNT> functional_last_signatures = {};
+    std::array<bool, LLAMA_FUNCTIONAL_LORA_COUNT> functional_signature_valid = {};
+    llama_functional_snapshot_maintenance_trace functional_snapshot_trace = {};
     llama_functional_lora_trace functional_trace = {};
     llama_functional_lora_ablation_config functional_ablation = {};
     std::vector<ggml_tensor *> targets;
@@ -1308,6 +1392,7 @@ struct llama_active_lora_manager::impl {
     std::mt19937_64 gating_rng { FUNCTIONAL_GATING_INIT_SEED };
     std::mt19937_64 bootstrap_rng { FUNCTIONAL_BOOTSTRAP_INIT_SEED };
     uint64_t gating_invocation_count = 0;
+    uint64_t next_functional_snapshot_id = 1;
     bool initialized = false;
     bool past_initialized = false;
 
@@ -1354,7 +1439,18 @@ struct llama_active_lora_manager::impl {
             functional_trace.family_state[family] = state;
             functional_updates[family] = {};
             functional_updates[family].family = family;
+            functional_differential_updates[family] = {};
             gating_training[family] = {};
+            functional_snapshot_archives[family] = {};
+            functional_snapshot_archives[family].family = family;
+            functional_snapshot_archives[family].next_capture_due_us = FUNCTIONAL_SNAPSHOT_PERIOD_US;
+            functional_replay_overrides[family] = {};
+            functional_signature_valid[family] = false;
+            for (size_t slot = 0; slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++slot) {
+                functional_snapshots[family][slot] = {};
+                functional_snapshots[family][slot].info.family = family;
+                functional_snapshots[family][slot].info.slot = static_cast<int32_t>(slot);
+            }
         }
     }
 
@@ -1900,6 +1996,353 @@ struct llama_active_lora_manager::impl {
         return true;
     }
 
+    bool copy_adapter(llama_adapter_lora & dst, const llama_adapter_lora & src) {
+        if (dst.ab_map.size() != src.ab_map.size()) {
+            return false;
+        }
+        for (const auto & it : src.ab_map) {
+            auto dst_it = dst.ab_map.find(it.first);
+            if (dst_it == dst.ab_map.end()) {
+                return false;
+            }
+            const auto & src_weight = it.second;
+            auto & dst_weight = dst_it->second;
+            const size_t size_a = src_weight.a->ne[0] * src_weight.a->ne[1];
+            const size_t size_b = src_weight.b->ne[0] * src_weight.b->ne[1];
+            std::vector<float> data_a(size_a, 0.0f);
+            std::vector<float> data_b(size_b, 0.0f);
+            ggml_backend_tensor_get(src_weight.a, data_a.data(), 0, data_a.size() * sizeof(float));
+            ggml_backend_tensor_get(src_weight.b, data_b.data(), 0, data_b.size() * sizeof(float));
+            ggml_backend_tensor_set(dst_weight.a, data_a.data(), 0, data_a.size() * sizeof(float));
+            ggml_backend_tensor_set(dst_weight.b, data_b.data(), 0, data_b.size() * sizeof(float));
+            dst_weight.gain = src_weight.gain;
+        }
+        return true;
+    }
+
+    float adapter_difference_norm(const llama_adapter_lora & lhs, const llama_adapter_lora & rhs) const {
+        double sum_sq = 0.0;
+        for (const auto & it : lhs.ab_map) {
+            auto rhs_it = rhs.ab_map.find(it.first);
+            if (rhs_it == rhs.ab_map.end()) {
+                continue;
+            }
+            const auto & lhs_weight = it.second;
+            const auto & rhs_weight = rhs_it->second;
+            const size_t size_a = lhs_weight.a->ne[0] * lhs_weight.a->ne[1];
+            const size_t size_b = lhs_weight.b->ne[0] * lhs_weight.b->ne[1];
+            std::vector<float> lhs_a(size_a, 0.0f);
+            std::vector<float> rhs_a(size_a, 0.0f);
+            std::vector<float> lhs_b(size_b, 0.0f);
+            std::vector<float> rhs_b(size_b, 0.0f);
+            ggml_backend_tensor_get(lhs_weight.a, lhs_a.data(), 0, lhs_a.size() * sizeof(float));
+            ggml_backend_tensor_get(rhs_weight.a, rhs_a.data(), 0, rhs_a.size() * sizeof(float));
+            ggml_backend_tensor_get(lhs_weight.b, lhs_b.data(), 0, lhs_b.size() * sizeof(float));
+            ggml_backend_tensor_get(rhs_weight.b, rhs_b.data(), 0, rhs_b.size() * sizeof(float));
+            for (size_t i = 0; i < size_a; ++i) {
+                const double delta = (double) lhs_a[i] - (double) rhs_a[i];
+                sum_sq += delta * delta;
+            }
+            for (size_t i = 0; i < size_b; ++i) {
+                const double delta = (double) lhs_b[i] - (double) rhs_b[i];
+                sum_sq += delta * delta;
+            }
+            const double gain_delta = (double) lhs_weight.gain - (double) rhs_weight.gain;
+            sum_sq += gain_delta * gain_delta;
+        }
+        return std::sqrt((float) sum_sq);
+    }
+
+    void record_functional_signature(int32_t family) {
+        if (family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT || !functional_adapters[family]) {
+            return;
+        }
+        const std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS> current =
+                project_adapter_signature(*functional_adapters[family]);
+        if (functional_signature_valid[family]) {
+            std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS> delta = {};
+            for (size_t i = 0; i < FUNCTIONAL_DIRECTION_SKETCH_DIMS; ++i) {
+                delta[i] = current[i] - functional_last_signatures[family][i];
+            }
+            normalize_array(delta);
+            if (fro_norm(std::vector<float>(delta.begin(), delta.end())) > DIRECTION_EPS) {
+                blend_toward_signature(functional_dominant_directions[family], delta, 0.35f);
+            }
+        } else {
+            functional_dominant_directions[family] = current;
+            functional_signature_valid[family] = true;
+        }
+        functional_last_signatures[family] = current;
+    }
+
+    bool ensure_snapshot_adapter(int32_t family, int32_t slot) {
+        if (family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT ||
+                slot < 0 || slot >= LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY) {
+            return false;
+        }
+        auto & runtime = functional_snapshots[family][slot];
+        if (runtime.adapter) {
+            return true;
+        }
+        const uint32_t rank = stats.selected_rank > 0 ? stats.selected_rank : params.min_rank;
+        return create_runtime_adapter(
+                runtime.adapter,
+                std::max<uint32_t>(1, rank),
+                std::string("functional.snapshot.") + functional_family_name(family) + "." + std::to_string(slot),
+                0.0f,
+                functional_family_role(family),
+                false);
+    }
+
+    bool ensure_replay_adapter(int32_t family) {
+        if (family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+            return false;
+        }
+        if (functional_replay_adapters[family]) {
+            return true;
+        }
+        const uint32_t rank = stats.selected_rank > 0 ? stats.selected_rank : params.min_rank;
+        return create_runtime_adapter(
+                functional_replay_adapters[family],
+                std::max<uint32_t>(1, rank),
+                std::string("functional.replay.") + functional_family_name(family),
+                0.0f,
+                functional_family_role(family),
+                false);
+    }
+
+    void clear_family_runtime_attachments(int32_t family) {
+        if (family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+            return;
+        }
+        if (functional_adapters[family]) {
+            owner.detach_adapter_runtime(functional_adapters[family].get());
+        }
+        if (functional_bootstrap_adapters[family]) {
+            owner.detach_adapter_runtime(functional_bootstrap_adapters[family].get());
+        }
+        if (functional_replay_adapters[family]) {
+            owner.detach_adapter_runtime(functional_replay_adapters[family].get());
+        }
+        for (size_t slot = 0; slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++slot) {
+            if (functional_snapshots[family][slot].adapter) {
+                owner.detach_adapter_runtime(functional_snapshots[family][slot].adapter.get());
+            }
+        }
+    }
+
+    void apply_functional_runtime_scale(int32_t family, float gain, float bootstrap_perturbation) {
+        if (family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+            return;
+        }
+
+        const auto & replay = functional_replay_overrides[family];
+        llama_adapter_lora * active_adapter = functional_adapters[family].get();
+        if (replay.active) {
+            if (replay.replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_ARCHIVED &&
+                    replay.snapshot_slot >= 0 &&
+                    replay.snapshot_slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY) {
+                active_adapter = functional_snapshots[family][replay.snapshot_slot].adapter.get();
+            } else if (replay.replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL ||
+                       replay.replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_LOCAL_PERTURBED) {
+                active_adapter = functional_replay_adapters[family].get();
+            }
+        }
+
+        clear_family_runtime_attachments(family);
+
+        if (active_adapter) {
+            owner.attach_adapter_runtime(active_adapter, gain, functional_family_role(family));
+        }
+        if (!replay.active || !replay.disable_bootstrap) {
+            if (functional_bootstrap_adapters[family]) {
+                owner.attach_adapter_runtime(
+                        functional_bootstrap_adapters[family].get(),
+                        replay.active && replay.disable_bootstrap ? 0.0f : bootstrap_perturbation,
+                        functional_family_role(family));
+            }
+        }
+    }
+
+    bool capture_functional_snapshot(int32_t family, uint64_t now_us) {
+        if (family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT ||
+                !functional_adapters[family] ||
+                !functional_configs[family].enabled) {
+            return false;
+        }
+
+        int32_t slot = -1;
+        for (int32_t i = 0; i < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++i) {
+            if (!functional_snapshots[family][i].info.valid) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            uint64_t oldest = std::numeric_limits<uint64_t>::max();
+            for (int32_t i = 0; i < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++i) {
+                if (functional_snapshots[family][i].info.captured_at_us < oldest) {
+                    oldest = functional_snapshots[family][i].info.captured_at_us;
+                    slot = i;
+                }
+            }
+        }
+        if (slot < 0 || !ensure_snapshot_adapter(family, slot) ||
+                !copy_adapter(*functional_snapshots[family][slot].adapter, *functional_adapters[family])) {
+            return false;
+        }
+
+        auto & archive = functional_snapshot_archives[family];
+        auto & runtime = functional_snapshots[family][slot];
+        runtime.info = {};
+        runtime.info.valid = true;
+        runtime.info.family = family;
+        runtime.info.slot = slot;
+        runtime.info.source = LLAMA_FUNCTIONAL_SNAPSHOT_SOURCE_WEEKLY_ARCHIVE;
+        runtime.info.snapshot_id = next_functional_snapshot_id++;
+        runtime.info.captured_at_us = now_us;
+        runtime.info.expires_at_us = now_us + FUNCTIONAL_SNAPSHOT_RETENTION_US;
+        runtime.info.source_update_count = functional_states[family].update_count;
+        runtime.info.self_state_gradient_norm = functional_trace.last_activation.allostatic_gradient_norm;
+        runtime.info.robustness_score = clamp_unit(0.5f + 0.5f * functional_states[family].last_signed_outcome);
+        runtime.info.last_signed_outcome = functional_states[family].last_signed_outcome;
+        runtime.info.dominant_direction_cosine =
+                vector_cosine_similarity(functional_dominant_directions[family], functional_last_signatures[family]);
+        archive.last_capture_us = now_us;
+        archive.next_capture_due_us = now_us + FUNCTIONAL_SNAPSHOT_PERIOD_US;
+        archive.items[slot] = runtime.info;
+
+        uint32_t count = 0;
+        for (int32_t i = 0; i < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++i) {
+            if (functional_snapshots[family][i].info.valid) {
+                count += 1;
+            }
+            archive.items[i] = functional_snapshots[family][i].info;
+        }
+        archive.count = count;
+        return true;
+    }
+
+    void expire_functional_snapshots(uint64_t now_us, uint32_t * out_expired_count = nullptr) {
+        for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+            auto & archive = functional_snapshot_archives[family];
+            uint32_t count = 0;
+            for (int32_t slot = 0; slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++slot) {
+                auto & runtime = functional_snapshots[family][slot];
+                if (runtime.info.valid && runtime.info.expires_at_us <= now_us) {
+                    runtime.info = {};
+                    if (runtime.adapter) {
+                        zero_adapter(*runtime.adapter);
+                    }
+                    if (out_expired_count) {
+                        *out_expired_count += 1;
+                    }
+                }
+                archive.items[slot] = runtime.info;
+                if (runtime.info.valid) {
+                    count += 1;
+                }
+            }
+            archive.count = count;
+        }
+    }
+
+    size_t serialized_adapter_size(const llama_adapter_lora & adapter) const {
+        size_t total = sizeof(uint32_t);
+        for (const auto & it : adapter.ab_map) {
+            const size_t size_a = it.second.a->ne[0] * it.second.a->ne[1];
+            const size_t size_b = it.second.b->ne[0] * it.second.b->ne[1];
+            total += sizeof(uint32_t) + it.first.size();
+            total += sizeof(float);
+            total += sizeof(uint64_t) * 2;
+            total += (size_a + size_b) * sizeof(float);
+        }
+        return total;
+    }
+
+    bool serialized_adapter_export(const llama_adapter_lora & adapter, void * dst, size_t size) const {
+        if (!dst || size < serialized_adapter_size(adapter)) {
+            return false;
+        }
+        uint8_t * cursor = static_cast<uint8_t *>(dst);
+        const uint32_t count = static_cast<uint32_t>(adapter.ab_map.size());
+        std::memcpy(cursor, &count, sizeof(count));
+        cursor += sizeof(count);
+        for (const auto & it : adapter.ab_map) {
+            const uint32_t name_len = static_cast<uint32_t>(it.first.size());
+            const uint64_t size_a = it.second.a->ne[0] * it.second.a->ne[1];
+            const uint64_t size_b = it.second.b->ne[0] * it.second.b->ne[1];
+            std::vector<float> data_a(size_a, 0.0f);
+            std::vector<float> data_b(size_b, 0.0f);
+            ggml_backend_tensor_get(it.second.a, data_a.data(), 0, data_a.size() * sizeof(float));
+            ggml_backend_tensor_get(it.second.b, data_b.data(), 0, data_b.size() * sizeof(float));
+            std::memcpy(cursor, &name_len, sizeof(name_len));
+            cursor += sizeof(name_len);
+            std::memcpy(cursor, it.first.data(), name_len);
+            cursor += name_len;
+            std::memcpy(cursor, &it.second.gain, sizeof(float));
+            cursor += sizeof(float);
+            std::memcpy(cursor, &size_a, sizeof(size_a));
+            cursor += sizeof(size_a);
+            std::memcpy(cursor, &size_b, sizeof(size_b));
+            cursor += sizeof(size_b);
+            std::memcpy(cursor, data_a.data(), data_a.size() * sizeof(float));
+            cursor += data_a.size() * sizeof(float);
+            std::memcpy(cursor, data_b.data(), data_b.size() * sizeof(float));
+            cursor += data_b.size() * sizeof(float);
+        }
+        return true;
+    }
+
+    bool serialized_adapter_import(llama_adapter_lora & adapter, const void * src, size_t size) {
+        if (!src || size < sizeof(uint32_t)) {
+            return false;
+        }
+        const uint8_t * cursor = static_cast<const uint8_t *>(src);
+        const uint8_t * end = cursor + size;
+        uint32_t count = 0;
+        std::memcpy(&count, cursor, sizeof(count));
+        cursor += sizeof(count);
+        for (uint32_t idx = 0; idx < count; ++idx) {
+            if (cursor + sizeof(uint32_t) > end) {
+                return false;
+            }
+            uint32_t name_len = 0;
+            std::memcpy(&name_len, cursor, sizeof(name_len));
+            cursor += sizeof(name_len);
+            if (cursor + name_len + sizeof(float) + sizeof(uint64_t) * 2 > end) {
+                return false;
+            }
+            const std::string name(reinterpret_cast<const char *>(cursor), name_len);
+            cursor += name_len;
+            auto it = adapter.ab_map.find(name);
+            if (it == adapter.ab_map.end()) {
+                return false;
+            }
+            float gain = 0.0f;
+            uint64_t size_a = 0;
+            uint64_t size_b = 0;
+            std::memcpy(&gain, cursor, sizeof(gain));
+            cursor += sizeof(gain);
+            std::memcpy(&size_a, cursor, sizeof(size_a));
+            cursor += sizeof(size_a);
+            std::memcpy(&size_b, cursor, sizeof(size_b));
+            cursor += sizeof(size_b);
+            const size_t expected_a = it->second.a->ne[0] * it->second.a->ne[1];
+            const size_t expected_b = it->second.b->ne[0] * it->second.b->ne[1];
+            if (size_a != expected_a || size_b != expected_b ||
+                    cursor + (size_a + size_b) * sizeof(float) > end) {
+                return false;
+            }
+            ggml_backend_tensor_set(it->second.a, cursor, 0, size_a * sizeof(float));
+            cursor += size_a * sizeof(float);
+            ggml_backend_tensor_set(it->second.b, cursor, 0, size_b * sizeof(float));
+            cursor += size_b * sizeof(float);
+            it->second.gain = gain;
+        }
+        return cursor == end;
+    }
+
     void set_adapter_scale(llama_adapter_lora * adapter_ptr, float scale, llama_adapter_lora_layer_role role) {
         owner.attach_adapter_runtime(adapter_ptr, scale, role);
     }
@@ -2369,6 +2812,20 @@ llama_active_lora_manager::~llama_active_lora_manager() {
             const_cast<llama_model &>(pimpl->owner.model).loras.erase(adapter.get());
         }
     }
+    for (auto & adapter : pimpl->functional_replay_adapters) {
+        if (adapter) {
+            pimpl->owner.detach_adapter_runtime(adapter.get());
+            const_cast<llama_model &>(pimpl->owner.model).loras.erase(adapter.get());
+        }
+    }
+    for (auto & family_snapshots : pimpl->functional_snapshots) {
+        for (auto & snapshot : family_snapshots) {
+            if (snapshot.adapter) {
+                pimpl->owner.detach_adapter_runtime(snapshot.adapter.get());
+                const_cast<llama_model &>(pimpl->owner.model).loras.erase(snapshot.adapter.get());
+            }
+        }
+    }
     for (auto & bucket : pimpl->buckets) {
         if (bucket.adapter) {
             pimpl->owner.detach_adapter_runtime(bucket.adapter.get());
@@ -2485,6 +2942,7 @@ bool llama_active_lora_manager::init(const llama_active_lora_params & params) {
                 pimpl->functional_adapters[family] != nullptr &&
                 pimpl->functional_bootstrap_adapters[family] != nullptr;
         pimpl->functional_trace.family_state[family] = pimpl->functional_states[family];
+        pimpl->record_functional_signature(family);
     }
 
     LLAMA_LOG_INFO("%s: initialized Active LoRA (rank=%u, host_budget=%" PRIu64 ", device_budget=%" PRIu64 ", embedder=%d)\n",
@@ -2679,6 +3137,38 @@ bool llama_active_lora_manager::functional_get_last_update(int32_t family, llama
     return true;
 }
 
+bool llama_active_lora_manager::functional_snapshot_archive_get(
+        int32_t family,
+        llama_functional_lora_snapshot_archive * out_archive) const {
+    if (!out_archive || family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+        return false;
+    }
+    *out_archive = pimpl->functional_snapshot_archives[family];
+    return true;
+}
+
+bool llama_active_lora_manager::functional_snapshot_info_get(
+        int32_t family,
+        int32_t slot,
+        llama_functional_lora_snapshot_info * out_info) const {
+    if (!out_info ||
+            family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT ||
+            slot < 0 || slot >= LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY) {
+        return false;
+    }
+    *out_info = pimpl->functional_snapshots[family][slot].info;
+    return true;
+}
+
+bool llama_active_lora_manager::functional_get_last_snapshot_maintenance(
+        llama_functional_snapshot_maintenance_trace * out_trace) const {
+    if (!out_trace) {
+        return false;
+    }
+    *out_trace = pimpl->functional_snapshot_trace;
+    return true;
+}
+
 bool llama_active_lora_manager::functional_set_ablation(const llama_functional_lora_ablation_config & config) {
     pimpl->functional_ablation = config;
     return true;
@@ -2689,6 +3179,171 @@ bool llama_active_lora_manager::functional_get_ablation(llama_functional_lora_ab
         return false;
     }
     *out_config = pimpl->functional_ablation;
+    return true;
+}
+
+bool llama_active_lora_manager::functional_replay_override_begin(const llama_functional_lora_replay_override & config) {
+    if (!pimpl->initialized ||
+            config.family < 0 || config.family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+        return false;
+    }
+
+    const int32_t family = config.family;
+    if (config.replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_ARCHIVED) {
+        if (config.snapshot_slot < 0 || config.snapshot_slot >= LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY ||
+                !pimpl->functional_snapshots[family][config.snapshot_slot].info.valid ||
+                !pimpl->functional_snapshots[family][config.snapshot_slot].adapter) {
+            return false;
+        }
+    } else if (config.replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL ||
+               config.replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_LOCAL_PERTURBED) {
+        if (!pimpl->functional_adapters[family] || !pimpl->ensure_replay_adapter(family)) {
+            return false;
+        }
+        if (!pimpl->copy_adapter(*pimpl->functional_replay_adapters[family], *pimpl->functional_adapters[family])) {
+            return false;
+        }
+
+        const float signed_scale =
+                config.replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL ?
+                        std::max(0.02f, config.perturbation_scale) :
+                        std::max(0.01f, config.perturbation_scale * 0.5f);
+        std::normal_distribution<float> dist(0.0f, signed_scale);
+        std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS> perturb_signature = {};
+        for (float & value : perturb_signature) {
+            value = dist(pimpl->bootstrap_rng);
+        }
+        if (config.replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL &&
+                pimpl->functional_signature_valid[family]) {
+            const auto & dominant = pimpl->functional_dominant_directions[family];
+            float dot = 0.0f;
+            for (size_t i = 0; i < FUNCTIONAL_DIRECTION_SKETCH_DIMS; ++i) {
+                dot += perturb_signature[i] * dominant[i];
+            }
+            for (size_t i = 0; i < FUNCTIONAL_DIRECTION_SKETCH_DIMS; ++i) {
+                perturb_signature[i] -= dot * dominant[i];
+            }
+        }
+        normalize_array(perturb_signature);
+        for (auto & it : pimpl->functional_replay_adapters[family]->ab_map) {
+            const size_t size_a = it.second.a->ne[0] * it.second.a->ne[1];
+            const size_t size_b = it.second.b->ne[0] * it.second.b->ne[1];
+            std::vector<float> data_a(size_a, 0.0f);
+            std::vector<float> data_b(size_b, 0.0f);
+            ggml_backend_tensor_get(it.second.a, data_a.data(), 0, data_a.size() * sizeof(float));
+            ggml_backend_tensor_get(it.second.b, data_b.data(), 0, data_b.size() * sizeof(float));
+            for (size_t i = 0; i < data_a.size(); ++i) {
+                data_a[i] += signed_scale * perturb_signature[i % FUNCTIONAL_DIRECTION_SKETCH_DIMS];
+            }
+            for (size_t i = 0; i < data_b.size(); ++i) {
+                data_b[i] += signed_scale * perturb_signature[(i + data_a.size()) % FUNCTIONAL_DIRECTION_SKETCH_DIMS];
+            }
+            ggml_backend_tensor_set(it.second.a, data_a.data(), 0, data_a.size() * sizeof(float));
+            ggml_backend_tensor_set(it.second.b, data_b.data(), 0, data_b.size() * sizeof(float));
+        }
+    }
+
+    pimpl->functional_replay_overrides[family] = config;
+    return true;
+}
+
+bool llama_active_lora_manager::functional_replay_override_end(int32_t family) {
+    if (!pimpl->initialized || family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+        return false;
+    }
+    pimpl->functional_replay_overrides[family] = {};
+    pimpl->apply_functional_runtime_scale(
+            family,
+            pimpl->functional_states[family].current_gain,
+            pimpl->functional_states[family].last_bootstrap_perturbation);
+    return true;
+}
+
+bool llama_active_lora_manager::functional_get_last_differential_update(
+        int32_t family,
+        llama_functional_lora_differential_update * out_update) const {
+    if (!out_update || family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+        return false;
+    }
+    *out_update = pimpl->functional_differential_updates[family];
+    return true;
+}
+
+size_t llama_active_lora_manager::functional_snapshot_blob_size(int32_t family, int32_t slot) const {
+    if (family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT ||
+            slot < 0 || slot >= LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY) {
+        return 0;
+    }
+    const auto & runtime = pimpl->functional_snapshots[family][slot];
+    if (!runtime.info.valid || !runtime.adapter) {
+        return 0;
+    }
+    return pimpl->serialized_adapter_size(*runtime.adapter);
+}
+
+bool llama_active_lora_manager::functional_snapshot_blob_export(int32_t family, int32_t slot, void * dst, size_t size) const {
+    if (family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT ||
+            slot < 0 || slot >= LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY) {
+        return false;
+    }
+    const auto & runtime = pimpl->functional_snapshots[family][slot];
+    return runtime.info.valid && runtime.adapter &&
+            pimpl->serialized_adapter_export(*runtime.adapter, dst, size);
+}
+
+bool llama_active_lora_manager::functional_snapshot_blob_import(
+        int32_t family,
+        int32_t slot,
+        const llama_functional_lora_snapshot_info & info,
+        const void * src,
+        size_t size) {
+    if (!pimpl->initialized ||
+            family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT ||
+            slot < 0 || slot >= LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY ||
+            !pimpl->ensure_snapshot_adapter(family, slot) ||
+            !pimpl->serialized_adapter_import(*pimpl->functional_snapshots[family][slot].adapter, src, size)) {
+        return false;
+    }
+    pimpl->functional_snapshots[family][slot].info = info;
+    pimpl->functional_snapshot_archives[family].items[slot] = info;
+    uint32_t count = 0;
+    uint64_t last_capture = 0;
+    for (int32_t i = 0; i < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++i) {
+        if (pimpl->functional_snapshots[family][i].info.valid) {
+            count += 1;
+            last_capture = std::max(last_capture, pimpl->functional_snapshots[family][i].info.captured_at_us);
+        }
+    }
+    pimpl->functional_snapshot_archives[family].family = family;
+    pimpl->functional_snapshot_archives[family].count = count;
+    pimpl->functional_snapshot_archives[family].last_capture_us = last_capture;
+    pimpl->functional_snapshot_archives[family].next_capture_due_us = last_capture == 0 ? FUNCTIONAL_SNAPSHOT_PERIOD_US : last_capture + FUNCTIONAL_SNAPSHOT_PERIOD_US;
+    return true;
+}
+
+bool llama_active_lora_manager::functional_snapshot_maintain(uint64_t now_us) {
+    if (!pimpl->initialized) {
+        return false;
+    }
+    pimpl->functional_snapshot_trace = {};
+    pimpl->functional_snapshot_trace.ran = true;
+    pimpl->functional_snapshot_trace.now_us = now_us;
+    pimpl->expire_functional_snapshots(now_us, &pimpl->functional_snapshot_trace.expired_count);
+    for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+        auto & archive = pimpl->functional_snapshot_archives[family];
+        if (archive.next_capture_due_us == 0) {
+            archive.next_capture_due_us = now_us + FUNCTIONAL_SNAPSHOT_PERIOD_US;
+        }
+        if (now_us >= archive.next_capture_due_us && pimpl->capture_functional_snapshot(family, now_us)) {
+            pimpl->functional_snapshot_trace.captured_any = true;
+            pimpl->functional_snapshot_trace.captured_count += 1;
+            pimpl->functional_snapshot_trace.captured_family_mask |= (1ull << family);
+        }
+        if (pimpl->functional_snapshot_trace.next_due_us == 0 ||
+                (archive.next_capture_due_us > 0 && archive.next_capture_due_us < pimpl->functional_snapshot_trace.next_due_us)) {
+            pimpl->functional_snapshot_trace.next_due_us = archive.next_capture_due_us;
+        }
+    }
     return true;
 }
 
@@ -2827,15 +3482,7 @@ bool llama_active_lora_manager::functional_activate(const llama_functional_activ
 
         const float gain = hold.active ? hold.gain : 0.0f;
         const float bootstrap_perturbation = hold.active ? hold.bootstrap_perturbation : 0.0f;
-        if (pimpl->functional_adapters[family]) {
-            pimpl->set_adapter_scale(pimpl->functional_adapters[family].get(), gain, functional_family_role(family));
-        }
-        if (pimpl->functional_bootstrap_adapters[family]) {
-            pimpl->set_adapter_scale(
-                    pimpl->functional_bootstrap_adapters[family].get(),
-                    bootstrap_perturbation,
-                    functional_family_role(family));
-        }
+        pimpl->apply_functional_runtime_scale(family, gain, bootstrap_perturbation);
 
         state.family = family;
         state.enabled = pimpl->functional_configs[family].enabled && !family_disabled;
@@ -2883,15 +3530,7 @@ bool llama_active_lora_manager::functional_note_command_complete(int32_t origin)
                 hold.gain = 0.0f;
                 hold.bootstrap_std = 0.0f;
                 hold.bootstrap_perturbation = 0.0f;
-                if (pimpl->functional_adapters[family]) {
-                    pimpl->set_adapter_scale(pimpl->functional_adapters[family].get(), 0.0f, functional_family_role(family));
-                }
-                if (pimpl->functional_bootstrap_adapters[family]) {
-                    pimpl->set_adapter_scale(
-                            pimpl->functional_bootstrap_adapters[family].get(),
-                            0.0f,
-                            functional_family_role(family));
-                }
+                pimpl->apply_functional_runtime_scale(family, 0.0f, 0.0f);
                 pimpl->functional_states[family].active_now = false;
                 pimpl->functional_states[family].current_gain = 0.0f;
                 pimpl->functional_states[family].current_bootstrap_std = bootstrap_noise_std(
@@ -2985,7 +3624,101 @@ bool llama_active_lora_manager::functional_apply_update(
     pimpl->functional_states[family].update_count += 1;
     pimpl->functional_states[family].last_signed_outcome = signed_outcome;
     pimpl->functional_states[family].last_meta_loss = update.meta_loss;
+    pimpl->record_functional_signature(family);
     pimpl->functional_trace.family_state[family] = pimpl->functional_states[family];
+    return true;
+}
+
+bool llama_active_lora_manager::functional_apply_differential_update(
+        int32_t family,
+        int32_t proposal_family,
+        int32_t replay_mode,
+        int32_t snapshot_slot,
+        float signed_score_delta,
+        float magnitude,
+        float robustness_score) {
+    if (!pimpl->initialized ||
+            family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT ||
+            !pimpl->functional_adapters[family]) {
+        return false;
+    }
+
+    llama_adapter_lora * source_adapter = nullptr;
+    if (replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_ARCHIVED) {
+        if (snapshot_slot < 0 || snapshot_slot >= LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY) {
+            return false;
+        }
+        source_adapter = pimpl->functional_snapshots[family][snapshot_slot].adapter.get();
+    } else if (replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL ||
+               replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_LOCAL_PERTURBED) {
+        source_adapter = pimpl->functional_replay_adapters[family].get();
+    } else {
+        return false;
+    }
+    if (!source_adapter) {
+        return false;
+    }
+
+    const float signed_step = clamp_range(signed_score_delta * std::max(0.05f, magnitude), -0.75f, 0.75f);
+    if (std::fabs(signed_step) <= 1.0e-5f) {
+        return false;
+    }
+
+    double sum_sq = 0.0;
+    for (auto & it : pimpl->functional_adapters[family]->ab_map) {
+        auto src_it = source_adapter->ab_map.find(it.first);
+        if (src_it == source_adapter->ab_map.end()) {
+            continue;
+        }
+        auto & dst_weight = it.second;
+        const auto & src_weight = src_it->second;
+        const size_t size_a = dst_weight.a->ne[0] * dst_weight.a->ne[1];
+        const size_t size_b = dst_weight.b->ne[0] * dst_weight.b->ne[1];
+        std::vector<float> dst_a(size_a, 0.0f);
+        std::vector<float> src_a(size_a, 0.0f);
+        std::vector<float> dst_b(size_b, 0.0f);
+        std::vector<float> src_b(size_b, 0.0f);
+        ggml_backend_tensor_get(dst_weight.a, dst_a.data(), 0, dst_a.size() * sizeof(float));
+        ggml_backend_tensor_get(src_weight.a, src_a.data(), 0, src_a.size() * sizeof(float));
+        ggml_backend_tensor_get(dst_weight.b, dst_b.data(), 0, dst_b.size() * sizeof(float));
+        ggml_backend_tensor_get(src_weight.b, src_b.data(), 0, src_b.size() * sizeof(float));
+        for (size_t i = 0; i < size_a; ++i) {
+            const float delta = signed_step * (src_a[i] - dst_a[i]);
+            dst_a[i] += delta;
+            sum_sq += (double) delta * (double) delta;
+        }
+        for (size_t i = 0; i < size_b; ++i) {
+            const float delta = signed_step * (src_b[i] - dst_b[i]);
+            dst_b[i] += delta;
+            sum_sq += (double) delta * (double) delta;
+        }
+        ggml_backend_tensor_set(dst_weight.a, dst_a.data(), 0, dst_a.size() * sizeof(float));
+        ggml_backend_tensor_set(dst_weight.b, dst_b.data(), 0, dst_b.size() * sizeof(float));
+        const float gain_delta = signed_step * (src_weight.gain - dst_weight.gain);
+        dst_weight.gain = clamp_range(
+                dst_weight.gain + gain_delta,
+                pimpl->functional_configs[family].gain_clip_min,
+                pimpl->functional_configs[family].gain_clip_max);
+        sum_sq += (double) gain_delta * (double) gain_delta;
+    }
+
+    const float difference_norm = pimpl->adapter_difference_norm(*pimpl->functional_adapters[family], *source_adapter);
+    const float applied_update_norm = std::sqrt((float) sum_sq);
+    const uint64_t transaction_step = ++pimpl->runtime_lora_write_count[pimpl->functional_adapters[family].get()];
+
+    auto & diff = pimpl->functional_differential_updates[family];
+    diff = {};
+    diff.valid = true;
+    diff.family = family;
+    diff.proposal_family = proposal_family;
+    diff.source_snapshot_slot = snapshot_slot;
+    diff.signed_score_delta = signed_score_delta;
+    diff.magnitude = magnitude;
+    diff.lora_difference_norm = difference_norm;
+    diff.applied_update_norm = applied_update_norm;
+    diff.robustness_score = robustness_score;
+    diff.adapter_optimizer_step = transaction_step;
+    pimpl->record_functional_signature(family);
     return true;
 }
 

@@ -124,6 +124,18 @@ Accuracy guidance for tool integrations:
   structured finding in host code and upsert it explicitly
 - do not mark hard-memory-like retrieved facts as allostatic targets by default
 
+### Runtime Snapshot Persistence
+
+`server_context` runtime persistence now includes functional-bias replay
+archives in addition to self-state, updater policy, and tool configuration.
+
+- weekly functional LoRA snapshots are serialized into the runtime snapshot file
+  alongside per-slot metadata
+- the server restores those archives on startup so DMN historical replay can
+  substitute archived functional families immediately after recovery
+- archived functional replay remains substitution-only during counterfactual
+  evaluation; restored snapshots do not introduce extra serving-stack layers
+
 ### User-Model Capture Guidance
 
 Vicuña now distinguishes between durable user memory, bounded user-preference

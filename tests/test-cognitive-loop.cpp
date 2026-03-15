@@ -1173,6 +1173,14 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
+        const uint64_t one_week_us = 7ull * 24ull * 60ull * 60ull * 1000000ull;
+        if (llama_functional_lora_snapshot_maintain(ctx, 1) != 0 ||
+            llama_functional_lora_snapshot_maintain(ctx, one_week_us + 1) != 0) {
+            std::fprintf(stderr, "failed to seed weekly functional snapshot archive before DMN tick\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
 
         llama_dmn_tick_trace trace = {};
         if (llama_dmn_tick(ctx, 6000, &trace) != 0 ||
@@ -1312,35 +1320,121 @@ int main(int argc, char ** argv) {
 
         llama_counterfactual_trace counterfactual = {};
         if (llama_counterfactual_get_last_trace(ctx, &counterfactual) != 0 ||
-            counterfactual.candidate_count < 6 ||
-            counterfactual.winner_index < 0 ||
-            counterfactual.candidates[0].family != LLAMA_COUNTERFACTUAL_FAMILY_MESSAGE_VARIANT ||
-            counterfactual.candidates[1].family != LLAMA_COUNTERFACTUAL_FAMILY_TOOL_ARGUMENTS ||
-            counterfactual.candidates[2].family != LLAMA_COUNTERFACTUAL_FAMILY_HARD_MEMORY_QUERY ||
-            counterfactual.candidates[3].family != LLAMA_COUNTERFACTUAL_FAMILY_TOOL_CHOICE ||
-            counterfactual.candidates[4].family != LLAMA_COUNTERFACTUAL_FAMILY_TIMING_SHIFT ||
-            !counterfactual.simulated_user.valid ||
-            !counterfactual.simulated_user.used_user_personality_adapter ||
-            !counterfactual.simulated_user.temporal_layers_ablated ||
-            counterfactual.simulated_user.source_family != LLAMA_COUNTERFACTUAL_FAMILY_MESSAGE_VARIANT ||
-            counterfactual.simulated_user.reply_token_count <= 0 ||
-            counterfactual.simulated_user.simulation_confidence <= 0.0f ||
-            counterfactual.simulated_user.candidate_message[0] == '\0' ||
-            counterfactual.simulated_user.simulated_user_reply[0] == '\0') {
-            std::fprintf(stderr, "counterfactual ladder was not generated in low-risk-first order\n");
+            counterfactual.candidate_count < 4 ||
+            counterfactual.winner_index < 0) {
+            std::fprintf(stderr, "counterfactual ladder was not generated for DMN internal write\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
         }
         bool saw_lora_ablation = false;
+        bool saw_message_variant = false;
         for (int32_t i = 0; i < counterfactual.candidate_count; ++i) {
             if (counterfactual.candidates[i].family == LLAMA_COUNTERFACTUAL_FAMILY_LORA_ABLATION) {
                 saw_lora_ablation = true;
-                break;
+            }
+            if (counterfactual.candidates[i].family == LLAMA_COUNTERFACTUAL_FAMILY_MESSAGE_VARIANT) {
+                saw_message_variant = true;
             }
         }
-        if (!saw_lora_ablation) {
-            std::fprintf(stderr, "counterfactual ladder did not include LoRA ablation\n");
+        if (!saw_lora_ablation || saw_message_variant ||
+            counterfactual.simulated_user.valid ||
+            counterfactual.simulated_user.used_user_personality_adapter ||
+            counterfactual.simulated_user.temporal_layers_ablated) {
+            std::fprintf(stderr, "counterfactual ladder did not remain hypothesis-first\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        bool saw_functional_local = false;
+        bool saw_functional_history = false;
+        bool saw_functional_orthogonal = false;
+        const llama_counterfactual_candidate * best_functional_candidate = nullptr;
+        int32_t last_primary_index = -1;
+        int32_t first_fallback_index = -1;
+        for (int32_t i = 0; i < counterfactual.candidate_count; ++i) {
+            const auto & candidate = counterfactual.candidates[i];
+            const bool primary_family =
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_LORA_ABLATION ||
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_LOCAL ||
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_HISTORY ||
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_ORTHOGONAL;
+            const bool fallback_family =
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_TOOL_ARGUMENTS ||
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_HARD_MEMORY_QUERY ||
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_TOOL_CHOICE ||
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_TIMING_SHIFT;
+            if (primary_family) {
+                last_primary_index = i;
+            } else if (fallback_family && first_fallback_index < 0) {
+                first_fallback_index = i;
+            }
+            if (candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_LOCAL &&
+                candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_HISTORY &&
+                candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_ORTHOGONAL) {
+                continue;
+            }
+            if (candidate.functional_family < 0 ||
+                candidate.proposal_family < 0 ||
+                candidate.replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_NONE) {
+                std::fprintf(stderr, "functional counterfactual candidate metadata missing\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+            if (candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_LOCAL) {
+                saw_functional_local = true;
+            } else if (candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_HISTORY) {
+                saw_functional_history = true;
+                if (candidate.snapshot_slot < 0) {
+                    std::fprintf(stderr, "historical functional counterfactual missing snapshot slot\n");
+                    llama_free(ctx);
+                    llama_model_free(model);
+                    return 1;
+                }
+            } else if (candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_ORTHOGONAL) {
+                saw_functional_orthogonal = true;
+                if (candidate.orthogonality > 0.10f + 1.0e-6f) {
+                    std::fprintf(stderr, "orthogonal functional counterfactual exceeded cosine limit\n");
+                    llama_free(ctx);
+                    llama_model_free(model);
+                    return 1;
+                }
+            }
+            if (!best_functional_candidate ||
+                candidate.realized_score > best_functional_candidate->realized_score + 1.0e-6f ||
+                (std::fabs(candidate.realized_score - best_functional_candidate->realized_score) <= 1.0e-6f &&
+                 candidate.robustness_score > best_functional_candidate->robustness_score + 1.0e-6f)) {
+                best_functional_candidate = &candidate;
+            }
+        }
+        if (!saw_functional_local || !saw_functional_history || !saw_functional_orthogonal || !best_functional_candidate) {
+            std::fprintf(stderr, "counterfactual ladder did not include the full functional bias replay set\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (first_fallback_index >= 0 && first_fallback_index < last_primary_index) {
+            std::fprintf(stderr, "discrete fallback candidates appeared before primary temporal/functional hypotheses\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_functional_lora_differential_update differential = {};
+        if (llama_functional_lora_get_last_differential_update(
+                    ctx,
+                    best_functional_candidate->functional_family,
+                    &differential) != 0 ||
+            !differential.valid ||
+            differential.family != best_functional_candidate->functional_family ||
+            differential.proposal_family != best_functional_candidate->proposal_family ||
+            differential.source_snapshot_slot != best_functional_candidate->snapshot_slot ||
+            std::fabs(differential.signed_score_delta - best_functional_candidate->signed_advantage_vs_current) > 1.0e-5f ||
+            differential.magnitude <= 0.0f ||
+            differential.applied_update_norm <= 0.0f) {
+            std::fprintf(stderr, "DMN did not retain functional differential update metadata\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;

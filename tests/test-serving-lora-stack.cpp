@@ -2,6 +2,7 @@
 #include "ggml.h"
 #include "llama.h"
 #include "llama-adapter.h"
+#include "llama-context.h"
 #include "llama-model.h"
 
 #include <cstdio>
@@ -116,6 +117,76 @@ int main(int argc, char ** argv) {
         !expect_layer(ctx.get(), 14, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_SELF_OBSERVE, 0.0f) ||
         !expect_layer(ctx.get(), 15, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_SELF_OBSERVE, 0.0f)) {
         fprintf(stderr, "unexpected runtime-only serving stack\n");
+        return 1;
+    }
+    const int32_t baseline_stack_count = llama_serving_lora_stack_count(ctx.get());
+
+    const uint64_t one_week_us = 7ull * 24ull * 60ull * 60ull * 1000000ull;
+    if (llama_functional_lora_snapshot_maintain(ctx.get(), 1) != 0 ||
+        llama_functional_lora_snapshot_maintain(ctx.get(), one_week_us + 1) != 0) {
+        fprintf(stderr, "failed to seed functional snapshot archive\n");
+        return 1;
+    }
+
+    llama_functional_lora_snapshot_archive archive = {};
+    if (llama_functional_lora_snapshot_archive_get(ctx.get(), LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, &archive) != 0 ||
+        archive.count != 1 ||
+        !archive.items[0].valid) {
+        fprintf(stderr, "failed to create archived functional replay input\n");
+        return 1;
+    }
+
+    llama_functional_activation_decision decision = {};
+    decision.loop_origin = LLAMA_COG_COMMAND_ORIGIN_DMN;
+    decision.microphase = LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE;
+    decision.family_count = LLAMA_FUNCTIONAL_LORA_COUNT;
+    decision.top_family = LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
+    decision.eligible_mask = 1ull << LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
+    decision.activated_mask = 1ull << LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
+    decision.gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] = 1.0f;
+    decision.predicted_gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] = 1.0f;
+    decision.hold_unit[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] = LLAMA_FUNCTIONAL_HOLD_LOOP_STEPS;
+    decision.hold_value[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] = 1;
+    llama_functional_activation_decision inactive = {};
+    inactive.loop_origin = LLAMA_COG_COMMAND_ORIGIN_DMN;
+    inactive.family_count = LLAMA_FUNCTIONAL_LORA_COUNT;
+    inactive.top_family = -1;
+
+    llama_functional_lora_replay_override replay = {};
+    replay.active = true;
+    replay.family = LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
+    replay.replay_mode = LLAMA_FUNCTIONAL_REPLAY_MODE_ARCHIVED;
+    replay.snapshot_slot = 0;
+    replay.replay_gain = 1.0f;
+    replay.disable_bootstrap = true;
+    if (llama_functional_lora_replay_override_begin(ctx.get(), replay) != 0 ||
+        !ctx->functional_lora_activate(decision) ||
+        llama_serving_lora_stack_count(ctx.get()) > baseline_stack_count ||
+        !expect_layer(ctx.get(), 6, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_TOOL_SELECTION, 0.0f) ||
+        llama_functional_lora_replay_override_end(ctx.get(), LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION) != 0 ||
+        !ctx->functional_lora_activate(inactive) ||
+        llama_serving_lora_stack_count(ctx.get()) != baseline_stack_count) {
+        fprintf(stderr, "archived functional replay changed serving stack cardinality\n");
+        return 1;
+    }
+
+    replay = {};
+    replay.active = true;
+    replay.family = LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
+    replay.replay_mode = LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL;
+    replay.snapshot_slot = -1;
+    replay.replay_gain = 1.0f;
+    replay.perturbation_scale = 0.08f;
+    replay.cosine_limit = 0.10f;
+    replay.disable_bootstrap = true;
+    if (llama_functional_lora_replay_override_begin(ctx.get(), replay) != 0 ||
+        !ctx->functional_lora_activate(decision) ||
+        llama_serving_lora_stack_count(ctx.get()) > baseline_stack_count ||
+        !expect_layer(ctx.get(), 6, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_TOOL_SELECTION, 0.0f) ||
+        llama_functional_lora_replay_override_end(ctx.get(), LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION) != 0 ||
+        !ctx->functional_lora_activate(inactive) ||
+        llama_serving_lora_stack_count(ctx.get()) != baseline_stack_count) {
+        fprintf(stderr, "orthogonal functional replay changed serving stack cardinality\n");
         return 1;
     }
 

@@ -472,6 +472,117 @@ const llama_counterfactual_candidate * best_temporal_ablation_candidate(
     return best;
 }
 
+int32_t select_functional_bias_family(const llama_favorable_state_profile & profile) {
+    if (profile.priority_count <= 0) {
+        return LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL;
+    }
+    const int32_t top_dim = profile.dimensions[profile.priority_order[0]].dimension_id;
+    switch (top_dim) {
+        case LLAMA_FAVORABLE_DIM_TOOL_BACKLOG:
+        case LLAMA_FAVORABLE_DIM_TOOL_READINESS:
+            return LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
+        case LLAMA_FAVORABLE_DIM_MEMORY_WRITE_PRIORITY:
+        case LLAMA_FAVORABLE_DIM_REACTIVATION_PRIORITY:
+            return LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION;
+        case LLAMA_FAVORABLE_DIM_SOCIAL_TRUST:
+        case LLAMA_FAVORABLE_DIM_SOCIAL_RECIPROCITY:
+        case LLAMA_FAVORABLE_DIM_SOCIAL_DISSATISFACTION:
+            return LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION;
+        default:
+            return LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL;
+    }
+}
+
+float score_functional_bias_candidate(
+        llama_context & ctx,
+        const llama_favorable_state_profile & profile,
+        int32_t functional_family,
+        int32_t /*proposal_family*/,
+        int32_t replay_mode,
+        int32_t snapshot_slot,
+        float orthogonality,
+        float * out_fragility,
+        float * out_concentration,
+        float * out_robustness) {
+    if (out_fragility) {
+        *out_fragility = 0.0f;
+    }
+    if (out_concentration) {
+        *out_concentration = 0.0f;
+    }
+    if (out_robustness) {
+        *out_robustness = 0.0f;
+    }
+
+    const float aggregate = clamp_unit(profile.aggregate_divergence);
+    float robustness = 0.45f + 0.35f * aggregate;
+    float base = 0.04f + 0.18f * aggregate;
+
+    if (replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_ARCHIVED) {
+        llama_functional_lora_snapshot_info info = {};
+        if (ctx.functional_lora_snapshot_info_get(functional_family, snapshot_slot, &info)) {
+            robustness = clamp_unit(std::max(0.0f, info.robustness_score));
+            base += 0.22f * clamp_unit(0.5f + 0.5f * info.last_signed_outcome);
+            base += 0.12f * robustness;
+        }
+    } else if (replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL) {
+        base += 0.20f * clamp_unit(1.0f - std::fabs(orthogonality));
+        robustness = clamp_unit(0.40f + 0.25f * aggregate + 0.20f * (1.0f - std::fabs(orthogonality)));
+    } else {
+        base += 0.10f * aggregate;
+        robustness = clamp_unit(0.35f + 0.20f * aggregate);
+    }
+
+    llama_functional_lora_replay_override replay = {};
+    replay.active = replay_mode != LLAMA_FUNCTIONAL_REPLAY_MODE_NONE;
+    replay.family = functional_family;
+    replay.replay_mode = replay_mode;
+    replay.snapshot_slot = snapshot_slot;
+    replay.replay_gain = 1.0f;
+    replay.perturbation_scale = 0.05f + 0.05f * aggregate;
+    replay.cosine_limit = 0.10f;
+    replay.disable_bootstrap = true;
+    if (replay.active) {
+        (void) ctx.functional_lora_replay_override_begin(replay);
+    }
+
+    llama_functional_activation_decision decision = {};
+    decision.loop_origin = LLAMA_COG_COMMAND_ORIGIN_DMN;
+    decision.microphase = LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE;
+    decision.family_count = LLAMA_FUNCTIONAL_LORA_COUNT;
+    decision.top_family = functional_family;
+    decision.eligible_mask = (1ull << functional_family);
+    decision.activated_mask = (1ull << functional_family);
+    decision.gains[functional_family] = 1.0f;
+    decision.predicted_gains[functional_family] = 1.0f;
+    decision.hold_unit[functional_family] = LLAMA_FUNCTIONAL_HOLD_LOOP_STEPS;
+    decision.hold_value[functional_family] = 1;
+    (void) ctx.functional_lora_activate(decision);
+
+    const float fragility = clamp_unit(
+            0.30f * std::max(0.0f, aggregate - robustness) +
+            0.20f * std::max(0.0f, std::fabs(orthogonality) - 0.10f));
+    const float concentration = clamp_unit(
+            0.22f * aggregate +
+            0.12f * (functional_family == LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL ? 1.0f : 0.0f));
+
+    if (replay.active) {
+        (void) ctx.functional_lora_replay_override_end(functional_family);
+    }
+
+    if (out_fragility) {
+        *out_fragility = fragility;
+    }
+    if (out_concentration) {
+        *out_concentration = concentration;
+    }
+    if (out_robustness) {
+        *out_robustness = robustness;
+    }
+
+    return clamp_unit(base - fragility - concentration);
+}
+
 llama_functional_activation_decision make_inactive_functional_decision(int32_t loop_origin) {
     llama_functional_activation_decision decision = {};
     decision.loop_origin = loop_origin;
@@ -1732,6 +1843,12 @@ std::string remediation_prompt_for_family(int32_t family) {
             return "Prefer timing and follow-up choices that reduce social dissatisfaction without increasing broadcast inhibition.";
         case LLAMA_COUNTERFACTUAL_FAMILY_LORA_ABLATION:
             return "Bias responses toward lower-divergence behaviors retained in earlier runtime memory adapters when recent behavior is unstable.";
+        case LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_LOCAL:
+            return "Prefer nearby functional-bias perturbations that reduce favorable-state divergence without concentrating policy.";
+        case LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_HISTORY:
+            return "Prefer earlier archived functional-bias states when they outperform the current bias stance under DMN replay.";
+        case LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_ORTHOGONAL:
+            return "Prefer orthogonal functional-bias proposals that escape recent attractors while remaining robust under perturbation.";
         default:
             return "Prefer lower-divergence responses that move the system toward favorable self-state.";
     }
@@ -1863,15 +1980,12 @@ public:
         const auto * tool_backlog = find_dimension(profile, LLAMA_FAVORABLE_DIM_TOOL_BACKLOG);
         const auto * tool_readiness = find_dimension(profile, LLAMA_FAVORABLE_DIM_TOOL_READINESS);
         const auto * dissatisfaction = find_dimension(profile, LLAMA_FAVORABLE_DIM_SOCIAL_DISSATISFACTION);
-        const auto * continuation = find_dimension(profile, LLAMA_FAVORABLE_DIM_FOLLOWUP_CONTINUATION);
-
         const float contradiction_div = contradiction ? contradiction->divergence : 0.0f;
         const float uncertainty_div = uncertainty ? uncertainty->divergence : 0.0f;
         const float tool_div = std::max(
                 tool_backlog ? tool_backlog->divergence : 0.0f,
                 tool_readiness ? tool_readiness->divergence : 0.0f);
         const float dissatisfaction_div = dissatisfaction ? dissatisfaction->divergence : 0.0f;
-        const float continuation_div = continuation ? continuation->divergence : 0.0f;
         const float aggregate = clamp_unit(profile.aggregate_divergence);
 
         auto append_candidate = [&](int32_t family, int32_t risk_tier, int32_t subject_id, float expected_improvement, float confidence) {
@@ -1883,58 +1997,24 @@ public:
             candidate.family = family;
             candidate.risk_tier = risk_tier;
             candidate.subject_id = subject_id;
+            candidate.functional_family = -1;
+            candidate.proposal_family = -1;
+            candidate.replay_mode = LLAMA_FUNCTIONAL_REPLAY_MODE_NONE;
+            candidate.snapshot_slot = -1;
             candidate.expected_improvement = clamp_unit(expected_improvement);
             candidate.confidence = clamp_unit(confidence);
+            candidate.fragility_penalty = 0.0f;
+            candidate.concentration_penalty = 0.0f;
+            candidate.robustness_score = 0.0f;
+            candidate.orthogonality = 0.0f;
+            candidate.realized_score = candidate.expected_improvement;
+            candidate.signed_advantage_vs_current = 0.0f;
         };
 
-        append_candidate(
-                LLAMA_COUNTERFACTUAL_FAMILY_MESSAGE_VARIANT,
-                LLAMA_COUNTERFACTUAL_RISK_LOW,
-                profile.priority_count > 0 ? profile.dimensions[profile.priority_order[0]].dimension_id : -1,
-                0.12f + 0.35f * aggregate + 0.20f * dissatisfaction_div + 0.18f * contradiction_div + 0.10f * uncertainty_div,
-                0.78f);
-        append_candidate(
-                LLAMA_COUNTERFACTUAL_FAMILY_TOOL_ARGUMENTS,
-                LLAMA_COUNTERFACTUAL_RISK_LOW,
-                LLAMA_FAVORABLE_DIM_TOOL_BACKLOG,
-                0.08f + 0.42f * tool_div + 0.18f * uncertainty_div + 0.10f * aggregate,
-                0.72f);
         llama_hard_memory_config hard_memory = {};
         const bool hard_memory_enabled =
                 ctx.hard_memory_get_config(&hard_memory) &&
                 hard_memory.enabled;
-        if (hard_memory_enabled) {
-            int32_t temporal_role = LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK;
-            const int32_t lora_count = ctx.serving_lora_stack_count();
-            for (int32_t i = 0; i < lora_count; ++i) {
-                llama_serving_lora_layer_info info = {};
-                if (ctx.serving_lora_stack_layer(i, &info) &&
-                        (info.role == LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK || info.role == LLAMA_ADAPTER_LORA_LAYER_ACTIVE)) {
-                    temporal_role = info.role;
-                    if (info.role == LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK) {
-                        break;
-                    }
-                }
-            }
-            append_candidate(
-                    LLAMA_COUNTERFACTUAL_FAMILY_HARD_MEMORY_QUERY,
-                    LLAMA_COUNTERFACTUAL_RISK_LOW,
-                    temporal_role,
-                    0.07f + 0.28f * aggregate + 0.18f * tool_div + 0.16f * dissatisfaction_div + 0.12f * uncertainty_div,
-                    0.70f);
-        }
-        append_candidate(
-                LLAMA_COUNTERFACTUAL_FAMILY_TOOL_CHOICE,
-                LLAMA_COUNTERFACTUAL_RISK_LOW,
-                LLAMA_FAVORABLE_DIM_TOOL_READINESS,
-                0.06f + 0.34f * tool_div + 0.24f * aggregate + 0.10f * contradiction_div,
-                0.68f);
-        append_candidate(
-                LLAMA_COUNTERFACTUAL_FAMILY_TIMING_SHIFT,
-                LLAMA_COUNTERFACTUAL_RISK_LOW,
-                LLAMA_FAVORABLE_DIM_FOLLOWUP_CONTINUATION,
-                0.05f + 0.26f * continuation_div + 0.26f * dissatisfaction_div + 0.16f * aggregate,
-                0.64f);
 
         float best_low_risk_improvement = 0.0f;
         for (int32_t i = 0; i < trace.candidate_count; ++i) {
@@ -1965,8 +2045,16 @@ public:
             return lhs.precedence < rhs.precedence;
         });
 
+        const int32_t functional_family = select_functional_bias_family(profile);
+        llama_functional_lora_snapshot_archive snapshot_archive = {};
+        const bool have_functional_history =
+                ctx.functional_lora_snapshot_archive_get(functional_family, &snapshot_archive) &&
+                snapshot_archive.count > 0;
+        const int32_t reserved_functional_slots = 2 + (have_functional_history ? 1 : 0);
+        const int32_t reserved_escalation_slots = 2;
         for (const auto & layer : runtime_loras) {
-            if (trace.candidate_count >= LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+            if (trace.candidate_count >=
+                    LLAMA_COUNTERFACTUAL_MAX_CANDIDATES - reserved_functional_slots - reserved_escalation_slots) {
                 break;
             }
             const int32_t recency_rank = role_recency_rank(layer.role);
@@ -1980,6 +2068,175 @@ public:
                     expected,
                     confidence);
             best_low_risk_improvement = std::max(best_low_risk_improvement, clamp_unit(expected));
+        }
+
+        float fragility = 0.0f;
+        float concentration = 0.0f;
+        float robustness = 0.0f;
+        if (trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+            const float expected = score_functional_bias_candidate(
+                    ctx,
+                    profile,
+                    functional_family,
+                    LLAMA_FUNCTIONAL_BIAS_PROPOSAL_LOCAL,
+                    LLAMA_FUNCTIONAL_REPLAY_MODE_LOCAL_PERTURBED,
+                    -1,
+                    0.0f,
+                    &fragility,
+                    &concentration,
+                    &robustness);
+            auto & candidate = trace.candidates[trace.candidate_count++];
+            candidate.family = LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_LOCAL;
+            candidate.risk_tier = LLAMA_COUNTERFACTUAL_RISK_LOW;
+            candidate.subject_id = functional_family;
+            candidate.functional_family = functional_family;
+            candidate.proposal_family = LLAMA_FUNCTIONAL_BIAS_PROPOSAL_LOCAL;
+            candidate.replay_mode = LLAMA_FUNCTIONAL_REPLAY_MODE_LOCAL_PERTURBED;
+            candidate.snapshot_slot = -1;
+            candidate.expected_improvement = expected;
+            candidate.confidence = clamp_unit(0.52f + 0.20f * robustness);
+            candidate.fragility_penalty = fragility;
+            candidate.concentration_penalty = concentration;
+            candidate.robustness_score = robustness;
+            candidate.orthogonality = 0.0f;
+            candidate.realized_score = clamp_unit(expected - fragility - concentration);
+            candidate.signed_advantage_vs_current = clamp_signed_unit(candidate.realized_score - aggregate * 0.18f);
+            best_low_risk_improvement = std::max(best_low_risk_improvement, candidate.expected_improvement);
+        }
+
+        int32_t best_snapshot_slot = -1;
+        if (have_functional_history) {
+            for (int32_t slot = 0; slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++slot) {
+                const auto & item = snapshot_archive.items[slot];
+                if (!item.valid) {
+                    continue;
+                }
+                if (best_snapshot_slot < 0) {
+                    best_snapshot_slot = slot;
+                    continue;
+                }
+                const auto & best_item = snapshot_archive.items[best_snapshot_slot];
+                if (item.robustness_score > best_item.robustness_score + 1.0e-6f ||
+                        (std::fabs(item.robustness_score - best_item.robustness_score) <= 1.0e-6f &&
+                         item.captured_at_us > best_item.captured_at_us)) {
+                    best_snapshot_slot = slot;
+                }
+            }
+        }
+        if (best_snapshot_slot >= 0 && trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+            const auto & item = snapshot_archive.items[best_snapshot_slot];
+            const float expected = score_functional_bias_candidate(
+                    ctx,
+                    profile,
+                    functional_family,
+                    LLAMA_FUNCTIONAL_BIAS_PROPOSAL_HISTORICAL,
+                    LLAMA_FUNCTIONAL_REPLAY_MODE_ARCHIVED,
+                    best_snapshot_slot,
+                    0.0f,
+                    &fragility,
+                    &concentration,
+                    &robustness);
+            auto & candidate = trace.candidates[trace.candidate_count++];
+            candidate.family = LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_HISTORY;
+            candidate.risk_tier = LLAMA_COUNTERFACTUAL_RISK_LOW;
+            candidate.subject_id = best_snapshot_slot;
+            candidate.functional_family = functional_family;
+            candidate.proposal_family = LLAMA_FUNCTIONAL_BIAS_PROPOSAL_HISTORICAL;
+            candidate.replay_mode = LLAMA_FUNCTIONAL_REPLAY_MODE_ARCHIVED;
+            candidate.snapshot_slot = best_snapshot_slot;
+            candidate.expected_improvement = expected;
+            candidate.confidence = clamp_unit(0.50f + 0.25f * robustness);
+            candidate.fragility_penalty = fragility;
+            candidate.concentration_penalty = concentration;
+            candidate.robustness_score = robustness;
+            candidate.orthogonality = item.dominant_direction_cosine;
+            candidate.realized_score = clamp_unit(expected - fragility - concentration);
+            candidate.signed_advantage_vs_current = clamp_signed_unit(candidate.realized_score - aggregate * 0.18f);
+            best_low_risk_improvement = std::max(best_low_risk_improvement, candidate.expected_improvement);
+        }
+
+        if (trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+            const float orthogonality = 0.05f;
+            const float expected = score_functional_bias_candidate(
+                    ctx,
+                    profile,
+                    functional_family,
+                    LLAMA_FUNCTIONAL_BIAS_PROPOSAL_ORTHOGONAL,
+                    LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL,
+                    -1,
+                    orthogonality,
+                    &fragility,
+                    &concentration,
+                    &robustness);
+            auto & candidate = trace.candidates[trace.candidate_count++];
+            candidate.family = LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_ORTHOGONAL;
+            candidate.risk_tier = LLAMA_COUNTERFACTUAL_RISK_LOW;
+            candidate.subject_id = functional_family;
+            candidate.functional_family = functional_family;
+            candidate.proposal_family = LLAMA_FUNCTIONAL_BIAS_PROPOSAL_ORTHOGONAL;
+            candidate.replay_mode = LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL;
+            candidate.snapshot_slot = -1;
+            candidate.expected_improvement = expected;
+            candidate.confidence = clamp_unit(0.48f + 0.22f * robustness);
+            candidate.fragility_penalty = fragility;
+            candidate.concentration_penalty = concentration;
+            candidate.robustness_score = robustness;
+            candidate.orthogonality = orthogonality;
+            candidate.realized_score = clamp_unit(expected - fragility - concentration);
+            candidate.signed_advantage_vs_current = clamp_signed_unit(candidate.realized_score - aggregate * 0.18f);
+            best_low_risk_improvement = std::max(best_low_risk_improvement, candidate.expected_improvement);
+        }
+
+        const bool need_discrete_tool_fallback =
+                tool_div > 0.24f ||
+                uncertainty_div > 0.30f ||
+                best_low_risk_improvement < 0.18f;
+        if (need_discrete_tool_fallback) {
+            if (hard_memory_enabled && trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+                int32_t temporal_role = LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK;
+                const int32_t lora_count = ctx.serving_lora_stack_count();
+                for (int32_t i = 0; i < lora_count; ++i) {
+                    llama_serving_lora_layer_info info = {};
+                    if (ctx.serving_lora_stack_layer(i, &info) &&
+                            (info.role == LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK || info.role == LLAMA_ADAPTER_LORA_LAYER_ACTIVE)) {
+                        temporal_role = info.role;
+                        if (info.role == LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK) {
+                            break;
+                        }
+                    }
+                }
+                append_candidate(
+                        LLAMA_COUNTERFACTUAL_FAMILY_HARD_MEMORY_QUERY,
+                        LLAMA_COUNTERFACTUAL_RISK_LOW,
+                        temporal_role,
+                        0.05f + 0.22f * aggregate + 0.20f * tool_div + 0.16f * uncertainty_div,
+                        0.62f);
+                best_low_risk_improvement = std::max(
+                        best_low_risk_improvement,
+                        trace.candidates[trace.candidate_count - 1].expected_improvement);
+            }
+            if (tool_div > 0.18f && trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+                append_candidate(
+                        LLAMA_COUNTERFACTUAL_FAMILY_TOOL_CHOICE,
+                        LLAMA_COUNTERFACTUAL_RISK_LOW,
+                        LLAMA_FAVORABLE_DIM_TOOL_READINESS,
+                        0.04f + 0.24f * tool_div + 0.12f * aggregate + 0.08f * contradiction_div,
+                        0.56f);
+                best_low_risk_improvement = std::max(
+                        best_low_risk_improvement,
+                        trace.candidates[trace.candidate_count - 1].expected_improvement);
+            }
+            if (tool_div > 0.28f && trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+                append_candidate(
+                        LLAMA_COUNTERFACTUAL_FAMILY_TOOL_ARGUMENTS,
+                        LLAMA_COUNTERFACTUAL_RISK_LOW,
+                        LLAMA_FAVORABLE_DIM_TOOL_BACKLOG,
+                        0.04f + 0.26f * tool_div + 0.10f * uncertainty_div + 0.08f * aggregate,
+                        0.54f);
+                best_low_risk_improvement = std::max(
+                        best_low_risk_improvement,
+                        trace.candidates[trace.candidate_count - 1].expected_improvement);
+            }
         }
 
         if ((best_low_risk_improvement < 0.18f || aggregate > 0.55f || dissatisfaction_div > 0.45f) &&
@@ -3648,6 +3905,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     if (working_memory_count >= 4) {
         trace.maintenance_mask |= LLAMA_DMN_MAINTENANCE_COMPRESS_WORKING_MEMORY;
     }
+    (void) ctx.functional_lora_snapshot_maintain(now_us);
     if (ctx.past_lora_tick(now_us)) {
         trace.maintenance_mask |= LLAMA_DMN_MAINTENANCE_PAST_LORA_TICK;
     }
@@ -4390,6 +4648,40 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 magnitude,
                 "winner_index " + std::to_string(last_counterfactual_trace.winner_index) +
                         " candidates " + std::to_string(last_counterfactual_trace.candidate_count));
+    }
+
+    const llama_counterfactual_candidate * best_functional_candidate = nullptr;
+    for (int32_t i = 0; i < last_counterfactual_trace.candidate_count; ++i) {
+        const auto & candidate = last_counterfactual_trace.candidates[i];
+        if (candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_LOCAL &&
+                candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_HISTORY &&
+                candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_ORTHOGONAL) {
+            continue;
+        }
+        if (candidate.functional_family < 0 || candidate.replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_NONE) {
+            continue;
+        }
+        if (!best_functional_candidate ||
+                candidate.realized_score > best_functional_candidate->realized_score + 1.0e-6f ||
+                (std::fabs(candidate.realized_score - best_functional_candidate->realized_score) <= 1.0e-6f &&
+                 candidate.robustness_score > best_functional_candidate->robustness_score + 1.0e-6f)) {
+            best_functional_candidate = &candidate;
+        }
+    }
+    if (best_functional_candidate) {
+        const float differential_magnitude = clamp_unit(
+                0.45f * std::fabs(best_functional_candidate->signed_advantage_vs_current) +
+                0.25f * best_functional_candidate->expected_improvement +
+                0.20f * best_functional_candidate->robustness_score +
+                0.10f * std::max(0.0f, 1.0f - best_functional_candidate->fragility_penalty));
+        (void) ctx.functional_lora_apply_differential_update(
+                best_functional_candidate->functional_family,
+                best_functional_candidate->proposal_family,
+                best_functional_candidate->replay_mode,
+                best_functional_candidate->snapshot_slot,
+                best_functional_candidate->signed_advantage_vs_current,
+                differential_magnitude,
+                best_functional_candidate->robustness_score);
     }
 
     if (compression_eligible) {
