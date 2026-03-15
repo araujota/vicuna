@@ -1130,7 +1130,9 @@ bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_
         }
 
         const auto & cur = (*request_loras)[idx_non_zero++];
-        if (cur.adapter != adapters[i] || cur.scale != scales[i]) {
+        const float scale = scales[i];
+        const float scale_tol = 1e-6f * std::max({1.0f, std::fabs(cur.scale), std::fabs(scale)});
+        if (cur.adapter != adapters[i] || std::fabs(cur.scale - scale) > scale_tol) {
             return false;
         }
     }
@@ -1638,8 +1640,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
                     GGML_ASSERT(embd.data != nullptr);
                     const uint32_t n_embd_out = hparams.n_embd_out();
 
-                    GGML_ASSERT(n_tokens*n_embd_out <= (int64_t) embd.size);
-                    ggml_backend_tensor_get_async(backend_embd, t_embd, embd.data, 0, n_tokens*n_embd_out*sizeof(float));
+                    const int64_t embd_elem_count = static_cast<int64_t>(n_tokens) * static_cast<int64_t>(n_embd_out);
+                    GGML_ASSERT(embd_elem_count >= 0 && embd_elem_count <= static_cast<int64_t>(embd.size));
+                    const size_t embd_nbytes = static_cast<size_t>(embd_elem_count) * sizeof(float);
+                    ggml_backend_tensor_get_async(backend_embd, t_embd, embd.data, 0, embd_nbytes);
                 } break;
             case LLAMA_POOLING_TYPE_MEAN:
             case LLAMA_POOLING_TYPE_CLS:

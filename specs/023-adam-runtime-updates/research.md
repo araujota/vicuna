@@ -109,3 +109,25 @@ Decision: do not adopt Adam here in this change set.
    advanced.
 5. Document the explicit rejection of Adam for the discrete counterfactual
    ranking ladder.
+
+## PR Code-Scanning Follow-Up
+
+GitHub code-scanning review comments on PR #2 surfaced a small set of cleanup
+items on touched files. The signal split is:
+
+- Real correctness/safety issues worth fixing in code:
+  - float equality in request LoRA stack matching should use a bounded
+    tolerance rather than raw `==`/`!=`
+  - embedding-copy size arithmetic in `llama_context::decode` should promote to
+    a wide type before multiplication
+  - commented-out code and wildcard test imports should be removed on touched
+    files
+- Low-value style-only findings worth normalizing away if the fix is cheap:
+  - trivial one-case `switch` statements should be simplified
+  - passing a 2 KB bash-tool config by value through the public C API should be
+    replaced with a pointer-based API to avoid repeated copies
+
+Decision: fix the real arithmetic/comparison findings directly, simplify the
+touched style findings that are cheap, and move the bash-tool configure entry
+point to pointer-based C API shape because the branch only has internal
+callers and the change is easy to propagate explicitly.

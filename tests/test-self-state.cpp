@@ -1031,7 +1031,7 @@ int main(int argc, char ** argv) {
 
         if (llama_self_state_set_updater_program(ctx, persisted_program) != 0 ||
             llama_self_state_upsert_model_extension(ctx, persisted_extension) != 0 ||
-            llama_bash_tool_configure(ctx, persisted_bash) != 0 ||
+            llama_bash_tool_configure(ctx, &persisted_bash) != 0 ||
             llama_hard_memory_configure(ctx, persisted_hard_memory) != 0) {
             std::fprintf(stderr, "failed to seed runtime persistence surfaces\n");
             llama_free(ctx);
@@ -1058,7 +1058,7 @@ int main(int argc, char ** argv) {
         }
 
         if (llama_self_state_set_updater_program(restored_ctx, persisted_program) != 0 ||
-            llama_bash_tool_configure(restored_ctx, persisted_bash) != 0 ||
+            llama_bash_tool_configure(restored_ctx, &persisted_bash) != 0 ||
             llama_hard_memory_configure(restored_ctx, persisted_hard_memory) != 0 ||
             llama_self_state_trace_import(restored_ctx, persisted_trace.data(), persisted_trace.size(), true) != 0 ||
             llama_self_state_replay_trace(restored_ctx, -1) != 0 ||

@@ -1835,7 +1835,7 @@ private:
             llama_hard_memory_config hard_memory_config = llama_hard_memory_default_config();
             if (!bash_tool_config_from_json(snapshot.at("bash_tool_config"), &bash_config) ||
                 !hard_memory_config_from_json(snapshot.at("hard_memory_config"), &hard_memory_config) ||
-                llama_bash_tool_configure(ctx, bash_config) != 0 ||
+                llama_bash_tool_configure(ctx, &bash_config) != 0 ||
                 llama_hard_memory_configure(ctx, hard_memory_config) != 0) {
                 throw std::runtime_error("failed to restore runtime tool configuration");
             }
@@ -2440,7 +2440,7 @@ private:
                 bash_tool.max_file_size_bytes = std::max(1024, atoi(bash_max_file_size));
             }
 
-            if (llama_bash_tool_configure(ctx, bash_tool) == 0) {
+            if (llama_bash_tool_configure(ctx, &bash_tool) == 0) {
                 if (bash_tool.enabled) {
                     SRV_INF("bash tool enabled: bash=%s cwd=%s timeout_ms=%d stdout=%d stderr=%d login=%d inherit_env=%d reject_meta=%d cpu_s=%d max_children=%d max_open_files=%d max_file_size=%d allow=%s block=%s env=%s\n",
                             bash_tool.bash_path,

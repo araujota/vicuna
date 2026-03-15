@@ -2728,7 +2728,7 @@ extern "C" {
             struct llama_hard_memory_archive_trace * out_trace);
     LLAMA_API int32_t llama_bash_tool_configure(
             struct llama_context * ctx,
-            struct llama_bash_tool_config config);
+            const struct llama_bash_tool_config * config);
     LLAMA_API int32_t llama_bash_tool_get_config(
             const struct llama_context * ctx,
             struct llama_bash_tool_config * out_config);

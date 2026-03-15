@@ -1,7 +1,7 @@
 import pytest
 import requests
 import time
-from utils import *
+from utils import ServerPreset, match_regex
 
 server = ServerPreset.tinyllama2()
 

@@ -154,7 +154,7 @@ static void llama_token_data_array_partial_sort(const llama_token_data_array & c
         const float val = cur.data[i].logit;
         int ib = 0;
         if (std::isfinite(val)) {
-            ib = int(bucket_scale * val + bucket_inter); //nbuckets * (val - bucket_low) / (bucket_high - bucket_low);
+            ib = int(bucket_scale * val + bucket_inter);
         } else if (val > 0.0f) {
             ib = nbuckets - 1;
         }

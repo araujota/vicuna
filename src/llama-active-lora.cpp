@@ -293,10 +293,7 @@ uint32_t functional_update_horizon_steps(int32_t family) {
 }
 
 float functional_target_value(size_t index) {
-    switch (index) {
-        case 5: return 1.0f; // answerability
-        default: return 0.0f;
-    }
+    return index == 5 ? 1.0f : 0.0f; // answerability
 }
 
 float functional_snapshot_component(const llama_functional_outcome_snapshot & snapshot, size_t index) {

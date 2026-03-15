@@ -102,3 +102,19 @@ uses explicit ranking logic without optimizer state.
 - [ ] T017 Run targeted validation from
   `/Users/tyleraraujo/vicuna/specs/023-adam-runtime-updates/quickstart.md`
   and fix any regressions before closeout.
+
+## Phase 7: PR Code-Scanning Cleanup
+
+- [x] T018 Fix the touched Python wildcard import in
+  `/Users/tyleraraujo/vicuna/tools/server/tests/unit/test_basic.py`.
+- [x] T019 Replace raw float equality in request LoRA stack matching and widen
+  embedding-copy arithmetic in `/Users/tyleraraujo/vicuna/src/llama-context.cpp`.
+- [x] T020 Replace the by-value bash-tool configure C API with a pointer-based
+  entry point in `/Users/tyleraraujo/vicuna/include/llama.h`,
+  `/Users/tyleraraujo/vicuna/src/llama-bash-tool.cpp`,
+  `/Users/tyleraraujo/vicuna/tools/server/server-context.cpp`, and
+  `/Users/tyleraraujo/vicuna/tests/test-self-state.cpp`.
+- [x] T021 Remove low-signal CodeQL findings from touched native files by
+  simplifying the one-case switch in
+  `/Users/tyleraraujo/vicuna/src/llama-active-lora.cpp` and removing the
+  commented-out formula in `/Users/tyleraraujo/vicuna/src/llama-sampler.cpp`.

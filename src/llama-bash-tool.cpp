@@ -193,8 +193,8 @@ bool llama_context::cognitive_bash_tool_get_request(int32_t command_id, llama_ba
 
 int32_t llama_bash_tool_configure(
         struct llama_context * ctx,
-        struct llama_bash_tool_config config) {
-    return ctx && ctx->bash_tool_configure(config) ? 0 : -1;
+        const struct llama_bash_tool_config * config) {
+    return ctx && config && ctx->bash_tool_configure(*config) ? 0 : -1;
 }
 
 int32_t llama_bash_tool_get_config(
