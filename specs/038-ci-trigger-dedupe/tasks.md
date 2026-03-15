@@ -55,6 +55,10 @@
 - [x] T017 [US3] Preserve baseline semantics in `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_format_baseline.py` and `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_tidy_baseline.py` so tool exit code `1` only blocks CI when it represents new/regressed findings or isolated tool-execution failures
 - [x] T018 [US3] Harden integer-mode Jinja arithmetic in `/Users/tyleraraujo/vicuna/common/jinja/runtime.cpp` so sanitizer-detected non-finite or out-of-range integer casts become explicit runtime errors
 - [x] T019 [US3] Add a regression case in `/Users/tyleraraujo/vicuna/tests/test-jinja.cpp` covering integer-overflow arithmetic so the sanitizer fix stays locked in
+- [x] T020 [US3] Harden `/Users/tyleraraujo/vicuna/common/jinja/value.h` so large integer values converted through `value_int_t` avoid UB when checking whether they can round-trip through `double`
+- [x] T021 [US3] Normalize stored baseline paths in `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_tidy_baseline.py` so equivalent paths with `..` segments do not show up as new diagnostics
+- [x] T022 [US3] Remove the new `readability-static-accessed-through-instance` regression from `/Users/tyleraraujo/vicuna/tests/test-jinja.cpp`
+- [x] T023 [US3] Restore `clang-format` conformance for `/Users/tyleraraujo/vicuna/common/jinja/runtime.cpp` and `/Users/tyleraraujo/vicuna/tests/test-jinja.cpp` so repo-wide quality checks stay at baseline
 
 ## Phase 6: Polish
 

@@ -25,8 +25,11 @@ def write_line(text: str = "", *, stream: object = sys.stdout) -> None:
 
 
 def normalize_path(path: str, root: Path) -> str:
+    path_obj = Path(path)
+    if not path_obj.is_absolute():
+        path_obj = root / path_obj
     try:
-        return str(Path(path).resolve().relative_to(root))
+        return str(path_obj.resolve().relative_to(root))
     except ValueError:
         return path
 
@@ -100,7 +103,7 @@ def read_baseline(path: Path) -> Counter[tuple[str, str]]:
             continue
         count_str, _, remainder = line.partition("\t")
         check_name, _, file_path = remainder.partition("\t")
-        counts[(file_path, check_name)] = int(count_str)
+        counts[(normalize_path(file_path, repo_root()), check_name)] = int(count_str)
     return counts
 
 
