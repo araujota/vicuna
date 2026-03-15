@@ -92,21 +92,7 @@ jobs:
           run_check "pyright" pyright --warnings
 
           if [[ ${#yaml_files[@]} -gt 0 ]]; then
-            run_check "check-yaml" python - "${yaml_files[@]}" <<'PY'
-import sys
-import yaml
-
-failed = False
-for path in sys.argv[1:]:
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            yaml.safe_load(handle)
-    except Exception as exc:
-        failed = True
-        print(f"{path}: {exc}")
-
-sys.exit(1 if failed else 0)
-PY
+            run_check "check-yaml" ruby .github/scripts/check_yaml_syntax.rb "${yaml_files[@]}"
           else
             echo "No YAML files found for syntax validation."
           fi
