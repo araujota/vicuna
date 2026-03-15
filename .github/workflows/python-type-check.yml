@@ -7,12 +7,6 @@ on:
       - 'pyrightconfig.json'
       - '**.py'
       - '**/requirements*.txt'
-  pull_request:
-    paths:
-      - '.github/workflows/python-type-check.yml'
-      - 'pyrightconfig.json'
-      - '**.py'
-      - '**/requirements*.txt'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}

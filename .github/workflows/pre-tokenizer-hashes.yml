@@ -5,10 +5,6 @@ on:
         paths:
             - 'convert_hf_to_gguf.py'
             - 'convert_hf_to_gguf_update.py'
-    pull_request:
-        paths:
-            - 'convert_hf_to_gguf.py'
-            - 'convert_hf_to_gguf_update.py'
 
 jobs:
     pre-tokenizer-hashes:

@@ -3,7 +3,6 @@ name: Vicuna CI
 on:
   workflow_dispatch:
   push:
-  pull_request:
   schedule:
     - cron: "27 5 * * 1"
 
