@@ -17,7 +17,14 @@ def chunked(items: list[str], size: int) -> list[list[str]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
 
-def parse_diagnostics(text: str) -> Counter[str]:
+def normalize_path(path: str, root: Path) -> str:
+    try:
+        return str(Path(path).resolve().relative_to(root))
+    except ValueError:
+        return path
+
+
+def parse_diagnostics(text: str, root: Path) -> Counter[str]:
     counts: Counter[str] = Counter()
     needle = ": error: code should be clang-formatted"
 
@@ -28,12 +35,12 @@ def parse_diagnostics(text: str) -> Counter[str]:
         line = tail or raw_line
         path, _, _ = line.partition(":")
         if path:
-            counts[path] += 1
+            counts[normalize_path(path, root)] += 1
 
     return counts
 
 
-def run_clang_format(files: list[str], binary: str) -> tuple[int, Counter[str]]:
+def run_clang_format(files: list[str], binary: str, root: Path) -> tuple[int, Counter[str]]:
     status = 0
     counts: Counter[str] = Counter()
 
@@ -44,8 +51,8 @@ def run_clang_format(files: list[str], binary: str) -> tuple[int, Counter[str]]:
             print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
         if proc.stderr:
             print(proc.stderr, file=sys.stderr, end="" if proc.stderr.endswith("\n") else "\n")
-        counts.update(parse_diagnostics(proc.stdout))
-        counts.update(parse_diagnostics(proc.stderr))
+        counts.update(parse_diagnostics(proc.stdout, root))
+        counts.update(parse_diagnostics(proc.stderr, root))
         if proc.returncode not in (0, 1):
             return proc.returncode, counts
         if proc.returncode != 0:
@@ -112,7 +119,7 @@ def main() -> int:
     if not baseline_path.is_absolute():
         baseline_path = root / baseline_path
 
-    rc, counts = run_clang_format(args.files, args.binary)
+    rc, counts = run_clang_format(args.files, args.binary, root)
     if rc not in (0, 1):
         print(f"clang-format exited with unexpected status {rc}", file=sys.stderr)
         return rc

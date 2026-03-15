@@ -196,6 +196,9 @@ value binary_expression::execute_impl(context & ctx) {
         } else if (op.value == "%") {
             double rem = std::fmod(a, b);
             JJ_DEBUG("Modulo operation: %f %% %f = %f", a, b, rem);
+            if (!std::isfinite(rem)) {
+                throw std::runtime_error("Modulo operation produced a non-finite result");
+            }
             bool is_float = is_val<value_float>(left_val) || is_val<value_float>(right_val);
             if (is_float) {
                 return mk_val<value_float>(rem);

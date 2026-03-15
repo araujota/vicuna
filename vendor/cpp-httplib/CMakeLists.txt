@@ -5,7 +5,11 @@ find_package(Threads REQUIRED)
 
 llama_add_compile_flags()
 
-add_library(${TARGET} STATIC httplib.cpp httplib.h)
+if (BUILD_SHARED_LIBS)
+    add_library(${TARGET} SHARED httplib.cpp httplib.h)
+else()
+    add_library(${TARGET} STATIC httplib.cpp httplib.h)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)

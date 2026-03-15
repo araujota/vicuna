@@ -143,7 +143,7 @@ class TokenizerGroundtruth (Tokenizer):
         self.vocab = list(sorted(self.vocab))
         # tokens and lists
         self.special_tokens = list(self.model.all_special_tokens)
-        self.added_tokens   = self.model.batch_decode(self.model.added_tokens_encoder.values(), skip_special_tokens=False)
+        self.added_tokens   = self.model.batch_decode(list(self.model.added_tokens_encoder.values()), skip_special_tokens=False)
         self.bos_token = self.model.bos_token
         self.eos_token = self.model.eos_token
 

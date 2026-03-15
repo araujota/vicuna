@@ -13,7 +13,14 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def parse_diagnostics(text: str) -> Counter[tuple[str, str]]:
+def normalize_path(path: str, root: Path) -> str:
+    try:
+        return str(Path(path).resolve().relative_to(root))
+    except ValueError:
+        return path
+
+
+def parse_diagnostics(text: str, root: Path) -> Counter[tuple[str, str]]:
     counts: Counter[tuple[str, str]] = Counter()
 
     for raw_line in text.splitlines():
@@ -34,12 +41,18 @@ def parse_diagnostics(text: str) -> Counter[tuple[str, str]]:
         file_path, _, _ = head.partition(":")
 
         if file_path and check_name:
-            counts[(file_path, check_name)] += 1
+            counts[(normalize_path(file_path, root), check_name)] += 1
 
     return counts
 
 
-def run_clang_tidy(files: list[str], build_dir: str, header_filter: str, binary: str) -> tuple[int, Counter[tuple[str, str]]]:
+def run_clang_tidy(
+    files: list[str],
+    build_dir: str,
+    header_filter: str,
+    binary: str,
+    root: Path,
+) -> tuple[int, Counter[tuple[str, str]]]:
     status = 0
     counts: Counter[tuple[str, str]] = Counter()
 
@@ -58,8 +71,8 @@ def run_clang_tidy(files: list[str], build_dir: str, header_filter: str, binary:
             print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
         if proc.stderr:
             print(proc.stderr, file=sys.stderr, end="" if proc.stderr.endswith("\n") else "\n")
-        counts.update(parse_diagnostics(proc.stdout))
-        counts.update(parse_diagnostics(proc.stderr))
+        counts.update(parse_diagnostics(proc.stdout, root))
+        counts.update(parse_diagnostics(proc.stderr, root))
         if proc.returncode not in (0, 1):
             return proc.returncode, counts
         if proc.returncode != 0:
@@ -135,7 +148,7 @@ def main() -> int:
     if not baseline_path.is_absolute():
         baseline_path = root / baseline_path
 
-    rc, counts = run_clang_tidy(args.files, args.build_dir, args.header_filter, args.binary)
+    rc, counts = run_clang_tidy(args.files, args.build_dir, args.header_filter, args.binary, root)
     if rc not in (0, 1):
         print(f"clang-tidy exited with unexpected status {rc}", file=sys.stderr)
         return rc

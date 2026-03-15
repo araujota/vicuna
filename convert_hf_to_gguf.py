@@ -57,6 +57,12 @@ except ImportError:
 logger = logging.getLogger("hf-to-gguf")
 
 
+def require_int(value: Any, name: str) -> int:
+    if value is None:
+        raise TypeError(f"missing required integer hyperparameter: {name}")
+    return int(value)
+
+
 ###### MODEL DEFINITIONS ######
 
 class SentencePieceTokenTypes(IntEnum):
@@ -2055,8 +2061,8 @@ class GPTNeoXModel(TextModel):
         self.gguf_writer.add_layer_norm_eps(self.hparams["layer_norm_eps"])
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        n_head = self.hparams.get("n_head", self.hparams.get("num_attention_heads"))
-        n_embed = self.hparams.get("hidden_size", self.hparams.get("n_embed"))
+        n_head = require_int(self.hparams.get("n_head", self.hparams.get("num_attention_heads")), "n_head")
+        n_embed = require_int(self.hparams.get("hidden_size", self.hparams.get("n_embed")), "hidden_size")
 
         if re.match(r"gpt_neox\.layers\.\d+\.attention\.query_key_value\.weight", name):
             # Map bloom-style qkv_linear to gpt-style qkv_linear
@@ -2092,9 +2098,9 @@ class BloomModel(TextModel):
     model_arch = gguf.MODEL_ARCH.BLOOM
 
     def set_gguf_parameters(self):
-        n_embed = self.hparams.get("hidden_size", self.hparams.get("n_embed"))
-        n_head = self.hparams.get("n_head", self.hparams.get("num_attention_heads"))
-        self.gguf_writer.add_context_length(self.hparams.get("seq_length", n_embed))
+        n_embed = require_int(self.hparams.get("hidden_size", self.hparams.get("n_embed")), "hidden_size")
+        n_head = require_int(self.hparams.get("n_head", self.hparams.get("num_attention_heads")), "n_head")
+        self.gguf_writer.add_context_length(require_int(self.hparams.get("seq_length", n_embed), "seq_length"))
         self.gguf_writer.add_embedding_length(n_embed)
         self.gguf_writer.add_feed_forward_length(4 * n_embed)
         self.gguf_writer.add_block_count(self.block_count)
@@ -2104,8 +2110,8 @@ class BloomModel(TextModel):
         self.gguf_writer.add_file_type(self.ftype)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        n_head = self.hparams.get("n_head", self.hparams.get("num_attention_heads"))
-        n_embed = self.hparams.get("hidden_size", self.hparams.get("n_embed"))
+        n_head = require_int(self.hparams.get("n_head", self.hparams.get("num_attention_heads")), "n_head")
+        n_embed = require_int(self.hparams.get("hidden_size", self.hparams.get("n_embed")), "hidden_size")
 
         name = re.sub(r'transformer\.', '', name)
 
@@ -3715,9 +3721,9 @@ class LLaDAModel(TextModel):
         self.gguf_writer.add_vocab_size(hparams["vocab_size"])
 
         if (rope_dim := hparams.get("head_dim")) is None:
-            n_heads = hparams.get("num_attention_heads", hparams.get("n_heads"))
-            rope_dim = hparams.get("hidden_size", hparams.get("d_model")) // n_heads
-        self.gguf_writer.add_rope_dimension_count(rope_dim)
+            n_heads = require_int(hparams.get("num_attention_heads", hparams.get("n_heads")), "num_attention_heads")
+            rope_dim = require_int(hparams.get("hidden_size", hparams.get("d_model")), "hidden_size") // n_heads
+        self.gguf_writer.add_rope_dimension_count(int(rope_dim))
 
         # Set context length for LLaDA
         context_length = self.hparams.get("max_sequence_length", 4096)
@@ -3746,8 +3752,8 @@ class LLaDAModel(TextModel):
                 .reshape(weights.shape))
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        n_head = self.hparams.get("num_attention_heads", self.hparams.get("n_heads"))
-        n_kv_head = self.hparams.get("num_key_value_heads", self.hparams.get("n_kv_heads"))
+        n_head = require_int(self.hparams.get("num_attention_heads", self.hparams.get("n_heads")), "num_attention_heads")
+        n_kv_head = require_int(self.hparams.get("num_key_value_heads", self.hparams.get("n_kv_heads")), "num_key_value_heads")
 
         if self.undo_permute:
             if name.endswith(("q_proj.weight", "q_proj.bias")):
@@ -9200,12 +9206,17 @@ class ChatGLMModel(TextModel):
         special_vocab.add_to_gguf(self.gguf_writer)
 
     def set_gguf_parameters(self):
-        n_embed = self.hparams.get("hidden_size", self.hparams.get("n_embed"))
-        n_head = self.hparams.get("n_head", self.hparams.get("num_attention_heads"))
-        n_head_kv = self.hparams.get("multi_query_group_num", self.hparams.get("num_key_value_heads", n_head))
-        self.gguf_writer.add_context_length(self.hparams.get("seq_length", n_embed))
+        n_embed = require_int(self.hparams.get("hidden_size", self.hparams.get("n_embed")), "hidden_size")
+        n_head = require_int(self.hparams.get("n_head", self.hparams.get("num_attention_heads")), "n_head")
+        n_head_kv = require_int(
+            self.hparams.get("multi_query_group_num", self.hparams.get("num_key_value_heads", n_head)),
+            "num_key_value_heads",
+        )
+        self.gguf_writer.add_context_length(require_int(self.hparams.get("seq_length", n_embed), "seq_length"))
         self.gguf_writer.add_embedding_length(n_embed)
-        self.gguf_writer.add_feed_forward_length(self.hparams.get("ffn_hidden_size", self.hparams.get("intermediate_size", 4 * n_embed)))
+        self.gguf_writer.add_feed_forward_length(
+            require_int(self.hparams.get("ffn_hidden_size", self.hparams.get("intermediate_size", 4 * n_embed)), "ffn_hidden_size"),
+        )
         self.gguf_writer.add_block_count(self.block_count)
         self.gguf_writer.add_head_count(n_head)
         self.gguf_writer.add_head_count_kv(n_head_kv)
@@ -9717,8 +9728,7 @@ class NemotronHModel(GraniteHybridModel):
         super().__init__(*args, **kwargs)
 
         # Save the top-level head_dim for later
-        self.head_dim = self.hparams.get("head_dim", self.hparams.get("attention_head_dim"))
-        assert self.head_dim is not None, "Could not find the attention head dim in config"
+        self.head_dim = require_int(self.hparams.get("head_dim", self.hparams.get("attention_head_dim")), "head_dim")
 
         # Don't use expand to calculate d_inner
         self.d_inner = self.find_hparam(["num_heads"]) * self.d_model
