@@ -1922,8 +1922,9 @@ bool llama_self_state::promote_hard_memory_query(
     const int32_t candidate_limit = std::min<int32_t>(result.result_count, LLAMA_SELF_MODEL_EXTENSION_MAX_CANDIDATES);
     for (int32_t i = 0; i < candidate_limit; ++i) {
         const auto & hit = result.results[i];
-        char key[LLAMA_HARD_MEMORY_MAX_ID_CHARS] = {};
-        std::snprintf(key, sizeof(key), "hard_memory:%s", hit.id[0] != '\0' ? hit.id : "unknown");
+        const char * hit_id = hit.id[0] != '\0' ? hit.id : "unknown";
+        std::string key = "hard_memory:";
+        key.append(hit_id);
 
         int32_t candidate_domain = default_domain;
         switch (hit.domain) {
@@ -1949,8 +1950,8 @@ bool llama_self_state::promote_hard_memory_query(
         candidate.confidence = clamp_unit(std::max(hit.confidence, hit.similarity));
         candidate.salience = clamp_unit(std::max(hit.importance, hit.similarity));
         candidate.gain_weight = clamp_unit(0.35f + 0.35f * hit.similarity + 0.30f * hit.gain_bias);
-        copy_bounded_cstr(candidate.key, key);
-        copy_bounded_cstr(candidate.label, hit.title[0] != '\0' ? hit.title : key);
+        copy_bounded_cstr(candidate.key, key.c_str());
+        copy_bounded_cstr(candidate.label, hit.title[0] != '\0' ? hit.title : key.c_str());
         copy_bounded_cstr(candidate.content, hit.content);
 
         extension_domain_signal signal = {};
