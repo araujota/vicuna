@@ -61,7 +61,6 @@ def run_clang_format_cmd(args: list[str], binary: str, root: Path) -> tuple[int,
 
 
 def run_clang_format(files: list[str], binary: str, root: Path) -> tuple[int, Counter[str], list[tuple[str, int]]]:
-    status = 0
     counts: Counter[str] = Counter()
     tool_failures: list[tuple[str, int]] = []
 
@@ -69,23 +68,16 @@ def run_clang_format(files: list[str], binary: str, root: Path) -> tuple[int, Co
         rc, chunk_counts = run_clang_format_cmd(chunk, binary, root)
         counts.update(chunk_counts)
         if rc in (0, 1):
-            if rc != 0:
-                status = 1
             continue
 
-        status = 1
         for file_path in chunk:
             rc, single_counts = run_clang_format_cmd([file_path], binary, root)
             counts.update(single_counts)
             if rc not in (0, 1):
                 tool_failures.append((file_path, rc))
                 continue
-            if rc != 0:
-                status = 1
-        if rc != 0:
-            status = 1
 
-    return status, counts, tool_failures
+    return 0, counts, tool_failures
 
 
 def read_baseline(path: Path) -> Counter[str]:
@@ -146,7 +138,7 @@ def main() -> int:
     if not baseline_path.is_absolute():
         baseline_path = root / baseline_path
 
-    status, counts, tool_failures = run_clang_format(args.files, args.binary, root)
+    _, counts, tool_failures = run_clang_format(args.files, args.binary, root)
     if args.write_baseline:
         write_baseline(baseline_path, counts)
         write_line(f"Wrote {len(counts)} clang-format baseline entries to {baseline_path.relative_to(root)}")
@@ -188,7 +180,7 @@ def main() -> int:
         write_line("tool execution failures: none")
     write_line("::endgroup::")
 
-    return 1 if new_files or regressed or tool_failures or status else 0
+    return 1 if new_files or regressed or tool_failures else 0
 
 
 if __name__ == "__main__":

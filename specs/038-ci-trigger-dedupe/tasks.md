@@ -52,6 +52,7 @@
 - [x] T014 [US3] Update `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_format_baseline.py` so unexpected tool exits are isolated and reported without aborting the remaining repository scan
 - [x] T015 [US3] Update `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_tidy_baseline.py` so unexpected file-level tool exits are accumulated and reported after the full repository scan
 - [x] T016 [US3] Replace `print()` usage in `/Users/tyleraraujo/vicuna/.github/scripts/check_lizard_baseline.py`, `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_format_baseline.py`, and `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_tidy_baseline.py` so the repo-wide flake8 policy remains satisfied
+- [x] T017 [US3] Preserve baseline semantics in `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_format_baseline.py` and `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_tidy_baseline.py` so tool exit code `1` only blocks CI when it represents new/regressed findings or isolated tool-execution failures
 
 ## Phase 6: Polish
 

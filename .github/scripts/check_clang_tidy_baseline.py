@@ -64,7 +64,6 @@ def run_clang_tidy(
     binary: str,
     root: Path,
 ) -> tuple[int, Counter[tuple[str, str]], list[tuple[str, int]]]:
-    status = 0
     counts: Counter[tuple[str, str]] = Counter()
     tool_failures: list[tuple[str, int]] = []
 
@@ -85,12 +84,9 @@ def run_clang_tidy(
         counts.update(parse_diagnostics(proc.stderr, root))
         if proc.returncode not in (0, 1):
             tool_failures.append((file_path, proc.returncode))
-            status = 1
             continue
-        if proc.returncode != 0:
-            status = 1
 
-    return status, counts, tool_failures
+    return 0, counts, tool_failures
 
 
 def read_baseline(path: Path) -> Counter[tuple[str, str]]:
@@ -160,7 +156,7 @@ def main() -> int:
     if not baseline_path.is_absolute():
         baseline_path = root / baseline_path
 
-    status, counts, tool_failures = run_clang_tidy(args.files, args.build_dir, args.header_filter, args.binary, root)
+    _, counts, tool_failures = run_clang_tidy(args.files, args.build_dir, args.header_filter, args.binary, root)
     if args.write_baseline:
         write_baseline(baseline_path, counts)
         write_line(f"Wrote {len(counts)} clang-tidy baseline entries to {baseline_path.relative_to(root)}")
@@ -202,7 +198,7 @@ def main() -> int:
         write_line("tool execution failures: none")
     write_line("::endgroup::")
 
-    return 1 if new_findings or regressed or tool_failures or status else 0
+    return 1 if new_findings or regressed or tool_failures else 0
 
 
 if __name__ == "__main__":
