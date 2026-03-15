@@ -423,6 +423,35 @@ static void test_expressions(testing & t) {
         "20"
     );
 
+    if (!g_python_mode) {
+        t.test("integer overflow arithmetic throws", [](testing & t) {
+            const std::string tmpl = "{{ x * y }}";
+
+            jinja::lexer lexer;
+            auto lexer_res = lexer.tokenize(tmpl);
+            jinja::program ast = jinja::parse_from_tokens(lexer_res);
+
+            jinja::context ctx(tmpl);
+            const json vars = {{"x", 9223372036854775807LL}, {"y", 2}};
+            jinja::global_from_json(ctx, vars, true);
+
+            jinja::runtime runtime(ctx);
+
+            bool threw = false;
+            try {
+                const jinja::value results = runtime.execute(ast);
+                runtime.gather_string_parts(results);
+            } catch (const std::exception & e) {
+                threw = true;
+                t.assert_true(
+                    "overflow error message",
+                    std::string(e.what()).find("not representable as int64") != std::string::npos);
+            }
+
+            t.assert_true("expected overflow exception", threw);
+        });
+    }
+
     test_template(t, "string concat ~",
         "{{ 'hello' ~ ' ' ~ 'world' }}",
         json::object(),

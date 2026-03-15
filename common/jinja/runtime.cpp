@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory>
 #include <cmath>
+#include <limits>
 
 #define FILENAME "jinja-runtime"
 
@@ -42,6 +43,15 @@ static std::string get_line_col(const std::string & source, size_t pos) {
         }
     }
     return "line " + std::to_string(line) + ", column " + std::to_string(col);
+}
+
+static int64_t checked_int_result(double value, const char * op_name) {
+    if (!std::isfinite(value) ||
+        value < static_cast<double>(std::numeric_limits<int64_t>::min()) ||
+        value > static_cast<double>(std::numeric_limits<int64_t>::max())) {
+        throw std::runtime_error(std::string(op_name) + " result is not representable as int64");
+    }
+    return static_cast<int64_t>(value);
 }
 
 static void ensure_key_type_allowed(const value & val) {
@@ -188,7 +198,7 @@ value binary_expression::execute_impl(context & ctx) {
             if (is_float) {
                 return mk_val<value_float>(res);
             } else {
-                return mk_val<value_int>(static_cast<int64_t>(res));
+                return mk_val<value_int>(checked_int_result(res, "Arithmetic"));
             }
         } else if (op.value == "/") {
             JJ_DEBUG("Division operation: %f / %f", a, b);
@@ -203,7 +213,7 @@ value binary_expression::execute_impl(context & ctx) {
             if (is_float) {
                 return mk_val<value_float>(rem);
             } else {
-                return mk_val<value_int>(static_cast<int64_t>(rem));
+                return mk_val<value_int>(checked_int_result(rem, "Modulo"));
             }
         } else if (op.value == "<") {
             JJ_DEBUG("Comparison operation: %f < %f is %d", a, b, a < b);
