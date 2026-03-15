@@ -65,6 +65,7 @@ As a maintainer, I want repository-quality and static-analysis gates to inspect 
 - **FR-008**: Full-repository gates that would otherwise fail on pre-existing repository-wide debt MUST use an explicit checked-in baseline so CI blocks only on newly introduced or regressed findings while still reporting the full current result set.
 - **FR-009**: Independent CI jobs MUST continue running even when another repository-wide gate fails so one push reports the full gate result set.
 - **FR-010**: Sanitizer builds MUST remain link-correct for mixed C/C++ test targets so repository-wide sanitizer coverage can complete on Linux.
+- **FR-011**: Repository-wide formatting and static-analysis baseline scripts MUST continue scanning remaining files and report isolated per-file tool-execution failures instead of aborting at the first unexpected non-zero tool exit.
 
 ## Success Criteria *(mandatory)*
 
@@ -77,3 +78,4 @@ As a maintainer, I want repository-quality and static-analysis gates to inspect 
 - **SC-005**: Repository-wide quality gates that preserve legacy debt visibility do so through checked-in baseline artifacts rather than hidden ignores or silent pass-through behavior.
 - **SC-006**: `python-server-tests` is no longer skipped solely because `lint-type-quality` fails.
 - **SC-007**: The Linux Clang sanitizer build completes linking for `test-c` and proceeds into the test suite.
+- **SC-008**: Baseline-backed repository-wide gates print any per-file tool-execution failures they encounter while still reporting all other findings collected from the remaining files in the same run.

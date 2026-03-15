@@ -49,6 +49,8 @@
 - [x] T011 [US3] Add a checked-in repository-wide clang-tidy baseline in `/Users/tyleraraujo/vicuna/.github/ci/clang-tidy-baseline.txt` and compare future full-tree diagnostics via `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_tidy_baseline.py`
 - [x] T012 [US3] Remove the lint dependency from `/Users/tyleraraujo/vicuna/.github/workflows/vicuna-ci.yml` so `python-server-tests` always reports in the same push run
 - [x] T013 [US3] Repair mixed C/C++ sanitizer linking for `/Users/tyleraraujo/vicuna/tests/test-c.c` in `/Users/tyleraraujo/vicuna/tests/CMakeLists.txt`
+- [x] T014 [US3] Update `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_format_baseline.py` so unexpected tool exits are isolated and reported without aborting the remaining repository scan
+- [x] T015 [US3] Update `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_tidy_baseline.py` so unexpected file-level tool exits are accumulated and reported after the full repository scan
 
 ## Phase 6: Polish
 

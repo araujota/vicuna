@@ -40,25 +40,46 @@ def parse_diagnostics(text: str, root: Path) -> Counter[str]:
     return counts
 
 
-def run_clang_format(files: list[str], binary: str, root: Path) -> tuple[int, Counter[str]]:
+def print_stream(text: str, *, stream: object = sys.stdout) -> None:
+    if text:
+        print(text, file=stream, end="" if text.endswith("\n") else "\n")
+
+
+def run_clang_format_cmd(args: list[str], binary: str, root: Path) -> tuple[int, Counter[str]]:
+    proc = subprocess.run([binary, "--dry-run", "--Werror", *args], capture_output=True, text=True)
+    print_stream(proc.stdout)
+    print_stream(proc.stderr, stream=sys.stderr)
+    counts = parse_diagnostics(proc.stdout, root)
+    counts.update(parse_diagnostics(proc.stderr, root))
+    return proc.returncode, counts
+
+
+def run_clang_format(files: list[str], binary: str, root: Path) -> tuple[int, Counter[str], list[tuple[str, int]]]:
     status = 0
     counts: Counter[str] = Counter()
+    tool_failures: list[tuple[str, int]] = []
 
     for chunk in chunked(files, 100):
-        cmd = [binary, "--dry-run", "--Werror", *chunk]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.stdout:
-            print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
-        if proc.stderr:
-            print(proc.stderr, file=sys.stderr, end="" if proc.stderr.endswith("\n") else "\n")
-        counts.update(parse_diagnostics(proc.stdout, root))
-        counts.update(parse_diagnostics(proc.stderr, root))
-        if proc.returncode not in (0, 1):
-            return proc.returncode, counts
-        if proc.returncode != 0:
+        rc, chunk_counts = run_clang_format_cmd(chunk, binary, root)
+        counts.update(chunk_counts)
+        if rc in (0, 1):
+            if rc != 0:
+                status = 1
+            continue
+
+        status = 1
+        for file_path in chunk:
+            rc, single_counts = run_clang_format_cmd([file_path], binary, root)
+            counts.update(single_counts)
+            if rc not in (0, 1):
+                tool_failures.append((file_path, rc))
+                continue
+            if rc != 0:
+                status = 1
+        if rc != 0:
             status = 1
 
-    return status, counts
+    return status, counts, tool_failures
 
 
 def read_baseline(path: Path) -> Counter[str]:
@@ -119,11 +140,7 @@ def main() -> int:
     if not baseline_path.is_absolute():
         baseline_path = root / baseline_path
 
-    rc, counts = run_clang_format(args.files, args.binary, root)
-    if rc not in (0, 1):
-        print(f"clang-format exited with unexpected status {rc}", file=sys.stderr)
-        return rc
-
+    status, counts, tool_failures = run_clang_format(args.files, args.binary, root)
     if args.write_baseline:
         write_baseline(baseline_path, counts)
         print(f"Wrote {len(counts)} clang-format baseline entries to {baseline_path.relative_to(root)}")
@@ -156,9 +173,16 @@ def main() -> int:
             print(f"{old_count} -> {new_count}\t{file_path}")
     else:
         print("resolved or improved baseline files: none")
+
+    if tool_failures:
+        print("tool execution failures:")
+        for file_path, rc in tool_failures:
+            print(f"{rc}\t{file_path}")
+    else:
+        print("tool execution failures: none")
     print("::endgroup::")
 
-    return 1 if new_files or regressed else 0
+    return 1 if new_files or regressed or tool_failures or status else 0
 
 
 if __name__ == "__main__":

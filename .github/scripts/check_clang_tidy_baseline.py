@@ -46,15 +46,21 @@ def parse_diagnostics(text: str, root: Path) -> Counter[tuple[str, str]]:
     return counts
 
 
+def print_stream(text: str, *, stream: object = sys.stdout) -> None:
+    if text:
+        print(text, file=stream, end="" if text.endswith("\n") else "\n")
+
+
 def run_clang_tidy(
     files: list[str],
     build_dir: str,
     header_filter: str,
     binary: str,
     root: Path,
-) -> tuple[int, Counter[tuple[str, str]]]:
+) -> tuple[int, Counter[tuple[str, str]], list[tuple[str, int]]]:
     status = 0
     counts: Counter[tuple[str, str]] = Counter()
+    tool_failures: list[tuple[str, int]] = []
 
     for file_path in files:
         cmd = [
@@ -67,18 +73,18 @@ def run_clang_tidy(
             file_path,
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.stdout:
-            print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
-        if proc.stderr:
-            print(proc.stderr, file=sys.stderr, end="" if proc.stderr.endswith("\n") else "\n")
+        print_stream(proc.stdout)
+        print_stream(proc.stderr, stream=sys.stderr)
         counts.update(parse_diagnostics(proc.stdout, root))
         counts.update(parse_diagnostics(proc.stderr, root))
         if proc.returncode not in (0, 1):
-            return proc.returncode, counts
+            tool_failures.append((file_path, proc.returncode))
+            status = 1
+            continue
         if proc.returncode != 0:
             status = 1
 
-    return status, counts
+    return status, counts, tool_failures
 
 
 def read_baseline(path: Path) -> Counter[tuple[str, str]]:
@@ -148,11 +154,7 @@ def main() -> int:
     if not baseline_path.is_absolute():
         baseline_path = root / baseline_path
 
-    rc, counts = run_clang_tidy(args.files, args.build_dir, args.header_filter, args.binary, root)
-    if rc not in (0, 1):
-        print(f"clang-tidy exited with unexpected status {rc}", file=sys.stderr)
-        return rc
-
+    status, counts, tool_failures = run_clang_tidy(args.files, args.build_dir, args.header_filter, args.binary, root)
     if args.write_baseline:
         write_baseline(baseline_path, counts)
         print(f"Wrote {len(counts)} clang-tidy baseline entries to {baseline_path.relative_to(root)}")
@@ -185,9 +187,16 @@ def main() -> int:
             print(f"{old_count} -> {new_count}\t{check_name}\t{file_path}")
     else:
         print("resolved or improved diagnostics: none")
+
+    if tool_failures:
+        print("tool execution failures:")
+        for file_path, rc in tool_failures:
+            print(f"{rc}\t{file_path}")
+    else:
+        print("tool execution failures: none")
     print("::endgroup::")
 
-    return 1 if new_findings or regressed else 0
+    return 1 if new_findings or regressed or tool_failures or status else 0
 
 
 if __name__ == "__main__":
