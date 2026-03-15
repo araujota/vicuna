@@ -51,6 +51,7 @@
 - [x] T013 [US3] Repair mixed C/C++ sanitizer linking for `/Users/tyleraraujo/vicuna/tests/test-c.c` in `/Users/tyleraraujo/vicuna/tests/CMakeLists.txt`
 - [x] T014 [US3] Update `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_format_baseline.py` so unexpected tool exits are isolated and reported without aborting the remaining repository scan
 - [x] T015 [US3] Update `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_tidy_baseline.py` so unexpected file-level tool exits are accumulated and reported after the full repository scan
+- [x] T016 [US3] Replace `print()` usage in `/Users/tyleraraujo/vicuna/.github/scripts/check_lizard_baseline.py`, `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_format_baseline.py`, and `/Users/tyleraraujo/vicuna/.github/scripts/check_clang_tidy_baseline.py` so the repo-wide flake8 policy remains satisfied
 
 ## Phase 6: Polish
 

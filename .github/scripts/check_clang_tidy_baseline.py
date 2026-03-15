@@ -13,6 +13,17 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def write_stream(text: str, *, stream: object = sys.stdout) -> None:
+    if not text:
+        return
+    suffix = "" if text.endswith("\n") else "\n"
+    stream.write(f"{text}{suffix}")
+
+
+def write_line(text: str = "", *, stream: object = sys.stdout) -> None:
+    stream.write(f"{text}\n")
+
+
 def normalize_path(path: str, root: Path) -> str:
     try:
         return str(Path(path).resolve().relative_to(root))
@@ -46,11 +57,6 @@ def parse_diagnostics(text: str, root: Path) -> Counter[tuple[str, str]]:
     return counts
 
 
-def print_stream(text: str, *, stream: object = sys.stdout) -> None:
-    if text:
-        print(text, file=stream, end="" if text.endswith("\n") else "\n")
-
-
 def run_clang_tidy(
     files: list[str],
     build_dir: str,
@@ -73,8 +79,8 @@ def run_clang_tidy(
             file_path,
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True)
-        print_stream(proc.stdout)
-        print_stream(proc.stderr, stream=sys.stderr)
+        write_stream(proc.stdout)
+        write_stream(proc.stderr, stream=sys.stderr)
         counts.update(parse_diagnostics(proc.stdout, root))
         counts.update(parse_diagnostics(proc.stderr, root))
         if proc.returncode not in (0, 1):
@@ -157,44 +163,44 @@ def main() -> int:
     status, counts, tool_failures = run_clang_tidy(args.files, args.build_dir, args.header_filter, args.binary, root)
     if args.write_baseline:
         write_baseline(baseline_path, counts)
-        print(f"Wrote {len(counts)} clang-tidy baseline entries to {baseline_path.relative_to(root)}")
+        write_line(f"Wrote {len(counts)} clang-tidy baseline entries to {baseline_path.relative_to(root)}")
         return 0
 
     baseline = read_baseline(baseline_path)
     new_findings, regressed, resolved = compare(counts, baseline)
 
-    print("::group::clang-tidy baseline comparison")
-    print(f"baseline diagnostics: {sum(baseline.values())}")
-    print(f"current diagnostics: {sum(counts.values())}")
+    write_line("::group::clang-tidy baseline comparison")
+    write_line(f"baseline diagnostics: {sum(baseline.values())}")
+    write_line(f"current diagnostics: {sum(counts.values())}")
 
     if new_findings:
-        print("new diagnostics:")
+        write_line("new diagnostics:")
         for file_path, check_name, count in new_findings:
-            print(f"{count}\t{check_name}\t{file_path}")
+            write_line(f"{count}\t{check_name}\t{file_path}")
     else:
-        print("new diagnostics: none")
+        write_line("new diagnostics: none")
 
     if regressed:
-        print("regressed diagnostics:")
+        write_line("regressed diagnostics:")
         for file_path, check_name, old_count, new_count in regressed:
-            print(f"{old_count} -> {new_count}\t{check_name}\t{file_path}")
+            write_line(f"{old_count} -> {new_count}\t{check_name}\t{file_path}")
     else:
-        print("regressed diagnostics: none")
+        write_line("regressed diagnostics: none")
 
     if resolved:
-        print("resolved or improved diagnostics:")
+        write_line("resolved or improved diagnostics:")
         for file_path, check_name, old_count, new_count in resolved:
-            print(f"{old_count} -> {new_count}\t{check_name}\t{file_path}")
+            write_line(f"{old_count} -> {new_count}\t{check_name}\t{file_path}")
     else:
-        print("resolved or improved diagnostics: none")
+        write_line("resolved or improved diagnostics: none")
 
     if tool_failures:
-        print("tool execution failures:")
+        write_line("tool execution failures:")
         for file_path, rc in tool_failures:
-            print(f"{rc}\t{file_path}")
+            write_line(f"{rc}\t{file_path}")
     else:
-        print("tool execution failures: none")
-    print("::endgroup::")
+        write_line("tool execution failures: none")
+    write_line("::endgroup::")
 
     return 1 if new_findings or regressed or tool_failures or status else 0
 

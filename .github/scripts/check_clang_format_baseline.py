@@ -13,6 +13,17 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def write_stream(text: str, *, stream: object = sys.stdout) -> None:
+    if not text:
+        return
+    suffix = "" if text.endswith("\n") else "\n"
+    stream.write(f"{text}{suffix}")
+
+
+def write_line(text: str = "", *, stream: object = sys.stdout) -> None:
+    stream.write(f"{text}\n")
+
+
 def chunked(items: list[str], size: int) -> list[list[str]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
@@ -40,15 +51,10 @@ def parse_diagnostics(text: str, root: Path) -> Counter[str]:
     return counts
 
 
-def print_stream(text: str, *, stream: object = sys.stdout) -> None:
-    if text:
-        print(text, file=stream, end="" if text.endswith("\n") else "\n")
-
-
 def run_clang_format_cmd(args: list[str], binary: str, root: Path) -> tuple[int, Counter[str]]:
     proc = subprocess.run([binary, "--dry-run", "--Werror", *args], capture_output=True, text=True)
-    print_stream(proc.stdout)
-    print_stream(proc.stderr, stream=sys.stderr)
+    write_stream(proc.stdout)
+    write_stream(proc.stderr, stream=sys.stderr)
     counts = parse_diagnostics(proc.stdout, root)
     counts.update(parse_diagnostics(proc.stderr, root))
     return proc.returncode, counts
@@ -143,44 +149,44 @@ def main() -> int:
     status, counts, tool_failures = run_clang_format(args.files, args.binary, root)
     if args.write_baseline:
         write_baseline(baseline_path, counts)
-        print(f"Wrote {len(counts)} clang-format baseline entries to {baseline_path.relative_to(root)}")
+        write_line(f"Wrote {len(counts)} clang-format baseline entries to {baseline_path.relative_to(root)}")
         return 0
 
     baseline = read_baseline(baseline_path)
     new_files, regressed, resolved = compare(counts, baseline)
 
-    print("::group::clang-format baseline comparison")
-    print(f"baseline files with formatting drift: {len(baseline)}")
-    print(f"current files with formatting drift: {len(counts)}")
+    write_line("::group::clang-format baseline comparison")
+    write_line(f"baseline files with formatting drift: {len(baseline)}")
+    write_line(f"current files with formatting drift: {len(counts)}")
 
     if new_files:
-        print("new files with formatting drift:")
+        write_line("new files with formatting drift:")
         for file_path, count in new_files:
-            print(f"{count}\t{file_path}")
+            write_line(f"{count}\t{file_path}")
     else:
-        print("new files with formatting drift: none")
+        write_line("new files with formatting drift: none")
 
     if regressed:
-        print("regressed files with additional formatting drift:")
+        write_line("regressed files with additional formatting drift:")
         for file_path, old_count, new_count in regressed:
-            print(f"{old_count} -> {new_count}\t{file_path}")
+            write_line(f"{old_count} -> {new_count}\t{file_path}")
     else:
-        print("regressed files with additional formatting drift: none")
+        write_line("regressed files with additional formatting drift: none")
 
     if resolved:
-        print("resolved or improved baseline files:")
+        write_line("resolved or improved baseline files:")
         for file_path, old_count, new_count in resolved:
-            print(f"{old_count} -> {new_count}\t{file_path}")
+            write_line(f"{old_count} -> {new_count}\t{file_path}")
     else:
-        print("resolved or improved baseline files: none")
+        write_line("resolved or improved baseline files: none")
 
     if tool_failures:
-        print("tool execution failures:")
+        write_line("tool execution failures:")
         for file_path, rc in tool_failures:
-            print(f"{rc}\t{file_path}")
+            write_line(f"{rc}\t{file_path}")
     else:
-        print("tool execution failures: none")
-    print("::endgroup::")
+        write_line("tool execution failures: none")
+    write_line("::endgroup::")
 
     return 1 if new_files or regressed or tool_failures or status else 0
 

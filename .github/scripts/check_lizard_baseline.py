@@ -26,6 +26,17 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def write_stream(text: str, *, stream: object = sys.stdout) -> None:
+    if not text:
+        return
+    suffix = "" if text.endswith("\n") else "\n"
+    stream.write(f"{text}{suffix}")
+
+
+def write_line(text: str = "", *, stream: object = sys.stdout) -> None:
+    stream.write(f"{text}\n")
+
+
 def tracked_files(root: Path) -> list[str]:
     cmd = ["git", "ls-files", *SOURCE_PATTERNS]
     proc = subprocess.run(cmd, cwd=root, capture_output=True, text=True, check=True)
@@ -102,24 +113,22 @@ def main() -> int:
 
     files = tracked_files(root)
     if not files:
-        print("No files found for lizard analysis.")
+        write_line("No files found for lizard analysis.")
         return 0
 
     rc, stdout, stderr = run_lizard(root, files, args.complexity, args.length)
-    if stdout:
-        print(stdout, end="" if stdout.endswith("\n") else "\n")
-    if stderr:
-        print(stderr, file=sys.stderr, end="" if stderr.endswith("\n") else "\n")
+    write_stream(stdout)
+    write_stream(stderr, stream=sys.stderr)
 
     warnings = parse_warning_lines(stdout)
 
     if args.write_baseline:
         write_baseline(baseline_path, warnings)
-        print(f"Wrote {len(warnings)} lizard baseline entries to {baseline_path.relative_to(root)}")
+        write_line(f"Wrote {len(warnings)} lizard baseline entries to {baseline_path.relative_to(root)}")
         return 0
 
     if rc not in (0, 1):
-        print(f"lizard exited with unexpected status {rc}", file=sys.stderr)
+        write_line(f"lizard exited with unexpected status {rc}", stream=sys.stderr)
         return rc
 
     baseline = read_baseline(baseline_path)
@@ -129,24 +138,24 @@ def main() -> int:
     unexpected = sorted(warning_set - baseline_set)
     resolved = sorted(baseline_set - warning_set)
 
-    print("::group::lizard baseline comparison")
-    print(f"baseline warnings: {len(baseline)}")
-    print(f"current warnings: {len(warnings)}")
+    write_line("::group::lizard baseline comparison")
+    write_line(f"baseline warnings: {len(baseline)}")
+    write_line(f"current warnings: {len(warnings)}")
 
     if unexpected:
-        print("new or changed warnings:")
+        write_line("new or changed warnings:")
         for line in unexpected:
-            print(line)
+            write_line(line)
     else:
-        print("new or changed warnings: none")
+        write_line("new or changed warnings: none")
 
     if resolved:
-        print("resolved baseline warnings:")
+        write_line("resolved baseline warnings:")
         for line in resolved:
-            print(line)
+            write_line(line)
     else:
-        print("resolved baseline warnings: none")
-    print("::endgroup::")
+        write_line("resolved baseline warnings: none")
+    write_line("::endgroup::")
 
     return 1 if unexpected else 0
 
