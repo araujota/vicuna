@@ -2356,174 +2356,178 @@ private:
             }
             snapshot["model_extensions"] = std::move(extensions);
 
-            json functional_snapshots = json::array();
-            for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
-                llama_functional_lora_snapshot_archive archive = {};
-                if (llama_functional_lora_snapshot_archive_get(ctx, family, &archive) != 0) {
-                    throw std::runtime_error("failed to query functional snapshot archive");
-                }
-                json family_entry = json::object();
-                family_entry["family"] = family;
-                family_entry["count"] = archive.count;
-                family_entry["last_capture_us"] = archive.last_capture_us;
-                family_entry["next_capture_due_us"] = archive.next_capture_due_us;
-                json items = json::array();
-                for (int32_t slot = 0; slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++slot) {
-                    llama_functional_lora_snapshot_info info = {};
-                    if (llama_functional_lora_snapshot_info_get(ctx, family, slot, &info) != 0) {
-                        throw std::runtime_error("failed to query functional snapshot info");
+            llama_functional_lora_family_state functional_state = {};
+            if (llama_functional_lora_family_state_get(ctx, 0, &functional_state) == 0) {
+                json functional_snapshots = json::array();
+                for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+                    llama_functional_lora_snapshot_archive archive = {};
+                    if (llama_functional_lora_snapshot_archive_get(ctx, family, &archive) != 0) {
+                        throw std::runtime_error("failed to query functional snapshot archive");
                     }
-                    if (!info.valid) {
-                        continue;
-                    }
-                    const size_t blob_size = llama_functional_lora_snapshot_blob_size(ctx, family, slot);
-                    if (blob_size == 0) {
-                        throw std::runtime_error("functional snapshot archive reported empty blob");
-                    }
-                    std::vector<uint8_t> blob(blob_size);
-                    if (llama_functional_lora_snapshot_blob_export(ctx, family, slot, blob.data(), blob.size()) != 0) {
-                        throw std::runtime_error("failed to export functional snapshot blob");
-                    }
+                    json family_entry = json::object();
+                    family_entry["family"] = family;
+                    family_entry["count"] = archive.count;
+                    family_entry["last_capture_us"] = archive.last_capture_us;
+                    family_entry["next_capture_due_us"] = archive.next_capture_due_us;
+                    json items = json::array();
+                    for (int32_t slot = 0; slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++slot) {
+                        llama_functional_lora_snapshot_info info = {};
+                        if (llama_functional_lora_snapshot_info_get(ctx, family, slot, &info) != 0) {
+                            throw std::runtime_error("failed to query functional snapshot info");
+                        }
+                        if (!info.valid) {
+                            continue;
+                        }
+                        const size_t blob_size = llama_functional_lora_snapshot_blob_size(ctx, family, slot);
+                        if (blob_size == 0) {
+                            throw std::runtime_error("functional snapshot archive reported empty blob");
+                        }
+                        std::vector<uint8_t> blob(blob_size);
+                        if (llama_functional_lora_snapshot_blob_export(ctx, family, slot, blob.data(), blob.size()) != 0) {
+                            throw std::runtime_error("failed to export functional snapshot blob");
+                        }
 
-                    json item = json::object();
-                    item["valid"] = info.valid;
-                    item["family"] = info.family;
-                    item["slot"] = info.slot;
-                    item["source"] = info.source;
-                    item["snapshot_id"] = info.snapshot_id;
-                    item["captured_at_us"] = info.captured_at_us;
-                    item["expires_at_us"] = info.expires_at_us;
-                    item["source_update_count"] = info.source_update_count;
-                    item["self_state_gradient_norm"] = info.self_state_gradient_norm;
-                    item["robustness_score"] = info.robustness_score;
-                    item["last_signed_outcome"] = info.last_signed_outcome;
-                    item["dominant_direction_cosine"] = info.dominant_direction_cosine;
-                    item["blob_b64"] = base64::encode((const char *) blob.data(), blob.size());
-                    items.push_back(std::move(item));
+                        json item = json::object();
+                        item["valid"] = info.valid;
+                        item["family"] = info.family;
+                        item["slot"] = info.slot;
+                        item["source"] = info.source;
+                        item["snapshot_id"] = info.snapshot_id;
+                        item["captured_at_us"] = info.captured_at_us;
+                        item["expires_at_us"] = info.expires_at_us;
+                        item["source_update_count"] = info.source_update_count;
+                        item["self_state_gradient_norm"] = info.self_state_gradient_norm;
+                        item["robustness_score"] = info.robustness_score;
+                        item["last_signed_outcome"] = info.last_signed_outcome;
+                        item["dominant_direction_cosine"] = info.dominant_direction_cosine;
+                        item["blob_b64"] = base64::encode((const char *) blob.data(), blob.size());
+                        items.push_back(std::move(item));
+                    }
+                    family_entry["items"] = std::move(items);
+                    functional_snapshots.push_back(std::move(family_entry));
                 }
-                family_entry["items"] = std::move(items);
-                functional_snapshots.push_back(std::move(family_entry));
+                snapshot["functional_snapshots"] = std::move(functional_snapshots);
             }
-            snapshot["functional_snapshots"] = std::move(functional_snapshots);
 
             llama_process_functional_params process_params = llama_process_functional_default_params();
-            (void) llama_process_functional_get_params(ctx, &process_params);
-            json process_params_json = json::object();
-            process_params_json["enabled"] = process_params.enabled;
-            process_params_json["max_entries"] = process_params.max_entries;
-            process_params_json["min_observations"] = process_params.min_observations;
-            process_params_json["noop_abs_ceiling"] = process_params.noop_abs_ceiling;
-            process_params_json["weak_positive_ceiling"] = process_params.weak_positive_ceiling;
-            process_params_json["mean_outcome_ceiling"] = process_params.mean_outcome_ceiling;
-            process_params_json["weak_or_worse_ratio_threshold"] = process_params.weak_or_worse_ratio_threshold;
-            process_params_json["creation_cooldown_updates"] = process_params.creation_cooldown_updates;
-            process_params_json["utility_decay"] = process_params.utility_decay;
-            snapshot["process_functional_params"] = std::move(process_params_json);
+            if (llama_process_functional_get_params(ctx, &process_params) == 0) {
+                json process_params_json = json::object();
+                process_params_json["enabled"] = process_params.enabled;
+                process_params_json["max_entries"] = process_params.max_entries;
+                process_params_json["min_observations"] = process_params.min_observations;
+                process_params_json["noop_abs_ceiling"] = process_params.noop_abs_ceiling;
+                process_params_json["weak_positive_ceiling"] = process_params.weak_positive_ceiling;
+                process_params_json["mean_outcome_ceiling"] = process_params.mean_outcome_ceiling;
+                process_params_json["weak_or_worse_ratio_threshold"] = process_params.weak_or_worse_ratio_threshold;
+                process_params_json["creation_cooldown_updates"] = process_params.creation_cooldown_updates;
+                process_params_json["utility_decay"] = process_params.utility_decay;
+                snapshot["process_functional_params"] = std::move(process_params_json);
 
-            json process_entries = json::array();
-            for (int32_t i = 0; i < llama_process_functional_entry_count(ctx); ++i) {
-                llama_process_functional_entry_info info = {};
-                if (llama_process_functional_entry_get(ctx, i, &info) != 0 || !info.valid) {
-                    continue;
-                }
-                const size_t blob_size = llama_process_functional_entry_blob_size(ctx, i);
-                if (blob_size == 0) {
-                    continue;
-                }
-                std::vector<uint8_t> blob(blob_size);
-                if (llama_process_functional_entry_blob_export(ctx, i, blob.data(), blob.size()) != 0) {
-                    throw std::runtime_error("failed to export process functional blob");
-                }
-                json entry = json::object();
-                entry["valid"] = info.valid;
-                entry["slot"] = info.slot;
-                entry["created_at_us"] = info.created_at_us;
-                entry["last_used_us"] = info.last_used_us;
-                entry["activation_count"] = info.activation_count;
-                entry["update_count"] = info.update_count;
-                entry["utility_score"] = info.utility_score;
-                entry["current_gain"] = info.current_gain;
-                entry["last_signed_outcome"] = info.last_signed_outcome;
-                entry["current_bootstrap_std"] = info.current_bootstrap_std;
-                entry["last_bootstrap_perturbation"] = info.last_bootstrap_perturbation;
-                entry["signature"] = {
-                        {"valid", info.signature.valid},
-                        {"signature_hash", info.signature.signature_hash},
-                        {"scope_kind", info.signature.scope_kind},
-                        {"family", info.signature.family},
-                        {"loop_origin", info.signature.loop_origin},
-                        {"microphase", info.signature.microphase},
-                        {"plan_mode", info.signature.plan_mode},
-                        {"plan_step_kind", info.signature.plan_step_kind},
-                        {"tool_kind", info.signature.tool_kind},
-                        {"source_family", info.signature.source_family},
-                        {"requires_tool_result", info.signature.requires_tool_result},
-                        {"transient_plan_id", info.signature.transient_plan_id},
-                        {"transient_step_index", info.signature.transient_step_index},
-                        {"transient_source_id", info.signature.transient_source_id},
-                        {"tool_name", info.signature.tool_name},
-                        {"semantic_key", info.signature.semantic_key},
-                };
-                entry["blob_b64"] = base64::encode((const char *) blob.data(), blob.size());
-                process_entries.push_back(std::move(entry));
-            }
-            snapshot["process_functional_entries"] = std::move(process_entries);
-
-            json process_snapshots = json::array();
-            for (int32_t entry_slot = 0; entry_slot < LLAMA_PROCESS_FUNCTIONAL_MAX_ENTRIES; ++entry_slot) {
-                llama_process_functional_entry_info entry_info = {};
-                if (llama_process_functional_entry_get(ctx, entry_slot, &entry_info) != 0 || !entry_info.valid) {
-                    continue;
-                }
-                llama_functional_lora_snapshot_archive archive = {};
-                if (llama_process_functional_snapshot_archive_get(ctx, entry_slot, &archive) != 0) {
-                    throw std::runtime_error("failed to query process functional snapshot archive");
-                }
-
-                json entry_archive = json::object();
-                entry_archive["entry_slot"] = entry_slot;
-                entry_archive["family"] = archive.family;
-                entry_archive["count"] = archive.count;
-                entry_archive["last_capture_us"] = archive.last_capture_us;
-                entry_archive["next_capture_due_us"] = archive.next_capture_due_us;
-                json items = json::array();
-                for (int32_t snapshot_slot = 0; snapshot_slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++snapshot_slot) {
-                    llama_functional_lora_snapshot_info info = {};
-                    if (llama_process_functional_snapshot_info_get(ctx, entry_slot, snapshot_slot, &info) != 0) {
-                        throw std::runtime_error("failed to query process functional snapshot info");
-                    }
-                    if (!info.valid) {
+                json process_entries = json::array();
+                for (int32_t i = 0; i < llama_process_functional_entry_count(ctx); ++i) {
+                    llama_process_functional_entry_info info = {};
+                    if (llama_process_functional_entry_get(ctx, i, &info) != 0 || !info.valid) {
                         continue;
                     }
-                    const size_t blob_size = llama_process_functional_snapshot_blob_size(ctx, entry_slot, snapshot_slot);
+                    const size_t blob_size = llama_process_functional_entry_blob_size(ctx, i);
                     if (blob_size == 0) {
-                        throw std::runtime_error("process functional snapshot archive reported empty blob");
+                        continue;
                     }
                     std::vector<uint8_t> blob(blob_size);
-                    if (llama_process_functional_snapshot_blob_export(ctx, entry_slot, snapshot_slot, blob.data(), blob.size()) != 0) {
-                        throw std::runtime_error("failed to export process functional snapshot blob");
+                    if (llama_process_functional_entry_blob_export(ctx, i, blob.data(), blob.size()) != 0) {
+                        throw std::runtime_error("failed to export process functional blob");
+                    }
+                    json entry = json::object();
+                    entry["valid"] = info.valid;
+                    entry["slot"] = info.slot;
+                    entry["created_at_us"] = info.created_at_us;
+                    entry["last_used_us"] = info.last_used_us;
+                    entry["activation_count"] = info.activation_count;
+                    entry["update_count"] = info.update_count;
+                    entry["utility_score"] = info.utility_score;
+                    entry["current_gain"] = info.current_gain;
+                    entry["last_signed_outcome"] = info.last_signed_outcome;
+                    entry["current_bootstrap_std"] = info.current_bootstrap_std;
+                    entry["last_bootstrap_perturbation"] = info.last_bootstrap_perturbation;
+                    entry["signature"] = {
+                            {"valid", info.signature.valid},
+                            {"signature_hash", info.signature.signature_hash},
+                            {"scope_kind", info.signature.scope_kind},
+                            {"family", info.signature.family},
+                            {"loop_origin", info.signature.loop_origin},
+                            {"microphase", info.signature.microphase},
+                            {"plan_mode", info.signature.plan_mode},
+                            {"plan_step_kind", info.signature.plan_step_kind},
+                            {"tool_kind", info.signature.tool_kind},
+                            {"source_family", info.signature.source_family},
+                            {"requires_tool_result", info.signature.requires_tool_result},
+                            {"transient_plan_id", info.signature.transient_plan_id},
+                            {"transient_step_index", info.signature.transient_step_index},
+                            {"transient_source_id", info.signature.transient_source_id},
+                            {"tool_name", info.signature.tool_name},
+                            {"semantic_key", info.signature.semantic_key},
+                    };
+                    entry["blob_b64"] = base64::encode((const char *) blob.data(), blob.size());
+                    process_entries.push_back(std::move(entry));
+                }
+                snapshot["process_functional_entries"] = std::move(process_entries);
+
+                json process_snapshots = json::array();
+                for (int32_t entry_slot = 0; entry_slot < LLAMA_PROCESS_FUNCTIONAL_MAX_ENTRIES; ++entry_slot) {
+                    llama_process_functional_entry_info entry_info = {};
+                    if (llama_process_functional_entry_get(ctx, entry_slot, &entry_info) != 0 || !entry_info.valid) {
+                        continue;
+                    }
+                    llama_functional_lora_snapshot_archive archive = {};
+                    if (llama_process_functional_snapshot_archive_get(ctx, entry_slot, &archive) != 0) {
+                        throw std::runtime_error("failed to query process functional snapshot archive");
                     }
 
-                    json item = json::object();
-                    item["valid"] = info.valid;
-                    item["family"] = info.family;
-                    item["slot"] = info.slot;
-                    item["source"] = info.source;
-                    item["snapshot_id"] = info.snapshot_id;
-                    item["captured_at_us"] = info.captured_at_us;
-                    item["expires_at_us"] = info.expires_at_us;
-                    item["source_update_count"] = info.source_update_count;
-                    item["self_state_gradient_norm"] = info.self_state_gradient_norm;
-                    item["robustness_score"] = info.robustness_score;
-                    item["last_signed_outcome"] = info.last_signed_outcome;
-                    item["dominant_direction_cosine"] = info.dominant_direction_cosine;
-                    item["blob_b64"] = base64::encode((const char *) blob.data(), blob.size());
-                    items.push_back(std::move(item));
+                    json entry_archive = json::object();
+                    entry_archive["entry_slot"] = entry_slot;
+                    entry_archive["family"] = archive.family;
+                    entry_archive["count"] = archive.count;
+                    entry_archive["last_capture_us"] = archive.last_capture_us;
+                    entry_archive["next_capture_due_us"] = archive.next_capture_due_us;
+                    json items = json::array();
+                    for (int32_t snapshot_slot = 0; snapshot_slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++snapshot_slot) {
+                        llama_functional_lora_snapshot_info info = {};
+                        if (llama_process_functional_snapshot_info_get(ctx, entry_slot, snapshot_slot, &info) != 0) {
+                            throw std::runtime_error("failed to query process functional snapshot info");
+                        }
+                        if (!info.valid) {
+                            continue;
+                        }
+                        const size_t blob_size = llama_process_functional_snapshot_blob_size(ctx, entry_slot, snapshot_slot);
+                        if (blob_size == 0) {
+                            throw std::runtime_error("process functional snapshot archive reported empty blob");
+                        }
+                        std::vector<uint8_t> blob(blob_size);
+                        if (llama_process_functional_snapshot_blob_export(ctx, entry_slot, snapshot_slot, blob.data(), blob.size()) != 0) {
+                            throw std::runtime_error("failed to export process functional snapshot blob");
+                        }
+
+                        json item = json::object();
+                        item["valid"] = info.valid;
+                        item["family"] = info.family;
+                        item["slot"] = info.slot;
+                        item["source"] = info.source;
+                        item["snapshot_id"] = info.snapshot_id;
+                        item["captured_at_us"] = info.captured_at_us;
+                        item["expires_at_us"] = info.expires_at_us;
+                        item["source_update_count"] = info.source_update_count;
+                        item["self_state_gradient_norm"] = info.self_state_gradient_norm;
+                        item["robustness_score"] = info.robustness_score;
+                        item["last_signed_outcome"] = info.last_signed_outcome;
+                        item["dominant_direction_cosine"] = info.dominant_direction_cosine;
+                        item["blob_b64"] = base64::encode((const char *) blob.data(), blob.size());
+                        items.push_back(std::move(item));
+                    }
+                    entry_archive["items"] = std::move(items);
+                    process_snapshots.push_back(std::move(entry_archive));
                 }
-                entry_archive["items"] = std::move(items);
-                process_snapshots.push_back(std::move(entry_archive));
+                snapshot["process_functional_snapshots"] = std::move(process_snapshots);
             }
-            snapshot["process_functional_snapshots"] = std::move(process_snapshots);
 
             const std::filesystem::path target_path(snapshot_path);
             if (!target_path.parent_path().empty()) {
@@ -2765,7 +2769,7 @@ private:
                             info.slot < 0 ||
                             info.slot >= LLAMA_PROCESS_FUNCTIONAL_MAX_ENTRIES ||
                             blob.empty() ||
-                            llama_process_functional_entry_blob_import(ctx, info.slot, info, blob.data(), blob.size()) != 0) {
+                            llama_process_functional_entry_blob_import(ctx, info.slot, &info, blob.data(), blob.size()) != 0) {
                         throw std::runtime_error("failed to restore process functional entry");
                     }
                 }

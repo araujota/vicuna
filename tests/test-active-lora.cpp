@@ -602,7 +602,7 @@ int main(int argc, char ** argv) {
         process_snapshot_blob_size == 0 ||
         llama_process_functional_entry_blob_export(ctx, process_entry.slot, process_entry_blob.data(), process_entry_blob.size()) != 0 ||
         llama_process_functional_snapshot_blob_export(ctx, process_entry.slot, 0, process_snapshot_blob.data(), process_snapshot_blob.size()) != 0 ||
-        llama_process_functional_entry_blob_import(ctx_pool, process_entry.slot, process_entry, process_entry_blob.data(), process_entry_blob.size()) != 0 ||
+        llama_process_functional_entry_blob_import(ctx_pool, process_entry.slot, &process_entry, process_entry_blob.data(), process_entry_blob.size()) != 0 ||
         llama_process_functional_snapshot_blob_import(ctx_pool, process_entry.slot, 0, process_snapshot, process_snapshot_blob.data(), process_snapshot_blob.size()) != 0) {
         fprintf(stderr, "failed to roundtrip process-functional lifecycle blobs\n");
         llama_free(ctx_custom);

@@ -20,6 +20,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1421,8 +1422,8 @@ struct llama_active_lora_manager::impl {
     functional_gating_network gating_network = {};
     functional_gating_adam_state gating_adam = {};
     std::array<functional_gating_training_tuple, LLAMA_FUNCTIONAL_LORA_COUNT> gating_training = {};
-    std::unordered_map<const ggml_tensor *, runtime_lora_adam_state> runtime_lora_adam = {};
-    std::unordered_map<const llama_adapter_lora *, uint64_t> runtime_lora_write_count = {};
+    std::unordered_map<const ggml_tensor *, runtime_lora_adam_state> runtime_lora_adam;
+    std::unordered_map<const llama_adapter_lora *, uint64_t> runtime_lora_write_count;
     std::mt19937_64 gating_rng { FUNCTIONAL_GATING_INIT_SEED };
     std::mt19937_64 bootstrap_rng { FUNCTIONAL_BOOTSTRAP_INIT_SEED };
     uint64_t gating_invocation_count = 0;
@@ -1593,9 +1594,9 @@ struct llama_active_lora_manager::impl {
         return state;
     }
 
-    std::array<float, FUNCTIONAL_GATING_INPUT_DIM> build_gating_input(
+    static std::array<float, FUNCTIONAL_GATING_INPUT_DIM> build_gating_input(
             const llama_functional_gating_observation & observation,
-            float * out_gradient_norm = nullptr) const {
+            float * out_gradient_norm = nullptr) {
         std::array<float, FUNCTIONAL_GATING_INPUT_DIM> input = {};
         float norm_sq = 0.0f;
         for (size_t i = 0; i < 9; ++i) {
@@ -2094,7 +2095,7 @@ struct llama_active_lora_manager::impl {
         return true;
     }
 
-    bool copy_adapter(llama_adapter_lora & dst, const llama_adapter_lora & src) {
+    static bool copy_adapter(llama_adapter_lora & dst, const llama_adapter_lora & src) {
         if (dst.ab_map.size() != src.ab_map.size()) {
             return false;
         }
@@ -2191,7 +2192,7 @@ struct llama_active_lora_manager::impl {
         return -1;
     }
 
-    float process_entry_eviction_score(const process_functional_entry_runtime & entry, uint64_t now_us) const {
+    static float process_entry_eviction_score(const process_functional_entry_runtime & entry, uint64_t now_us) {
         if (!entry.info.valid) {
             return -1.0e9f;
         }
@@ -2330,7 +2331,7 @@ struct llama_active_lora_manager::impl {
         return ledger.info.mean_signed_outcome <= process_params.mean_outcome_ceiling;
     }
 
-    float adapter_difference_norm(const llama_adapter_lora & lhs, const llama_adapter_lora & rhs) const {
+    static float adapter_difference_norm(const llama_adapter_lora & lhs, const llama_adapter_lora & rhs) {
         double sum_sq = 0.0;
         for (const auto & it : lhs.ab_map) {
             auto rhs_it = rhs.ab_map.find(it.first);
@@ -2363,7 +2364,7 @@ struct llama_active_lora_manager::impl {
         return std::sqrt((float) sum_sq);
     }
 
-    void record_adapter_signature(
+    static void record_adapter_signature(
             llama_adapter_lora * live_adapter,
             std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS> & dominant_direction,
             std::array<float, FUNCTIONAL_DIRECTION_SKETCH_DIMS> & last_signature,
@@ -2727,7 +2728,7 @@ struct llama_active_lora_manager::impl {
         }
     }
 
-    size_t serialized_adapter_size(const llama_adapter_lora & adapter) const {
+    static size_t serialized_adapter_size(const llama_adapter_lora & adapter) {
         size_t total = sizeof(uint32_t);
         for (const auto & it : adapter.ab_map) {
             const size_t size_a = it.second.a->ne[0] * it.second.a->ne[1];
@@ -2758,7 +2759,7 @@ struct llama_active_lora_manager::impl {
             ggml_backend_tensor_get(it.second.b, data_b.data(), 0, data_b.size() * sizeof(float));
             std::memcpy(cursor, &name_len, sizeof(name_len));
             cursor += sizeof(name_len);
-            std::memcpy(cursor, it.first.data(), name_len);
+            std::copy_n(it.first.begin(), name_len, cursor);
             cursor += name_len;
             std::memcpy(cursor, &it.second.gain, sizeof(float));
             cursor += sizeof(float);
@@ -2774,7 +2775,7 @@ struct llama_active_lora_manager::impl {
         return true;
     }
 
-    bool serialized_adapter_import(llama_adapter_lora & adapter, const void * src, size_t size) {
+    static bool serialized_adapter_import(llama_adapter_lora & adapter, const void * src, size_t size) {
         if (!src || size < sizeof(uint32_t)) {
             return false;
         }

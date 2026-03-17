@@ -3989,10 +3989,10 @@ int32_t llama_process_functional_entry_blob_export(
 int32_t llama_process_functional_entry_blob_import(
         llama_context * ctx,
         int32_t index,
-        llama_process_functional_entry_info info,
+        const llama_process_functional_entry_info * info,
         const void * src,
         size_t size) {
-    return ctx && ctx->process_functional_entry_blob_import(index, info, src, size) ? 0 : -1;
+    return ctx && info && ctx->process_functional_entry_blob_import(index, *info, src, size) ? 0 : -1;
 }
 
 size_t llama_process_functional_snapshot_blob_size(

@@ -561,6 +561,9 @@ float score_functional_bias_candidate(
         float * out_fragility,
         float * out_concentration,
         float * out_robustness) {
+    // Counterfactual functional replay stays explicit here on purpose:
+    // score archived or perturbed candidates from typed replay metadata,
+    // then apply the same bounded replay override surface used by serving.
     if (out_fragility) {
         *out_fragility = 0.0f;
     }
@@ -863,7 +866,13 @@ llama_process_functional_signature make_process_signature(
     signature.microphase = microphase;
     signature.plan_mode = plan && plan->valid ? plan->mode : LLAMA_COG_PLAN_MODE_NONE;
     signature.plan_step_kind = step ? step->kind : LLAMA_COG_PLAN_STEP_NONE;
-    signature.tool_kind = step ? step->tool_kind : (tool_spec ? tool_spec->tool_kind : LLAMA_TOOL_KIND_NONE);
+    if (step) {
+        signature.tool_kind = step->tool_kind;
+    } else if (tool_spec) {
+        signature.tool_kind = tool_spec->tool_kind;
+    } else {
+        signature.tool_kind = LLAMA_TOOL_KIND_NONE;
+    }
     signature.source_family = step ? step->source_family : family;
     signature.requires_tool_result = step ? step->requires_tool_result : false;
     signature.transient_plan_id = plan && plan->valid ? plan->plan_id : -1;
@@ -2252,9 +2261,9 @@ public:
         const int32_t process_entry_slot =
                 find_process_entry_slot_for_signature(ctx, compare_process_signature);
         llama_functional_lora_snapshot_archive snapshot_archive = {};
-        const bool have_functional_history =
-                ctx.functional_lora_snapshot_archive_get(functional_family, &snapshot_archive) &&
-                snapshot_archive.count > 0;
+    const bool have_functional_history =
+            ctx.functional_lora_snapshot_archive_get(functional_family, &snapshot_archive) &&
+            snapshot_archive.count > 0;
         const int32_t best_process_snapshot_slot = process_entry_slot >= 0 ?
                 select_best_process_snapshot_slot(ctx, process_entry_slot) :
                 -1;
@@ -2525,8 +2534,8 @@ public:
         if (need_discrete_tool_fallback) {
             if (hard_memory_enabled && trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
                 int32_t temporal_role = LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK;
-                const int32_t lora_count = ctx.serving_lora_stack_count();
-                for (int32_t i = 0; i < lora_count; ++i) {
+                const int32_t serving_layer_count = ctx.serving_lora_stack_count();
+                for (int32_t i = 0; i < serving_layer_count; ++i) {
                     llama_serving_lora_layer_info info = {};
                     if (ctx.serving_lora_stack_layer(i, &info) &&
                             (info.role == LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK || info.role == LLAMA_ADAPTER_LORA_LAYER_ACTIVE)) {
@@ -3181,8 +3190,12 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 planning_pressure_seed,
                 plan_complexity_seed,
                 plan_revision_seed);
-        const llama_cognitive_plan_trace * process_plan =
-                trace.plan.valid ? &trace.plan : (active_plan.valid ? &active_plan : nullptr);
+        const llama_cognitive_plan_trace * process_plan = nullptr;
+        if (trace.plan.valid) {
+            process_plan = &trace.plan;
+        } else if (active_plan.valid) {
+            process_plan = &active_plan;
+        }
         int32_t process_tool_kind = LLAMA_TOOL_KIND_NONE;
         if (process_plan &&
                 process_plan->valid &&
@@ -3396,10 +3409,13 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 1,
                 true);
     } else {
+        const int32_t wait_status = waiting_on_tool ?
+                LLAMA_COG_PLAN_STEP_STATUS_PENDING :
+                LLAMA_COG_PLAN_STEP_STATUS_COMPLETED;
         (void) append_plan_step(
                 trace.plan,
                 LLAMA_COG_PLAN_STEP_WAIT,
-                waiting_on_tool ? LLAMA_COG_PLAN_STEP_STATUS_PENDING : LLAMA_COG_PLAN_STEP_STATUS_COMPLETED,
+                wait_status,
                 proposed_tool_kind,
                 -1,
                 trace.reason_mask,
@@ -3408,10 +3424,13 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 waiting_on_tool);
     }
     trace.plan.current_step_index = first_ready_plan_step(trace.plan);
-    trace.plan.status =
-            trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT ? LLAMA_COG_PLAN_STATUS_WAITING_TOOL :
-            trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_WAIT && !waiting_on_tool ? LLAMA_COG_PLAN_STATUS_COMPLETED :
-            LLAMA_COG_PLAN_STATUS_EXECUTING;
+    if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
+        trace.plan.status = LLAMA_COG_PLAN_STATUS_WAITING_TOOL;
+    } else if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_WAIT && !waiting_on_tool) {
+        trace.plan.status = LLAMA_COG_PLAN_STATUS_COMPLETED;
+    } else {
+        trace.plan.status = LLAMA_COG_PLAN_STATUS_EXECUTING;
+    }
     active_plan = trace.plan;
     active_runner.plan_id = trace.plan.plan_id;
     active_runner.plan_mode = trace.plan.mode;
@@ -4121,8 +4140,12 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 planning_pressure_seed,
                 plan_complexity_seed,
                 plan_revision_seed);
-        const llama_cognitive_plan_trace * process_plan =
-                trace.plan.valid ? &trace.plan : (dmn_plan.valid ? &dmn_plan : nullptr);
+        const llama_cognitive_plan_trace * process_plan = nullptr;
+        if (trace.plan.valid) {
+            process_plan = &trace.plan;
+        } else if (dmn_plan.valid) {
+            process_plan = &dmn_plan;
+        }
         int32_t process_tool_kind = LLAMA_TOOL_KIND_NONE;
         if (process_plan &&
                 process_plan->valid &&
@@ -4362,13 +4385,15 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 1,
                 false);
     } else {
+        const int32_t governance_status =
+                last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DENY ||
+                last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DEFER ?
+                        LLAMA_COG_PLAN_STEP_STATUS_BLOCKED :
+                        LLAMA_COG_PLAN_STEP_STATUS_COMPLETED;
         (void) append_plan_step(
                 trace.plan,
                 LLAMA_COG_PLAN_STEP_WAIT,
-                last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DENY ||
-                        last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DEFER ?
-                                LLAMA_COG_PLAN_STEP_STATUS_BLOCKED :
-                                LLAMA_COG_PLAN_STEP_STATUS_COMPLETED,
+                governance_status,
                 LLAMA_TOOL_KIND_NONE,
                 last_remediation_plan.source_family,
                 selected_reason_mask,

@@ -2898,7 +2898,7 @@ extern "C" {
     LLAMA_API int32_t llama_process_functional_entry_blob_import(
             struct llama_context * ctx,
             int32_t index,
-            struct llama_process_functional_entry_info info,
+            const struct llama_process_functional_entry_info * info,
             const void * src,
             size_t size);
     LLAMA_API size_t llama_process_functional_snapshot_blob_size(

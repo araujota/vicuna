@@ -33,12 +33,12 @@ static constexpr size_t   LLAMA_SELF_MAX_MEMORY_HANDLES = 24;
 static constexpr size_t   LLAMA_SELF_MAX_TRACE_ITEMS = 256;
 static constexpr size_t   LLAMA_SELF_MAX_TRACE_TOKENS = 2048;
 static constexpr uint32_t LLAMA_SELF_TRACE_MAGIC = 0x4c535354u; // LSST
-static constexpr uint32_t LLAMA_SELF_TRACE_VERSION = 4;
-static constexpr size_t   LLAMA_SELF_BELIEF_SIGNATURE_DIM = 4;
-static constexpr float    LLAMA_SELF_DISCOVERY_HALF_LIFE_MS = 20.0f * 60.0f * 1000.0f;
-static constexpr float    LLAMA_SELF_DISCOVERY_ADMISSION_THRESHOLD = 0.52f;
-static constexpr float    LLAMA_SELF_DISCOVERY_PERMANENCE_THRESHOLD = 0.68f;
-static constexpr float    LLAMA_SELF_DISCOVERY_ALLOSTATIC_THRESHOLD = 0.70f;
+constexpr uint32_t LLAMA_SELF_TRACE_VERSION = 4;
+constexpr size_t   LLAMA_SELF_BELIEF_SIGNATURE_DIM = 4;
+constexpr float    LLAMA_SELF_DISCOVERY_HALF_LIFE_MS = 20.0f * 60.0f * 1000.0f;
+constexpr float    LLAMA_SELF_DISCOVERY_ADMISSION_THRESHOLD = 0.52f;
+constexpr float    LLAMA_SELF_DISCOVERY_PERMANENCE_THRESHOLD = 0.68f;
+constexpr float    LLAMA_SELF_DISCOVERY_ALLOSTATIC_THRESHOLD = 0.70f;
 
 static int64_t current_wall_clock_ms() {
     using namespace std::chrono;
@@ -433,7 +433,7 @@ static bool sketch_is_zero(const std::array<float, 32> & sketch) {
     return true;
 }
 
-static float extension_stage_weight(int32_t stage) {
+float extension_stage_weight(int32_t stage) {
     switch (stage) {
         case LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT:  return 0.50f;
         case LLAMA_SELF_MODEL_EXTENSION_STAGE_PERMANENT:  return 0.80f;
@@ -442,7 +442,7 @@ static float extension_stage_weight(int32_t stage) {
     }
 }
 
-static std::string sketch_signature(const std::array<float, 32> & sketch) {
+std::string sketch_signature(const std::array<float, 32> & sketch) {
     struct slot_score {
         int32_t index = -1;
         float magnitude = 0.0f;
@@ -1916,11 +1916,13 @@ bool llama_self_state::validate_model_extension_update(llama_self_model_extensio
 
     if (update->lifecycle_stage < LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT ||
         update->lifecycle_stage > LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC) {
-        update->lifecycle_stage = (update->flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) != 0 ?
-                LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT :
-                ((update->flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS) != 0 ?
-                        LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC :
-                        LLAMA_SELF_MODEL_EXTENSION_STAGE_PERMANENT);
+        if ((update->flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) != 0) {
+            update->lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT;
+        } else if ((update->flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS) != 0) {
+            update->lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC;
+        } else {
+            update->lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_PERMANENT;
+        }
     }
 
     return true;
@@ -2195,13 +2197,15 @@ bool llama_self_state::upsert_model_extension(const llama_self_model_extension_u
     }
     it->lifecycle_stage = normalized.lifecycle_stage;
     it->flags = normalized.flags;
-    it->support_count = discovered ?
-            (existed ?
-                    (normalized.support_count > 1 ?
-                            std::max<uint32_t>(it->support_count, normalized.support_count) :
-                            std::max<uint32_t>(normalized.support_count, it->support_count + 1)) :
-                    std::max<uint32_t>(1u, normalized.support_count)) :
-            std::max<uint32_t>(1u, normalized.support_count);
+    if (!discovered) {
+        it->support_count = std::max<uint32_t>(1u, normalized.support_count);
+    } else if (!existed) {
+        it->support_count = std::max<uint32_t>(1u, normalized.support_count);
+    } else if (normalized.support_count > 1) {
+        it->support_count = std::max<uint32_t>(it->support_count, normalized.support_count);
+    } else {
+        it->support_count = std::max<uint32_t>(normalized.support_count, it->support_count + 1);
+    }
     it->value = normalized.value;
     it->desired_value = normalized.desired_value;
     it->desired_value_min = normalized.desired_value_min;
@@ -3371,6 +3375,9 @@ bool llama_self_state::note_validated_progress(float signed_progress, float effi
 bool llama_self_state::maybe_admit_event_discovered_state(
         const llama_self_state_event & event,
         const llama_self_state_feature_vector & features) {
+    // Discovered-state admission intentionally keeps the policy visible:
+    // score surprise, relevance, and confidence from typed self-state features,
+    // then upsert only bounded discovered extensions that clear the floor.
     if ((event.flags & LLAMA_SELF_STATE_EVENT_ADMITTED) == 0 ||
         event.channel == LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL ||
         is_internal_artifact_event(event) ||
@@ -3473,19 +3480,30 @@ bool llama_self_state::maybe_admit_event_discovered_state(
     }
 
     if (best_similarity < 0.90f || key.empty()) {
+        const char * role_tag = "system";
+        if (event.role == LLAMA_SELF_STATE_EVENT_USER) {
+            role_tag = "user";
+        } else if (event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
+            role_tag = "tool";
+        }
+
         std::ostringstream oss;
         oss << "event_feedback:"
-            << (event.role == LLAMA_SELF_STATE_EVENT_USER ? "user" :
-                    event.role == LLAMA_SELF_STATE_EVENT_TOOL ? "tool" : "system")
+            << role_tag
             << ":" << domain
             << ":" << sketch_signature(sketch);
         key = oss.str();
     }
 
+    const char * role_label = "System";
+    if (event.role == LLAMA_SELF_STATE_EVENT_USER) {
+        role_label = "User";
+    } else if (event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
+        role_label = "Tool";
+    }
+
     std::ostringstream label;
-    label << (event.role == LLAMA_SELF_STATE_EVENT_USER ? "User" :
-            event.role == LLAMA_SELF_STATE_EVENT_TOOL ? "Tool" : "System")
-          << " discovered feedback";
+    label << role_label << " discovered feedback";
     std::ostringstream content;
     content << "domain=" << domain
             << " surprise=" << surprise

@@ -6,8 +6,10 @@
 #include "llama-model.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 static std::vector<llama_token> tokenize_or_die(const llama_vocab * vocab, const std::string & text) {
@@ -327,7 +329,7 @@ int main(int argc, char ** argv) {
         process_snapshot_blob_size == 0 ||
         llama_process_functional_entry_blob_export(ctx.get(), process_entry.slot, process_entry_blob.data(), process_entry_blob.size()) != 0 ||
         llama_process_functional_snapshot_blob_export(ctx.get(), process_entry.slot, 0, process_snapshot_blob.data(), process_snapshot_blob.size()) != 0 ||
-        llama_process_functional_entry_blob_import(ctx_import.get(), process_entry.slot, process_entry, process_entry_blob.data(), process_entry_blob.size()) != 0 ||
+        llama_process_functional_entry_blob_import(ctx_import.get(), process_entry.slot, &process_entry, process_entry_blob.data(), process_entry_blob.size()) != 0 ||
         llama_process_functional_snapshot_blob_import(ctx_import.get(), process_entry.slot, 0, process_snapshot, process_snapshot_blob.data(), process_snapshot_blob.size()) != 0) {
         fprintf(stderr, "failed to roundtrip process-functional snapshot archive blobs\n");
         return 1;
