@@ -94,6 +94,21 @@ The functional bank is intentionally separate from the temporal cascade:
 - the same Adam family is also used for self-state-driven runtime LoRA tensor
   writes and temporal write-bias updates, while discrete counterfactual
   intervention ranking remains explicit CPU policy rather than an optimizer path
+- process-functional LoRAs extend that family stack with a bounded
+  process/process-step bank keyed by stable semantic execution signatures rather
+  than transient plan IDs or tick IDs
+- each process entry follows the same runtime pattern as shipped functional
+  families: a learned adapter that begins as a no-op plus a tiny bootstrap
+  adapter whose perturbation decays toward a small floor
+- process-generated functional entries now share the same lifecycle substrate as
+  shipped functional families: weekly snapshot capture, archived replay,
+  orthogonal/local replay overrides, and differential replay-to-live updates
+- only the currently matching process entry is attached, so the serving stack
+  grows by two runtime layers at most even if the stored bank contains many
+  historical process specializations
+- DMN counterfactual simulation scores those process-generated entries through
+  the same replay surface, so process-local, process-history, and
+  process-orthogonal proposals participate in the same functional-bias ladder
 
 The current request/response cycle is:
 
@@ -307,6 +322,68 @@ That summary cooperates with the functional LoRA stack in two ways:
 
 This keeps hard memory, self-model state, and LoRA modulation coupled through
 typed bounded surfaces rather than prompt text.
+
+### Closed Self-Improvement Synthesis
+
+The self-improvement architecture should be read as one bounded loop, not as a
+set of adjacent features:
+
+1. admitted primary feedback updates the typed self-state and may create or
+   revise discovered self-model extensions,
+2. self-state, extension, belief, and hard-memory residue are compressed into
+   bounded summaries rather than fed forward as variable-width prompt text,
+3. favorable-state error plus those bounded summaries drive functional gain
+   routing,
+4. the active or DMN loop executes under the selected functional family and, if
+   applicable, the matching process-functional specialization,
+5. post-action deltas settle family and process-functional updates, emit durable
+   hard-memory residue, and update discovered-state support,
+6. DMN counterfactual replay compares local, historical, and orthogonal
+   functional hypotheses, including process-functional entries on the same
+   lifecycle substrate,
+7. validated progress and postwrite support can consolidate discovered state
+   into permanent or allostatic self-model structure,
+8. runtime snapshots persist the resulting self-state plus functional/process
+   archives so the loop survives restart.
+
+The invariants that keep this loop synthesized are:
+
+- no raw variable-length self-model or hard-memory structure reaches the gating
+  controller directly,
+- process-functional adapters are not a second adaptation regime; they use the
+  same snapshot, replay, and differential-update substrate as shipped
+  functional families,
+- DMN functional counterfactuals improve the same live bias layers that serve
+  execution,
+- and discovered/permanent/allostatic self-state feeds future routing through
+  bounded explicit summaries instead of latent prompt residue.
+
+### Unified Provenance
+
+Release evaluation of semi-biological growth cannot depend on ad hoc debug
+strings or last-trace inspection alone. The server now maintains one
+append-only structured provenance repository for self-improvement events.
+
+That repository is aligned with the implemented loop boundaries:
+
+- active-loop episodes
+- tool-result integrations
+- admitted DMN ticks with counterfactual/governance summaries
+
+Each event carries stable session and sequence identity plus bounded summaries
+of:
+
+- self-model extension counts and allostatic pressure
+- belief/promotion readiness
+- functional and process-functional update surfaces
+- counterfactual choice and governance outcome
+
+This keeps the observability model unified:
+
+- one local source of truth for longitudinal analysis
+- one online metrics/health surface derived from the same data
+- and one schema that can later be exported into broader tracing/evaluation
+  infrastructure without redesigning the runtime
 
 ### Extensibility
 

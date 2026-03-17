@@ -1390,6 +1390,135 @@ bool llama_context::functional_lora_snapshot_maintain(uint64_t now_us) {
     return active_lora_manager && active_lora_manager->functional_snapshot_maintain(now_us);
 }
 
+bool llama_context::process_functional_get_params(llama_process_functional_params * out_params) const {
+    return active_lora_manager && active_lora_manager->process_functional_get_params(out_params);
+}
+
+bool llama_context::process_functional_set_params(const llama_process_functional_params & params) {
+    return active_lora_manager && active_lora_manager->process_functional_set_params(params);
+}
+
+int32_t llama_context::process_functional_entry_count() const {
+    return active_lora_manager ? active_lora_manager->process_functional_entry_count() : 0;
+}
+
+bool llama_context::process_functional_entry_get(int32_t index, llama_process_functional_entry_info * out_info) const {
+    return active_lora_manager && active_lora_manager->process_functional_entry_get(index, out_info);
+}
+
+int32_t llama_context::process_functional_ledger_count() const {
+    return active_lora_manager ? active_lora_manager->process_functional_ledger_count() : 0;
+}
+
+bool llama_context::process_functional_ledger_get(int32_t index, llama_process_functional_ledger_info * out_info) const {
+    return active_lora_manager && active_lora_manager->process_functional_ledger_get(index, out_info);
+}
+
+bool llama_context::process_functional_get_last_trace(llama_process_functional_trace * out_trace) const {
+    return active_lora_manager && active_lora_manager->process_functional_get_last_trace(out_trace);
+}
+
+bool llama_context::process_functional_get_current_signature(llama_process_functional_signature * out_signature) const {
+    return active_lora_manager && active_lora_manager->process_functional_get_current_signature(out_signature);
+}
+
+bool llama_context::process_functional_snapshot_archive_get(
+        int32_t entry_slot,
+        llama_functional_lora_snapshot_archive * out_archive) const {
+    return active_lora_manager && active_lora_manager->process_functional_snapshot_archive_get(entry_slot, out_archive);
+}
+
+bool llama_context::process_functional_snapshot_info_get(
+        int32_t entry_slot,
+        int32_t snapshot_slot,
+        llama_functional_lora_snapshot_info * out_info) const {
+    return active_lora_manager && active_lora_manager->process_functional_snapshot_info_get(entry_slot, snapshot_slot, out_info);
+}
+
+bool llama_context::process_functional_get_last_snapshot_maintenance(
+        llama_functional_snapshot_maintenance_trace * out_trace) const {
+    return active_lora_manager && active_lora_manager->process_functional_get_last_snapshot_maintenance(out_trace);
+}
+
+bool llama_context::process_functional_replay_override_begin(
+        int32_t entry_slot,
+        const llama_functional_lora_replay_override & config) {
+    return active_lora_manager && active_lora_manager->process_functional_replay_override_begin(entry_slot, config);
+}
+
+bool llama_context::process_functional_replay_override_end(int32_t entry_slot) {
+    return active_lora_manager && active_lora_manager->process_functional_replay_override_end(entry_slot);
+}
+
+bool llama_context::process_functional_get_last_differential_update(
+        int32_t entry_slot,
+        llama_functional_lora_differential_update * out_update) const {
+    return active_lora_manager && active_lora_manager->process_functional_get_last_differential_update(entry_slot, out_update);
+}
+
+bool llama_context::process_functional_apply_differential_update(
+        int32_t entry_slot,
+        int32_t proposal_family,
+        int32_t replay_mode,
+        int32_t snapshot_slot,
+        float signed_score_delta,
+        float magnitude,
+        float robustness_score) {
+    return active_lora_manager && active_lora_manager->process_functional_apply_differential_update(
+            entry_slot,
+            proposal_family,
+            replay_mode,
+            snapshot_slot,
+            signed_score_delta,
+            magnitude,
+            robustness_score);
+}
+
+size_t llama_context::process_functional_entry_blob_size(int32_t index) const {
+    return active_lora_manager ? active_lora_manager->process_functional_entry_blob_size(index) : 0;
+}
+
+bool llama_context::process_functional_entry_blob_export(int32_t index, void * dst, size_t size) const {
+    return active_lora_manager && active_lora_manager->process_functional_entry_blob_export(index, dst, size);
+}
+
+bool llama_context::process_functional_entry_blob_import(
+        int32_t index,
+        const llama_process_functional_entry_info & info,
+        const void * src,
+        size_t size) {
+    return active_lora_manager && active_lora_manager->process_functional_entry_blob_import(index, info, src, size);
+}
+
+size_t llama_context::process_functional_snapshot_blob_size(int32_t entry_slot, int32_t snapshot_slot) const {
+    return active_lora_manager ? active_lora_manager->process_functional_snapshot_blob_size(entry_slot, snapshot_slot) : 0;
+}
+
+bool llama_context::process_functional_snapshot_blob_export(
+        int32_t entry_slot,
+        int32_t snapshot_slot,
+        void * dst,
+        size_t size) const {
+    return active_lora_manager && active_lora_manager->process_functional_snapshot_blob_export(entry_slot, snapshot_slot, dst, size);
+}
+
+bool llama_context::process_functional_snapshot_blob_import(
+        int32_t entry_slot,
+        int32_t snapshot_slot,
+        const llama_functional_lora_snapshot_info & info,
+        const void * src,
+        size_t size) {
+    return active_lora_manager && active_lora_manager->process_functional_snapshot_blob_import(entry_slot, snapshot_slot, info, src, size);
+}
+
+bool llama_context::process_functional_snapshot_maintain(uint64_t now_us) {
+    return active_lora_manager && active_lora_manager->process_functional_snapshot_maintain(now_us);
+}
+
+bool llama_context::process_functional_set_execution(const llama_process_functional_signature & signature) {
+    return active_lora_manager && active_lora_manager->process_functional_set_execution(signature);
+}
+
 bool llama_context::active_temporal_encoding_bias_get(llama_active_temporal_encoding_bias * out_bias) const {
     return active_lora_manager && active_lora_manager->temporal_encoding_bias_get(out_bias);
 }
@@ -3286,6 +3415,20 @@ llama_context_params llama_context_default_params() {
     return result;
 }
 
+llama_process_functional_params llama_process_functional_default_params(void) {
+    llama_process_functional_params result = {};
+    result.enabled = true;
+    result.max_entries = LLAMA_PROCESS_FUNCTIONAL_MAX_ENTRIES;
+    result.min_observations = 6;
+    result.noop_abs_ceiling = 0.05f;
+    result.weak_positive_ceiling = 0.15f;
+    result.mean_outcome_ceiling = 0.10f;
+    result.weak_or_worse_ratio_threshold = 0.66f;
+    result.creation_cooldown_updates = 4;
+    result.utility_decay = 0.92f;
+    return result;
+}
+
 llama_context * llama_init_from_model(
                  llama_model * model,
         llama_context_params   params) {
@@ -3721,6 +3864,167 @@ int32_t llama_functional_lora_snapshot_maintain(
         llama_context * ctx,
         uint64_t now_us) {
     return ctx && ctx->functional_lora_snapshot_maintain(now_us) ? 0 : -1;
+}
+
+int32_t llama_process_functional_get_params(
+        const llama_context * ctx,
+        llama_process_functional_params * out_params) {
+    return ctx && ctx->process_functional_get_params(out_params) ? 0 : -1;
+}
+
+int32_t llama_process_functional_set_params(
+        llama_context * ctx,
+        llama_process_functional_params params) {
+    return ctx && ctx->process_functional_set_params(params) ? 0 : -1;
+}
+
+int32_t llama_process_functional_entry_count(const llama_context * ctx) {
+    return ctx ? ctx->process_functional_entry_count() : -1;
+}
+
+int32_t llama_process_functional_entry_get(
+        const llama_context * ctx,
+        int32_t index,
+        llama_process_functional_entry_info * out_info) {
+    return ctx && ctx->process_functional_entry_get(index, out_info) ? 0 : -1;
+}
+
+int32_t llama_process_functional_ledger_count(const llama_context * ctx) {
+    return ctx ? ctx->process_functional_ledger_count() : -1;
+}
+
+int32_t llama_process_functional_ledger_get(
+        const llama_context * ctx,
+        int32_t index,
+        llama_process_functional_ledger_info * out_info) {
+    return ctx && ctx->process_functional_ledger_get(index, out_info) ? 0 : -1;
+}
+
+int32_t llama_process_functional_get_last_trace(
+        const llama_context * ctx,
+        llama_process_functional_trace * out_trace) {
+    return ctx && ctx->process_functional_get_last_trace(out_trace) ? 0 : -1;
+}
+
+int32_t llama_process_functional_get_current_signature(
+        const llama_context * ctx,
+        llama_process_functional_signature * out_signature) {
+    return ctx && ctx->process_functional_get_current_signature(out_signature) ? 0 : -1;
+}
+
+int32_t llama_process_functional_snapshot_archive_get(
+        const llama_context * ctx,
+        int32_t entry_slot,
+        llama_functional_lora_snapshot_archive * out_archive) {
+    return ctx && ctx->process_functional_snapshot_archive_get(entry_slot, out_archive) ? 0 : -1;
+}
+
+int32_t llama_process_functional_snapshot_info_get(
+        const llama_context * ctx,
+        int32_t entry_slot,
+        int32_t snapshot_slot,
+        llama_functional_lora_snapshot_info * out_info) {
+    return ctx && ctx->process_functional_snapshot_info_get(entry_slot, snapshot_slot, out_info) ? 0 : -1;
+}
+
+int32_t llama_process_functional_get_last_snapshot_maintenance(
+        const llama_context * ctx,
+        llama_functional_snapshot_maintenance_trace * out_trace) {
+    return ctx && ctx->process_functional_get_last_snapshot_maintenance(out_trace) ? 0 : -1;
+}
+
+int32_t llama_process_functional_replay_override_begin(
+        llama_context * ctx,
+        int32_t entry_slot,
+        llama_functional_lora_replay_override config) {
+    return ctx && ctx->process_functional_replay_override_begin(entry_slot, config) ? 0 : -1;
+}
+
+int32_t llama_process_functional_replay_override_end(
+        llama_context * ctx,
+        int32_t entry_slot) {
+    return ctx && ctx->process_functional_replay_override_end(entry_slot) ? 0 : -1;
+}
+
+int32_t llama_process_functional_get_last_differential_update(
+        const llama_context * ctx,
+        int32_t entry_slot,
+        llama_functional_lora_differential_update * out_update) {
+    return ctx && ctx->process_functional_get_last_differential_update(entry_slot, out_update) ? 0 : -1;
+}
+
+int32_t llama_process_functional_apply_differential_update(
+        llama_context * ctx,
+        int32_t entry_slot,
+        int32_t proposal_family,
+        int32_t replay_mode,
+        int32_t snapshot_slot,
+        float signed_score_delta,
+        float magnitude,
+        float robustness_score) {
+    return ctx && ctx->process_functional_apply_differential_update(
+            entry_slot,
+            proposal_family,
+            replay_mode,
+            snapshot_slot,
+            signed_score_delta,
+            magnitude,
+            robustness_score) ? 0 : -1;
+}
+
+size_t llama_process_functional_entry_blob_size(
+        const llama_context * ctx,
+        int32_t index) {
+    return ctx ? ctx->process_functional_entry_blob_size(index) : 0;
+}
+
+int32_t llama_process_functional_entry_blob_export(
+        const llama_context * ctx,
+        int32_t index,
+        void * dst,
+        size_t size) {
+    return ctx && ctx->process_functional_entry_blob_export(index, dst, size) ? 0 : -1;
+}
+
+int32_t llama_process_functional_entry_blob_import(
+        llama_context * ctx,
+        int32_t index,
+        llama_process_functional_entry_info info,
+        const void * src,
+        size_t size) {
+    return ctx && ctx->process_functional_entry_blob_import(index, info, src, size) ? 0 : -1;
+}
+
+size_t llama_process_functional_snapshot_blob_size(
+        const llama_context * ctx,
+        int32_t entry_slot,
+        int32_t snapshot_slot) {
+    return ctx ? ctx->process_functional_snapshot_blob_size(entry_slot, snapshot_slot) : 0;
+}
+
+int32_t llama_process_functional_snapshot_blob_export(
+        const llama_context * ctx,
+        int32_t entry_slot,
+        int32_t snapshot_slot,
+        void * dst,
+        size_t size) {
+    return ctx && ctx->process_functional_snapshot_blob_export(entry_slot, snapshot_slot, dst, size) ? 0 : -1;
+}
+
+int32_t llama_process_functional_snapshot_blob_import(
+        llama_context * ctx,
+        int32_t entry_slot,
+        int32_t snapshot_slot,
+        llama_functional_lora_snapshot_info info,
+        const void * src,
+        size_t size) {
+    return ctx && ctx->process_functional_snapshot_blob_import(entry_slot, snapshot_slot, info, src, size) ? 0 : -1;
+}
+
+int32_t llama_process_functional_snapshot_maintain(
+        llama_context * ctx,
+        uint64_t now_us) {
+    return ctx && ctx->process_functional_snapshot_maintain(now_us) ? 0 : -1;
 }
 
 int32_t llama_active_temporal_encoding_bias_get(

@@ -39,6 +39,8 @@ int32_t llama_adapter_lora_layer_precedence(llama_adapter_lora_layer_role role) 
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_COUNTERFACTUAL:   return 170;
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_MEMORY_COMPRESSION:return 180;
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_SELF_OBSERVATION: return 190;
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_PROCESS_LEARNED:  return 195;
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_PROCESS_BOOTSTRAP:return 196;
         default:                                    return 1000;
     }
 }
@@ -58,6 +60,8 @@ const char * llama_adapter_lora_layer_role_name(llama_adapter_lora_layer_role ro
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_COUNTERFACTUAL:   return "functional_counterfactual";
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_MEMORY_COMPRESSION:return "functional_memory_compression";
         case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_SELF_OBSERVATION: return "functional_self_observation";
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_PROCESS_LEARNED:  return "functional_process_learned";
+        case LLAMA_ADAPTER_LORA_LAYER_FUNCTIONAL_PROCESS_BOOTSTRAP:return "functional_process_bootstrap";
         default:                                    return "unknown";
     }
 }

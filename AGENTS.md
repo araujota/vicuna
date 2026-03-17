@@ -41,3 +41,10 @@ For build and development guidance, start with:
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [docs/build.md](docs/build.md)
 - [tools/server/README-dev.md](tools/server/README-dev.md)
+
+## Active Technologies
+- C++17 with the existing `llama.cpp`/Vicuña runtime and C API surfaces + Existing Active LoRA manager, cognitive loop runtime, self-state and server serialization surfaces (044-process-functional-lora)
+- In-memory runtime bank plus existing server export/import and typed state surfaces (044-process-functional-lora)
+
+## Recent Changes
+- 044-process-functional-lora: Added C++17 with the existing `llama.cpp`/Vicuña runtime and C API surfaces + Existing Active LoRA manager, cognitive loop runtime, self-state and server serialization surfaces

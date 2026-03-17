@@ -512,11 +512,14 @@ struct server_task_result_metrics : server_task_result {
     int64_t t_start;
     int64_t runtime_last_persist_ms = 0;
     int64_t runtime_last_restore_ms = 0;
+    int64_t provenance_last_append_ms = 0;
     int64_t proactive_last_publish_ms = 0;
     bool runtime_persistence_enabled = false;
     bool runtime_persistence_healthy = true;
     bool runtime_restore_attempted = false;
     bool runtime_restore_success = false;
+    bool provenance_enabled = false;
+    bool provenance_healthy = true;
     bool proactive_live_stream_connected = false;
 
     // TODO: somehow reuse server_metrics in the future, instead of duplicating the fields
@@ -547,6 +550,23 @@ struct server_task_result_metrics : server_task_result {
     uint64_t proactive_dropped_total = 0;
     uint64_t runtime_persist_success_total = 0;
     uint64_t runtime_persist_fail_total = 0;
+    uint64_t provenance_append_total = 0;
+    uint64_t provenance_append_fail_total = 0;
+    uint64_t provenance_active_loop_total = 0;
+    uint64_t provenance_tool_result_total = 0;
+    uint64_t provenance_dmn_total = 0;
+    uint64_t provenance_discovered_increase_total = 0;
+    uint64_t provenance_permanent_increase_total = 0;
+    uint64_t provenance_allostatic_increase_total = 0;
+    uint64_t provenance_functional_update_total = 0;
+    uint64_t provenance_process_update_total = 0;
+    int32_t provenance_self_state_active_count = 0;
+    int32_t provenance_self_state_discovered_count = 0;
+    int32_t provenance_self_state_permanent_count = 0;
+    int32_t provenance_self_state_allostatic_count = 0;
+    float provenance_self_state_allostatic_divergence = 0.0f;
+    float provenance_self_state_promotion_readiness = 0.0f;
+    float provenance_self_state_belief_pressure = 0.0f;
 
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result

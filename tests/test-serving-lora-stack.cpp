@@ -10,6 +10,16 @@
 #include <memory>
 #include <vector>
 
+static std::vector<llama_token> tokenize_or_die(const llama_vocab * vocab, const std::string & text) {
+    const int count = -llama_tokenize(vocab, text.c_str(), text.size(), nullptr, 0, true, true);
+    std::vector<llama_token> tokens(count);
+    if (llama_tokenize(vocab, text.c_str(), text.size(), tokens.data(), tokens.size(), true, true) < 0) {
+        std::fprintf(stderr, "failed to tokenize serving-lora prompt\n");
+        std::exit(1);
+    }
+    return tokens;
+}
+
 static ggml_tensor * pick_request_target(const llama_model * model) {
     for (const auto & entry : model->tensors_by_name) {
         ggml_tensor * tensor = entry.second;
@@ -60,6 +70,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to load model\n");
         return 1;
     }
+    const llama_vocab * vocab = llama_model_get_vocab(model.get());
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = 128;
@@ -70,6 +81,13 @@ int main(int argc, char ** argv) {
             llama_free);
     if (!ctx) {
         fprintf(stderr, "failed to create context\n");
+        return 1;
+    }
+    std::unique_ptr<llama_context, decltype(&llama_free)> ctx_import(
+            llama_init_from_model(model.get(), cparams),
+            llama_free);
+    if (!ctx_import) {
+        fprintf(stderr, "failed to create import context\n");
         return 1;
     }
 
@@ -84,6 +102,10 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to initialize Active LoRA\n");
         return 1;
     }
+    if (llama_active_lora_init(ctx_import.get(), active) != 0) {
+        fprintf(stderr, "failed to initialize Active LoRA for import context\n");
+        return 1;
+    }
 
     llama_past_lora_params past = llama_past_lora_default_params();
     past.enabled = true;
@@ -96,6 +118,10 @@ int main(int argc, char ** argv) {
 
     if (llama_past_lora_init(ctx.get(), past) != 0) {
         fprintf(stderr, "failed to initialize past LoRA stack\n");
+        return 1;
+    }
+    if (llama_past_lora_init(ctx_import.get(), past) != 0) {
+        fprintf(stderr, "failed to initialize past LoRA stack for import context\n");
         return 1;
     }
 
@@ -187,6 +213,160 @@ int main(int argc, char ** argv) {
         !ctx->functional_lora_activate(inactive) ||
         llama_serving_lora_stack_count(ctx.get()) != baseline_stack_count) {
         fprintf(stderr, "orthogonal functional replay changed serving stack cardinality\n");
+        return 1;
+    }
+
+    llama_process_functional_signature process_signature = {};
+    process_signature.valid = true;
+    process_signature.signature_hash = 0x1234ULL;
+    process_signature.scope_kind = LLAMA_PROCESS_FUNCTIONAL_SCOPE_PROCESS_STEP;
+    process_signature.family = LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
+    process_signature.loop_origin = LLAMA_COG_COMMAND_ORIGIN_DMN;
+    process_signature.microphase = LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE;
+    process_signature.plan_mode = LLAMA_COG_PLAN_MODE_COMPOSITION;
+    process_signature.plan_step_kind = LLAMA_COG_PLAN_STEP_OBSERVE_TOOL;
+    process_signature.tool_kind = LLAMA_TOOL_KIND_BASH_CLI;
+    process_signature.source_family = LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
+    process_signature.requires_tool_result = true;
+    process_signature.transient_plan_id = 7;
+    process_signature.transient_step_index = 1;
+    process_signature.transient_source_id = 11;
+    std::snprintf(process_signature.tool_name, sizeof(process_signature.tool_name), "%s", "bash-cli");
+    std::snprintf(process_signature.semantic_key, sizeof(process_signature.semantic_key), "%s", "dmn/counterfactual_compare/step_kind:4/tool:bash-cli");
+    if (!ctx->process_functional_set_execution(process_signature)) {
+        fprintf(stderr, "failed to seed process-functional execution signature\n");
+        return 1;
+    }
+
+    const std::vector<llama_token> process_tokens = tokenize_or_die(vocab, "process specialization weak outcome");
+    const llama_self_state_event process_event = {
+        /*.tokens =*/ process_tokens.data(),
+        /*.n_tokens =*/ process_tokens.size(),
+        /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
+        /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
+        /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
+        /*.decoder_entropy =*/ 0.0f,
+        /*.decoder_top_margin =*/ 1.0f,
+    };
+    const llama_functional_outcome_snapshot before = {
+        /*.favorable_divergence =*/ 0.8f,
+        /*.user_satisfaction_risk =*/ 0.3f,
+        /*.goal_progress_pressure =*/ 0.4f,
+        /*.loop_inefficiency =*/ 0.5f,
+        /*.recovery_urgency =*/ 0.2f,
+        /*.answerability =*/ 0.5f,
+        /*.preference_uncertainty =*/ 0.4f,
+        /*.expected_steps_remaining =*/ 0.6f,
+        /*.expected_inference_cost_remaining =*/ 0.5f,
+    };
+    const llama_functional_outcome_snapshot after = before;
+    const float metrics[] = { -0.2f, 0.0f, 0.0f };
+    for (int i = 0; i < 6; ++i) {
+        if (!ctx->functional_lora_apply_update(
+                    LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION,
+                    LLAMA_COG_COMMAND_ORIGIN_DMN,
+                    LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_GENERATE,
+                    LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE,
+                    before,
+                    after,
+                    LLAMA_TOOL_KIND_BASH_CLI,
+                    1,
+                    metrics,
+                    sizeof(metrics)/sizeof(metrics[0]),
+                    -0.2f,
+                    0.6f,
+                    process_event,
+                    nullptr)) {
+            fprintf(stderr, "failed to accumulate process-functional update evidence\n");
+            return 1;
+        }
+    }
+
+    llama_process_functional_entry_info process_entry = {};
+    if (llama_process_functional_entry_count(ctx.get()) < 1 ||
+        llama_process_functional_entry_get(ctx.get(), 0, &process_entry) != 0 ||
+        !process_entry.valid ||
+        process_entry.signature.signature_hash != process_signature.signature_hash) {
+        fprintf(stderr, "process-functional entry was not created after repeated weak outcomes\n");
+        return 1;
+    }
+
+    if (llama_process_functional_snapshot_maintain(ctx.get(), 1) != 0 ||
+        llama_process_functional_snapshot_maintain(ctx.get(), one_week_us + 1) != 0) {
+        fprintf(stderr, "failed to run process-functional snapshot maintenance\n");
+        return 1;
+    }
+
+    llama_functional_snapshot_maintenance_trace process_maintenance = {};
+    if (llama_process_functional_get_last_snapshot_maintenance(ctx.get(), &process_maintenance) != 0 ||
+        !process_maintenance.ran ||
+        !process_maintenance.captured_any ||
+        process_maintenance.captured_count != 1) {
+        fprintf(stderr, "unexpected process-functional snapshot maintenance trace\n");
+        return 1;
+    }
+
+    llama_functional_lora_snapshot_archive process_archive = {};
+    llama_functional_lora_snapshot_info process_snapshot = {};
+    if (llama_process_functional_snapshot_archive_get(ctx.get(), process_entry.slot, &process_archive) != 0 ||
+        llama_process_functional_snapshot_info_get(ctx.get(), process_entry.slot, 0, &process_snapshot) != 0 ||
+        process_archive.count != 1 ||
+        process_archive.family != LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ||
+        process_archive.last_capture_us != one_week_us + 1 ||
+        process_archive.next_capture_due_us <= process_archive.last_capture_us ||
+        !process_snapshot.valid) {
+        fprintf(stderr, "unexpected process-functional snapshot archive contents\n");
+        return 1;
+    }
+
+    const size_t process_entry_blob_size = llama_process_functional_entry_blob_size(ctx.get(), process_entry.slot);
+    const size_t process_snapshot_blob_size = llama_process_functional_snapshot_blob_size(ctx.get(), process_entry.slot, 0);
+    std::vector<uint8_t> process_entry_blob(process_entry_blob_size);
+    std::vector<uint8_t> process_snapshot_blob(process_snapshot_blob_size);
+    if (process_entry_blob_size == 0 ||
+        process_snapshot_blob_size == 0 ||
+        llama_process_functional_entry_blob_export(ctx.get(), process_entry.slot, process_entry_blob.data(), process_entry_blob.size()) != 0 ||
+        llama_process_functional_snapshot_blob_export(ctx.get(), process_entry.slot, 0, process_snapshot_blob.data(), process_snapshot_blob.size()) != 0 ||
+        llama_process_functional_entry_blob_import(ctx_import.get(), process_entry.slot, process_entry, process_entry_blob.data(), process_entry_blob.size()) != 0 ||
+        llama_process_functional_snapshot_blob_import(ctx_import.get(), process_entry.slot, 0, process_snapshot, process_snapshot_blob.data(), process_snapshot_blob.size()) != 0) {
+        fprintf(stderr, "failed to roundtrip process-functional snapshot archive blobs\n");
+        return 1;
+    }
+
+    llama_functional_lora_snapshot_archive imported_process_archive = {};
+    llama_functional_lora_snapshot_info imported_process_snapshot = {};
+    if (llama_process_functional_snapshot_archive_get(ctx_import.get(), process_entry.slot, &imported_process_archive) != 0 ||
+        llama_process_functional_snapshot_info_get(ctx_import.get(), process_entry.slot, 0, &imported_process_snapshot) != 0 ||
+        imported_process_archive.count != 1 ||
+        !imported_process_snapshot.valid ||
+        imported_process_snapshot.snapshot_id != process_snapshot.snapshot_id ||
+        imported_process_snapshot.captured_at_us != process_snapshot.captured_at_us) {
+        fprintf(stderr, "process-functional snapshot import did not restore metadata\n");
+        return 1;
+    }
+
+    if (!ctx->process_functional_set_execution(process_signature) ||
+        !ctx->functional_lora_activate(decision) ||
+        llama_serving_lora_stack_count(ctx.get()) != baseline_stack_count + 2 ||
+        !expect_layer(ctx.get(), baseline_stack_count, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_PROCESS_LEARNED, 0.0f) ||
+        !expect_layer(ctx.get(), baseline_stack_count + 1, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_PROCESS_BOOTSTRAP)) {
+        fprintf(stderr, "process-functional adapters were not attached for the matching process\n");
+        return 1;
+    }
+
+    llama_process_functional_trace process_trace = {};
+    if (llama_process_functional_get_last_trace(ctx.get(), &process_trace) != 0 ||
+        !process_trace.valid ||
+        !process_trace.activation_attached ||
+        !process_trace.matched_existing_entry) {
+        fprintf(stderr, "process-functional trace did not expose matching activation\n");
+        return 1;
+    }
+
+    if (!ctx->process_functional_set_execution(llama_process_functional_signature {}) ||
+        !ctx->functional_lora_activate(inactive) ||
+        llama_serving_lora_stack_count(ctx.get()) != baseline_stack_count) {
+        fprintf(stderr, "clearing process-functional execution did not remove process layers\n");
         return 1;
     }
 
