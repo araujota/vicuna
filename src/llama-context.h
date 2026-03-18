@@ -139,8 +139,41 @@ struct llama_context {
     bool functional_lora_family_state_get(int32_t family, llama_functional_lora_family_state * out_state) const;
     bool functional_lora_get_last_trace(llama_functional_lora_trace * out_trace) const;
     bool functional_lora_get_last_update(int32_t family, llama_functional_lora_update_info * out_update) const;
+    bool functional_lora_snapshot_archive_get(int32_t family, llama_functional_lora_snapshot_archive * out_archive) const;
+    bool functional_lora_snapshot_info_get(int32_t family, int32_t slot, llama_functional_lora_snapshot_info * out_info) const;
+    bool functional_lora_get_last_snapshot_maintenance(llama_functional_snapshot_maintenance_trace * out_trace) const;
     bool functional_lora_set_ablation(const llama_functional_lora_ablation_config & config);
     bool functional_lora_get_ablation(llama_functional_lora_ablation_config * out_config) const;
+    bool functional_lora_replay_override_begin(const llama_functional_lora_replay_override & config);
+    bool functional_lora_replay_override_end(int32_t family);
+    bool functional_lora_get_last_differential_update(int32_t family, llama_functional_lora_differential_update * out_update) const;
+    size_t functional_lora_snapshot_blob_size(int32_t family, int32_t slot) const;
+    bool functional_lora_snapshot_blob_export(int32_t family, int32_t slot, void * dst, size_t size) const;
+    bool functional_lora_snapshot_blob_import(int32_t family, int32_t slot, const llama_functional_lora_snapshot_info & info, const void * src, size_t size);
+    bool functional_lora_snapshot_maintain(uint64_t now_us);
+    bool process_functional_get_params(llama_process_functional_params * out_params) const;
+    bool process_functional_set_params(const llama_process_functional_params & params);
+    int32_t process_functional_entry_count() const;
+    bool process_functional_entry_get(int32_t index, llama_process_functional_entry_info * out_info) const;
+    int32_t process_functional_ledger_count() const;
+    bool process_functional_ledger_get(int32_t index, llama_process_functional_ledger_info * out_info) const;
+    bool process_functional_get_last_trace(llama_process_functional_trace * out_trace) const;
+    bool process_functional_get_current_signature(llama_process_functional_signature * out_signature) const;
+    bool process_functional_snapshot_archive_get(int32_t entry_slot, llama_functional_lora_snapshot_archive * out_archive) const;
+    bool process_functional_snapshot_info_get(int32_t entry_slot, int32_t snapshot_slot, llama_functional_lora_snapshot_info * out_info) const;
+    bool process_functional_get_last_snapshot_maintenance(llama_functional_snapshot_maintenance_trace * out_trace) const;
+    bool process_functional_replay_override_begin(int32_t entry_slot, const llama_functional_lora_replay_override & config);
+    bool process_functional_replay_override_end(int32_t entry_slot);
+    bool process_functional_get_last_differential_update(int32_t entry_slot, llama_functional_lora_differential_update * out_update) const;
+    bool process_functional_apply_differential_update(int32_t entry_slot, int32_t proposal_family, int32_t replay_mode, int32_t snapshot_slot, float signed_score_delta, float magnitude, float robustness_score);
+    size_t process_functional_entry_blob_size(int32_t index) const;
+    bool process_functional_entry_blob_export(int32_t index, void * dst, size_t size) const;
+    bool process_functional_entry_blob_import(int32_t index, const llama_process_functional_entry_info & info, const void * src, size_t size);
+    size_t process_functional_snapshot_blob_size(int32_t entry_slot, int32_t snapshot_slot) const;
+    bool process_functional_snapshot_blob_export(int32_t entry_slot, int32_t snapshot_slot, void * dst, size_t size) const;
+    bool process_functional_snapshot_blob_import(int32_t entry_slot, int32_t snapshot_slot, const llama_functional_lora_snapshot_info & info, const void * src, size_t size);
+    bool process_functional_snapshot_maintain(uint64_t now_us);
+    bool process_functional_set_execution(const llama_process_functional_signature & signature);
     bool active_temporal_encoding_bias_get(llama_active_temporal_encoding_bias * out_bias) const;
     bool active_temporal_encoding_bias_apply(float signed_advantage, float efficiency_advantage, int64_t monotonic_ms);
     bool functional_lora_predict_activation(
@@ -164,6 +197,14 @@ struct llama_context {
             float magnitude,
             const llama_self_state_event & event,
             const llama_self_state_feature_vector * features);
+    bool functional_lora_apply_differential_update(
+            int32_t family,
+            int32_t proposal_family,
+            int32_t replay_mode,
+            int32_t snapshot_slot,
+            float signed_score_delta,
+            float magnitude,
+            float robustness_score);
     bool self_state_refresh_time();
     bool self_state_set_time(const llama_self_state_time_point & time_point);
     bool self_state_get_datetime(llama_self_state_datetime * out_info) const;

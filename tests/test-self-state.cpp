@@ -25,6 +25,29 @@ static std::vector<llama_token> tokenize_or_die(const llama_vocab * vocab, const
     return tokens;
 }
 
+static bool find_model_extension_by_key(
+        llama_context * ctx,
+        const std::string & key,
+        llama_self_model_extension_info * out_info) {
+    if (!ctx || !out_info) {
+        return false;
+    }
+
+    const int32_t count = llama_self_state_model_extension_count(ctx);
+    for (int32_t i = 0; i < count; ++i) {
+        llama_self_model_extension_info info = {};
+        if (llama_self_state_get_model_extension(ctx, i, &info) != 0) {
+            continue;
+        }
+        if (std::string(info.key) == key) {
+            *out_info = info;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool contradiction_head_callback(
         const llama_self_state_feature_vector * features,
         float * out_score,
@@ -184,6 +207,138 @@ struct mock_supermemory_server {
         }
     }
 };
+
+static bool verify_runtime_persistence_surfaces(
+        llama_context * ctx,
+        llama_model * model,
+        const llama_context_params & cparams,
+        const llama_self_updater_program & program,
+        int32_t expected_trace_count) {
+    llama_self_model_extension_update persisted_extension = llama_self_model_extension_default_update();
+    persisted_extension.source = LLAMA_SELF_MODEL_EXTENSION_SOURCE_EVENT_FEEDBACK;
+    persisted_extension.kind = LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM;
+    persisted_extension.domain = LLAMA_SELF_MODEL_EXTENSION_DOMAIN_RECOVERY;
+    persisted_extension.lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC;
+    persisted_extension.flags = LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE |
+            LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED |
+            LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_GAIN |
+            LLAMA_SELF_MODEL_EXTENSION_FLAG_HAS_DESIRED_STATE |
+            LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS;
+    persisted_extension.support_count = 4;
+    persisted_extension.value = 0.72f;
+    persisted_extension.desired_value = 0.85f;
+    persisted_extension.desired_value_min = 0.80f;
+    persisted_extension.desired_value_max = 0.90f;
+    persisted_extension.confidence = 0.81f;
+    persisted_extension.salience = 0.66f;
+    persisted_extension.gain_weight = 0.40f;
+    persisted_extension.allostatic_weight = 0.76f;
+    persisted_extension.surprise_score = 0.61f;
+    persisted_extension.relevance_score = 0.73f;
+    persisted_extension.admission_score = 0.69f;
+    persisted_extension.permanence_score = 0.88f;
+    persisted_extension.stability_score = 0.83f;
+    persisted_extension.allostatic_eligibility = 0.91f;
+    std::snprintf(persisted_extension.key, sizeof(persisted_extension.key), "%s", "persistence.discovered_register");
+    std::snprintf(persisted_extension.label, sizeof(persisted_extension.label), "%s", "Discovered persistence register");
+    std::snprintf(persisted_extension.content, sizeof(persisted_extension.content), "%s", "Recovered from runtime snapshot");
+
+    llama_self_updater_program persisted_program = program;
+    persisted_program.repair_emit_threshold += 0.05f;
+    persisted_program.repair_admission_floor += 0.02f;
+
+    llama_bash_tool_config persisted_bash = llama_bash_tool_default_config();
+    persisted_bash.enabled = true;
+    persisted_bash.reject_shell_metacharacters = true;
+    persisted_bash.cpu_time_limit_secs = 4;
+    persisted_bash.max_child_processes = 4;
+    persisted_bash.max_open_files = 24;
+    persisted_bash.max_file_size_bytes = 4096;
+    std::snprintf(persisted_bash.allowed_commands, sizeof(persisted_bash.allowed_commands), "%s", "pwd,rg");
+    std::snprintf(persisted_bash.blocked_patterns, sizeof(persisted_bash.blocked_patterns), "%s", "rm -rf,:(){:|:&};:");
+
+    llama_hard_memory_config persisted_hard_memory = llama_hard_memory_default_config();
+    persisted_hard_memory.enabled = true;
+    persisted_hard_memory.timeout_ms = 4321;
+    persisted_hard_memory.max_results = 3;
+    persisted_hard_memory.query_threshold = 0.42f;
+    std::snprintf(persisted_hard_memory.base_url, sizeof(persisted_hard_memory.base_url), "%s", "http://127.0.0.1:9999");
+    std::snprintf(persisted_hard_memory.auth_token, sizeof(persisted_hard_memory.auth_token), "%s", "persist-token");
+    std::snprintf(persisted_hard_memory.container_tag, sizeof(persisted_hard_memory.container_tag), "%s", "persist-container");
+    std::snprintf(persisted_hard_memory.runtime_identity, sizeof(persisted_hard_memory.runtime_identity), "%s", "persist-runtime");
+
+    if (llama_self_state_set_updater_program(ctx, persisted_program) != 0 ||
+        llama_self_state_upsert_model_extension(ctx, persisted_extension) != 0 ||
+        llama_bash_tool_configure(ctx, &persisted_bash) != 0 ||
+        llama_hard_memory_configure(ctx, persisted_hard_memory) != 0) {
+        std::fprintf(stderr, "failed to seed runtime persistence surfaces\n");
+        return false;
+    }
+
+    const size_t persisted_trace_size = llama_self_state_trace_export_size(ctx);
+    std::vector<uint8_t> persisted_trace(persisted_trace_size);
+    if (persisted_trace_size == 0 ||
+        llama_self_state_trace_export(ctx, persisted_trace.data(), persisted_trace.size()) != 0) {
+        std::fprintf(stderr, "failed to export persisted trace\n");
+        return false;
+    }
+
+    llama_context * restored_ctx = llama_init_from_model(model, cparams);
+    if (!restored_ctx) {
+        std::fprintf(stderr, "failed to create restored runtime context\n");
+        return false;
+    }
+
+    if (llama_self_state_set_updater_program(restored_ctx, persisted_program) != 0 ||
+        llama_bash_tool_configure(restored_ctx, &persisted_bash) != 0 ||
+        llama_hard_memory_configure(restored_ctx, persisted_hard_memory) != 0 ||
+        llama_self_state_trace_import(restored_ctx, persisted_trace.data(), persisted_trace.size(), true) != 0 ||
+        llama_self_state_replay_trace(restored_ctx, -1) != 0 ||
+        llama_self_state_upsert_model_extension(restored_ctx, persisted_extension) != 0) {
+        std::fprintf(stderr, "failed to replay runtime persistence snapshot\n");
+        llama_free(restored_ctx);
+        return false;
+    }
+
+    llama_self_updater_program restored_program = {};
+    llama_bash_tool_config restored_bash = {};
+    llama_hard_memory_config restored_hard_memory = {};
+    llama_self_model_extension_info restored_extension = {};
+    const int32_t expected_restored_extension_count = llama_self_state_model_extension_count(ctx);
+    const bool restored_ok =
+            llama_self_state_get_updater_program(restored_ctx, &restored_program) == 0 &&
+            llama_bash_tool_get_config(restored_ctx, &restored_bash) == 0 &&
+            llama_hard_memory_get_config(restored_ctx, &restored_hard_memory) == 0 &&
+            llama_self_state_model_extension_count(restored_ctx) == expected_restored_extension_count &&
+            find_model_extension_by_key(restored_ctx, "persistence.discovered_register", &restored_extension) &&
+            restored_program.repair_emit_threshold == persisted_program.repair_emit_threshold &&
+            restored_program.repair_admission_floor == persisted_program.repair_admission_floor &&
+            restored_bash.enabled &&
+            restored_bash.reject_shell_metacharacters &&
+            restored_bash.cpu_time_limit_secs == persisted_bash.cpu_time_limit_secs &&
+            std::string(restored_bash.allowed_commands) == "pwd,rg" &&
+            restored_hard_memory.enabled &&
+            restored_hard_memory.timeout_ms == persisted_hard_memory.timeout_ms &&
+            restored_hard_memory.max_results == persisted_hard_memory.max_results &&
+            std::string(restored_hard_memory.container_tag) == "persist-container" &&
+            std::string(restored_extension.key) == "persistence.discovered_register" &&
+            (restored_extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) != 0 &&
+            restored_extension.lifecycle_stage == LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC &&
+            restored_extension.support_count == 4 &&
+            restored_extension.desired_value_min >= 0.79f &&
+            restored_extension.desired_value_max >= 0.89f &&
+            restored_extension.permanence_score >= 0.87f &&
+            restored_extension.allostatic_eligibility >= 0.90f &&
+            llama_self_state_trace_count(restored_ctx) == expected_trace_count;
+    if (!restored_ok) {
+        std::fprintf(stderr, "runtime persistence surfaces did not survive snapshot replay\n");
+        llama_free(restored_ctx);
+        return false;
+    }
+
+    llama_free(restored_ctx);
+    return true;
+}
 
 int main(int argc, char ** argv) {
     char * model_path = get_model_or_exit(argc, argv);
@@ -571,6 +726,33 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const std::vector<llama_token> discovered_tokens = tokenize_or_die(
+            vocab,
+            "I am still unsure the strict memory runtime implementation is correct because the latest result contradicts the current repair path and the answer looks wrong.");
+    llama_self_state_event discovered_event = {
+        /*.tokens =*/ discovered_tokens.data(),
+        /*.n_tokens =*/ discovered_tokens.size(),
+        /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+        /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+        /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
+        /*.decoder_entropy =*/ 2.8f,
+        /*.decoder_top_margin =*/ 0.08f,
+    };
+    llama_self_state_feature_vector discovered_prewrite = {};
+    llama_self_state_feature_vector discovered_postwrite = {};
+    if (llama_self_state_build_prewrite_features(ctx, &discovered_event, &discovered_prewrite) != 0 ||
+        discovered_prewrite.goal_top_similarity <= 0.05f ||
+        discovered_prewrite.uncertainty_score <= 0.0f ||
+        discovered_prewrite.contradiction_score <= 0.0f ||
+        llama_self_state_apply_prewrite(ctx, &discovered_event, &discovered_prewrite) != 0 ||
+        llama_self_state_build_postwrite_features(ctx, &discovered_event, &discovered_postwrite) != 0 ||
+        llama_self_state_apply_postwrite(ctx, &discovered_event, &discovered_postwrite) != 0) {
+        std::fprintf(stderr, "failed to apply discovered-state stress event\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
     llama_self_social_state_info social_state = {};
     if (llama_self_state_get_social_state(ctx, &social_state) != 0 ||
         social_state.familiarity <= 0.0f ||
@@ -606,8 +788,48 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (llama_self_state_model_extension_count(ctx) != 0) {
-        std::fprintf(stderr, "unexpected default self-model extension count\n");
+    const int32_t baseline_extension_count = llama_self_state_model_extension_count(ctx);
+    if (baseline_extension_count <= 0 ||
+        model_state.extension_summary.discovered_count <= 0 ||
+        model_state.extension_summary.transient_count <= 0 ||
+        model_state.extension_summary.mean_admission <= 0.0f ||
+        model_state.extension_summary.context_activation <= 0.0f) {
+        std::fprintf(stderr, "discovered-state admission did not populate the lifecycle registry\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    llama_self_model_extension_info discovered_context = {};
+    bool found_discovered_context = false;
+    llama_self_model_extension_info discovered_scalar = {};
+    bool found_discovered_scalar = false;
+    for (int32_t i = 0; i < baseline_extension_count; ++i) {
+        llama_self_model_extension_info info = {};
+        if (llama_self_state_get_model_extension(ctx, i, &info) != 0) {
+            continue;
+        }
+        if (!found_discovered_context &&
+            info.source == LLAMA_SELF_MODEL_EXTENSION_SOURCE_EVENT_FEEDBACK &&
+            info.kind == LLAMA_SELF_MODEL_EXTENSION_MEMORY_CONTEXT &&
+            (info.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) != 0) {
+            discovered_context = info;
+            found_discovered_context = true;
+        }
+        if (!found_discovered_scalar &&
+            info.source == LLAMA_SELF_MODEL_EXTENSION_SOURCE_EVENT_FEEDBACK &&
+            info.kind == LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM &&
+            (info.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) != 0) {
+            discovered_scalar = info;
+            found_discovered_scalar = true;
+        }
+    }
+    if (!found_discovered_context ||
+        discovered_context.lifecycle_stage != LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT ||
+        discovered_context.admission_score < 0.52f ||
+        !found_discovered_scalar ||
+        discovered_scalar.support_count == 0) {
+        std::fprintf(stderr, "discovered-state lifecycle surfaces were not populated from primary feedback\n");
         llama_free(ctx);
         llama_model_free(model);
         return 1;
@@ -634,7 +856,7 @@ int main(int argc, char ** argv) {
     std::snprintf(tool_extension.content, sizeof(tool_extension.content), "%s", "CLI tool discovered whether the repository state is answerable.");
 
     if (llama_self_state_upsert_model_extension(ctx, tool_extension) != 0 ||
-        llama_self_state_model_extension_count(ctx) != 1) {
+        llama_self_state_model_extension_count(ctx) != baseline_extension_count + 1) {
         std::fprintf(stderr, "failed to upsert tool-authored self-model extension\n");
         llama_free(ctx);
         llama_model_free(model);
@@ -642,10 +864,11 @@ int main(int argc, char ** argv) {
     }
 
     llama_self_model_extension_info extension_info = {};
-    if (llama_self_state_get_model_extension(ctx, 0, &extension_info) != 0 ||
+    if (!find_model_extension_by_key(ctx, "bash.answerability", &extension_info) ||
         extension_info.source_tool_kind != LLAMA_TOOL_KIND_BASH_CLI ||
         extension_info.kind != LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM ||
         extension_info.domain != LLAMA_SELF_MODEL_EXTENSION_DOMAIN_EPISTEMIC ||
+        extension_info.lifecycle_stage != LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC ||
         extension_info.desired_value < 0.99f ||
         extension_info.value > 0.21f) {
         std::fprintf(stderr, "tool-authored self-model extension was not preserved\n");
@@ -655,9 +878,9 @@ int main(int argc, char ** argv) {
     }
 
     if (llama_self_state_get_model_state(ctx, &model_state) != 0 ||
-        model_state.extension_summary.active_count != 1 ||
-        model_state.extension_summary.gain_count != 1 ||
-        model_state.extension_summary.allostatic_count != 1 ||
+        model_state.extension_summary.active_count != baseline_extension_count + 1 ||
+        model_state.extension_summary.gain_count < 1 ||
+        model_state.extension_summary.allostatic_count < 1 ||
         model_state.extension_summary.allostatic_divergence <= 0.70f) {
         std::fprintf(stderr, "self-model extension summary did not reflect tool-authored allostatic state\n");
         llama_free(ctx);
@@ -666,7 +889,7 @@ int main(int argc, char ** argv) {
     }
 
     if (llama_self_state_remove_model_extension(ctx, "bash.answerability") != 0 ||
-        llama_self_state_model_extension_count(ctx) != 0) {
+        llama_self_state_model_extension_count(ctx) != baseline_extension_count) {
         std::fprintf(stderr, "failed to remove tool-authored self-model extension\n");
         llama_free(ctx);
         llama_model_free(model);
@@ -678,11 +901,37 @@ int main(int argc, char ** argv) {
         llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_RECOVERY_URGENCY, &register_info) != 0 ||
         llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_USER_DIRECTNESS_PREFERENCE, &register_info) != 0 ||
         register_info.scalar_value <= 0.0f ||
+        llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_DISCOVERED_STATE_LOAD, &register_info) != 0 ||
+        register_info.scalar_value <= 0.0f ||
+        llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_DISCOVERED_STATE_PERMANENCE, &register_info) != 0 ||
+        register_info.scalar_value <= 0.0f ||
+        llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_DISCOVERED_STATE_ALLOSTATIC_LOAD, &register_info) != 0 ||
+        register_info.scalar_value < 0.0f ||
         llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_USER_STRUCTURE_PREFERENCE, &register_info) != 0 ||
         register_info.scalar_value <= 0.0f ||
         llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_USER_AUTONOMY_PREFERENCE, &register_info) != 0 ||
         register_info.scalar_value <= 0.0f) {
         std::fprintf(stderr, "expanded summary registers were not addressable\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        if (llama_self_state_note_validated_progress(ctx, 0.85f, 0.70f) != 0) {
+            std::fprintf(stderr, "failed to apply validated progress for discovered-state consolidation\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+    }
+    if (!find_model_extension_by_key(ctx, discovered_scalar.key, &extension_info) ||
+        extension_info.lifecycle_stage != LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC ||
+        (extension_info.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS) == 0 ||
+        (extension_info.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_HAS_DESIRED_STATE) == 0 ||
+        extension_info.desired_value_max < extension_info.desired_value_min ||
+        extension_info.allostatic_eligibility < 0.70f) {
+        std::fprintf(stderr, "discovered scalar state did not consolidate into an allostatic objective\n");
         llama_free(ctx);
         llama_model_free(model);
         return 1;
@@ -989,117 +1238,10 @@ int main(int argc, char ** argv) {
         llama_free(compaction_ctx);
     }
 
-    {
-        llama_self_model_extension_update persisted_extension = llama_self_model_extension_default_update();
-        persisted_extension.source = LLAMA_SELF_MODEL_EXTENSION_SOURCE_TOOL_HARD_MEMORY;
-        persisted_extension.source_tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_QUERY;
-        persisted_extension.kind = LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM;
-        persisted_extension.domain = LLAMA_SELF_MODEL_EXTENSION_DOMAIN_EPISTEMIC;
-        persisted_extension.flags = LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE | LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED;
-        persisted_extension.value = 0.72f;
-        persisted_extension.desired_value = 0.85f;
-        persisted_extension.confidence = 0.81f;
-        persisted_extension.salience = 0.66f;
-        persisted_extension.gain_weight = 0.40f;
-        std::snprintf(persisted_extension.key, sizeof(persisted_extension.key), "%s", "persistence.discovered_register");
-        std::snprintf(persisted_extension.label, sizeof(persisted_extension.label), "%s", "Discovered persistence register");
-        std::snprintf(persisted_extension.content, sizeof(persisted_extension.content), "%s", "Recovered from runtime snapshot");
-
-        llama_self_updater_program persisted_program = program;
-        persisted_program.repair_emit_threshold += 0.05f;
-        persisted_program.repair_admission_floor += 0.02f;
-
-        llama_bash_tool_config persisted_bash = llama_bash_tool_default_config();
-        persisted_bash.enabled = true;
-        persisted_bash.reject_shell_metacharacters = true;
-        persisted_bash.cpu_time_limit_secs = 4;
-        persisted_bash.max_child_processes = 4;
-        persisted_bash.max_open_files = 24;
-        persisted_bash.max_file_size_bytes = 4096;
-        std::snprintf(persisted_bash.allowed_commands, sizeof(persisted_bash.allowed_commands), "%s", "pwd,rg");
-        std::snprintf(persisted_bash.blocked_patterns, sizeof(persisted_bash.blocked_patterns), "%s", "rm -rf,:(){:|:&};:");
-
-        llama_hard_memory_config persisted_hard_memory = llama_hard_memory_default_config();
-        persisted_hard_memory.enabled = true;
-        persisted_hard_memory.timeout_ms = 4321;
-        persisted_hard_memory.max_results = 3;
-        persisted_hard_memory.query_threshold = 0.42f;
-        std::snprintf(persisted_hard_memory.base_url, sizeof(persisted_hard_memory.base_url), "%s", "http://127.0.0.1:9999");
-        std::snprintf(persisted_hard_memory.auth_token, sizeof(persisted_hard_memory.auth_token), "%s", "persist-token");
-        std::snprintf(persisted_hard_memory.container_tag, sizeof(persisted_hard_memory.container_tag), "%s", "persist-container");
-        std::snprintf(persisted_hard_memory.runtime_identity, sizeof(persisted_hard_memory.runtime_identity), "%s", "persist-runtime");
-
-        if (llama_self_state_set_updater_program(ctx, persisted_program) != 0 ||
-            llama_self_state_upsert_model_extension(ctx, persisted_extension) != 0 ||
-            llama_bash_tool_configure(ctx, &persisted_bash) != 0 ||
-            llama_hard_memory_configure(ctx, persisted_hard_memory) != 0) {
-            std::fprintf(stderr, "failed to seed runtime persistence surfaces\n");
-            llama_free(ctx);
-            llama_model_free(model);
-            return 1;
-        }
-
-        const size_t persisted_trace_size = llama_self_state_trace_export_size(ctx);
-        std::vector<uint8_t> persisted_trace(persisted_trace_size);
-        if (persisted_trace_size == 0 ||
-            llama_self_state_trace_export(ctx, persisted_trace.data(), persisted_trace.size()) != 0) {
-            std::fprintf(stderr, "failed to export persisted trace\n");
-            llama_free(ctx);
-            llama_model_free(model);
-            return 1;
-        }
-
-        llama_context * restored_ctx = llama_init_from_model(model, cparams);
-        if (!restored_ctx) {
-            std::fprintf(stderr, "failed to create restored runtime context\n");
-            llama_free(ctx);
-            llama_model_free(model);
-            return 1;
-        }
-
-        if (llama_self_state_set_updater_program(restored_ctx, persisted_program) != 0 ||
-            llama_bash_tool_configure(restored_ctx, &persisted_bash) != 0 ||
-            llama_hard_memory_configure(restored_ctx, persisted_hard_memory) != 0 ||
-            llama_self_state_trace_import(restored_ctx, persisted_trace.data(), persisted_trace.size(), true) != 0 ||
-            llama_self_state_replay_trace(restored_ctx, -1) != 0 ||
-            llama_self_state_upsert_model_extension(restored_ctx, persisted_extension) != 0) {
-            std::fprintf(stderr, "failed to replay runtime persistence snapshot\n");
-            llama_free(restored_ctx);
-            llama_free(ctx);
-            llama_model_free(model);
-            return 1;
-        }
-
-        llama_self_updater_program restored_program = {};
-        llama_bash_tool_config restored_bash = {};
-        llama_hard_memory_config restored_hard_memory = {};
-        llama_self_model_extension_info restored_extension = {};
-        if (llama_self_state_get_updater_program(restored_ctx, &restored_program) != 0 ||
-            llama_bash_tool_get_config(restored_ctx, &restored_bash) != 0 ||
-            llama_hard_memory_get_config(restored_ctx, &restored_hard_memory) != 0 ||
-            llama_self_state_model_extension_count(restored_ctx) != 1 ||
-            llama_self_state_get_model_extension(restored_ctx, 0, &restored_extension) != 0 ||
-            restored_program.repair_emit_threshold != persisted_program.repair_emit_threshold ||
-            restored_program.repair_admission_floor != persisted_program.repair_admission_floor ||
-            !restored_bash.enabled ||
-            !restored_bash.reject_shell_metacharacters ||
-            restored_bash.cpu_time_limit_secs != persisted_bash.cpu_time_limit_secs ||
-            std::string(restored_bash.allowed_commands) != "pwd,rg" ||
-            !restored_hard_memory.enabled ||
-            restored_hard_memory.timeout_ms != persisted_hard_memory.timeout_ms ||
-            restored_hard_memory.max_results != persisted_hard_memory.max_results ||
-            std::string(restored_hard_memory.container_tag) != "persist-container" ||
-            std::string(restored_extension.key) != "persistence.discovered_register" ||
-            (restored_extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) == 0 ||
-            llama_self_state_trace_count(restored_ctx) != expected_trace_count) {
-            std::fprintf(stderr, "runtime persistence surfaces did not survive snapshot replay\n");
-            llama_free(restored_ctx);
-            llama_free(ctx);
-            llama_model_free(model);
-            return 1;
-        }
-
-        llama_free(restored_ctx);
+    if (!verify_runtime_persistence_surfaces(ctx, model, cparams, program, expected_trace_count)) {
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
     }
 
     {
@@ -1190,10 +1332,12 @@ int main(int argc, char ** argv) {
             !hard_memory_model_state.last_extension_trace.valid ||
             hard_memory_model_state.last_extension_trace.promoted_count <= 0 ||
             hard_memory_model_state.extension_summary.hard_memory_count <= 0 ||
+            hard_memory_model_state.extension_summary.discovered_count <= 0 ||
             hard_memory_model_state.extension_summary.allostatic_count != 0 ||
             hard_memory_model_state.extension_summary.context_activation <= 0.0f ||
             llama_self_state_get_model_extension(hard_memory_ctx, 0, &hard_memory_extension) != 0 ||
             hard_memory_extension.source_tool_kind != LLAMA_TOOL_KIND_HARD_MEMORY_QUERY ||
+            hard_memory_extension.lifecycle_stage != LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT ||
             (hard_memory_extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS) != 0) {
             std::fprintf(stderr, "hard-memory query did not promote bounded non-allostatic self-model extensions\n");
             llama_free(hard_memory_ctx);

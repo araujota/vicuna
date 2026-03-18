@@ -124,6 +124,83 @@ Accuracy guidance for tool integrations:
   structured finding in host code and upsert it explicitly
 - do not mark hard-memory-like retrieved facts as allostatic targets by default
 
+Runtime-created discovered state now follows an explicit lifecycle as well:
+
+- primary-channel admitted feedback can create transient discovered extensions
+  when surprise, relevance, and confidence cross the runtime admission floor
+- repeated corroboration and validated progress increase permanence rather than
+  immediately turning every discovery into durable state
+- only discovered scalar states can become allostatic, and only after the
+  runtime infers a bounded desired band from repeated favorable outcomes
+- hard-memory-derived contextual discoveries stay gain-only by default even when
+  they are promoted into the extension registry
+
+### Runtime Snapshot Persistence
+
+`server_context` runtime persistence now includes functional-bias replay
+archives in addition to self-state, updater policy, and tool configuration.
+
+- weekly functional LoRA snapshots are serialized into the runtime snapshot file
+  alongside per-slot metadata
+- the server restores those archives on startup so DMN historical replay can
+  substitute archived functional families immediately after recovery
+- archived functional replay remains substitution-only during counterfactual
+  evaluation; restored snapshots do not introduce extra serving-stack layers
+- process-functional adapter entries, including their stable semantic process
+  signatures and learned-plus-bootstrap weights, are serialized into the same
+  runtime snapshot so process-scoped specialization survives restart
+- process-functional snapshot archives are serialized and restored with the same
+  versioned snapshot/replay surface as shipped functional families, so archived
+  process history is available for DMN process-local/history/orthogonal replay
+  immediately after recovery
+
+### Unified Provenance Repository
+
+`llama-server` now supports one append-only structured provenance repository for
+self-improvement evaluation.
+
+- `VICUNA_PROVENANCE_ENABLED`: enable or disable provenance capture
+- `VICUNA_PROVENANCE_LOG_PATH`: optional explicit JSONL path
+- if provenance is enabled and no explicit path is provided, the server derives
+  the repository path from `VICUNA_RUNTIME_STATE_PATH` by appending
+  `.provenance.jsonl`
+
+The repository is intentionally local and low-overhead:
+
+- events are appended only at existing loop boundaries rather than on every
+  decode step
+- each line is one JSON object with explicit `schema_version`, `session_id`,
+  `sequence`, `timestamp_ms`, `event_kind`, `source`, and `payload`
+- payloads summarize typed runtime surfaces rather than copying human logs
+
+Current event kinds are:
+
+- `active_loop` for admitted active-loop episodes
+- `tool_result` for bash and hard-memory result integration, including
+  immediate host-side failures
+- `dmn_tick` for admitted DMN work, including counterfactual, governance, and
+  remediation summaries
+
+This repository is meant to answer direction-of-progress questions with one
+source of truth:
+
+- are discovered, permanent, and allostatic self-state counts increasing
+  productively
+- are counterfactual winners changing and getting applied
+- are functional and process-functional update counts rising in contexts that
+  matter
+- are tool-result integrations improving the self-model or leaving the system
+  flat
+
+Health and `/metrics` expose the same repository state online:
+
+- repository enabled / healthy
+- append totals and append failures
+- active-loop, tool-result, and DMN event totals
+- observed increases in discovered / permanent / allostatic self-state counts
+- latest self-state progress gauges such as allostatic divergence and promotion
+  readiness
+
 ### User-Model Capture Guidance
 
 Vicuña now distinguishes between durable user memory, bounded user-preference

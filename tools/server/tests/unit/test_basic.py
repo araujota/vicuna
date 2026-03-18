@@ -1,6 +1,7 @@
 import pytest
 import requests
 import time
+import json
 from utils import ServerPreset, match_regex
 
 server = ServerPreset.tinyllama2()
@@ -102,6 +103,62 @@ def test_runtime_snapshot_survives_restart(tmp_path):
         stop_when=lambda event_name, _: event_name == "response.completed",
     )
     assert events[-1][1]["response"]["output"][0]["content"][0]["text"] == "persisted proactive message"
+
+
+def test_unified_provenance_repository_records_self_improvement_events(tmp_path):
+    global server
+    snapshot_path = tmp_path / "runtime-state.json"
+    provenance_path = tmp_path / "runtime-provenance.jsonl"
+    server.server_metrics = True
+    server.api_surface = "openai"
+    server.extra_env = {
+        "VICUNA_RUNTIME_STATE_PATH": str(snapshot_path),
+        "VICUNA_PROVENANCE_ENABLED": "1",
+        "VICUNA_PROVENANCE_LOG_PATH": str(provenance_path),
+    }
+    server.start()
+    res = server.make_request("POST", "/v1/responses", data={
+        "model": server.model_alias,
+        "input": [
+            {"role": "user", "content": "Summarize your current plan in one sentence."},
+        ],
+        "max_output_tokens": 12,
+        "temperature": 0.0,
+    })
+    assert res.status_code == 200
+
+    lines = []
+    for _ in range(20):
+        if provenance_path.exists() and provenance_path.read_text().strip():
+            lines = [line for line in provenance_path.read_text().splitlines() if line.strip()]
+            if lines:
+                break
+        time.sleep(0.25)
+
+    assert lines
+    events = [json.loads(line) for line in lines]
+    assert any(event["event_kind"] == "active_loop" for event in events)
+    active_event = next(event for event in events if event["event_kind"] == "active_loop")
+    assert active_event["schema_version"] == 1
+    assert active_event["sequence"] >= 1
+    assert active_event["session_id"].startswith("prov_")
+    assert active_event["payload"]["self_model"]["extension_summary"]["active_count"] >= 0
+    assert "functional" in active_event["payload"]
+    assert "process_functional" in active_event["payload"]
+
+    health = server.make_request("GET", "/health")
+    assert health.status_code == 200
+    assert health.body["provenance_repository"]["enabled"] is True
+    assert health.body["provenance_repository"]["healthy"] is True
+    assert health.body["provenance_repository"]["path"] == str(provenance_path)
+    assert health.body["provenance_repository"]["append_total"] >= 1
+
+    metrics = server.make_request("GET", "/metrics")
+    assert metrics.status_code == 200
+    assert "llamacpp:provenance_append_total" in metrics.body
+    assert "llamacpp:provenance_active_loop_total" in metrics.body
+    assert "llamacpp:provenance_enabled" in metrics.body
+    assert "llamacpp:provenance_self_state_allostatic_divergence" in metrics.body
 
 
 def test_server_props():

@@ -642,6 +642,41 @@ struct vicuna_runtime_persistence_state {
     std::string last_error;
 };
 
+struct vicuna_progress_snapshot {
+    bool valid = false;
+    int32_t active_extensions = 0;
+    int32_t discovered_extensions = 0;
+    int32_t permanent_extensions = 0;
+    int32_t allostatic_extensions = 0;
+    float allostatic_divergence = 0.0f;
+    float promotion_readiness = 0.0f;
+    float belief_pressure = 0.0f;
+    uint64_t functional_update_total = 0;
+    uint64_t process_update_total = 0;
+};
+
+struct vicuna_provenance_repository_state {
+    bool enabled = false;
+    bool healthy = true;
+    uint64_t next_sequence = 1;
+    uint64_t append_total = 0;
+    uint64_t append_fail_total = 0;
+    uint64_t active_loop_total = 0;
+    uint64_t tool_result_total = 0;
+    uint64_t dmn_total = 0;
+    uint64_t discovered_increase_total = 0;
+    uint64_t permanent_increase_total = 0;
+    uint64_t allostatic_increase_total = 0;
+    uint64_t functional_update_observed_total = 0;
+    uint64_t process_update_observed_total = 0;
+    int64_t last_append_ms = 0;
+    std::string path;
+    std::string session_id;
+    std::string last_error;
+    bool has_last_snapshot = false;
+    vicuna_progress_snapshot last_snapshot = {};
+};
+
 struct vicuna_external_observability {
     uint64_t bash_dispatch_total = 0;
     uint64_t bash_complete_total = 0;
@@ -697,6 +732,310 @@ struct vicuna_mailbox_snapshot {
 
 static std::string bounded_cstr_to_string(const char * value) {
     return value ? std::string(value) : std::string();
+}
+
+static json functional_activation_to_json(const llama_functional_activation_decision & activation) {
+    json families = json::array();
+    const int32_t family_count = std::min<int32_t>(activation.family_count, LLAMA_FUNCTIONAL_LORA_COUNT);
+    for (int32_t family = 0; family < family_count; ++family) {
+        families.push_back({
+            {"family", family},
+            {"gain", activation.gains[family]},
+            {"predicted_gain", activation.predicted_gains[family]},
+            {"sampled_noise", activation.sampled_noise[family]},
+            {"bootstrap_std", activation.bootstrap_std[family]},
+            {"bootstrap_perturbation", activation.bootstrap_perturbation[family]},
+            {"hold_unit", activation.hold_unit[family]},
+            {"hold_value", activation.hold_value[family]},
+            {"priority", activation.priority[family]},
+            {"reason_mask", activation.reason_mask[family]},
+        });
+    }
+    return {
+        {"loop_origin", activation.loop_origin},
+        {"microphase", activation.microphase},
+        {"top_family", activation.top_family},
+        {"family_count", activation.family_count},
+        {"activated_mask", activation.activated_mask},
+        {"eligible_mask", activation.eligible_mask},
+        {"exploration_std", activation.exploration_std},
+        {"allostatic_distance", activation.allostatic_distance},
+        {"allostatic_gradient_norm", activation.allostatic_gradient_norm},
+        {"gating_invocation_count", activation.gating_invocation_count},
+        {"families", std::move(families)},
+    };
+}
+
+static json self_model_summary_to_json(const llama_self_model_state_info & model_state) {
+    return {
+        {"extension_summary", {
+            {"active_count", model_state.extension_summary.active_count},
+            {"transient_count", model_state.extension_summary.transient_count},
+            {"permanent_count", model_state.extension_summary.permanent_count},
+            {"discovered_count", model_state.extension_summary.discovered_count},
+            {"gain_count", model_state.extension_summary.gain_count},
+            {"allostatic_count", model_state.extension_summary.allostatic_count},
+            {"hard_memory_count", model_state.extension_summary.hard_memory_count},
+            {"tool_count", model_state.extension_summary.tool_count},
+            {"mean_admission", model_state.extension_summary.mean_admission},
+            {"mean_permanence", model_state.extension_summary.mean_permanence},
+            {"mean_allostatic_eligibility", model_state.extension_summary.mean_allostatic_eligibility},
+            {"context_activation", model_state.extension_summary.context_activation},
+            {"gain_signal", model_state.extension_summary.gain_signal},
+            {"gain_signal_abs", model_state.extension_summary.gain_signal_abs},
+            {"allostatic_divergence", model_state.extension_summary.allostatic_divergence},
+        }},
+        {"belief_summary", {
+            {"residual_allostatic_pressure", model_state.belief_summary.residual_allostatic_pressure},
+            {"promotion_readiness", model_state.belief_summary.promotion_readiness},
+            {"belief_entropy", model_state.belief_summary.belief_entropy},
+            {"belief_confidence", model_state.belief_summary.belief_confidence},
+            {"slot_pressure_mean", model_state.belief_summary.slot_pressure_mean},
+            {"max_slot_pressure", model_state.belief_summary.max_slot_pressure},
+        }},
+        {"last_extension_trace", {
+            {"valid", model_state.last_extension_trace.valid},
+            {"candidate_count", model_state.last_extension_trace.candidate_count},
+            {"promoted_count", model_state.last_extension_trace.promoted_count},
+            {"winner_index", model_state.last_extension_trace.winner_index},
+        }},
+        {"forecast", {
+            {"valid", model_state.forecast.valid},
+            {"predicted_steps_remaining", model_state.forecast.predicted_steps_remaining},
+            {"predicted_inference_cost_remaining", model_state.forecast.predicted_inference_cost_remaining},
+            {"predicted_satisfaction_delta", model_state.forecast.predicted_satisfaction_delta},
+            {"predicted_recovery_delta", model_state.forecast.predicted_recovery_delta},
+            {"predicted_goal_progress_delta", model_state.forecast.predicted_goal_progress_delta},
+            {"confidence", model_state.forecast.confidence},
+        }},
+        {"prediction_error", {
+            {"valid", model_state.prediction_error.valid},
+            {"steps_error", model_state.prediction_error.steps_error},
+            {"inference_cost_error", model_state.prediction_error.inference_cost_error},
+            {"satisfaction_error", model_state.prediction_error.satisfaction_error},
+            {"recovery_error", model_state.prediction_error.recovery_error},
+            {"goal_progress_error", model_state.prediction_error.goal_progress_error},
+        }},
+    };
+}
+
+static json functional_trace_summary_to_json(const llama_functional_lora_trace & trace) {
+    json families = json::array();
+    for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+        const auto & state = trace.family_state[family];
+        families.push_back({
+            {"family", state.family},
+            {"enabled", state.enabled},
+            {"compatible", state.compatible},
+            {"active_now", state.active_now},
+            {"current_gain", state.current_gain},
+            {"predicted_gain", state.predicted_gain},
+            {"current_microphase", state.current_microphase},
+            {"activation_count", state.activation_count},
+            {"update_count", state.update_count},
+            {"last_signed_outcome", state.last_signed_outcome},
+            {"last_meta_loss", state.last_meta_loss},
+        });
+    }
+    return {
+        {"activation", functional_activation_to_json(trace.last_activation)},
+        {"families", std::move(families)},
+    };
+}
+
+static json process_trace_summary_to_json(const llama_process_functional_trace & trace) {
+    return {
+        {"valid", trace.valid},
+        {"matched_existing_entry", trace.matched_existing_entry},
+        {"matched_entry_slot", trace.matched_entry_slot},
+        {"created_entry", trace.created_entry},
+        {"created_entry_slot", trace.created_entry_slot},
+        {"creation_reason", trace.creation_reason},
+        {"evicted_entry_slot", trace.evicted_entry_slot},
+        {"signed_outcome", trace.signed_outcome},
+        {"magnitude", trace.magnitude},
+        {"weak_or_worse_ratio", trace.weak_or_worse_ratio},
+        {"bank_size", trace.bank_size},
+        {"bank_capacity", trace.bank_capacity},
+        {"activation_attached", trace.activation_attached},
+        {"signature", {
+            {"valid", trace.signature.valid},
+            {"signature_hash", trace.signature.signature_hash},
+            {"scope_kind", trace.signature.scope_kind},
+            {"family", trace.signature.family},
+            {"loop_origin", trace.signature.loop_origin},
+            {"microphase", trace.signature.microphase},
+            {"plan_mode", trace.signature.plan_mode},
+            {"plan_step_kind", trace.signature.plan_step_kind},
+            {"tool_kind", trace.signature.tool_kind},
+            {"source_family", trace.signature.source_family},
+            {"requires_tool_result", trace.signature.requires_tool_result},
+            {"tool_name", bounded_cstr_to_string(trace.signature.tool_name)},
+            {"semantic_key", bounded_cstr_to_string(trace.signature.semantic_key)},
+        }},
+    };
+}
+
+static json active_trace_summary_to_json(const llama_active_loop_trace & trace) {
+    return {
+        {"episode_id", trace.episode_id},
+        {"source_role", trace.source_role},
+        {"channel", trace.channel},
+        {"event_flags", trace.event_flags},
+        {"arrival_time_us", trace.arrival_time_us},
+        {"completed_time_us", trace.completed_time_us},
+        {"shared_state_version", trace.shared_state_version},
+        {"deferred_background", trace.deferred_background},
+        {"emit_allowed", trace.emit_allowed},
+        {"emit_noted", trace.emit_noted},
+        {"tool_followup_expected", trace.tool_followup_expected},
+        {"winner_action", trace.winner_action},
+        {"winner_score", trace.winner_score},
+        {"runner_up_action", trace.runner_up_action},
+        {"runner_up_score", trace.runner_up_score},
+        {"reason_mask", trace.reason_mask},
+        {"functional_activation", functional_activation_to_json(trace.functional_activation)},
+        {"tool_proposal", {
+            {"valid", trace.tool_proposal.valid},
+            {"tool_kind", trace.tool_proposal.tool_kind},
+            {"spec_index", trace.tool_proposal.spec_index},
+            {"reason_mask", trace.tool_proposal.reason_mask},
+            {"source_family", trace.tool_proposal.source_family},
+            {"expected_steps", trace.tool_proposal.expected_steps},
+            {"expected_observation_gain", trace.tool_proposal.expected_observation_gain},
+            {"job_id", trace.tool_proposal.job_id},
+        }},
+        {"observation", {
+            {"valid", trace.observation.valid},
+            {"tool_kind", trace.observation.tool_kind},
+            {"job_id", trace.observation.job_id},
+            {"status", trace.observation.status},
+            {"signal", trace.observation.signal},
+            {"followup_affinity", trace.observation.followup_affinity},
+        }},
+    };
+}
+
+static json dmn_trace_summary_to_json(const llama_dmn_tick_trace & trace) {
+    return {
+        {"tick_id", trace.tick_id},
+        {"admitted", trace.admitted},
+        {"deferred_for_foreground", trace.deferred_for_foreground},
+        {"pressure", {
+            {"contradiction", trace.pressure.contradiction},
+            {"uncertainty", trace.pressure.uncertainty},
+            {"reactivation", trace.pressure.reactivation},
+            {"goals", trace.pressure.goals},
+            {"tool_delta", trace.pressure.tool_delta},
+            {"counterfactual", trace.pressure.counterfactual},
+            {"continuation", trace.pressure.continuation},
+            {"repair", trace.pressure.repair},
+            {"total", trace.pressure.total},
+        }},
+        {"candidate_count", trace.candidate_count},
+        {"winner_action", trace.winner_action},
+        {"winner_score", trace.winner_score},
+        {"runner_up_action", trace.runner_up_action},
+        {"runner_up_score", trace.runner_up_score},
+        {"burst_count", trace.burst_count},
+        {"maintenance_mask", trace.maintenance_mask},
+        {"tool_kind", trace.tool_kind},
+        {"tool_job_id", trace.tool_job_id},
+        {"favorable_divergence", trace.favorable_divergence},
+        {"functional_activation", functional_activation_to_json(trace.functional_activation)},
+    };
+}
+
+static json counterfactual_trace_summary_to_json(const llama_counterfactual_trace & trace) {
+    json candidates = json::array();
+    for (int32_t i = 0; i < trace.candidate_count; ++i) {
+        const auto & candidate = trace.candidates[i];
+        candidates.push_back({
+            {"family", candidate.family},
+            {"risk_tier", candidate.risk_tier},
+            {"subject_id", candidate.subject_id},
+            {"functional_target_kind", candidate.functional_target_kind},
+            {"functional_family", candidate.functional_family},
+            {"process_entry_slot", candidate.process_entry_slot},
+            {"proposal_family", candidate.proposal_family},
+            {"replay_mode", candidate.replay_mode},
+            {"snapshot_slot", candidate.snapshot_slot},
+            {"expected_improvement", candidate.expected_improvement},
+            {"confidence", candidate.confidence},
+            {"fragility_penalty", candidate.fragility_penalty},
+            {"concentration_penalty", candidate.concentration_penalty},
+            {"robustness_score", candidate.robustness_score},
+            {"orthogonality", candidate.orthogonality},
+            {"realized_score", candidate.realized_score},
+            {"signed_advantage_vs_current", candidate.signed_advantage_vs_current},
+        });
+    }
+    return {
+        {"candidate_count", trace.candidate_count},
+        {"winner_index", trace.winner_index},
+        {"escalated", trace.escalated},
+        {"escalation_family", trace.escalation_family},
+        {"candidates", std::move(candidates)},
+    };
+}
+
+static json governance_trace_summary_to_json(const llama_governance_trace & trace) {
+    return {
+        {"proposal_family", trace.proposal_family},
+        {"risk_tier", trace.risk_tier},
+        {"outcome", trace.outcome},
+        {"evidence", trace.evidence},
+        {"threshold", trace.threshold},
+        {"dissatisfaction", trace.dissatisfaction},
+        {"recent_user_valence", trace.recent_user_valence},
+        {"repair_rendered", trace.repair_rendered},
+        {"repair_message_length", trace.repair_message_length},
+        {"repair_message", bounded_cstr_to_string(trace.repair_message)},
+    };
+}
+
+static json remediation_plan_to_json(const llama_remediation_plan & plan) {
+    return {
+        {"action", plan.action},
+        {"source_family", plan.source_family},
+        {"tool_kind", plan.tool_kind},
+        {"expected_improvement", plan.expected_improvement},
+        {"confidence", plan.confidence},
+        {"budget", plan.budget},
+        {"tool_job_id", plan.tool_job_id},
+        {"applied", plan.applied},
+        {"pre_divergence", plan.pre_divergence},
+        {"post_divergence", plan.post_divergence},
+    };
+}
+
+static json bash_result_to_json(const llama_bash_tool_result & result) {
+    return {
+        {"command_id", result.command_id},
+        {"tool_job_id", result.tool_job_id},
+        {"exit_code", result.exit_code},
+        {"term_signal", result.term_signal},
+        {"runtime_ms", result.runtime_ms},
+        {"timed_out", result.timed_out},
+        {"launch_failed", result.launch_failed},
+        {"truncated_stdout", result.truncated_stdout},
+        {"truncated_stderr", result.truncated_stderr},
+    };
+}
+
+static json hard_memory_result_to_json(const llama_cognitive_hard_memory_result & result) {
+    return {
+        {"command_id", result.command_id},
+        {"tool_job_id", result.tool_job_id},
+        {"ok", result.result.ok},
+        {"status_code", result.result.status_code},
+        {"result_count", result.result.result_count},
+        {"request_started_us", result.result.request_started_us},
+        {"request_completed_us", result.result.request_completed_us},
+        {"mean_similarity", result.result.retrieval_summary.mean_similarity},
+        {"gain_support", result.result.retrieval_summary.gain_support},
+        {"allostatic_support", result.result.retrieval_summary.allostatic_support},
+    };
 }
 
 static bool parse_env_flag(const char * value, bool fallback) {
@@ -1166,13 +1505,23 @@ static json model_extension_info_to_json(const llama_self_model_extension_info &
         {"source_tool_kind", info.source_tool_kind},
         {"kind", info.kind},
         {"domain", info.domain},
+        {"lifecycle_stage", info.lifecycle_stage},
         {"flags", info.flags},
+        {"support_count", info.support_count},
         {"value", info.value},
         {"desired_value", info.desired_value},
+        {"desired_value_min", info.desired_value_min},
+        {"desired_value_max", info.desired_value_max},
         {"confidence", info.confidence},
         {"salience", info.salience},
         {"gain_weight", info.gain_weight},
         {"allostatic_weight", info.allostatic_weight},
+        {"surprise_score", info.surprise_score},
+        {"relevance_score", info.relevance_score},
+        {"admission_score", info.admission_score},
+        {"permanence_score", info.permanence_score},
+        {"stability_score", info.stability_score},
+        {"allostatic_eligibility", info.allostatic_eligibility},
         {"key", bounded_cstr_to_string(info.key)},
         {"label", bounded_cstr_to_string(info.label)},
         {"content", bounded_cstr_to_string(info.content)},
@@ -1189,13 +1538,23 @@ static bool model_extension_update_from_json(const json & data, llama_self_model
     out_update->source_tool_kind = json_value(data, "source_tool_kind", out_update->source_tool_kind);
     out_update->kind = json_value(data, "kind", out_update->kind);
     out_update->domain = json_value(data, "domain", out_update->domain);
+    out_update->lifecycle_stage = json_value(data, "lifecycle_stage", out_update->lifecycle_stage);
     out_update->flags = json_value(data, "flags", out_update->flags);
+    out_update->support_count = json_value(data, "support_count", out_update->support_count);
     out_update->value = json_value(data, "value", out_update->value);
     out_update->desired_value = json_value(data, "desired_value", out_update->desired_value);
+    out_update->desired_value_min = json_value(data, "desired_value_min", out_update->desired_value_min);
+    out_update->desired_value_max = json_value(data, "desired_value_max", out_update->desired_value_max);
     out_update->confidence = json_value(data, "confidence", out_update->confidence);
     out_update->salience = json_value(data, "salience", out_update->salience);
     out_update->gain_weight = json_value(data, "gain_weight", out_update->gain_weight);
     out_update->allostatic_weight = json_value(data, "allostatic_weight", out_update->allostatic_weight);
+    out_update->surprise_score = json_value(data, "surprise_score", out_update->surprise_score);
+    out_update->relevance_score = json_value(data, "relevance_score", out_update->relevance_score);
+    out_update->admission_score = json_value(data, "admission_score", out_update->admission_score);
+    out_update->permanence_score = json_value(data, "permanence_score", out_update->permanence_score);
+    out_update->stability_score = json_value(data, "stability_score", out_update->stability_score);
+    out_update->allostatic_eligibility = json_value(data, "allostatic_eligibility", out_update->allostatic_eligibility);
     std::snprintf(out_update->key, sizeof(out_update->key), "%s", json_value(data, "key", std::string(out_update->key)).c_str());
     std::snprintf(out_update->label, sizeof(out_update->label), "%s", json_value(data, "label", std::string(out_update->label)).c_str());
     std::snprintf(out_update->content, sizeof(out_update->content), "%s", json_value(data, "content", std::string(out_update->content)).c_str());
@@ -1280,6 +1639,7 @@ private:
     mutable std::mutex runtime_state_mutex;
     std::unordered_map<int32_t, server_task> waiting_active_tasks;
     vicuna_runtime_persistence_state runtime_persistence;
+    vicuna_provenance_repository_state provenance_repository;
     vicuna_external_observability external_observability;
     mutable vicuna_proactive_mailbox proactive_mailbox;
     bool runtime_state_dirty = false;
@@ -1300,6 +1660,246 @@ private:
         if (reason && reason[0] != '\0') {
             SRV_DBG("runtime state dirty: %s\n", reason);
         }
+    }
+
+    bool collect_progress_snapshot(
+            vicuna_progress_snapshot * out_snapshot,
+            llama_self_model_state_info * out_model_state = nullptr,
+            llama_functional_lora_trace * out_functional_trace = nullptr,
+            llama_process_functional_trace * out_process_trace = nullptr) const {
+        if (!ctx || !out_snapshot) {
+            return false;
+        }
+
+        llama_self_model_state_info model_state = {};
+        if (llama_self_state_get_model_state(ctx, &model_state) != 0) {
+            return false;
+        }
+        llama_functional_lora_trace functional_trace = {};
+        (void) llama_functional_lora_get_last_trace(ctx, &functional_trace);
+        llama_process_functional_trace process_trace = {};
+        (void) llama_process_functional_get_last_trace(ctx, &process_trace);
+
+        uint64_t functional_updates = 0;
+        for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+            functional_updates += functional_trace.family_state[family].update_count;
+        }
+
+        uint64_t process_updates = 0;
+        const int32_t process_entry_count = llama_process_functional_entry_count(ctx);
+        for (int32_t i = 0; i < process_entry_count; ++i) {
+            llama_process_functional_entry_info info = {};
+            if (llama_process_functional_entry_get(ctx, i, &info) == 0 && info.valid) {
+                process_updates += info.update_count;
+            }
+        }
+
+        out_snapshot->valid = true;
+        out_snapshot->active_extensions = model_state.extension_summary.active_count;
+        out_snapshot->discovered_extensions = model_state.extension_summary.discovered_count;
+        out_snapshot->permanent_extensions = model_state.extension_summary.permanent_count;
+        out_snapshot->allostatic_extensions = model_state.extension_summary.allostatic_count;
+        out_snapshot->allostatic_divergence = model_state.extension_summary.allostatic_divergence;
+        out_snapshot->promotion_readiness = model_state.belief_summary.promotion_readiness;
+        out_snapshot->belief_pressure = model_state.belief_summary.residual_allostatic_pressure;
+        out_snapshot->functional_update_total = functional_updates;
+        out_snapshot->process_update_total = process_updates;
+
+        if (out_model_state) {
+            *out_model_state = model_state;
+        }
+        if (out_functional_trace) {
+            *out_functional_trace = functional_trace;
+        }
+        if (out_process_trace) {
+            *out_process_trace = process_trace;
+        }
+        return true;
+    }
+
+    void note_provenance_progress_locked(const vicuna_progress_snapshot & snapshot, const std::string & event_kind) {
+        if (!snapshot.valid) {
+            return;
+        }
+
+        if (event_kind == "active_loop") {
+            provenance_repository.active_loop_total++;
+        } else if (event_kind == "tool_result") {
+            provenance_repository.tool_result_total++;
+        } else if (event_kind == "dmn_tick") {
+            provenance_repository.dmn_total++;
+        }
+
+        if (provenance_repository.has_last_snapshot) {
+            const auto & prev = provenance_repository.last_snapshot;
+            if (snapshot.discovered_extensions > prev.discovered_extensions) {
+                provenance_repository.discovered_increase_total +=
+                        (uint64_t) (snapshot.discovered_extensions - prev.discovered_extensions);
+            }
+            if (snapshot.permanent_extensions > prev.permanent_extensions) {
+                provenance_repository.permanent_increase_total +=
+                        (uint64_t) (snapshot.permanent_extensions - prev.permanent_extensions);
+            }
+            if (snapshot.allostatic_extensions > prev.allostatic_extensions) {
+                provenance_repository.allostatic_increase_total +=
+                        (uint64_t) (snapshot.allostatic_extensions - prev.allostatic_extensions);
+            }
+            if (snapshot.functional_update_total > prev.functional_update_total) {
+                provenance_repository.functional_update_observed_total +=
+                        snapshot.functional_update_total - prev.functional_update_total;
+            }
+            if (snapshot.process_update_total > prev.process_update_total) {
+                provenance_repository.process_update_observed_total +=
+                        snapshot.process_update_total - prev.process_update_total;
+            }
+        }
+
+        provenance_repository.last_snapshot = snapshot;
+        provenance_repository.has_last_snapshot = true;
+    }
+
+    bool append_provenance_event(
+            const std::string & event_kind,
+            const std::string & source,
+            const json & payload,
+            const vicuna_progress_snapshot & snapshot) {
+        std::string path;
+        json event = json::object();
+        {
+            std::lock_guard<std::mutex> lock(runtime_state_mutex);
+            if (!provenance_repository.enabled || provenance_repository.path.empty()) {
+                return false;
+            }
+            path = provenance_repository.path;
+            event["schema_version"] = 1;
+            event["session_id"] = provenance_repository.session_id;
+            event["sequence"] = provenance_repository.next_sequence++;
+            event["timestamp_ms"] = ggml_time_ms();
+            event["event_kind"] = event_kind;
+            event["source"] = source;
+            event["payload"] = payload;
+        }
+
+        try {
+            const std::filesystem::path target_path(path);
+            if (!target_path.parent_path().empty()) {
+                std::filesystem::create_directories(target_path.parent_path());
+            }
+            std::ofstream out(target_path, std::ios::binary | std::ios::app);
+            if (!out) {
+                throw std::runtime_error("failed to open provenance repository");
+            }
+            out << event.dump() << '\n';
+            out.flush();
+            if (!out) {
+                throw std::runtime_error("failed to flush provenance repository");
+            }
+        } catch (const std::exception & err) {
+            std::lock_guard<std::mutex> lock(runtime_state_mutex);
+            provenance_repository.healthy = false;
+            provenance_repository.append_fail_total++;
+            provenance_repository.last_error = err.what();
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(runtime_state_mutex);
+            provenance_repository.healthy = true;
+            provenance_repository.append_total++;
+            provenance_repository.last_append_ms = ggml_time_ms();
+            provenance_repository.last_error.clear();
+            note_provenance_progress_locked(snapshot, event_kind);
+        }
+        return true;
+    }
+
+    void capture_active_loop_provenance(
+            const char * source,
+            const llama_active_loop_trace & active_trace,
+            const json * extra = nullptr) {
+        vicuna_progress_snapshot progress = {};
+        llama_self_model_state_info model_state = {};
+        llama_functional_lora_trace functional_trace = {};
+        llama_process_functional_trace process_trace = {};
+        if (!collect_progress_snapshot(&progress, &model_state, &functional_trace, &process_trace)) {
+            return;
+        }
+
+        json payload = {
+            {"active_loop", active_trace_summary_to_json(active_trace)},
+            {"self_model", self_model_summary_to_json(model_state)},
+            {"functional", functional_trace_summary_to_json(functional_trace)},
+            {"process_functional", process_trace_summary_to_json(process_trace)},
+        };
+        if (extra) {
+            payload["extra"] = *extra;
+        }
+        (void) append_provenance_event("active_loop", source ? source : "active", payload, progress);
+    }
+
+    void capture_tool_result_provenance(
+            const char * source,
+            const json & tool_result,
+            const llama_active_loop_trace * active_trace = nullptr) {
+        vicuna_progress_snapshot progress = {};
+        llama_self_model_state_info model_state = {};
+        llama_functional_lora_trace functional_trace = {};
+        llama_process_functional_trace process_trace = {};
+        if (!collect_progress_snapshot(&progress, &model_state, &functional_trace, &process_trace)) {
+            return;
+        }
+
+        json payload = {
+            {"tool_result", tool_result},
+            {"self_model", self_model_summary_to_json(model_state)},
+            {"functional", functional_trace_summary_to_json(functional_trace)},
+            {"process_functional", process_trace_summary_to_json(process_trace)},
+        };
+        if (active_trace) {
+            payload["active_loop"] = active_trace_summary_to_json(*active_trace);
+        }
+        (void) append_provenance_event("tool_result", source ? source : "tool", payload, progress);
+    }
+
+    void capture_dmn_provenance(const char * source, const llama_dmn_tick_trace & dmn_trace) {
+        vicuna_progress_snapshot progress = {};
+        llama_self_model_state_info model_state = {};
+        llama_functional_lora_trace functional_trace = {};
+        llama_process_functional_trace process_trace = {};
+        if (!collect_progress_snapshot(&progress, &model_state, &functional_trace, &process_trace)) {
+            return;
+        }
+
+        llama_counterfactual_trace counterfactual = {};
+        llama_governance_trace governance = {};
+        llama_remediation_plan remediation = {};
+        llama_temporal_self_improvement_trace temporal = {};
+        (void) llama_counterfactual_get_last_trace(ctx, &counterfactual);
+        (void) llama_governance_get_last_trace(ctx, &governance);
+        (void) llama_remediation_get_last_plan(ctx, &remediation);
+        (void) llama_temporal_self_improvement_get_last(ctx, &temporal);
+
+        json payload = {
+            {"dmn", dmn_trace_summary_to_json(dmn_trace)},
+            {"counterfactual", counterfactual_trace_summary_to_json(counterfactual)},
+            {"governance", governance_trace_summary_to_json(governance)},
+            {"remediation", remediation_plan_to_json(remediation)},
+            {"temporal_self_improvement", {
+                {"valid", temporal.valid},
+                {"loop_origin", temporal.loop_origin},
+                {"selected_temporal_role", temporal.selected_temporal_role},
+                {"counterfactual_family", temporal.counterfactual_family},
+                {"outcome", temporal.outcome},
+                {"signed_advantage", temporal.signed_advantage},
+                {"efficiency_advantage", temporal.efficiency_advantage},
+                {"evolution_uncertainty_before", temporal.evolution_uncertainty_before},
+                {"evolution_uncertainty_after", temporal.evolution_uncertainty_after},
+            }},
+            {"self_model", self_model_summary_to_json(model_state)},
+            {"functional", functional_trace_summary_to_json(functional_trace)},
+            {"process_functional", process_trace_summary_to_json(process_trace)},
+        };
+        (void) append_provenance_event("dmn_tick", source ? source : "dmn", payload, progress);
     }
 
     void post_next_response_task() {
@@ -1723,7 +2323,7 @@ private:
 
         try {
             json snapshot = json::object();
-            snapshot["version"] = 2;
+            snapshot["version"] = 5;
             snapshot["saved_at_unix_ms"] = ggml_time_ms();
             snapshot["reason"] = reason ? reason : "";
 
@@ -1755,6 +2355,179 @@ private:
                 }
             }
             snapshot["model_extensions"] = std::move(extensions);
+
+            llama_functional_lora_family_state functional_state = {};
+            if (llama_functional_lora_family_state_get(ctx, 0, &functional_state) == 0) {
+                json functional_snapshots = json::array();
+                for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+                    llama_functional_lora_snapshot_archive archive = {};
+                    if (llama_functional_lora_snapshot_archive_get(ctx, family, &archive) != 0) {
+                        throw std::runtime_error("failed to query functional snapshot archive");
+                    }
+                    json family_entry = json::object();
+                    family_entry["family"] = family;
+                    family_entry["count"] = archive.count;
+                    family_entry["last_capture_us"] = archive.last_capture_us;
+                    family_entry["next_capture_due_us"] = archive.next_capture_due_us;
+                    json items = json::array();
+                    for (int32_t slot = 0; slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++slot) {
+                        llama_functional_lora_snapshot_info info = {};
+                        if (llama_functional_lora_snapshot_info_get(ctx, family, slot, &info) != 0) {
+                            throw std::runtime_error("failed to query functional snapshot info");
+                        }
+                        if (!info.valid) {
+                            continue;
+                        }
+                        const size_t blob_size = llama_functional_lora_snapshot_blob_size(ctx, family, slot);
+                        if (blob_size == 0) {
+                            throw std::runtime_error("functional snapshot archive reported empty blob");
+                        }
+                        std::vector<uint8_t> blob(blob_size);
+                        if (llama_functional_lora_snapshot_blob_export(ctx, family, slot, blob.data(), blob.size()) != 0) {
+                            throw std::runtime_error("failed to export functional snapshot blob");
+                        }
+
+                        json item = json::object();
+                        item["valid"] = info.valid;
+                        item["family"] = info.family;
+                        item["slot"] = info.slot;
+                        item["source"] = info.source;
+                        item["snapshot_id"] = info.snapshot_id;
+                        item["captured_at_us"] = info.captured_at_us;
+                        item["expires_at_us"] = info.expires_at_us;
+                        item["source_update_count"] = info.source_update_count;
+                        item["self_state_gradient_norm"] = info.self_state_gradient_norm;
+                        item["robustness_score"] = info.robustness_score;
+                        item["last_signed_outcome"] = info.last_signed_outcome;
+                        item["dominant_direction_cosine"] = info.dominant_direction_cosine;
+                        item["blob_b64"] = base64::encode((const char *) blob.data(), blob.size());
+                        items.push_back(std::move(item));
+                    }
+                    family_entry["items"] = std::move(items);
+                    functional_snapshots.push_back(std::move(family_entry));
+                }
+                snapshot["functional_snapshots"] = std::move(functional_snapshots);
+            }
+
+            llama_process_functional_params process_params = llama_process_functional_default_params();
+            if (llama_process_functional_get_params(ctx, &process_params) == 0) {
+                json process_params_json = json::object();
+                process_params_json["enabled"] = process_params.enabled;
+                process_params_json["max_entries"] = process_params.max_entries;
+                process_params_json["min_observations"] = process_params.min_observations;
+                process_params_json["noop_abs_ceiling"] = process_params.noop_abs_ceiling;
+                process_params_json["weak_positive_ceiling"] = process_params.weak_positive_ceiling;
+                process_params_json["mean_outcome_ceiling"] = process_params.mean_outcome_ceiling;
+                process_params_json["weak_or_worse_ratio_threshold"] = process_params.weak_or_worse_ratio_threshold;
+                process_params_json["creation_cooldown_updates"] = process_params.creation_cooldown_updates;
+                process_params_json["utility_decay"] = process_params.utility_decay;
+                snapshot["process_functional_params"] = std::move(process_params_json);
+
+                json process_entries = json::array();
+                for (int32_t i = 0; i < llama_process_functional_entry_count(ctx); ++i) {
+                    llama_process_functional_entry_info info = {};
+                    if (llama_process_functional_entry_get(ctx, i, &info) != 0 || !info.valid) {
+                        continue;
+                    }
+                    const size_t blob_size = llama_process_functional_entry_blob_size(ctx, i);
+                    if (blob_size == 0) {
+                        continue;
+                    }
+                    std::vector<uint8_t> blob(blob_size);
+                    if (llama_process_functional_entry_blob_export(ctx, i, blob.data(), blob.size()) != 0) {
+                        throw std::runtime_error("failed to export process functional blob");
+                    }
+                    json entry = json::object();
+                    entry["valid"] = info.valid;
+                    entry["slot"] = info.slot;
+                    entry["created_at_us"] = info.created_at_us;
+                    entry["last_used_us"] = info.last_used_us;
+                    entry["activation_count"] = info.activation_count;
+                    entry["update_count"] = info.update_count;
+                    entry["utility_score"] = info.utility_score;
+                    entry["current_gain"] = info.current_gain;
+                    entry["last_signed_outcome"] = info.last_signed_outcome;
+                    entry["current_bootstrap_std"] = info.current_bootstrap_std;
+                    entry["last_bootstrap_perturbation"] = info.last_bootstrap_perturbation;
+                    entry["signature"] = {
+                            {"valid", info.signature.valid},
+                            {"signature_hash", info.signature.signature_hash},
+                            {"scope_kind", info.signature.scope_kind},
+                            {"family", info.signature.family},
+                            {"loop_origin", info.signature.loop_origin},
+                            {"microphase", info.signature.microphase},
+                            {"plan_mode", info.signature.plan_mode},
+                            {"plan_step_kind", info.signature.plan_step_kind},
+                            {"tool_kind", info.signature.tool_kind},
+                            {"source_family", info.signature.source_family},
+                            {"requires_tool_result", info.signature.requires_tool_result},
+                            {"transient_plan_id", info.signature.transient_plan_id},
+                            {"transient_step_index", info.signature.transient_step_index},
+                            {"transient_source_id", info.signature.transient_source_id},
+                            {"tool_name", info.signature.tool_name},
+                            {"semantic_key", info.signature.semantic_key},
+                    };
+                    entry["blob_b64"] = base64::encode((const char *) blob.data(), blob.size());
+                    process_entries.push_back(std::move(entry));
+                }
+                snapshot["process_functional_entries"] = std::move(process_entries);
+
+                json process_snapshots = json::array();
+                for (int32_t entry_slot = 0; entry_slot < LLAMA_PROCESS_FUNCTIONAL_MAX_ENTRIES; ++entry_slot) {
+                    llama_process_functional_entry_info entry_info = {};
+                    if (llama_process_functional_entry_get(ctx, entry_slot, &entry_info) != 0 || !entry_info.valid) {
+                        continue;
+                    }
+                    llama_functional_lora_snapshot_archive archive = {};
+                    if (llama_process_functional_snapshot_archive_get(ctx, entry_slot, &archive) != 0) {
+                        throw std::runtime_error("failed to query process functional snapshot archive");
+                    }
+
+                    json entry_archive = json::object();
+                    entry_archive["entry_slot"] = entry_slot;
+                    entry_archive["family"] = archive.family;
+                    entry_archive["count"] = archive.count;
+                    entry_archive["last_capture_us"] = archive.last_capture_us;
+                    entry_archive["next_capture_due_us"] = archive.next_capture_due_us;
+                    json items = json::array();
+                    for (int32_t snapshot_slot = 0; snapshot_slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++snapshot_slot) {
+                        llama_functional_lora_snapshot_info info = {};
+                        if (llama_process_functional_snapshot_info_get(ctx, entry_slot, snapshot_slot, &info) != 0) {
+                            throw std::runtime_error("failed to query process functional snapshot info");
+                        }
+                        if (!info.valid) {
+                            continue;
+                        }
+                        const size_t blob_size = llama_process_functional_snapshot_blob_size(ctx, entry_slot, snapshot_slot);
+                        if (blob_size == 0) {
+                            throw std::runtime_error("process functional snapshot archive reported empty blob");
+                        }
+                        std::vector<uint8_t> blob(blob_size);
+                        if (llama_process_functional_snapshot_blob_export(ctx, entry_slot, snapshot_slot, blob.data(), blob.size()) != 0) {
+                            throw std::runtime_error("failed to export process functional snapshot blob");
+                        }
+
+                        json item = json::object();
+                        item["valid"] = info.valid;
+                        item["family"] = info.family;
+                        item["slot"] = info.slot;
+                        item["source"] = info.source;
+                        item["snapshot_id"] = info.snapshot_id;
+                        item["captured_at_us"] = info.captured_at_us;
+                        item["expires_at_us"] = info.expires_at_us;
+                        item["source_update_count"] = info.source_update_count;
+                        item["self_state_gradient_norm"] = info.self_state_gradient_norm;
+                        item["robustness_score"] = info.robustness_score;
+                        item["last_signed_outcome"] = info.last_signed_outcome;
+                        item["dominant_direction_cosine"] = info.dominant_direction_cosine;
+                        item["blob_b64"] = base64::encode((const char *) blob.data(), blob.size());
+                        items.push_back(std::move(item));
+                    }
+                    entry_archive["items"] = std::move(items);
+                    process_snapshots.push_back(std::move(entry_archive));
+                }
+                snapshot["process_functional_snapshots"] = std::move(process_snapshots);
+            }
 
             const std::filesystem::path target_path(snapshot_path);
             if (!target_path.parent_path().empty()) {
@@ -1827,7 +2600,7 @@ private:
             buffer << in.rdbuf();
             const json snapshot = json::parse(buffer.str());
             const int snapshot_version = json_value(snapshot, "version", 0);
-            if (snapshot_version != 1 && snapshot_version != 2) {
+            if (snapshot_version != 1 && snapshot_version != 2 && snapshot_version != 3 && snapshot_version != 4 && snapshot_version != 5) {
                 throw std::runtime_error("unsupported runtime snapshot version");
             }
 
@@ -1874,6 +2647,191 @@ private:
             if (snapshot_version >= 2 && snapshot.contains("proactive_mailbox")) {
                 if (!proactive_mailbox_from_json(snapshot.at("proactive_mailbox"), &proactive_mailbox)) {
                     throw std::runtime_error("failed to restore proactive mailbox");
+                }
+            }
+
+            if (snapshot_version >= 3 && snapshot.contains("functional_snapshots")) {
+                const auto & families = snapshot.at("functional_snapshots");
+                if (!families.is_array()) {
+                    throw std::runtime_error("invalid functional snapshot archive payload");
+                }
+                for (const auto & family_entry : families) {
+                    if (!family_entry.is_object()) {
+                        throw std::runtime_error("invalid functional snapshot archive entry");
+                    }
+                    const int32_t family = json_value(family_entry, "family", -1);
+                    if (family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+                        throw std::runtime_error("invalid functional snapshot family");
+                    }
+                    if (!family_entry.contains("items") || !family_entry.at("items").is_array()) {
+                        throw std::runtime_error("invalid functional snapshot item list");
+                    }
+                    for (const auto & item : family_entry.at("items")) {
+                        if (!item.is_object()) {
+                            throw std::runtime_error("invalid functional snapshot item");
+                        }
+                        llama_functional_lora_snapshot_info info = {};
+                        info.valid = json_value(item, "valid", false);
+                        info.family = json_value(item, "family", family);
+                        info.slot = json_value(item, "slot", -1);
+                        info.source = json_value(item, "source", 0);
+                        info.snapshot_id = json_value(item, "snapshot_id", (uint64_t) 0);
+                        info.captured_at_us = json_value(item, "captured_at_us", (uint64_t) 0);
+                        info.expires_at_us = json_value(item, "expires_at_us", (uint64_t) 0);
+                        info.source_update_count = json_value(item, "source_update_count", (uint64_t) 0);
+                        info.self_state_gradient_norm = json_value(item, "self_state_gradient_norm", 0.0f);
+                        info.robustness_score = json_value(item, "robustness_score", 0.0f);
+                        info.last_signed_outcome = json_value(item, "last_signed_outcome", 0.0f);
+                        info.dominant_direction_cosine = json_value(item, "dominant_direction_cosine", 0.0f);
+                        if (!info.valid) {
+                            continue;
+                        }
+                        if (info.family != family ||
+                                info.slot < 0 ||
+                                info.slot >= LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY ||
+                                !item.contains("blob_b64")) {
+                            throw std::runtime_error("functional snapshot metadata mismatch");
+                        }
+                        const std::string blob = base64::decode(item.at("blob_b64").get<std::string>());
+                        if (blob.empty()) {
+                            throw std::runtime_error("functional snapshot blob missing");
+                        }
+                        if (llama_functional_lora_snapshot_blob_import(
+                                    ctx,
+                                    family,
+                                    info.slot,
+                                    info,
+                                    blob.data(),
+                                    blob.size()) != 0) {
+                            throw std::runtime_error("failed to restore functional snapshot blob");
+                        }
+                    }
+                }
+            }
+
+            if (snapshot_version >= 4 && snapshot.contains("process_functional_params")) {
+                llama_process_functional_params process_params = llama_process_functional_default_params();
+                const auto & process_params_json = snapshot.at("process_functional_params");
+                process_params.enabled = json_value(process_params_json, "enabled", process_params.enabled);
+                process_params.max_entries = json_value(process_params_json, "max_entries", process_params.max_entries);
+                process_params.min_observations = json_value(process_params_json, "min_observations", process_params.min_observations);
+                process_params.noop_abs_ceiling = json_value(process_params_json, "noop_abs_ceiling", process_params.noop_abs_ceiling);
+                process_params.weak_positive_ceiling = json_value(process_params_json, "weak_positive_ceiling", process_params.weak_positive_ceiling);
+                process_params.mean_outcome_ceiling = json_value(process_params_json, "mean_outcome_ceiling", process_params.mean_outcome_ceiling);
+                process_params.weak_or_worse_ratio_threshold = json_value(process_params_json, "weak_or_worse_ratio_threshold", process_params.weak_or_worse_ratio_threshold);
+                process_params.creation_cooldown_updates = json_value(process_params_json, "creation_cooldown_updates", process_params.creation_cooldown_updates);
+                process_params.utility_decay = json_value(process_params_json, "utility_decay", process_params.utility_decay);
+                if (llama_process_functional_set_params(ctx, process_params) != 0) {
+                    throw std::runtime_error("failed to restore process functional params");
+                }
+            }
+
+            if (snapshot_version >= 4 && snapshot.contains("process_functional_entries")) {
+                const auto & entries = snapshot.at("process_functional_entries");
+                if (!entries.is_array()) {
+                    throw std::runtime_error("invalid process functional entry payload");
+                }
+                for (const auto & entry : entries) {
+                    if (!entry.is_object() || !entry.contains("signature") || !entry.contains("blob_b64")) {
+                        throw std::runtime_error("invalid process functional entry");
+                    }
+                    llama_process_functional_entry_info info = {};
+                    info.valid = json_value(entry, "valid", false);
+                    info.slot = json_value(entry, "slot", -1);
+                    info.created_at_us = json_value(entry, "created_at_us", (uint64_t) 0);
+                    info.last_used_us = json_value(entry, "last_used_us", (uint64_t) 0);
+                    info.activation_count = json_value(entry, "activation_count", (uint64_t) 0);
+                    info.update_count = json_value(entry, "update_count", (uint64_t) 0);
+                    info.utility_score = json_value(entry, "utility_score", 0.0f);
+                    info.current_gain = json_value(entry, "current_gain", 0.0f);
+                    info.last_signed_outcome = json_value(entry, "last_signed_outcome", 0.0f);
+                    info.current_bootstrap_std = json_value(entry, "current_bootstrap_std", 0.0f);
+                    info.last_bootstrap_perturbation = json_value(entry, "last_bootstrap_perturbation", 0.0f);
+                    const auto & signature = entry.at("signature");
+                    info.signature.valid = json_value(signature, "valid", false);
+                    info.signature.signature_hash = json_value(signature, "signature_hash", (uint64_t) 0);
+                    info.signature.scope_kind = json_value(signature, "scope_kind", 0);
+                    info.signature.family = json_value(signature, "family", -1);
+                    info.signature.loop_origin = json_value(signature, "loop_origin", -1);
+                    info.signature.microphase = json_value(signature, "microphase", 0);
+                    info.signature.plan_mode = json_value(signature, "plan_mode", 0);
+                    info.signature.plan_step_kind = json_value(signature, "plan_step_kind", 0);
+                    info.signature.tool_kind = json_value(signature, "tool_kind", 0);
+                    info.signature.source_family = json_value(signature, "source_family", -1);
+                    info.signature.requires_tool_result = json_value(signature, "requires_tool_result", false);
+                    info.signature.transient_plan_id = json_value(signature, "transient_plan_id", -1);
+                    info.signature.transient_step_index = json_value(signature, "transient_step_index", -1);
+                    info.signature.transient_source_id = json_value(signature, "transient_source_id", -1);
+                    std::snprintf(info.signature.tool_name, sizeof(info.signature.tool_name), "%s", json_value(signature, "tool_name", std::string()).c_str());
+                    std::snprintf(info.signature.semantic_key, sizeof(info.signature.semantic_key), "%s", json_value(signature, "semantic_key", std::string()).c_str());
+                    const std::string blob = base64::decode(entry.at("blob_b64").get<std::string>());
+                    if (!info.valid ||
+                            info.slot < 0 ||
+                            info.slot >= LLAMA_PROCESS_FUNCTIONAL_MAX_ENTRIES ||
+                            blob.empty() ||
+                            llama_process_functional_entry_blob_import(ctx, info.slot, &info, blob.data(), blob.size()) != 0) {
+                        throw std::runtime_error("failed to restore process functional entry");
+                    }
+                }
+            }
+
+            if (snapshot_version >= 5 && snapshot.contains("process_functional_snapshots")) {
+                const auto & entries = snapshot.at("process_functional_snapshots");
+                if (!entries.is_array()) {
+                    throw std::runtime_error("invalid process functional snapshot archive payload");
+                }
+                for (const auto & entry_archive : entries) {
+                    if (!entry_archive.is_object()) {
+                        throw std::runtime_error("invalid process functional snapshot archive entry");
+                    }
+                    const int32_t entry_slot = json_value(entry_archive, "entry_slot", -1);
+                    if (entry_slot < 0 || entry_slot >= LLAMA_PROCESS_FUNCTIONAL_MAX_ENTRIES) {
+                        throw std::runtime_error("invalid process functional snapshot entry slot");
+                    }
+                    if (!entry_archive.contains("items") || !entry_archive.at("items").is_array()) {
+                        throw std::runtime_error("invalid process functional snapshot item list");
+                    }
+                    for (const auto & item : entry_archive.at("items")) {
+                        if (!item.is_object()) {
+                            throw std::runtime_error("invalid process functional snapshot item");
+                        }
+                        llama_functional_lora_snapshot_info info = {};
+                        info.valid = json_value(item, "valid", false);
+                        info.family = json_value(item, "family", -1);
+                        info.slot = json_value(item, "slot", -1);
+                        info.source = json_value(item, "source", 0);
+                        info.snapshot_id = json_value(item, "snapshot_id", (uint64_t) 0);
+                        info.captured_at_us = json_value(item, "captured_at_us", (uint64_t) 0);
+                        info.expires_at_us = json_value(item, "expires_at_us", (uint64_t) 0);
+                        info.source_update_count = json_value(item, "source_update_count", (uint64_t) 0);
+                        info.self_state_gradient_norm = json_value(item, "self_state_gradient_norm", 0.0f);
+                        info.robustness_score = json_value(item, "robustness_score", 0.0f);
+                        info.last_signed_outcome = json_value(item, "last_signed_outcome", 0.0f);
+                        info.dominant_direction_cosine = json_value(item, "dominant_direction_cosine", 0.0f);
+                        if (!info.valid) {
+                            continue;
+                        }
+                        if (info.family < 0 ||
+                                info.family >= LLAMA_FUNCTIONAL_LORA_COUNT ||
+                                info.slot < 0 ||
+                                info.slot >= LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY ||
+                                !item.contains("blob_b64")) {
+                            throw std::runtime_error("process functional snapshot metadata mismatch");
+                        }
+                        const std::string blob = base64::decode(item.at("blob_b64").get<std::string>());
+                        if (blob.empty()) {
+                            throw std::runtime_error("process functional snapshot blob missing");
+                        }
+                        if (llama_process_functional_snapshot_blob_import(
+                                    ctx,
+                                    entry_slot,
+                                    info.slot,
+                                    info,
+                                    blob.data(),
+                                    blob.size()) != 0) {
+                            throw std::runtime_error("failed to restore process functional snapshot blob");
+                        }
+                    }
                 }
             }
 
@@ -1990,13 +2948,14 @@ private:
                     result.tool_job_id = request.tool_job_id;
                     result.launch_failed = true;
                     result.exit_code = 127;
-                    std::snprintf(result.error_text, sizeof(result.error_text), "%s",
-                            !config.enabled ? "bash tool is disabled" : "bash tool request did not include a command");
-                    if (llama_cognitive_bash_tool_submit_result(ctx, &result, nullptr) == 0) {
-                        mark_runtime_state_dirty("bash-tool-immediate-result");
-                    }
-                    continue;
-                }
+	                    std::snprintf(result.error_text, sizeof(result.error_text), "%s",
+	                            !config.enabled ? "bash tool is disabled" : "bash tool request did not include a command");
+	                    if (llama_cognitive_bash_tool_submit_result(ctx, &result, nullptr) == 0) {
+	                        mark_runtime_state_dirty("bash-tool-immediate-result");
+	                        capture_tool_result_provenance("bash_tool_immediate", bash_result_to_json(result), nullptr);
+	                    }
+	                    continue;
+	                }
 
                 vicuna_external_work_item work = {};
                 work.command_id = command.command_id;
@@ -2031,13 +2990,14 @@ private:
                     result.result.ok = false;
                     result.result.tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_QUERY;
                     result.result.status_code = !config.enabled ? 503 : 400;
-                    std::snprintf(result.result.error, sizeof(result.result.error), "%s",
-                            !config.enabled ? "hard memory is disabled" : "hard memory request did not include a query");
-                    if (llama_cognitive_hard_memory_submit_result(ctx, &result, nullptr) == 0) {
-                        mark_runtime_state_dirty("hard-memory-immediate-result");
-                    }
-                    continue;
-                }
+	                    std::snprintf(result.result.error, sizeof(result.result.error), "%s",
+	                            !config.enabled ? "hard memory is disabled" : "hard memory request did not include a query");
+	                    if (llama_cognitive_hard_memory_submit_result(ctx, &result, nullptr) == 0) {
+	                        mark_runtime_state_dirty("hard-memory-immediate-result");
+	                        capture_tool_result_provenance("hard_memory_immediate", hard_memory_result_to_json(result), nullptr);
+	                    }
+	                    continue;
+	                }
 
                 vicuna_external_work_item work = {};
                 work.command_id = command.command_id;
@@ -2111,17 +3071,28 @@ private:
                     }
                 }
 
-                if (!ok) {
-                    SRV_WRN("failed to submit external work result for command %d kind=%d\n",
-                            result.command_id,
-                            (int) kind);
-                    continue;
-                }
-
-                mark_runtime_state_dirty(kind == VICUNA_EXTERNAL_WORK_BASH ? "bash-tool-result" : "hard-memory-result");
-
-                if (result.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
-                    server_task resumed_task;
+	                if (!ok) {
+	                    SRV_WRN("failed to submit external work result for command %d kind=%d\n",
+	                            result.command_id,
+	                            (int) kind);
+	                    continue;
+	                }
+	
+	                mark_runtime_state_dirty(kind == VICUNA_EXTERNAL_WORK_BASH ? "bash-tool-result" : "hard-memory-result");
+	                if (kind == VICUNA_EXTERNAL_WORK_BASH) {
+	                    capture_tool_result_provenance(
+	                            "bash_tool",
+	                            bash_result_to_json(result.bash_result),
+	                            result.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE ? &active_trace : nullptr);
+	                } else {
+	                    capture_tool_result_provenance(
+	                            "hard_memory",
+	                            hard_memory_result_to_json(result.hard_memory_result),
+	                            result.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE ? &active_trace : nullptr);
+	                }
+	
+	                if (result.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+	                    server_task resumed_task;
                     bool found_task = false;
                     {
                         std::lock_guard<std::mutex> lock(runtime_state_mutex);
@@ -2185,6 +3156,25 @@ private:
             runtime_persistence.restore_success = false;
             runtime_persistence.snapshot_path.clear();
             runtime_persistence.last_error.clear();
+            provenance_repository.enabled = false;
+            provenance_repository.healthy = true;
+            provenance_repository.next_sequence = 1;
+            provenance_repository.append_total = 0;
+            provenance_repository.append_fail_total = 0;
+            provenance_repository.active_loop_total = 0;
+            provenance_repository.tool_result_total = 0;
+            provenance_repository.dmn_total = 0;
+            provenance_repository.discovered_increase_total = 0;
+            provenance_repository.permanent_increase_total = 0;
+            provenance_repository.allostatic_increase_total = 0;
+            provenance_repository.functional_update_observed_total = 0;
+            provenance_repository.process_update_observed_total = 0;
+            provenance_repository.last_append_ms = 0;
+            provenance_repository.path.clear();
+            provenance_repository.session_id.clear();
+            provenance_repository.last_error.clear();
+            provenance_repository.has_last_snapshot = false;
+            provenance_repository.last_snapshot = {};
         }
         proactive_mailbox_reset_live_stream();
 
@@ -2322,6 +3312,35 @@ private:
                 runtime_persistence.enabled = true;
                 runtime_persistence.snapshot_path = runtime_state_path;
                 SRV_INF("runtime persistence enabled: path=%s\n", runtime_state_path);
+            }
+        }
+
+        {
+            const char * provenance_enabled_env = getenv("VICUNA_PROVENANCE_ENABLED");
+            const char * provenance_path_env = getenv("VICUNA_PROVENANCE_LOG_PATH");
+            const bool runtime_state_enabled = runtime_persistence.enabled && !runtime_persistence.snapshot_path.empty();
+            const bool provenance_enabled = parse_env_flag(
+                    provenance_enabled_env,
+                    (provenance_path_env && provenance_path_env[0] != '\0') || runtime_state_enabled);
+            std::string provenance_path;
+            if (provenance_path_env && provenance_path_env[0] != '\0') {
+                provenance_path = provenance_path_env;
+            } else if (runtime_state_enabled) {
+                provenance_path = runtime_persistence.snapshot_path + ".provenance.jsonl";
+            }
+
+            if (provenance_enabled) {
+                if (provenance_path.empty()) {
+                    SRV_WRN("%s\n", "provenance repository requested but no path could be derived");
+                } else {
+                    std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                    provenance_repository.enabled = true;
+                    provenance_repository.path = provenance_path;
+                    provenance_repository.session_id = "prov_" + random_string();
+                    SRV_INF("provenance repository enabled: path=%s session=%s\n",
+                            provenance_repository.path.c_str(),
+                            provenance_repository.session_id.c_str());
+                }
             }
         }
 
@@ -2676,6 +3695,33 @@ private:
                 {"path", ""},
                 {"last_error", ""},
             }},
+            {"provenance_repository", {
+                {"enabled", false},
+                {"healthy", true},
+                {"session_id", ""},
+                {"path", ""},
+                {"last_append_ms", 0},
+                {"append_total", 0},
+                {"append_fail_total", 0},
+                {"active_loop_total", 0},
+                {"tool_result_total", 0},
+                {"dmn_total", 0},
+                {"discovered_increase_total", 0},
+                {"permanent_increase_total", 0},
+                {"allostatic_increase_total", 0},
+                {"functional_update_total", 0},
+                {"process_update_total", 0},
+                {"self_state", {
+                    {"active_count", 0},
+                    {"discovered_count", 0},
+                    {"permanent_count", 0},
+                    {"allostatic_count", 0},
+                    {"allostatic_divergence", 0.0},
+                    {"promotion_readiness", 0.0},
+                    {"belief_pressure", 0.0},
+                }},
+                {"last_error", ""},
+            }},
         };
 
         {
@@ -2692,7 +3738,37 @@ private:
                 {"path", runtime_persistence.snapshot_path},
                 {"last_error", runtime_persistence.last_error},
             };
+            health["provenance_repository"] = {
+                {"enabled", provenance_repository.enabled},
+                {"healthy", provenance_repository.healthy},
+                {"session_id", provenance_repository.session_id},
+                {"path", provenance_repository.path},
+                {"last_append_ms", provenance_repository.last_append_ms},
+                {"append_total", provenance_repository.append_total},
+                {"append_fail_total", provenance_repository.append_fail_total},
+                {"active_loop_total", provenance_repository.active_loop_total},
+                {"tool_result_total", provenance_repository.tool_result_total},
+                {"dmn_total", provenance_repository.dmn_total},
+                {"discovered_increase_total", provenance_repository.discovered_increase_total},
+                {"permanent_increase_total", provenance_repository.permanent_increase_total},
+                {"allostatic_increase_total", provenance_repository.allostatic_increase_total},
+                {"functional_update_total", provenance_repository.functional_update_observed_total},
+                {"process_update_total", provenance_repository.process_update_observed_total},
+                {"self_state", {
+                    {"active_count", provenance_repository.last_snapshot.active_extensions},
+                    {"discovered_count", provenance_repository.last_snapshot.discovered_extensions},
+                    {"permanent_count", provenance_repository.last_snapshot.permanent_extensions},
+                    {"allostatic_count", provenance_repository.last_snapshot.allostatic_extensions},
+                    {"allostatic_divergence", provenance_repository.last_snapshot.allostatic_divergence},
+                    {"promotion_readiness", provenance_repository.last_snapshot.promotion_readiness},
+                    {"belief_pressure", provenance_repository.last_snapshot.belief_pressure},
+                }},
+                {"last_error", provenance_repository.last_error},
+            };
             if (runtime_persistence.enabled && !runtime_persistence.healthy) {
+                health["status"] = "degraded";
+            }
+            if (provenance_repository.enabled && !provenance_repository.healthy) {
                 health["status"] = "degraded";
             }
         }
@@ -2943,10 +4019,14 @@ private:
                 /*.decoder_entropy =*/ 0.0f,
                 /*.decoder_top_margin =*/ 1.0f,
             };
+            const bool ran_active_loop_here = !task.skip_active_loop_preflight;
             if (!task.skip_active_loop_preflight) {
                 task.has_active_trace = llama_active_loop_process(ctx, &loop_event, &task.active_trace) == 0;
             }
             if (task.has_active_trace) {
+                if (ran_active_loop_here) {
+                    capture_active_loop_provenance("active_loop", task.active_trace);
+                }
                 SLT_INF(slot, "active loop episode %d winner=%d score=%.3f deferred_background=%d\n",
                         task.active_trace.episode_id,
                         task.active_trace.winner_action,
@@ -3519,12 +4599,13 @@ private:
                             /*.decoder_entropy =*/ 0.0f,
                             /*.decoder_top_margin =*/ 1.0f,
                         };
-                        task.has_active_trace = llama_active_loop_process(ctx, &loop_event, &task.active_trace) == 0;
-                        task.skip_active_loop_preflight = true;
-                        if (task.has_active_trace) {
-                            mark_runtime_state_dirty("active-loop-preflight");
-                            (void) dispatch_pending_tool_commands(LLAMA_COG_COMMAND_ORIGIN_ACTIVE);
-                            (void) llama_active_loop_get_last_trace(ctx, &task.active_trace);
+	                        task.has_active_trace = llama_active_loop_process(ctx, &loop_event, &task.active_trace) == 0;
+	                        task.skip_active_loop_preflight = true;
+	                        if (task.has_active_trace) {
+	                            mark_runtime_state_dirty("active-loop-preflight");
+	                            capture_active_loop_provenance("active_preflight", task.active_trace);
+	                            (void) dispatch_pending_tool_commands(LLAMA_COG_COMMAND_ORIGIN_ACTIVE);
+	                            (void) llama_active_loop_get_last_trace(ctx, &task.active_trace);
 
                             int32_t pending_command_id = -1;
                             int32_t pending_tool_kind = LLAMA_TOOL_KIND_NONE;
@@ -3669,6 +4750,26 @@ private:
                         res->n_external_hard_memory_dispatch_total = external_observability.hard_memory_dispatch_total;
                         res->n_external_hard_memory_complete_total = external_observability.hard_memory_complete_total;
                         res->n_external_hard_memory_fail_total = external_observability.hard_memory_fail_total;
+                        res->provenance_enabled = provenance_repository.enabled;
+                        res->provenance_healthy = provenance_repository.healthy;
+                        res->provenance_last_append_ms = provenance_repository.last_append_ms;
+                        res->provenance_append_total = provenance_repository.append_total;
+                        res->provenance_append_fail_total = provenance_repository.append_fail_total;
+                        res->provenance_active_loop_total = provenance_repository.active_loop_total;
+                        res->provenance_tool_result_total = provenance_repository.tool_result_total;
+                        res->provenance_dmn_total = provenance_repository.dmn_total;
+                        res->provenance_discovered_increase_total = provenance_repository.discovered_increase_total;
+                        res->provenance_permanent_increase_total = provenance_repository.permanent_increase_total;
+                        res->provenance_allostatic_increase_total = provenance_repository.allostatic_increase_total;
+                        res->provenance_functional_update_total = provenance_repository.functional_update_observed_total;
+                        res->provenance_process_update_total = provenance_repository.process_update_observed_total;
+                        res->provenance_self_state_active_count = provenance_repository.last_snapshot.active_extensions;
+                        res->provenance_self_state_discovered_count = provenance_repository.last_snapshot.discovered_extensions;
+                        res->provenance_self_state_permanent_count = provenance_repository.last_snapshot.permanent_extensions;
+                        res->provenance_self_state_allostatic_count = provenance_repository.last_snapshot.allostatic_extensions;
+                        res->provenance_self_state_allostatic_divergence = provenance_repository.last_snapshot.allostatic_divergence;
+                        res->provenance_self_state_promotion_readiness = provenance_repository.last_snapshot.promotion_readiness;
+                        res->provenance_self_state_belief_pressure = provenance_repository.last_snapshot.belief_pressure;
                     }
 
                     if (task.metrics_reset_bucket) {
@@ -3854,15 +4955,16 @@ private:
                 }
             }
 
-            if (all_idle) {
-                llama_dmn_tick_trace dmn_trace = {};
-                if (llama_dmn_tick(ctx, ggml_time_us(), &dmn_trace) == 0 && dmn_trace.admitted) {
-                    SRV_INF("dmn tick %d winner=%d score=%.3f burst=%d\n",
-                            dmn_trace.tick_id,
-                            dmn_trace.winner_action,
-                            dmn_trace.winner_score,
-                            dmn_trace.burst_count);
-                    llama_cognitive_dmn_runner_status runner = {};
+	            if (all_idle) {
+	                llama_dmn_tick_trace dmn_trace = {};
+	                if (llama_dmn_tick(ctx, ggml_time_us(), &dmn_trace) == 0 && dmn_trace.admitted) {
+	                    SRV_INF("dmn tick %d winner=%d score=%.3f burst=%d\n",
+	                            dmn_trace.tick_id,
+	                            dmn_trace.winner_action,
+	                            dmn_trace.winner_score,
+	                            dmn_trace.burst_count);
+	                    capture_dmn_provenance("dmn_tick", dmn_trace);
+	                    llama_cognitive_dmn_runner_status runner = {};
                     llama_cognitive_command command = {};
                     if (llama_cognitive_dmn_runner_get(ctx, &runner) == 0 && runner.pending_command_id > 0) {
                         for (int32_t i = 0, n = llama_cognitive_command_count(ctx); i < n; ++i) {
@@ -5403,6 +6505,46 @@ void server_routes::init_routes() {
                     {"name",  "proactive_dropped_total"},
                     {"help",  "Total number of proactive responses evicted from retention."},
                     {"value",  res_task->proactive_dropped_total}
+            }, {
+                    {"name",  "provenance_append_total"},
+                    {"help",  "Total number of unified provenance events appended."},
+                    {"value",  res_task->provenance_append_total}
+            }, {
+                    {"name",  "provenance_append_fail_total"},
+                    {"help",  "Total number of unified provenance append failures."},
+                    {"value",  res_task->provenance_append_fail_total}
+            }, {
+                    {"name",  "provenance_active_loop_total"},
+                    {"help",  "Total number of active-loop provenance events."},
+                    {"value",  res_task->provenance_active_loop_total}
+            }, {
+                    {"name",  "provenance_tool_result_total"},
+                    {"help",  "Total number of tool-result provenance events."},
+                    {"value",  res_task->provenance_tool_result_total}
+            }, {
+                    {"name",  "provenance_dmn_total"},
+                    {"help",  "Total number of admitted DMN provenance events."},
+                    {"value",  res_task->provenance_dmn_total}
+            }, {
+                    {"name",  "provenance_discovered_increase_total"},
+                    {"help",  "Observed increases in discovered self-state count across provenance snapshots."},
+                    {"value",  res_task->provenance_discovered_increase_total}
+            }, {
+                    {"name",  "provenance_permanent_increase_total"},
+                    {"help",  "Observed increases in permanent self-state count across provenance snapshots."},
+                    {"value",  res_task->provenance_permanent_increase_total}
+            }, {
+                    {"name",  "provenance_allostatic_increase_total"},
+                    {"help",  "Observed increases in allostatic self-state count across provenance snapshots."},
+                    {"value",  res_task->provenance_allostatic_increase_total}
+            }, {
+                    {"name",  "provenance_functional_update_total"},
+                    {"help",  "Observed functional LoRA update-count increases across provenance snapshots."},
+                    {"value",  res_task->provenance_functional_update_total}
+            }, {
+                    {"name",  "provenance_process_update_total"},
+                    {"help",  "Observed process-functional update-count increases across provenance snapshots."},
+                    {"value",  res_task->provenance_process_update_total}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},
@@ -5444,6 +6586,42 @@ void server_routes::init_routes() {
                     {"name",  "runtime_restore_success"},
                     {"help",  "Whether the most recent runtime restore succeeded."},
                     {"value",  res_task->runtime_restore_success ? 1 : 0}
+            },{
+                    {"name",  "provenance_enabled"},
+                    {"help",  "Whether the unified provenance repository is enabled."},
+                    {"value",  res_task->provenance_enabled ? 1 : 0}
+            },{
+                    {"name",  "provenance_healthy"},
+                    {"help",  "Whether the unified provenance repository is currently healthy."},
+                    {"value",  res_task->provenance_healthy ? 1 : 0}
+            },{
+                    {"name",  "provenance_self_state_active_count"},
+                    {"help",  "Latest observed active self-model extension count from provenance snapshots."},
+                    {"value",  res_task->provenance_self_state_active_count}
+            },{
+                    {"name",  "provenance_self_state_discovered_count"},
+                    {"help",  "Latest observed discovered self-model extension count from provenance snapshots."},
+                    {"value",  res_task->provenance_self_state_discovered_count}
+            },{
+                    {"name",  "provenance_self_state_permanent_count"},
+                    {"help",  "Latest observed permanent self-model extension count from provenance snapshots."},
+                    {"value",  res_task->provenance_self_state_permanent_count}
+            },{
+                    {"name",  "provenance_self_state_allostatic_count"},
+                    {"help",  "Latest observed allostatic self-model extension count from provenance snapshots."},
+                    {"value",  res_task->provenance_self_state_allostatic_count}
+            },{
+                    {"name",  "provenance_self_state_allostatic_divergence"},
+                    {"help",  "Latest observed allostatic divergence from provenance snapshots."},
+                    {"value",  res_task->provenance_self_state_allostatic_divergence}
+            },{
+                    {"name",  "provenance_self_state_promotion_readiness"},
+                    {"help",  "Latest observed promotion readiness from provenance snapshots."},
+                    {"value",  res_task->provenance_self_state_promotion_readiness}
+            },{
+                    {"name",  "provenance_self_state_belief_pressure"},
+                    {"help",  "Latest observed residual allostatic pressure from provenance snapshots."},
+                    {"value",  res_task->provenance_self_state_belief_pressure}
             },{
                     {"name",  "proactive_responses"},
                     {"help",  "Number of retained proactive responses."},

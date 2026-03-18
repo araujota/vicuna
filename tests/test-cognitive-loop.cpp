@@ -1,5 +1,6 @@
 #include "get-model.h"
 #include "llama.h"
+#include "../src/llama-context.h"
 
 #include <array>
 #include <cmath>
@@ -23,6 +24,87 @@ static std::vector<llama_token> tokenize_or_die(const llama_vocab * vocab, const
         std::exit(1);
     }
     return tokens;
+}
+
+static uint64_t process_hash_mix(uint64_t seed, uint64_t value) {
+    seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    return seed;
+}
+
+static llama_process_functional_signature make_dmn_process_signature(
+        llama_context * ctx,
+        const llama_dmn_tick_trace & trace,
+        int32_t family,
+        int32_t microphase) {
+    llama_process_functional_signature signature = {};
+    if (!ctx || family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+        return signature;
+    }
+
+    const llama_cognitive_plan_trace * plan = trace.plan.valid ? &trace.plan : nullptr;
+    const llama_cognitive_plan_step * step = nullptr;
+    if (plan &&
+        plan->current_step_index >= 0 &&
+        plan->current_step_index < plan->step_count) {
+        step = &plan->steps[plan->current_step_index];
+    }
+
+    signature.valid = true;
+    signature.scope_kind = step ? LLAMA_PROCESS_FUNCTIONAL_SCOPE_PROCESS_STEP : LLAMA_PROCESS_FUNCTIONAL_SCOPE_PROCESS;
+    signature.family = family;
+    signature.loop_origin = LLAMA_COG_COMMAND_ORIGIN_DMN;
+    signature.microphase = microphase;
+    signature.plan_mode = plan ? plan->mode : LLAMA_COG_PLAN_MODE_NONE;
+    signature.plan_step_kind = step ? step->kind : LLAMA_COG_PLAN_STEP_NONE;
+    signature.tool_kind = step ? step->tool_kind : trace.tool_kind;
+    signature.source_family = step ? step->source_family : family;
+    signature.requires_tool_result = step ? step->requires_tool_result : false;
+    signature.transient_plan_id = plan ? plan->plan_id : -1;
+    signature.transient_step_index = plan ? plan->current_step_index : -1;
+    signature.transient_source_id = trace.tick_id;
+
+    if (signature.tool_kind != LLAMA_TOOL_KIND_NONE) {
+        const int32_t spec_count = llama_cognitive_tool_spec_count(ctx);
+        for (int32_t i = 0; i < spec_count; ++i) {
+            llama_cognitive_tool_spec spec = {};
+            if (llama_cognitive_tool_spec_get(ctx, i, &spec) == 0 &&
+                spec.tool_kind == signature.tool_kind) {
+                std::snprintf(signature.tool_name, sizeof(signature.tool_name), "%s", spec.name);
+                break;
+            }
+        }
+    }
+
+    std::string semantic_key = "dmn/self_forecast";
+    if (step) {
+        semantic_key += "/step_kind:" + std::to_string(step->kind);
+        semantic_key += "/src_family:" + std::to_string(step->source_family);
+    }
+    if (signature.tool_kind != LLAMA_TOOL_KIND_NONE) {
+        semantic_key += "/tool:";
+        if (signature.tool_name[0] != '\0') {
+            semantic_key += signature.tool_name;
+        } else {
+            semantic_key += std::to_string(signature.tool_kind);
+        }
+    }
+    std::snprintf(signature.semantic_key, sizeof(signature.semantic_key), "%s", semantic_key.c_str());
+
+    uint64_t hash = 1469598103934665603ULL;
+    hash = process_hash_mix(hash, (uint64_t) signature.scope_kind);
+    hash = process_hash_mix(hash, (uint64_t) signature.family);
+    hash = process_hash_mix(hash, (uint64_t) signature.loop_origin);
+    hash = process_hash_mix(hash, (uint64_t) signature.microphase);
+    hash = process_hash_mix(hash, (uint64_t) signature.plan_mode);
+    hash = process_hash_mix(hash, (uint64_t) signature.plan_step_kind);
+    hash = process_hash_mix(hash, (uint64_t) signature.tool_kind);
+    hash = process_hash_mix(hash, (uint64_t) signature.source_family);
+    hash = process_hash_mix(hash, signature.requires_tool_result ? 1ULL : 0ULL);
+    for (const char * p = signature.tool_name; *p; ++p) {
+        hash = process_hash_mix(hash, (uint64_t) (uint8_t) *p);
+    }
+    signature.signature_hash = hash;
+    return signature;
 }
 
 static bool contradiction_head_callback(
@@ -354,6 +436,34 @@ static bool expect_functional_last_update(
     return true;
 }
 
+static bool expect_process_trace(
+        const char * label,
+        llama_context * ctx,
+        int32_t expected_family,
+        int32_t expected_microphase,
+        int32_t expected_loop_origin,
+        uint64_t * out_hash = nullptr) {
+    llama_process_functional_trace trace = {};
+    llama_process_functional_signature current = {};
+    if (llama_process_functional_get_last_trace(ctx, &trace) != 0 ||
+        !trace.valid ||
+        !trace.signature.valid ||
+        trace.signature.family != expected_family ||
+        trace.signature.microphase != expected_microphase ||
+        trace.signature.loop_origin != expected_loop_origin ||
+        trace.signature.signature_hash == 0 ||
+        trace.signature.semantic_key[0] == '\0' ||
+        llama_process_functional_get_current_signature(ctx, &current) != 0 ||
+        current.signature_hash != trace.signature.signature_hash) {
+        std::fprintf(stderr, "%s: missing or invalid process-functional trace\n", label);
+        return false;
+    }
+    if (out_hash) {
+        *out_hash = trace.signature.signature_hash;
+    }
+    return true;
+}
+
 static bool settle_active_runner(const char * label, llama_context * ctx) {
     while (llama_cognitive_command_count(ctx) > 0) {
         llama_cognitive_command command = {};
@@ -606,6 +716,18 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
+        uint64_t first_process_hash = 0;
+        if (!expect_process_trace(
+                    "active-answer-process-trace",
+                    ctx,
+                    LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION,
+                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION,
+                    LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                    &first_process_hash)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
 
         if (llama_active_loop_note_emit(ctx, trace.episode_id, 32) != 0) {
             std::fprintf(stderr, "failed to note active emit\n");
@@ -651,6 +773,20 @@ int main(int argc, char ** argv) {
             second_trace.functional_activation.bootstrap_std[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] <= 0.0f ||
             second_trace.functional_activation.bootstrap_perturbation[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] == 0.0f) {
             std::fprintf(stderr, "functional bootstrap perturbation did not decay with repeated usage\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        uint64_t second_process_hash = 0;
+        if (!expect_process_trace(
+                    "active-answer-process-trace-second",
+                    ctx,
+                    LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION,
+                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION,
+                    LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                    &second_process_hash) ||
+            second_process_hash != first_process_hash) {
+            std::fprintf(stderr, "active answer process signature was not stable across repeated executions\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -1173,6 +1309,14 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
+        const uint64_t one_week_us = 7ull * 24ull * 60ull * 60ull * 1000000ull;
+        if (llama_functional_lora_snapshot_maintain(ctx, 1) != 0 ||
+            llama_functional_lora_snapshot_maintain(ctx, one_week_us + 1) != 0) {
+            std::fprintf(stderr, "failed to seed weekly functional snapshot archive before DMN tick\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
 
         llama_dmn_tick_trace trace = {};
         if (llama_dmn_tick(ctx, 6000, &trace) != 0 ||
@@ -1312,35 +1456,256 @@ int main(int argc, char ** argv) {
 
         llama_counterfactual_trace counterfactual = {};
         if (llama_counterfactual_get_last_trace(ctx, &counterfactual) != 0 ||
-            counterfactual.candidate_count < 6 ||
-            counterfactual.winner_index < 0 ||
-            counterfactual.candidates[0].family != LLAMA_COUNTERFACTUAL_FAMILY_MESSAGE_VARIANT ||
-            counterfactual.candidates[1].family != LLAMA_COUNTERFACTUAL_FAMILY_TOOL_ARGUMENTS ||
-            counterfactual.candidates[2].family != LLAMA_COUNTERFACTUAL_FAMILY_HARD_MEMORY_QUERY ||
-            counterfactual.candidates[3].family != LLAMA_COUNTERFACTUAL_FAMILY_TOOL_CHOICE ||
-            counterfactual.candidates[4].family != LLAMA_COUNTERFACTUAL_FAMILY_TIMING_SHIFT ||
-            !counterfactual.simulated_user.valid ||
-            !counterfactual.simulated_user.used_user_personality_adapter ||
-            !counterfactual.simulated_user.temporal_layers_ablated ||
-            counterfactual.simulated_user.source_family != LLAMA_COUNTERFACTUAL_FAMILY_MESSAGE_VARIANT ||
-            counterfactual.simulated_user.reply_token_count <= 0 ||
-            counterfactual.simulated_user.simulation_confidence <= 0.0f ||
-            counterfactual.simulated_user.candidate_message[0] == '\0' ||
-            counterfactual.simulated_user.simulated_user_reply[0] == '\0') {
-            std::fprintf(stderr, "counterfactual ladder was not generated in low-risk-first order\n");
+            counterfactual.candidate_count < 4 ||
+            counterfactual.winner_index < 0) {
+            std::fprintf(stderr, "counterfactual ladder was not generated for DMN internal write\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
         }
         bool saw_lora_ablation = false;
+        bool saw_message_variant = false;
         for (int32_t i = 0; i < counterfactual.candidate_count; ++i) {
             if (counterfactual.candidates[i].family == LLAMA_COUNTERFACTUAL_FAMILY_LORA_ABLATION) {
                 saw_lora_ablation = true;
-                break;
+            }
+            if (counterfactual.candidates[i].family == LLAMA_COUNTERFACTUAL_FAMILY_MESSAGE_VARIANT) {
+                saw_message_variant = true;
             }
         }
-        if (!saw_lora_ablation) {
-            std::fprintf(stderr, "counterfactual ladder did not include LoRA ablation\n");
+        if (!saw_lora_ablation || saw_message_variant ||
+            counterfactual.simulated_user.valid ||
+            counterfactual.simulated_user.used_user_personality_adapter ||
+            counterfactual.simulated_user.temporal_layers_ablated) {
+            std::fprintf(stderr, "counterfactual ladder did not remain hypothesis-first\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        bool saw_functional_local = false;
+        bool saw_functional_history = false;
+        bool saw_functional_orthogonal = false;
+        const llama_counterfactual_candidate * best_functional_candidate = nullptr;
+        int32_t last_primary_index = -1;
+        int32_t first_fallback_index = -1;
+        for (int32_t i = 0; i < counterfactual.candidate_count; ++i) {
+            const auto & candidate = counterfactual.candidates[i];
+            const bool primary_family =
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_LORA_ABLATION ||
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_LOCAL ||
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_HISTORY ||
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_ORTHOGONAL;
+            const bool fallback_family =
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_TOOL_ARGUMENTS ||
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_HARD_MEMORY_QUERY ||
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_TOOL_CHOICE ||
+                candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_TIMING_SHIFT;
+            if (primary_family) {
+                last_primary_index = i;
+            } else if (fallback_family && first_fallback_index < 0) {
+                first_fallback_index = i;
+            }
+            if (candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_LOCAL &&
+                candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_HISTORY &&
+                candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_ORTHOGONAL) {
+                continue;
+            }
+            if (candidate.functional_family < 0 ||
+                candidate.proposal_family < 0 ||
+                candidate.replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_NONE) {
+                std::fprintf(stderr, "functional counterfactual candidate metadata missing\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+            if (candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_LOCAL) {
+                saw_functional_local = true;
+            } else if (candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_HISTORY) {
+                saw_functional_history = true;
+                if (candidate.snapshot_slot < 0) {
+                    std::fprintf(stderr, "historical functional counterfactual missing snapshot slot\n");
+                    llama_free(ctx);
+                    llama_model_free(model);
+                    return 1;
+                }
+            } else if (candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_ORTHOGONAL) {
+                saw_functional_orthogonal = true;
+                if (candidate.orthogonality > 0.10f + 1.0e-6f) {
+                    std::fprintf(stderr, "orthogonal functional counterfactual exceeded cosine limit\n");
+                    llama_free(ctx);
+                    llama_model_free(model);
+                    return 1;
+                }
+            }
+            if (!best_functional_candidate ||
+                candidate.realized_score > best_functional_candidate->realized_score + 1.0e-6f ||
+                (std::fabs(candidate.realized_score - best_functional_candidate->realized_score) <= 1.0e-6f &&
+                 candidate.robustness_score > best_functional_candidate->robustness_score + 1.0e-6f)) {
+                best_functional_candidate = &candidate;
+            }
+        }
+        if (!saw_functional_local || !saw_functional_history || !saw_functional_orthogonal || !best_functional_candidate) {
+            std::fprintf(stderr, "counterfactual ladder did not include the full functional bias replay set\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (first_fallback_index >= 0 && first_fallback_index < last_primary_index) {
+            std::fprintf(stderr, "discrete fallback candidates appeared before primary temporal/functional hypotheses\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_functional_lora_differential_update differential = {};
+        if (llama_functional_lora_get_last_differential_update(
+                    ctx,
+                    best_functional_candidate->functional_family,
+                    &differential) != 0 ||
+            !differential.valid ||
+            differential.family != best_functional_candidate->functional_family ||
+            differential.proposal_family != best_functional_candidate->proposal_family ||
+            differential.source_snapshot_slot != best_functional_candidate->snapshot_slot ||
+            std::fabs(differential.signed_score_delta - best_functional_candidate->signed_advantage_vs_current) > 1.0e-5f ||
+            differential.magnitude <= 0.0f ||
+            differential.applied_update_norm <= 0.0f) {
+            std::fprintf(stderr, "DMN did not retain functional differential update metadata\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const llama_self_state_event process_event = {
+            /*.tokens =*/ tokens.data(),
+            /*.n_tokens =*/ tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
+            /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
+            /*.decoder_entropy =*/ 0.0f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+        const llama_functional_outcome_snapshot process_before = {
+            /*.favorable_divergence =*/ 0.7f,
+            /*.user_satisfaction_risk =*/ 0.3f,
+            /*.goal_progress_pressure =*/ 0.4f,
+            /*.loop_inefficiency =*/ 0.5f,
+            /*.recovery_urgency =*/ 0.3f,
+            /*.answerability =*/ 0.5f,
+            /*.preference_uncertainty =*/ 0.4f,
+            /*.expected_steps_remaining =*/ 0.6f,
+            /*.expected_inference_cost_remaining =*/ 0.5f,
+        };
+        const float process_metrics[] = { -0.18f, 0.0f, 0.0f };
+        for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+            const llama_process_functional_signature process_signature =
+                    make_dmn_process_signature(
+                            ctx,
+                            trace,
+                            family,
+                            LLAMA_FUNCTIONAL_MICROPHASE_SELF_FORECAST);
+            if (!process_signature.valid || !ctx->process_functional_set_execution(process_signature)) {
+                std::fprintf(stderr, "failed to seed process-functional execution for DMN counterfactual parity\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+            for (int i = 0; i < 6; ++i) {
+                if (!ctx->functional_lora_apply_update(
+                            family,
+                            LLAMA_COG_COMMAND_ORIGIN_DMN,
+                            LLAMA_FUNCTIONAL_MICROPHASE_SELF_OBSERVE,
+                            LLAMA_FUNCTIONAL_MICROPHASE_SELF_FORECAST,
+                            process_before,
+                            process_before,
+                            process_signature.tool_kind,
+                            1,
+                            process_metrics,
+                            sizeof(process_metrics)/sizeof(process_metrics[0]),
+                            -0.18f,
+                            0.55f,
+                            process_event,
+                            nullptr)) {
+                    std::fprintf(stderr, "failed to accumulate process-functional evidence for family %d\n", family);
+                    llama_free(ctx);
+                    llama_model_free(model);
+                    return 1;
+                }
+            }
+        }
+        if (!ctx->process_functional_set_execution(llama_process_functional_signature {}) ||
+            llama_process_functional_snapshot_maintain(ctx, 1) != 0 ||
+            llama_process_functional_snapshot_maintain(ctx, one_week_us + 1) != 0) {
+            std::fprintf(stderr, "failed to seed process-functional lifecycle state for DMN counterfactual parity\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const llama_self_state_time_point future_time_2 = {
+            /*.wall_clock_ms =*/ 1700007200000,
+            /*.monotonic_ms =*/ 7201000,
+            /*.timezone_offset_minutes =*/ -360,
+        };
+        if (llama_self_state_set_time(ctx, future_time_2) != 0 ||
+            !ingest_event_without_runner("seed-process-counterfactual-dmn", ctx, event)) {
+            std::fprintf(stderr, "failed to restore DMN pressure for process-functional counterfactual parity test\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_dmn_tick_trace process_trace = {};
+        if (llama_dmn_tick(ctx, 7000, &process_trace) != 0 || !process_trace.admitted) {
+            std::fprintf(stderr, "failed to run second DMN tick for process-functional counterfactual parity\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_counterfactual_trace process_counterfactual = {};
+        if (llama_counterfactual_get_last_trace(ctx, &process_counterfactual) != 0 ||
+            process_counterfactual.candidate_count <= 0) {
+            std::fprintf(stderr, "missing counterfactual ladder after process-functional seeding\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        bool saw_process_local = false;
+        bool saw_process_history = false;
+        bool saw_process_orthogonal = false;
+        for (int32_t i = 0; i < process_counterfactual.candidate_count; ++i) {
+            const auto & candidate = process_counterfactual.candidates[i];
+            if (candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_PROCESS_FUNCTIONAL_LOCAL) {
+                saw_process_local = true;
+            } else if (candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_PROCESS_FUNCTIONAL_HISTORY) {
+                saw_process_history = true;
+            } else if (candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_PROCESS_FUNCTIONAL_ORTHOGONAL) {
+                saw_process_orthogonal = true;
+            } else {
+                continue;
+            }
+
+            if (candidate.functional_target_kind != LLAMA_FUNCTIONAL_LORA_TARGET_PROCESS_ENTRY ||
+                candidate.process_entry_slot < 0 ||
+                candidate.functional_family < 0 ||
+                candidate.replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_NONE) {
+                std::fprintf(stderr, "process-functional counterfactual candidate metadata missing\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+            if (candidate.family == LLAMA_COUNTERFACTUAL_FAMILY_PROCESS_FUNCTIONAL_HISTORY &&
+                candidate.snapshot_slot < 0) {
+                std::fprintf(stderr, "process-functional historical counterfactual missing snapshot slot\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+        }
+        if (!saw_process_local || !saw_process_history || !saw_process_orthogonal) {
+            std::fprintf(stderr, "DMN counterfactual ladder did not include process-functional replay candidates\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;

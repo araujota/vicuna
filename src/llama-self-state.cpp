@@ -33,8 +33,12 @@ static constexpr size_t   LLAMA_SELF_MAX_MEMORY_HANDLES = 24;
 static constexpr size_t   LLAMA_SELF_MAX_TRACE_ITEMS = 256;
 static constexpr size_t   LLAMA_SELF_MAX_TRACE_TOKENS = 2048;
 static constexpr uint32_t LLAMA_SELF_TRACE_MAGIC = 0x4c535354u; // LSST
-static constexpr uint32_t LLAMA_SELF_TRACE_VERSION = 3;
-static constexpr size_t   LLAMA_SELF_BELIEF_SIGNATURE_DIM = 4;
+constexpr uint32_t LLAMA_SELF_TRACE_VERSION = 4;
+constexpr size_t   LLAMA_SELF_BELIEF_SIGNATURE_DIM = 4;
+constexpr float    LLAMA_SELF_DISCOVERY_HALF_LIFE_MS = 20.0f * 60.0f * 1000.0f;
+constexpr float    LLAMA_SELF_DISCOVERY_ADMISSION_THRESHOLD = 0.52f;
+constexpr float    LLAMA_SELF_DISCOVERY_PERMANENCE_THRESHOLD = 0.68f;
+constexpr float    LLAMA_SELF_DISCOVERY_ALLOSTATIC_THRESHOLD = 0.70f;
 
 static int64_t current_wall_clock_ms() {
     using namespace std::chrono;
@@ -429,6 +433,54 @@ static bool sketch_is_zero(const std::array<float, 32> & sketch) {
     return true;
 }
 
+float extension_stage_weight(int32_t stage) {
+    switch (stage) {
+        case LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT:  return 0.50f;
+        case LLAMA_SELF_MODEL_EXTENSION_STAGE_PERMANENT:  return 0.80f;
+        case LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC: return 1.00f;
+        default: return 0.50f;
+    }
+}
+
+std::string sketch_signature(const std::array<float, 32> & sketch) {
+    struct slot_score {
+        int32_t index = -1;
+        float magnitude = 0.0f;
+    };
+
+    std::array<slot_score, 3> top = {};
+    for (int32_t i = 0; i < (int32_t) sketch.size(); ++i) {
+        const float magnitude = std::fabs(sketch[(size_t) i]);
+        for (size_t j = 0; j < top.size(); ++j) {
+            if (magnitude > top[j].magnitude) {
+                for (size_t k = top.size() - 1; k > j; --k) {
+                    top[k] = top[k - 1];
+                }
+                top[j] = {
+                    /*.index =*/ i,
+                    /*.magnitude =*/ magnitude,
+                };
+                break;
+            }
+        }
+    }
+
+    std::ostringstream oss;
+    for (size_t i = 0; i < top.size(); ++i) {
+        if (top[i].index < 0 || top[i].magnitude <= 0.0f) {
+            continue;
+        }
+        if (oss.tellp() > 0) {
+            oss << "-";
+        }
+        const float signed_value = sketch[(size_t) top[i].index];
+        oss << top[i].index << (signed_value >= 0.0f ? "p" : "n");
+    }
+
+    const std::string out = oss.str();
+    return out.empty() ? "zero" : out;
+}
+
 struct extension_domain_signal {
     float goal_progress = 0.0f;
     float user_outcome = 0.0f;
@@ -802,6 +854,10 @@ static void accumulate_model_extensions(
     llama_self_model_extension_summary summary = {};
     float confidence_sum = 0.0f;
     float salience_sum = 0.0f;
+    float admission_sum = 0.0f;
+    float permanence_sum = 0.0f;
+    float allostatic_eligibility_sum = 0.0f;
+    int32_t discovered_metric_count = 0;
     float gain_weight_sum = 0.0f;
     float allostatic_weight_sum = 0.0f;
     float context_sum = 0.0f;
@@ -812,6 +868,18 @@ static void accumulate_model_extensions(
         }
 
         ++summary.active_count;
+        if ((extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) != 0) {
+            ++summary.discovered_count;
+            ++discovered_metric_count;
+            if (extension.lifecycle_stage == LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT) {
+                ++summary.transient_count;
+            } else {
+                ++summary.permanent_count;
+            }
+            admission_sum += extension.admission_score;
+            permanence_sum += extension.permanence_score;
+            allostatic_eligibility_sum += extension.allostatic_eligibility;
+        }
         confidence_sum += extension.confidence;
         salience_sum += extension.salience;
         summary.max_salience = std::max(summary.max_salience, extension.salience);
@@ -830,7 +898,12 @@ static void accumulate_model_extensions(
         const float lane_value = extension.kind == LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM && has_desired_state ?
                 clamp_unit(1.0f - std::fabs(extension.desired_value - extension.value)) :
                 clamp_unit(extension.value);
-        const float activation = clamp_unit(lane_value * extension.salience * extension.confidence * context_similarity);
+        const float activation = clamp_unit(
+                lane_value *
+                extension.salience *
+                extension.confidence *
+                context_similarity *
+                extension_stage_weight(extension.lifecycle_stage));
         context_sum += activation;
         if (increment_activation_count && activation > 0.05f) {
             extension.activation_count += 1;
@@ -870,6 +943,11 @@ static void accumulate_model_extensions(
         summary.mean_confidence = clamp_unit(confidence_sum / (float) summary.active_count);
         summary.mean_salience = clamp_unit(salience_sum / (float) summary.active_count);
         summary.context_activation = clamp_unit(context_sum / (float) summary.active_count);
+    }
+    if (discovered_metric_count > 0) {
+        summary.mean_admission = clamp_unit(admission_sum / (float) discovered_metric_count);
+        summary.mean_permanence = clamp_unit(permanence_sum / (float) discovered_metric_count);
+        summary.mean_allostatic_eligibility = clamp_unit(allostatic_eligibility_sum / (float) discovered_metric_count);
     }
     if (gain_weight_sum > 0.0f) {
         summary.gain_signal = clamp_signed_unit(summary.gain_signal / gain_weight_sum);
@@ -979,6 +1057,9 @@ std::array<llama_self_register_definition, LLAMA_SELF_REGISTER_COUNT> llama_self
         { LLAMA_SELF_REGISTER_USER_CLARIFICATION_PREFERENCE, "r_user_clarification_preference", LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.5f, 0 },
         { LLAMA_SELF_REGISTER_USER_DISAGREEMENT_SENSITIVITY, "r_user_disagreement_sensitivity", LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.5f, 0 },
         { LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY, "r_evolution_uncertainty",  LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
+        { LLAMA_SELF_REGISTER_DISCOVERED_STATE_LOAD, "r_discovered_state_load", LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
+        { LLAMA_SELF_REGISTER_DISCOVERED_STATE_PERMANENCE, "r_discovered_state_permanence", LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
+        { LLAMA_SELF_REGISTER_DISCOVERED_STATE_ALLOSTATIC_LOAD, "r_discovered_state_allostatic_load", LLAMA_SELF_REGISTER_FAMILY_BOUNDED_SCALAR, 0.0f, 1.0f, 0.0f, 0 },
         { LLAMA_SELF_REGISTER_CHANNEL_STATE,         "r_channel_state",          LLAMA_SELF_REGISTER_FAMILY_CATEGORICAL,    0.0f, 2.0f, 0.0f, LLAMA_SELF_STATE_CHANNEL_WAITING },
     }};
 }
@@ -1721,15 +1802,25 @@ bool llama_self_state::get_model_extension(int32_t index, llama_self_model_exten
     out_info->source_tool_kind = extension.source_tool_kind;
     out_info->kind = extension.kind;
     out_info->domain = extension.domain;
+    out_info->lifecycle_stage = extension.lifecycle_stage;
     out_info->flags = extension.flags;
     out_info->last_update_monotonic_ms = extension.last_update_monotonic_ms;
     out_info->activation_count = extension.activation_count;
+    out_info->support_count = extension.support_count;
     out_info->value = extension.value;
     out_info->desired_value = extension.desired_value;
+    out_info->desired_value_min = extension.desired_value_min;
+    out_info->desired_value_max = extension.desired_value_max;
     out_info->confidence = extension.confidence;
     out_info->salience = extension.salience;
     out_info->gain_weight = extension.gain_weight;
     out_info->allostatic_weight = extension.allostatic_weight;
+    out_info->surprise_score = extension.surprise_score;
+    out_info->relevance_score = extension.relevance_score;
+    out_info->admission_score = extension.admission_score;
+    out_info->permanence_score = extension.permanence_score;
+    out_info->stability_score = extension.stability_score;
+    out_info->allostatic_eligibility = extension.allostatic_eligibility;
     copy_bounded_cstr(out_info->key, extension.key);
     copy_bounded_cstr(out_info->label, extension.label);
     copy_bounded_cstr(out_info->content, extension.content);
@@ -1754,10 +1845,18 @@ bool llama_self_state::validate_model_extension_update(llama_self_model_extensio
     const float * values[] = {
         &update->value,
         &update->desired_value,
+        &update->desired_value_min,
+        &update->desired_value_max,
         &update->confidence,
         &update->salience,
         &update->gain_weight,
         &update->allostatic_weight,
+        &update->surprise_score,
+        &update->relevance_score,
+        &update->admission_score,
+        &update->permanence_score,
+        &update->stability_score,
+        &update->allostatic_eligibility,
     };
     for (const float * value : values) {
         if (!std::isfinite(*value)) {
@@ -1772,34 +1871,247 @@ bool llama_self_state::validate_model_extension_update(llama_self_model_extensio
 
     update->value = clamp_unit(update->value);
     update->desired_value = clamp_unit(update->desired_value);
+    update->desired_value_min = clamp_unit(update->desired_value_min);
+    update->desired_value_max = clamp_unit(update->desired_value_max);
     update->confidence = clamp_unit(update->confidence);
     update->salience = clamp_unit(update->salience);
     update->gain_weight = clamp_unit(update->gain_weight <= 0.0f ? 1.0f : update->gain_weight);
     update->allostatic_weight = clamp_unit(update->allostatic_weight);
+    update->surprise_score = clamp_unit(update->surprise_score);
+    update->relevance_score = clamp_unit(update->relevance_score);
+    update->admission_score = clamp_unit(update->admission_score);
+    update->permanence_score = clamp_unit(update->permanence_score);
+    update->stability_score = clamp_unit(update->stability_score);
+    update->allostatic_eligibility = clamp_unit(update->allostatic_eligibility);
+    if (update->desired_value_min > update->desired_value_max) {
+        std::swap(update->desired_value_min, update->desired_value_max);
+    }
+    update->support_count = std::max<uint32_t>(1u, update->support_count);
 
     if (update->kind == LLAMA_SELF_MODEL_EXTENSION_MEMORY_CONTEXT ||
         update->source == LLAMA_SELF_MODEL_EXTENSION_SOURCE_TOOL_HARD_MEMORY) {
         update->flags &= ~LLAMA_SELF_MODEL_EXTENSION_FLAG_HAS_DESIRED_STATE;
         update->flags &= ~LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS;
         update->desired_value = 0.0f;
+        update->desired_value_min = 0.0f;
+        update->desired_value_max = 0.0f;
         update->allostatic_weight = 0.0f;
+        update->allostatic_eligibility = 0.0f;
+        if (update->lifecycle_stage == LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC) {
+            update->lifecycle_stage = (update->flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) != 0 ?
+                    LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT :
+                    LLAMA_SELF_MODEL_EXTENSION_STAGE_PERMANENT;
+        }
     }
 
     if ((update->flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_HAS_DESIRED_STATE) == 0) {
         update->flags &= ~LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS;
         update->desired_value = 0.0f;
+        update->desired_value_min = 0.0f;
+        update->desired_value_max = 0.0f;
         update->allostatic_weight = 0.0f;
     } else if (update->allostatic_weight <= 0.0f) {
         update->allostatic_weight = 1.0f;
+    }
+
+    if (update->lifecycle_stage < LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT ||
+        update->lifecycle_stage > LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC) {
+        if ((update->flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) != 0) {
+            update->lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT;
+        } else if ((update->flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS) != 0) {
+            update->lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC;
+        } else {
+            update->lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_PERMANENT;
+        }
     }
 
     return true;
 }
 
 void llama_self_state::refresh_model_extension_summary() {
+    refresh_model_extension_lifecycle();
     const std::array<float, 32> neutral_context = {};
     extension_domain_signal signal = {};
     accumulate_model_extensions(model_extensions, neutral_context, false, &signal, &extension_summary);
+}
+
+void llama_self_state::refresh_model_extension_lifecycle() {
+    const int64_t now_ms = datetime.monotonic_ms >= 0 ? datetime.monotonic_ms : current_monotonic_ms();
+
+    for (auto & extension : model_extensions) {
+        if ((extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE) == 0) {
+            continue;
+        }
+
+        if ((extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) == 0) {
+            extension.lifecycle_stage =
+                    ((extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS) != 0 &&
+                     (extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_HAS_DESIRED_STATE) != 0 &&
+                     extension.kind == LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM) ?
+                            LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC :
+                            LLAMA_SELF_MODEL_EXTENSION_STAGE_PERMANENT;
+            extension.support_count = std::max<uint32_t>(1u, extension.support_count);
+            extension.admission_score = std::max(extension.admission_score, clamp_unit(0.50f * extension.confidence + 0.50f * extension.salience));
+            extension.permanence_score = std::max(extension.permanence_score, clamp_unit(0.55f * extension.confidence + 0.45f * extension.salience));
+            extension.stability_score = std::max(extension.stability_score, clamp_unit(0.65f * extension.confidence + 0.35f * extension.salience));
+            extension.allostatic_eligibility = ((extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS) != 0 &&
+                    extension.kind == LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM) ?
+                            std::max(extension.allostatic_eligibility, extension.allostatic_weight) :
+                            0.0f;
+            if ((extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_HAS_DESIRED_STATE) != 0 &&
+                    extension.desired_value_min == 0.0f && extension.desired_value_max == 0.0f) {
+                extension.desired_value_min = extension.desired_value;
+                extension.desired_value_max = extension.desired_value;
+            }
+            continue;
+        }
+
+        const float recency = decay_to_unit(elapsed_or_unset(now_ms, extension.last_update_monotonic_ms), LLAMA_SELF_DISCOVERY_HALF_LIFE_MS);
+        const float support_norm = clamp_unit((float) extension.support_count / 4.0f);
+        const float desired_band_width = clamp_unit(std::fabs(extension.desired_value_max - extension.desired_value_min));
+        const float stability_target = clamp_unit(
+                0.45f * extension.confidence +
+                0.30f * support_norm +
+                0.25f * recency -
+                0.10f * desired_band_width);
+        const bool preserve_explicit_allostatic =
+                extension.lifecycle_stage == LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC &&
+                extension.support_count >= 3 &&
+                ((extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_HAS_DESIRED_STATE) != 0);
+        const float blended_stability = clamp_unit(blend_value(extension.stability_score, stability_target, 0.35f));
+        extension.stability_score = preserve_explicit_allostatic ?
+                std::max(extension.stability_score, blended_stability) :
+                blended_stability;
+
+        const float permanence_target = clamp_unit(
+                0.28f * extension.admission_score +
+                0.22f * extension.confidence +
+                0.20f * extension.relevance_score +
+                0.15f * extension.stability_score +
+                0.15f * support_norm);
+        const float blended_permanence = clamp_unit(blend_value(extension.permanence_score, permanence_target, 0.35f));
+        extension.permanence_score = preserve_explicit_allostatic ?
+                std::max(extension.permanence_score, blended_permanence) :
+                blended_permanence;
+        extension.lifecycle_stage = (extension.permanence_score >= LLAMA_SELF_DISCOVERY_PERMANENCE_THRESHOLD &&
+                extension.support_count >= 2) ?
+                        LLAMA_SELF_MODEL_EXTENSION_STAGE_PERMANENT :
+                        LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT;
+
+        if (extension.kind == LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM &&
+                extension.source != LLAMA_SELF_MODEL_EXTENSION_SOURCE_TOOL_HARD_MEMORY) {
+            const float eligibility_target = clamp_unit(
+                    0.38f * extension.permanence_score +
+                    0.24f * extension.stability_score +
+                    0.18f * extension.relevance_score +
+                    0.20f * (1.0f - desired_band_width));
+            const float blended_eligibility = clamp_unit(blend_value(extension.allostatic_eligibility, eligibility_target, 0.30f));
+            extension.allostatic_eligibility = preserve_explicit_allostatic ?
+                    std::max(extension.allostatic_eligibility, blended_eligibility) :
+                    blended_eligibility;
+
+            const bool have_band =
+                    extension.desired_value_max > 0.0f ||
+                    extension.desired_value_min > 0.0f ||
+                    extension.desired_value > 0.0f;
+            if (have_band &&
+                    extension.lifecycle_stage == LLAMA_SELF_MODEL_EXTENSION_STAGE_PERMANENT &&
+                    extension.support_count >= 3 &&
+                    extension.allostatic_eligibility >= LLAMA_SELF_DISCOVERY_ALLOSTATIC_THRESHOLD) {
+                extension.lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC;
+                extension.flags |= LLAMA_SELF_MODEL_EXTENSION_FLAG_HAS_DESIRED_STATE;
+                extension.flags |= LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS;
+                extension.desired_value = clamp_unit(0.5f * (extension.desired_value_min + extension.desired_value_max));
+                extension.allostatic_weight = std::max(extension.allostatic_weight, extension.allostatic_eligibility);
+            } else {
+                extension.flags &= ~LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS;
+            }
+        } else {
+            extension.allostatic_eligibility = 0.0f;
+            extension.flags &= ~LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS;
+        }
+    }
+}
+
+void llama_self_state::update_extension_outcome_support(float signed_progress, float efficiency_advantage) {
+    const float positive_support = clamp_unit(
+            0.65f * std::max(0.0f, signed_progress) +
+            0.35f * std::max(0.0f, efficiency_advantage));
+    const float negative_support = clamp_unit(
+            0.65f * std::max(0.0f, -signed_progress) +
+            0.35f * std::max(0.0f, -efficiency_advantage));
+
+    if (positive_support <= 0.0f && negative_support <= 0.0f) {
+        return;
+    }
+
+    for (auto & extension : model_extensions) {
+        if ((extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) == 0 ||
+            extension.kind != LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM ||
+            (extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE) == 0 ||
+            extension.source == LLAMA_SELF_MODEL_EXTENSION_SOURCE_TOOL_HARD_MEMORY) {
+            continue;
+        }
+
+        if (positive_support > 0.05f) {
+            extension.support_count += 1;
+            if ((extension.desired_value_min == 0.0f && extension.desired_value_max == 0.0f &&
+                 extension.desired_value == 0.0f) || extension.support_count <= 2) {
+                extension.desired_value_min = extension.value;
+                extension.desired_value_max = extension.value;
+            } else {
+                extension.desired_value_min = std::min(extension.desired_value_min, extension.value);
+                extension.desired_value_max = std::max(extension.desired_value_max, extension.value);
+            }
+            extension.desired_value = clamp_unit(0.5f * (extension.desired_value_min + extension.desired_value_max));
+            const float band_width = clamp_unit(std::fabs(extension.desired_value_max - extension.desired_value_min));
+            const float support_norm = clamp_unit((float) extension.support_count / 4.0f);
+            extension.stability_score = clamp_unit(blend_value(
+                    extension.stability_score,
+                    1.0f - band_width,
+                    0.20f + 0.30f * positive_support));
+            extension.admission_score = clamp_unit(std::max(
+                    extension.admission_score,
+                    0.40f * extension.admission_score +
+                    0.25f * positive_support +
+                    0.20f * support_norm +
+                    0.15f * extension.stability_score));
+            const float permanence_target = clamp_unit(
+                    0.35f * support_norm +
+                    0.30f * extension.stability_score +
+                    0.15f * extension.admission_score +
+                    0.10f * extension.relevance_score +
+                    0.10f * positive_support);
+            extension.permanence_score = clamp_unit(blend_value(
+                    extension.permanence_score,
+                    permanence_target,
+                    0.24f + 0.36f * positive_support));
+            const float allostatic_target = clamp_unit(
+                    0.30f * extension.permanence_score +
+                    0.25f * extension.stability_score +
+                    0.15f * support_norm +
+                    0.15f * positive_support +
+                    0.10f * extension.relevance_score +
+                    0.05f * (1.0f - band_width));
+            extension.allostatic_eligibility = clamp_unit(blend_value(
+                    extension.allostatic_eligibility,
+                    allostatic_target,
+                    0.22f + 0.34f * positive_support));
+        }
+
+        if (negative_support > 0.05f) {
+            extension.permanence_score = clamp_unit(extension.permanence_score * (1.0f - 0.35f * negative_support));
+            extension.allostatic_eligibility = clamp_unit(extension.allostatic_eligibility * (1.0f - 0.45f * negative_support));
+            extension.stability_score = clamp_unit(extension.stability_score * (1.0f - 0.25f * negative_support));
+            if (extension.lifecycle_stage == LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC &&
+                    extension.allostatic_eligibility < 0.45f) {
+                extension.lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_PERMANENT;
+                extension.flags &= ~LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_ALLOSTASIS;
+            }
+        }
+    }
+
+    refresh_model_extension_summary();
 }
 
 bool llama_self_state::upsert_model_extension(const llama_self_model_extension_update & update) {
@@ -1837,13 +2149,95 @@ bool llama_self_state::upsert_model_extension(const llama_self_model_extension_u
     it->source_tool_kind = normalized.source_tool_kind;
     it->kind = normalized.kind;
     it->domain = normalized.domain;
+    const bool discovered = (normalized.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) != 0;
+    const float previous_value = it->value;
+    const bool existed = it->last_update_monotonic_ms >= 0;
+    const auto nearly_equal = [](float lhs, float rhs) {
+        return std::fabs(lhs - rhs) <= 1e-6f;
+    };
+    if (discovered && existed &&
+        normalized.support_count > 1 &&
+        it->source == normalized.source &&
+        it->source_tool_kind == normalized.source_tool_kind &&
+        it->kind == normalized.kind &&
+        it->domain == normalized.domain &&
+        it->lifecycle_stage == normalized.lifecycle_stage &&
+        it->flags == normalized.flags &&
+        nearly_equal(it->value, normalized.value) &&
+        nearly_equal(it->desired_value, normalized.desired_value) &&
+        nearly_equal(it->desired_value_min, normalized.desired_value_min) &&
+        nearly_equal(it->desired_value_max, normalized.desired_value_max)) {
+        return true;
+    }
+    if (discovered && existed &&
+        it->source == normalized.source &&
+        it->source_tool_kind == normalized.source_tool_kind &&
+        it->kind == normalized.kind &&
+        it->domain == normalized.domain &&
+        it->lifecycle_stage == normalized.lifecycle_stage &&
+        it->flags == normalized.flags &&
+        it->support_count == normalized.support_count &&
+        nearly_equal(it->value, normalized.value) &&
+        nearly_equal(it->desired_value, normalized.desired_value) &&
+        nearly_equal(it->desired_value_min, normalized.desired_value_min) &&
+        nearly_equal(it->desired_value_max, normalized.desired_value_max) &&
+        nearly_equal(it->confidence, normalized.confidence) &&
+        nearly_equal(it->salience, normalized.salience) &&
+        nearly_equal(it->gain_weight, normalized.gain_weight) &&
+        nearly_equal(it->allostatic_weight, normalized.allostatic_weight) &&
+        nearly_equal(it->surprise_score, normalized.surprise_score) &&
+        nearly_equal(it->relevance_score, normalized.relevance_score) &&
+        nearly_equal(it->admission_score, normalized.admission_score) &&
+        nearly_equal(it->permanence_score, normalized.permanence_score) &&
+        nearly_equal(it->stability_score, normalized.stability_score) &&
+        nearly_equal(it->allostatic_eligibility, normalized.allostatic_eligibility) &&
+        std::strncmp(it->label, normalized.label, sizeof(it->label)) == 0 &&
+        std::strncmp(it->content, normalized.content, sizeof(it->content)) == 0) {
+        return true;
+    }
+    it->lifecycle_stage = normalized.lifecycle_stage;
     it->flags = normalized.flags;
+    if (!discovered) {
+        it->support_count = std::max<uint32_t>(1u, normalized.support_count);
+    } else if (!existed) {
+        it->support_count = std::max<uint32_t>(1u, normalized.support_count);
+    } else if (normalized.support_count > 1) {
+        it->support_count = std::max<uint32_t>(it->support_count, normalized.support_count);
+    } else {
+        it->support_count = std::max<uint32_t>(normalized.support_count, it->support_count + 1);
+    }
     it->value = normalized.value;
     it->desired_value = normalized.desired_value;
+    it->desired_value_min = normalized.desired_value_min;
+    it->desired_value_max = normalized.desired_value_max;
     it->confidence = normalized.confidence;
     it->salience = normalized.salience;
     it->gain_weight = normalized.gain_weight;
     it->allostatic_weight = normalized.allostatic_weight;
+    it->surprise_score = discovered && existed ?
+            clamp_unit(blend_value(it->surprise_score, normalized.surprise_score, 0.45f)) :
+            normalized.surprise_score;
+    it->relevance_score = discovered && existed ?
+            clamp_unit(blend_value(it->relevance_score, normalized.relevance_score, 0.45f)) :
+            normalized.relevance_score;
+    it->admission_score = discovered && existed ?
+            clamp_unit(blend_value(it->admission_score, normalized.admission_score, 0.45f)) :
+            normalized.admission_score;
+    it->permanence_score = discovered && existed ?
+            clamp_unit(std::max(it->permanence_score, normalized.permanence_score)) :
+            normalized.permanence_score;
+    it->stability_score = discovered && existed ?
+            clamp_unit(blend_value(
+                    it->stability_score,
+                    clamp_unit(1.0f - std::fabs(previous_value - normalized.value)),
+                    0.35f)) :
+            normalized.stability_score;
+    it->allostatic_eligibility = discovered && existed ?
+            clamp_unit(std::max(it->allostatic_eligibility, normalized.allostatic_eligibility)) :
+            normalized.allostatic_eligibility;
+    if (!existed) {
+        it->first_seen_monotonic_ms = datetime.monotonic_ms >= 0 ? datetime.monotonic_ms : current_monotonic_ms();
+    }
     it->last_update_monotonic_ms = datetime.monotonic_ms >= 0 ? datetime.monotonic_ms : current_monotonic_ms();
     copy_bounded_cstr(it->key, normalized.key);
     copy_bounded_cstr(it->label, normalized.label[0] != '\0' ? normalized.label : normalized.key);
@@ -1945,13 +2339,17 @@ bool llama_self_state::promote_hard_memory_query(
         candidate.source_tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_QUERY;
         candidate.kind = LLAMA_SELF_MODEL_EXTENSION_MEMORY_CONTEXT;
         candidate.domain = candidate_domain;
+        candidate.lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT;
         candidate.flags = LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE |
                 LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_GAIN |
                 LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED;
+        candidate.support_count = 1;
         candidate.value = clamp_unit(std::max(hit.similarity, hit.importance));
         candidate.confidence = clamp_unit(std::max(hit.confidence, hit.similarity));
         candidate.salience = clamp_unit(std::max(hit.importance, hit.similarity));
         candidate.gain_weight = clamp_unit(0.35f + 0.35f * hit.similarity + 0.30f * hit.gain_bias);
+        candidate.surprise_score = clamp_unit(0.50f * hit.similarity + 0.50f * hit.importance);
+        candidate.relevance_score = clamp_unit(0.55f * hit.gain_bias + 0.45f * hit.similarity);
         copy_bounded_cstr(candidate.key, key.c_str());
         copy_bounded_cstr(candidate.label, hit.title[0] != '\0' ? hit.title : key.c_str());
         copy_bounded_cstr(candidate.content, hit.content);
@@ -1992,6 +2390,12 @@ bool llama_self_state::promote_hard_memory_query(
                 0.08f * hit.importance +
                 0.06f * hit.gain_bias +
                 kind_bonus);
+        candidate.admission_score = clamp_unit(
+                0.45f * candidate.relevance_score +
+                0.35f * candidate.surprise_score +
+                0.20f * candidate.confidence);
+        candidate.permanence_score = clamp_unit(std::max(0.0f, improvement));
+        candidate.stability_score = clamp_unit(candidate.confidence);
 
         auto & out_candidate = extension_trace.candidates[extension_trace.candidate_count++];
         out_candidate.promoted = false;
@@ -2077,7 +2481,7 @@ bool llama_self_state::get_updater_program(llama_self_updater_program * out_prog
 }
 
 size_t llama_self_state::trace_export_size() const {
-    size_t size = sizeof(uint32_t) * 3;
+    size_t size = sizeof(uint32_t) * 4;
 
     for (const auto & item : trace_items) {
         size += sizeof(llama_self_state_time_point);
@@ -2089,6 +2493,8 @@ size_t llama_self_state::trace_export_size() const {
         size += sizeof(uint32_t);
         size += item.tokens.size() * sizeof(llama_token);
     }
+
+    size += model_extensions.size() * sizeof(llama_self_model_extension_entry);
 
     return size;
 }
@@ -2103,6 +2509,7 @@ bool llama_self_state::trace_export(void * dst, size_t size) const {
     append_bytes(buffer, LLAMA_SELF_TRACE_MAGIC);
     append_bytes(buffer, LLAMA_SELF_TRACE_VERSION);
     append_bytes(buffer, (uint32_t) trace_items.size());
+    append_bytes(buffer, (uint32_t) model_extensions.size());
 
     for (const auto & item : trace_items) {
         append_bytes(buffer, item.time_point);
@@ -2120,6 +2527,10 @@ bool llama_self_state::trace_export(void * dst, size_t size) const {
         for (llama_token token : item.tokens) {
             append_bytes(buffer, token);
         }
+    }
+
+    for (const auto & extension : model_extensions) {
+        append_bytes(buffer, extension);
     }
 
     if (buffer.size() > size) {
@@ -2140,16 +2551,20 @@ bool llama_self_state::trace_import(const void * src, size_t size, bool replace_
     uint32_t magic = 0;
     uint32_t version = 0;
     uint32_t count = 0;
+    uint32_t extension_count = 0;
     if (!read_bytes(bytes, size, &cursor, &magic) ||
         !read_bytes(bytes, size, &cursor, &version) ||
         !read_bytes(bytes, size, &cursor, &count) ||
         magic != LLAMA_SELF_TRACE_MAGIC ||
-        (version != 1 && version != 2 && version != LLAMA_SELF_TRACE_VERSION)) {
+        (version != 1 && version != 2 && version != 3 && version != LLAMA_SELF_TRACE_VERSION) ||
+        (version >= 4 && !read_bytes(bytes, size, &cursor, &extension_count))) {
         return false;
     }
 
     std::vector<llama_self_trace_item> imported;
     imported.reserve(count);
+    std::vector<llama_self_model_extension_entry> imported_extensions;
+    imported_extensions.reserve(extension_count);
 
     for (uint32_t i = 0; i < count; ++i) {
         llama_self_state_time_point time_point = {};
@@ -2206,14 +2621,27 @@ bool llama_self_state::trace_import(const void * src, size_t size, bool replace_
         imported.push_back(std::move(item));
     }
 
+    if (version >= 4) {
+        imported_extensions.resize(extension_count);
+        for (uint32_t i = 0; i < extension_count; ++i) {
+            if (!read_bytes(bytes, size, &cursor, &imported_extensions[(size_t) i])) {
+                return false;
+            }
+        }
+    }
+
     if (cursor != size) {
         return false;
     }
 
     if (replace_existing) {
         trace_items = std::move(imported);
+        model_extensions = std::move(imported_extensions);
     } else {
         trace_items.insert(trace_items.end(), imported.begin(), imported.end());
+        for (const auto & extension : imported_extensions) {
+            model_extensions.push_back(extension);
+        }
     }
 
     repair_trace_item_pointers(trace_items);
@@ -2228,6 +2656,15 @@ bool llama_self_state::trace_import(const void * src, size_t size, bool replace_
         trace_items.erase(trace_items.begin());
     }
     repair_trace_item_pointers(trace_items);
+    if (version >= 4) {
+        extension_summary = {};
+        extension_trace = {};
+        const std::array<float, 32> neutral_context = {};
+        extension_domain_signal signal = {};
+        accumulate_model_extensions(model_extensions, neutral_context, false, &signal, &extension_summary);
+    } else {
+        refresh_model_extension_summary();
+    }
 
     return true;
 }
@@ -2321,6 +2758,7 @@ bool llama_self_state::replay_trace(const llama_vocab * vocab, int32_t upto_coun
 
     const size_t limit = std::min(trace_items.size(), (size_t) upto_count);
     auto saved_trace = trace_items;
+    auto saved_model_extensions = model_extensions;
     repair_trace_item_pointers(saved_trace);
     trace_items.clear();
     reset_dynamic_state_preserve_static();
@@ -2350,6 +2788,14 @@ bool llama_self_state::replay_trace(const llama_vocab * vocab, int32_t upto_coun
         }
     }
 
+    if (!saved_model_extensions.empty()) {
+        model_extensions = std::move(saved_model_extensions);
+        extension_summary = {};
+        extension_trace = {};
+        const std::array<float, 32> neutral_context = {};
+        extension_domain_signal signal = {};
+        accumulate_model_extensions(model_extensions, neutral_context, false, &signal, &extension_summary);
+    }
     trace_items = saved_trace;
     return true;
 }
@@ -2883,7 +3329,6 @@ bool llama_self_state::apply_postwrite(const llama_self_state_event & event, con
 
     if ((event.flags & LLAMA_SELF_STATE_EVENT_ADMITTED) != 0) {
         admit_working_memory(event, build_event_sketch(event), features);
-
         if (event.channel != LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL &&
                 !is_internal_artifact_event(event)) {
             if (event.role == LLAMA_SELF_STATE_EVENT_USER) {
@@ -2902,6 +3347,9 @@ bool llama_self_state::apply_postwrite(const llama_self_state_event & event, con
             !is_internal_artifact_event(event)) {
         update_social_state(event, features);
         update_expanded_model(event, features, source_mask);
+        if ((event.flags & LLAMA_SELF_STATE_EVENT_ADMITTED) != 0) {
+            (void) maybe_admit_event_discovered_state(event, features);
+        }
     }
     previous_event_sketch = build_event_sketch(event);
     has_previous_event_sketch = event.n_tokens > 0;
@@ -2914,11 +3362,176 @@ bool llama_self_state::note_validated_progress(float signed_progress, float effi
         return false;
     }
 
+    update_extension_outcome_support(
+            clamp_signed_unit(signed_progress),
+            clamp_signed_unit(efficiency_advantage));
     update_evolution_uncertainty(
             LLAMA_SELF_SOURCE_COUNTERFACTUAL,
             clamp_signed_unit(signed_progress),
             clamp_signed_unit(efficiency_advantage));
     return true;
+}
+
+bool llama_self_state::maybe_admit_event_discovered_state(
+        const llama_self_state_event & event,
+        const llama_self_state_feature_vector & features) {
+    // Discovered-state admission intentionally keeps the policy visible:
+    // score surprise, relevance, and confidence from typed self-state features,
+    // then upsert only bounded discovered extensions that clear the floor.
+    if ((event.flags & LLAMA_SELF_STATE_EVENT_ADMITTED) == 0 ||
+        event.channel == LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL ||
+        is_internal_artifact_event(event) ||
+        event.n_tokens == 0) {
+        return false;
+    }
+
+    const float surprise = clamp_unit(
+            0.32f * features.novelty +
+            0.18f * features.topic_shift +
+            0.18f * features.uncertainty_score +
+            0.14f * features.contradiction_score +
+            0.10f * belief_summary.promotion_readiness +
+            0.08f * current_scalar_register(LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY));
+    const float relevance = clamp_unit(std::max({
+            0.55f * current_scalar_register(LLAMA_SELF_REGISTER_GOAL_PROGRESS_PRESSURE) + 0.45f * features.goal_top_similarity,
+            0.55f * current_scalar_register(LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK) + 0.45f * std::max(features.negative_user_valence, features.question_ratio),
+            0.58f * current_scalar_register(LLAMA_SELF_REGISTER_RECOVERY_URGENCY) + 0.42f * features.followup_hint,
+            0.55f * current_scalar_register(LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY) + 0.45f * features.tool_pending_pressure,
+            0.50f * current_scalar_register(LLAMA_SELF_REGISTER_UNCERTAINTY) + 0.25f * current_scalar_register(LLAMA_SELF_REGISTER_CONTRADICTION) + 0.25f * (1.0f - current_scalar_register(LLAMA_SELF_REGISTER_ANSWERABILITY)),
+            0.55f * belief_summary.promotion_readiness + 0.45f * extension_summary.context_activation,
+            0.40f * features.goal_top_similarity +
+                    0.25f * std::max(features.uncertainty_score, features.contradiction_score) +
+                    0.20f * features.followup_hint +
+                    0.15f * std::max(features.negative_user_valence, features.question_ratio),
+        }));
+    const float confidence = clamp_unit(
+            0.42f * (1.0f - features.uncertainty_score) +
+            0.24f * features.decoder_top_margin +
+            0.18f * (1.0f - features.novelty) +
+            0.16f * (1.0f - features.contradiction_score));
+    const float admission = clamp_unit(
+            0.38f * surprise +
+            0.37f * relevance +
+            0.25f * confidence);
+    if (admission < LLAMA_SELF_DISCOVERY_ADMISSION_THRESHOLD) {
+        return false;
+    }
+
+    const float goal_signal = clamp_unit(
+            0.55f * current_scalar_register(LLAMA_SELF_REGISTER_GOAL_PROGRESS_PRESSURE) +
+            0.45f * features.goal_top_similarity);
+    const float user_signal = clamp_unit(
+            0.50f * current_scalar_register(LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK) +
+            0.25f * features.negative_user_valence +
+            0.25f * features.question_ratio);
+    const float epistemic_signal = clamp_unit(
+            0.45f * current_scalar_register(LLAMA_SELF_REGISTER_UNCERTAINTY) +
+            0.25f * current_scalar_register(LLAMA_SELF_REGISTER_CONTRADICTION) +
+            0.15f * (1.0f - current_scalar_register(LLAMA_SELF_REGISTER_ANSWERABILITY)) +
+            0.15f * features.uncertainty_score);
+    const float efficiency_signal = clamp_unit(
+            0.55f * current_scalar_register(LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY) +
+            0.45f * features.tool_pending_pressure);
+    const float recovery_signal = clamp_unit(
+            0.55f * current_scalar_register(LLAMA_SELF_REGISTER_RECOVERY_URGENCY) +
+            0.45f * features.followup_hint);
+    const float self_improvement_signal = clamp_unit(
+            0.60f * current_scalar_register(LLAMA_SELF_REGISTER_EVOLUTION_UNCERTAINTY) +
+            0.40f * belief_summary.unmodeled_care_uncertainty);
+
+    int32_t domain = LLAMA_SELF_MODEL_EXTENSION_DOMAIN_EPISTEMIC;
+    float best_domain = epistemic_signal;
+    if (goal_signal > best_domain) {
+        best_domain = goal_signal;
+        domain = LLAMA_SELF_MODEL_EXTENSION_DOMAIN_GOAL_PROGRESS;
+    }
+    if (user_signal > best_domain) {
+        best_domain = user_signal;
+        domain = LLAMA_SELF_MODEL_EXTENSION_DOMAIN_USER_OUTCOME;
+    }
+    if (efficiency_signal > best_domain) {
+        best_domain = efficiency_signal;
+        domain = LLAMA_SELF_MODEL_EXTENSION_DOMAIN_EFFICIENCY;
+    }
+    if (recovery_signal > best_domain) {
+        best_domain = recovery_signal;
+        domain = LLAMA_SELF_MODEL_EXTENSION_DOMAIN_RECOVERY;
+    }
+    if (self_improvement_signal > best_domain) {
+        domain = LLAMA_SELF_MODEL_EXTENSION_DOMAIN_SELF_IMPROVEMENT;
+    }
+
+    const std::array<float, 32> sketch = build_event_sketch(event);
+    std::string key;
+    float best_similarity = 0.0f;
+    for (const auto & extension : model_extensions) {
+        if ((extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE) == 0 ||
+            extension.source != LLAMA_SELF_MODEL_EXTENSION_SOURCE_EVENT_FEEDBACK ||
+            extension.kind != LLAMA_SELF_MODEL_EXTENSION_MEMORY_CONTEXT ||
+            extension.domain != domain ||
+            (extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) == 0) {
+            continue;
+        }
+        const float similarity = clamp_unit(0.5f * (1.0f + sketch_similarity(extension.sketch, sketch)));
+        if (similarity > best_similarity) {
+            best_similarity = similarity;
+            key = read_bounded_cstr(extension.key);
+        }
+    }
+
+    if (best_similarity < 0.90f || key.empty()) {
+        const char * role_tag = "system";
+        if (event.role == LLAMA_SELF_STATE_EVENT_USER) {
+            role_tag = "user";
+        } else if (event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
+            role_tag = "tool";
+        }
+
+        std::ostringstream oss;
+        oss << "event_feedback:"
+            << role_tag
+            << ":" << domain
+            << ":" << sketch_signature(sketch);
+        key = oss.str();
+    }
+
+    const char * role_label = "System";
+    if (event.role == LLAMA_SELF_STATE_EVENT_USER) {
+        role_label = "User";
+    } else if (event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
+        role_label = "Tool";
+    }
+
+    std::ostringstream label;
+    label << role_label << " discovered feedback";
+    std::ostringstream content;
+    content << "domain=" << domain
+            << " surprise=" << surprise
+            << " relevance=" << relevance
+            << " confidence=" << confidence;
+
+    llama_self_model_extension_update update = llama_self_model_extension_default_update();
+    update.source = LLAMA_SELF_MODEL_EXTENSION_SOURCE_EVENT_FEEDBACK;
+    update.kind = LLAMA_SELF_MODEL_EXTENSION_MEMORY_CONTEXT;
+    update.domain = domain;
+    update.lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT;
+    update.flags = LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE |
+            LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_GAIN |
+            LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED;
+    update.support_count = 1;
+    update.value = admission;
+    update.confidence = confidence;
+    update.salience = std::max(surprise, relevance);
+    update.gain_weight = clamp_unit(0.30f + 0.40f * relevance + 0.30f * surprise);
+    update.surprise_score = surprise;
+    update.relevance_score = relevance;
+    update.admission_score = admission;
+    update.permanence_score = clamp_unit(0.35f * admission + 0.35f * confidence + 0.30f * best_similarity);
+    update.stability_score = clamp_unit(0.60f * confidence + 0.40f * best_similarity);
+    copy_bounded_cstr(update.key, key.c_str());
+    copy_bounded_cstr(update.label, label.str().c_str());
+    copy_bounded_cstr(update.content, trim_text(content.str(), LLAMA_SELF_MODEL_EXTENSION_CONTENT_MAX_CHARS - 1).c_str());
+    return upsert_model_extension(update);
 }
 
 void llama_self_state::update_reactivation_priorities(
@@ -3189,9 +3802,20 @@ void llama_self_state::refresh_belief_promotion_candidates() {
         return lhs.score > rhs.score;
     });
 
+    const bool discovered_bootstrap_ready =
+            extension_summary.discovered_count > 0 &&
+            extension_summary.mean_admission >= LLAMA_SELF_DISCOVERY_ADMISSION_THRESHOLD;
+    const float bootstrap_threshold = clamp_unit(std::max(0.42f, params.belief_promotion_threshold - 0.08f));
+
     for (int32_t i = 0; i < slot_count && promotion_candidate_count < LLAMA_SELF_BELIEF_MAX_PROMOTION_CANDIDATES; ++i) {
         const auto & choice = scored[(size_t) i];
-        if (choice.index < 0 || choice.score < params.belief_promotion_threshold) {
+        const bool bootstrap_candidate =
+                discovered_bootstrap_ready &&
+                promotion_candidate_count == 0 &&
+                i == 0 &&
+                choice.score >= bootstrap_threshold;
+        if (choice.index < 0 ||
+            (choice.score < params.belief_promotion_threshold && !bootstrap_candidate)) {
             continue;
         }
 
@@ -3214,6 +3838,115 @@ void llama_self_state::refresh_belief_promotion_candidates() {
                 sizeof(candidate.suggested_label),
                 "latent_residue_slot_%d",
                 choice.index);
+
+        std::string key = "belief_residue:slot:";
+        key.append(std::to_string(choice.index));
+        bool should_upsert = true;
+        for (const auto & extension : model_extensions) {
+            if (key == read_bounded_cstr(extension.key) &&
+                extension.last_update_monotonic_ms == datetime.monotonic_ms &&
+                std::fabs(extension.value - clamp_unit(slot.pressure)) < 0.01f) {
+                should_upsert = false;
+                break;
+            }
+        }
+        if (!should_upsert) {
+            continue;
+        }
+
+        llama_self_model_extension_update update = llama_self_model_extension_default_update();
+        update.source = LLAMA_SELF_MODEL_EXTENSION_SOURCE_EVENT_FEEDBACK;
+        update.kind = LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM;
+        update.domain = candidate.allostatic_relevance >= 0.55f ?
+                LLAMA_SELF_MODEL_EXTENSION_DOMAIN_RECOVERY :
+                LLAMA_SELF_MODEL_EXTENSION_DOMAIN_SELF_IMPROVEMENT;
+        update.lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT;
+        update.flags = LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE |
+                LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_GAIN |
+                LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED;
+        update.support_count = 1;
+        update.value = clamp_unit(slot.pressure);
+        update.confidence = clamp_unit(slot.confidence);
+        update.salience = clamp_unit(std::max(slot.pressure, choice.score));
+        update.gain_weight = clamp_unit(0.35f + 0.35f * candidate.support_score + 0.30f * candidate.allostatic_relevance);
+        update.surprise_score = clamp_unit(slot.novelty_support);
+        update.relevance_score = clamp_unit(candidate.allostatic_relevance);
+        update.admission_score = clamp_unit(candidate.support_score);
+        update.permanence_score = clamp_unit(0.45f * candidate.support_score + 0.30f * slot.confidence + 0.25f * slot.memory_support);
+        update.stability_score = clamp_unit(candidate.stability_score);
+        update.allostatic_eligibility = clamp_unit(0.55f * candidate.allostatic_relevance + 0.45f * candidate.stability_score);
+        copy_bounded_cstr(update.key, key.c_str());
+        copy_bounded_cstr(update.label, candidate.suggested_label);
+        copy_bounded_cstr(update.content, "Belief residue candidate admitted as discovered scalar state.");
+        (void) upsert_model_extension(update);
+    }
+
+    if (promotion_candidate_count == 0 && discovered_bootstrap_ready) {
+        const float bootstrap_support = clamp_unit(std::max(
+                belief_summary.promotion_readiness,
+                belief_summary.residual_allostatic_pressure));
+        const float bootstrap_stability = clamp_unit(
+                0.45f * belief_summary.belief_confidence +
+                0.30f * (1.0f - belief_summary.missing_observation_uncertainty) +
+                0.25f * (1.0f - belief_summary.known_care_uncertainty));
+        const float bootstrap_allostasis = clamp_unit(std::max(
+                belief_summary.residual_allostatic_pressure,
+                extension_summary.allostatic_divergence));
+
+        auto & candidate = promotion_candidates[(size_t) promotion_candidate_count++];
+        candidate.valid = true;
+        candidate.slot_index = -1;
+        candidate.support_score = bootstrap_support;
+        candidate.allostatic_relevance = bootstrap_allostasis;
+        candidate.suggested_desired_value = 0.0f;
+        candidate.stability_score = bootstrap_stability;
+        std::snprintf(
+                candidate.suggested_label,
+                sizeof(candidate.suggested_label),
+                "%s",
+                "latent_residue_global");
+
+        const std::string key = "belief_residue:global";
+        bool should_upsert = true;
+        for (const auto & extension : model_extensions) {
+            if (key == read_bounded_cstr(extension.key) &&
+                extension.last_update_monotonic_ms == datetime.monotonic_ms &&
+                std::fabs(extension.value - bootstrap_support) < 0.01f) {
+                should_upsert = false;
+                break;
+            }
+        }
+
+        if (should_upsert) {
+            llama_self_model_extension_update update = llama_self_model_extension_default_update();
+            update.source = LLAMA_SELF_MODEL_EXTENSION_SOURCE_EVENT_FEEDBACK;
+            update.kind = LLAMA_SELF_MODEL_EXTENSION_SCALAR_PARAM;
+            update.domain = bootstrap_allostasis >= 0.55f ?
+                    LLAMA_SELF_MODEL_EXTENSION_DOMAIN_RECOVERY :
+                    LLAMA_SELF_MODEL_EXTENSION_DOMAIN_SELF_IMPROVEMENT;
+            update.lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_TRANSIENT;
+            update.flags = LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE |
+                    LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_GAIN |
+                    LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED;
+            update.support_count = 1;
+            update.value = bootstrap_support;
+            update.confidence = clamp_unit(belief_summary.belief_confidence);
+            update.salience = clamp_unit(std::max(bootstrap_support, extension_summary.mean_admission));
+            update.gain_weight = clamp_unit(0.35f + 0.35f * bootstrap_support + 0.30f * bootstrap_allostasis);
+            update.surprise_score = clamp_unit(belief_summary.unmodeled_care_uncertainty);
+            update.relevance_score = bootstrap_allostasis;
+            update.admission_score = clamp_unit(std::max(bootstrap_support, extension_summary.mean_admission));
+            update.permanence_score = clamp_unit(
+                    0.40f * update.admission_score +
+                    0.35f * update.confidence +
+                    0.25f * bootstrap_stability);
+            update.stability_score = bootstrap_stability;
+            update.allostatic_eligibility = clamp_unit(0.55f * bootstrap_allostasis + 0.45f * bootstrap_stability);
+            copy_bounded_cstr(update.key, key.c_str());
+            copy_bounded_cstr(update.label, candidate.suggested_label);
+            copy_bounded_cstr(update.content, "Global belief residue candidate admitted as discovered scalar state.");
+            (void) upsert_model_extension(update);
+        }
     }
 }
 
@@ -3265,6 +3998,28 @@ void llama_self_state::update_summary_registers(uint32_t source_mask) {
     const float efficiency_advantage = clamp_signed_unit(
             0.60f * (previous_loop_inefficiency - current_scalar_register(LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY)) +
             0.40f * (previous_recovery_urgency - current_scalar_register(LLAMA_SELF_REGISTER_RECOVERY_URGENCY)));
+    update_extension_outcome_support(signed_progress, efficiency_advantage);
+    const float discovered_ratio = extension_summary.active_count > 0 ?
+            clamp_unit((float) extension_summary.discovered_count / (float) extension_summary.active_count) :
+            0.0f;
+    const float allostatic_ratio = extension_summary.active_count > 0 ?
+            clamp_unit((float) extension_summary.allostatic_count / (float) extension_summary.active_count) :
+            0.0f;
+    blend_scalar_register(
+            LLAMA_SELF_REGISTER_DISCOVERED_STATE_LOAD,
+            clamp_unit(discovered_ratio * std::max(extension_summary.context_activation, extension_summary.mean_admission)),
+            params.postwrite_gain,
+            source_mask);
+    blend_scalar_register(
+            LLAMA_SELF_REGISTER_DISCOVERED_STATE_PERMANENCE,
+            clamp_unit(discovered_ratio * extension_summary.mean_permanence),
+            params.postwrite_gain,
+            source_mask);
+    blend_scalar_register(
+            LLAMA_SELF_REGISTER_DISCOVERED_STATE_ALLOSTATIC_LOAD,
+            clamp_unit(std::max(allostatic_ratio, discovered_ratio * extension_summary.mean_allostatic_eligibility)),
+            params.postwrite_gain,
+            source_mask);
     update_evolution_uncertainty(source_mask, signed_progress, efficiency_advantage);
 }
 
@@ -4318,13 +5073,23 @@ llama_self_model_extension_update llama_self_model_extension_default_update(void
     update.source_tool_kind = LLAMA_TOOL_KIND_NONE;
     update.kind = LLAMA_SELF_MODEL_EXTENSION_MEMORY_CONTEXT;
     update.domain = LLAMA_SELF_MODEL_EXTENSION_DOMAIN_EPISTEMIC;
+    update.lifecycle_stage = LLAMA_SELF_MODEL_EXTENSION_STAGE_PERMANENT;
     update.flags = LLAMA_SELF_MODEL_EXTENSION_FLAG_ACTIVE | LLAMA_SELF_MODEL_EXTENSION_FLAG_AFFECT_GAIN;
+    update.support_count = 1;
     update.value = 1.0f;
     update.desired_value = 0.0f;
+    update.desired_value_min = 0.0f;
+    update.desired_value_max = 0.0f;
     update.confidence = 0.5f;
     update.salience = 0.5f;
     update.gain_weight = 1.0f;
     update.allostatic_weight = 0.0f;
+    update.surprise_score = 0.0f;
+    update.relevance_score = 0.0f;
+    update.admission_score = 0.0f;
+    update.permanence_score = 0.0f;
+    update.stability_score = 0.0f;
+    update.allostatic_eligibility = 0.0f;
     return update;
 }
 
@@ -4785,6 +5550,13 @@ int32_t llama_self_state_apply_postwrite(
         const struct llama_self_state_event * event,
         const struct llama_self_state_feature_vector * features) {
     return ctx && event && features && ctx->self_state_apply_postwrite(*event, *features) ? 0 : -1;
+}
+
+int32_t llama_self_state_note_validated_progress(
+        struct llama_context * ctx,
+        float signed_progress,
+        float efficiency_advantage) {
+    return ctx && ctx->self_state_note_validated_progress(signed_progress, efficiency_advantage) ? 0 : -1;
 }
 
 int32_t llama_hard_memory_configure(

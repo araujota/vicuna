@@ -94,6 +94,21 @@ The functional bank is intentionally separate from the temporal cascade:
 - the same Adam family is also used for self-state-driven runtime LoRA tensor
   writes and temporal write-bias updates, while discrete counterfactual
   intervention ranking remains explicit CPU policy rather than an optimizer path
+- process-functional LoRAs extend that family stack with a bounded
+  process/process-step bank keyed by stable semantic execution signatures rather
+  than transient plan IDs or tick IDs
+- each process entry follows the same runtime pattern as shipped functional
+  families: a learned adapter that begins as a no-op plus a tiny bootstrap
+  adapter whose perturbation decays toward a small floor
+- process-generated functional entries now share the same lifecycle substrate as
+  shipped functional families: weekly snapshot capture, archived replay,
+  orthogonal/local replay overrides, and differential replay-to-live updates
+- only the currently matching process entry is attached, so the serving stack
+  grows by two runtime layers at most even if the stored bank contains many
+  historical process specializations
+- DMN counterfactual simulation scores those process-generated entries through
+  the same replay surface, so process-local, process-history, and
+  process-orthogonal proposals participate in the same functional-bias ladder
 
 The current request/response cycle is:
 
@@ -308,6 +323,68 @@ That summary cooperates with the functional LoRA stack in two ways:
 This keeps hard memory, self-model state, and LoRA modulation coupled through
 typed bounded surfaces rather than prompt text.
 
+### Closed Self-Improvement Synthesis
+
+The self-improvement architecture should be read as one bounded loop, not as a
+set of adjacent features:
+
+1. admitted primary feedback updates the typed self-state and may create or
+   revise discovered self-model extensions,
+2. self-state, extension, belief, and hard-memory residue are compressed into
+   bounded summaries rather than fed forward as variable-width prompt text,
+3. favorable-state error plus those bounded summaries drive functional gain
+   routing,
+4. the active or DMN loop executes under the selected functional family and, if
+   applicable, the matching process-functional specialization,
+5. post-action deltas settle family and process-functional updates, emit durable
+   hard-memory residue, and update discovered-state support,
+6. DMN counterfactual replay compares local, historical, and orthogonal
+   functional hypotheses, including process-functional entries on the same
+   lifecycle substrate,
+7. validated progress and postwrite support can consolidate discovered state
+   into permanent or allostatic self-model structure,
+8. runtime snapshots persist the resulting self-state plus functional/process
+   archives so the loop survives restart.
+
+The invariants that keep this loop synthesized are:
+
+- no raw variable-length self-model or hard-memory structure reaches the gating
+  controller directly,
+- process-functional adapters are not a second adaptation regime; they use the
+  same snapshot, replay, and differential-update substrate as shipped
+  functional families,
+- DMN functional counterfactuals improve the same live bias layers that serve
+  execution,
+- and discovered/permanent/allostatic self-state feeds future routing through
+  bounded explicit summaries instead of latent prompt residue.
+
+### Unified Provenance
+
+Release evaluation of semi-biological growth cannot depend on ad hoc debug
+strings or last-trace inspection alone. The server now maintains one
+append-only structured provenance repository for self-improvement events.
+
+That repository is aligned with the implemented loop boundaries:
+
+- active-loop episodes
+- tool-result integrations
+- admitted DMN ticks with counterfactual/governance summaries
+
+Each event carries stable session and sequence identity plus bounded summaries
+of:
+
+- self-model extension counts and allostatic pressure
+- belief/promotion readiness
+- functional and process-functional update surfaces
+- counterfactual choice and governance outcome
+
+This keeps the observability model unified:
+
+- one local source of truth for longitudinal analysis
+- one online metrics/health surface derived from the same data
+- and one schema that can later be exported into broader tracing/evaluation
+  infrastructure without redesigning the runtime
+
 ### Extensibility
 
 The runtime must remain open to:
@@ -519,10 +596,11 @@ Current implementation slice:
 - primary-channel events that produce above-threshold self-state deltas can now
   be archived into hard memory with message context plus a bounded top-register
   delta summary, while counterfactual-channel events remain excluded by default,
-- counterfactual search now follows a low-risk-first ladder across message
-  variants, tool-argument changes, hard-memory query variants, tool-choice
-  changes, timing shifts, and runtime-memory LoRA ablation before it considers
-  higher-risk sensitivity or updater-policy proposals,
+- counterfactual search now follows a hypothesis-first low-risk ladder centered
+  on runtime-memory LoRA ablation plus functional-bias replay candidates
+  (local, historical, orthogonal), with tool- or retrieval-oriented discrete
+  variants kept only as bounded fallbacks before higher-risk sensitivity or
+  updater-policy proposals,
 - LoRA ablation is treated as a first-class diagnostic over the serving runtime
   memory stack in recency order (`active`, `past_week`, `past_month`,
   `past_quarter`, `past_year`, `all_time`),
@@ -563,23 +641,38 @@ reactivation / pressure spike
 -> Active LoRA update, gather-info tool job, defer, deny, or repair emit
 ```
 
-The message-variant branch now includes a bounded user-response simulation
-subpass:
+The normal DMN counterfactual budget is now spent on temporal and functional
+hypothesis testing first:
 
 ```text
-candidate assistant message
--> ablate temporal/runtime memory adapters
--> attach only base model + user-personality LoRA
--> decode bounded simulated user reply
--> replay simulated reply on counterfactual self-state channel
--> score signed self-state outcome
--> restore normal serving stack
+current self-state pressure
+-> temporal runtime-memory ablations
+-> local functional perturbation
+-> historical weekly functional replay
+-> orthogonal attractor-escape replay
+-> optional bounded tool/retrieval fallback candidates
 ```
 
-This is not a general second agent. It is a narrow evaluation mode used only by
-DMN counterfactual search. The user-personality LoRA is trained continuously
-from admitted user-message residue and stays fixed-size rather than versioned.
-Its job is rhetorical simulation, not durable memory storage.
+This keeps DMN compute focused on bias and memory hypotheses rather than asking
+the generic question "what if the input were different?" Tool-oriented fallbacks
+still exist when tool pressure or retrieval pressure makes them worthwhile.
+
+Functional-bias counterfactual search now runs in a separate control lane from
+temporal-memory replay:
+
+- DMN samples functional candidates from three families: local perturbation,
+  weekly archived historical replay, and orthogonal attractor-escape replay
+- archived functional snapshots are stored once per week, capped at four slots
+  per family, and expired after roughly 31 days
+- historical and orthogonal functional replay substitute the live functional
+  family during evaluation; they do not stack with the current functional LoRA
+  the way temporal memory layers stack
+- after scoring, the best functional replay candidate produces a signed
+  differential update against the live functional LoRA by applying the LoRA
+  tensor difference scaled by counterfactual advantage and robustness
+- orthogonal replay explicitly projects perturbation directions away from the
+  recent dominant functional update direction so the DMN can challenge
+  entrenched attractors
 
 Useful meta-registers and governance inputs include:
 
@@ -592,9 +685,9 @@ Useful meta-registers and governance inputs include:
 
 Safe initial improvement surfaces:
 
-- message-shaping biases captured in Active LoRA,
-- tool-argument and tool-choice heuristics,
-- timing / continuation policy,
+- temporal-memory ablation and replay policy,
+- functional-bias gain and differential-update policy,
+- tool-argument and tool-choice heuristics when tool pressure is high,
 - bounded scoring coefficients,
 - replay ordering and reactivation refresh policy,
 - auxiliary learned probes.

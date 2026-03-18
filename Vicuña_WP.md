@@ -701,6 +701,24 @@ reactivation / pressure spike
 -> optional human approval or constrained automatic application
 ```
 
+For functional-bias optimization, candidate generation should include:
+
+- temporal-memory ablation hypotheses over the runtime memory stack
+- local bias perturbations near the active functional LoRA state
+- historical replay of weekly archived functional LoRA snapshots
+- orthogonal perturbations that deliberately leave the dominant recent update
+  direction
+
+Historical functional replay should replace the current functional family during
+evaluation rather than stacking with it. Weekly functional snapshots should be
+retained for about one month, with bounded per-family storage, and the applied
+update should be the signed difference between the live functional LoRA and the
+better or worse replayed candidate, scaled by the observed self-state outcome.
+Simple message/input-variant exploration should no longer dominate the normal
+DMN counterfactual budget once these temporal and functional hypotheses are
+available; discrete tool-oriented variants are better treated as bounded
+fallbacks.
+
 ### 11.3 Meta-registers for self-improvement
 
 A first useful set:

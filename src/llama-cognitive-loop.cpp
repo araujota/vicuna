@@ -64,6 +64,14 @@ struct lexical_signals {
 };
 
 std::vector<llama_token> tokenize_text(const llama_vocab * vocab, const std::string & text);
+llama_process_functional_signature make_process_signature(
+        int32_t loop_origin,
+        int32_t family,
+        int32_t microphase,
+        const llama_cognitive_plan_trace * plan,
+        const llama_cognitive_tool_spec * tool_spec,
+        int32_t transient_source_id);
+int32_t primary_functional_family(const llama_functional_activation_decision & decision);
 
 lexical_signals analyze_event_lexicon(const llama_vocab * vocab, const llama_self_state_event & event) {
     lexical_signals out = {};
@@ -472,6 +480,183 @@ const llama_counterfactual_candidate * best_temporal_ablation_candidate(
     return best;
 }
 
+int32_t select_functional_bias_family(const llama_favorable_state_profile & profile) {
+    if (profile.priority_count <= 0) {
+        return LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL;
+    }
+    const int32_t top_dim = profile.dimensions[profile.priority_order[0]].dimension_id;
+    switch (top_dim) {
+        case LLAMA_FAVORABLE_DIM_TOOL_BACKLOG:
+        case LLAMA_FAVORABLE_DIM_TOOL_READINESS:
+            return LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
+        case LLAMA_FAVORABLE_DIM_MEMORY_WRITE_PRIORITY:
+        case LLAMA_FAVORABLE_DIM_REACTIVATION_PRIORITY:
+            return LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION;
+        case LLAMA_FAVORABLE_DIM_SOCIAL_TRUST:
+        case LLAMA_FAVORABLE_DIM_SOCIAL_RECIPROCITY:
+        case LLAMA_FAVORABLE_DIM_SOCIAL_DISSATISFACTION:
+            return LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION;
+        default:
+            return LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL;
+    }
+}
+
+int32_t find_process_entry_slot_for_signature(
+        llama_context & ctx,
+        const llama_process_functional_signature & signature) {
+    if (!signature.valid) {
+        return -1;
+    }
+    for (int32_t entry_slot = 0; entry_slot < LLAMA_PROCESS_FUNCTIONAL_MAX_ENTRIES; ++entry_slot) {
+        llama_process_functional_entry_info info = {};
+        if (!ctx.process_functional_entry_get(entry_slot, &info) || !info.valid) {
+            continue;
+        }
+        if (info.signature.valid &&
+                info.signature.family == signature.family &&
+                info.signature.signature_hash == signature.signature_hash) {
+            return entry_slot;
+        }
+    }
+    return -1;
+}
+
+int32_t select_best_process_snapshot_slot(
+        llama_context & ctx,
+        int32_t entry_slot) {
+    llama_functional_lora_snapshot_archive archive = {};
+    if (!ctx.process_functional_snapshot_archive_get(entry_slot, &archive) || archive.count == 0) {
+        return -1;
+    }
+    int32_t best_snapshot_slot = -1;
+    for (int32_t snapshot_slot = 0; snapshot_slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++snapshot_slot) {
+        const auto & item = archive.items[snapshot_slot];
+        if (!item.valid) {
+            continue;
+        }
+        if (best_snapshot_slot < 0) {
+            best_snapshot_slot = snapshot_slot;
+            continue;
+        }
+        const auto & best_item = archive.items[best_snapshot_slot];
+        if (item.robustness_score > best_item.robustness_score + 1.0e-6f ||
+                (std::fabs(item.robustness_score - best_item.robustness_score) <= 1.0e-6f &&
+                 item.captured_at_us > best_item.captured_at_us)) {
+            best_snapshot_slot = snapshot_slot;
+        }
+    }
+    return best_snapshot_slot;
+}
+
+float score_functional_bias_candidate(
+        llama_context & ctx,
+        const llama_favorable_state_profile & profile,
+        int32_t functional_target_kind,
+        int32_t functional_family,
+        int32_t process_entry_slot,
+        int32_t replay_mode,
+        int32_t snapshot_slot,
+        float orthogonality,
+        const llama_process_functional_signature * process_signature,
+        float * out_fragility,
+        float * out_concentration,
+        float * out_robustness) {
+    // Counterfactual functional replay stays explicit here on purpose:
+    // score archived or perturbed candidates from typed replay metadata,
+    // then apply the same bounded replay override surface used by serving.
+    if (out_fragility) {
+        *out_fragility = 0.0f;
+    }
+    if (out_concentration) {
+        *out_concentration = 0.0f;
+    }
+    if (out_robustness) {
+        *out_robustness = 0.0f;
+    }
+
+    const float aggregate = clamp_unit(profile.aggregate_divergence);
+    float robustness = 0.45f + 0.35f * aggregate;
+    float base = 0.04f + 0.18f * aggregate;
+
+    if (replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_ARCHIVED) {
+        llama_functional_lora_snapshot_info info = {};
+        const bool have_info =
+                functional_target_kind == LLAMA_FUNCTIONAL_LORA_TARGET_PROCESS_ENTRY ?
+                        ctx.process_functional_snapshot_info_get(process_entry_slot, snapshot_slot, &info) :
+                        ctx.functional_lora_snapshot_info_get(functional_family, snapshot_slot, &info);
+        if (have_info) {
+            robustness = clamp_unit(std::max(0.0f, info.robustness_score));
+            base += 0.22f * clamp_unit(0.5f + 0.5f * info.last_signed_outcome);
+            base += 0.12f * robustness;
+        }
+    } else if (replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL) {
+        base += 0.20f * clamp_unit(1.0f - std::fabs(orthogonality));
+        robustness = clamp_unit(0.40f + 0.25f * aggregate + 0.20f * (1.0f - std::fabs(orthogonality)));
+    } else {
+        base += 0.10f * aggregate;
+        robustness = clamp_unit(0.35f + 0.20f * aggregate);
+    }
+
+    llama_functional_lora_replay_override replay = {};
+    replay.active = replay_mode != LLAMA_FUNCTIONAL_REPLAY_MODE_NONE;
+    replay.family = functional_family;
+    replay.replay_mode = replay_mode;
+    replay.snapshot_slot = snapshot_slot;
+    replay.replay_gain = 1.0f;
+    replay.perturbation_scale = 0.05f + 0.05f * aggregate;
+    replay.cosine_limit = 0.10f;
+    replay.disable_bootstrap = true;
+    if (replay.active) {
+        if (functional_target_kind == LLAMA_FUNCTIONAL_LORA_TARGET_PROCESS_ENTRY) {
+            (void) ctx.process_functional_replay_override_begin(process_entry_slot, replay);
+        } else {
+            (void) ctx.functional_lora_replay_override_begin(replay);
+        }
+    }
+
+    llama_functional_activation_decision decision = {};
+    decision.loop_origin = LLAMA_COG_COMMAND_ORIGIN_DMN;
+    decision.microphase = LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE;
+    decision.family_count = LLAMA_FUNCTIONAL_LORA_COUNT;
+    decision.top_family = functional_family;
+    decision.eligible_mask = (1ull << functional_family);
+    decision.activated_mask = (1ull << functional_family);
+    decision.gains[functional_family] = 1.0f;
+    decision.predicted_gains[functional_family] = 1.0f;
+    decision.hold_unit[functional_family] = LLAMA_FUNCTIONAL_HOLD_LOOP_STEPS;
+    decision.hold_value[functional_family] = 1;
+    (void) ctx.process_functional_set_execution(process_signature ? *process_signature : llama_process_functional_signature {});
+    (void) ctx.functional_lora_activate(decision);
+
+    const float fragility = clamp_unit(
+            0.30f * std::max(0.0f, aggregate - robustness) +
+            0.20f * std::max(0.0f, std::fabs(orthogonality) - 0.10f));
+    const float concentration = clamp_unit(
+            0.22f * aggregate +
+            0.12f * (functional_family == LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL ? 1.0f : 0.0f) +
+            0.08f * (functional_target_kind == LLAMA_FUNCTIONAL_LORA_TARGET_PROCESS_ENTRY ? 1.0f : 0.0f));
+
+    if (replay.active) {
+        if (functional_target_kind == LLAMA_FUNCTIONAL_LORA_TARGET_PROCESS_ENTRY) {
+            (void) ctx.process_functional_replay_override_end(process_entry_slot);
+        } else {
+            (void) ctx.functional_lora_replay_override_end(functional_family);
+        }
+    }
+
+    if (out_fragility) {
+        *out_fragility = fragility;
+    }
+    if (out_concentration) {
+        *out_concentration = concentration;
+    }
+    if (out_robustness) {
+        *out_robustness = robustness;
+    }
+
+    return clamp_unit(base - fragility - concentration);
+}
+
 llama_functional_activation_decision make_inactive_functional_decision(int32_t loop_origin) {
     llama_functional_activation_decision decision = {};
     decision.loop_origin = loop_origin;
@@ -637,6 +822,138 @@ int32_t first_ready_plan_step(const llama_cognitive_plan_trace & plan) {
         if (plan.steps[i].status == LLAMA_COG_PLAN_STEP_STATUS_READY ||
                 plan.steps[i].status == LLAMA_COG_PLAN_STEP_STATUS_PENDING) {
             return i;
+        }
+    }
+    return -1;
+}
+
+uint64_t process_hash_mix(uint64_t seed, uint64_t value) {
+    seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    return seed;
+}
+
+const char * loop_origin_label(int32_t loop_origin) {
+    switch (loop_origin) {
+        case LLAMA_COG_COMMAND_ORIGIN_ACTIVE: return "active";
+        case LLAMA_COG_COMMAND_ORIGIN_DMN: return "dmn";
+        default: return "unknown";
+    }
+}
+
+llama_process_functional_signature make_process_signature(
+        int32_t loop_origin,
+        int32_t family,
+        int32_t microphase,
+        const llama_cognitive_plan_trace * plan,
+        const llama_cognitive_tool_spec * tool_spec,
+        int32_t transient_source_id) {
+    llama_process_functional_signature signature = {};
+    if (family < 0 || microphase <= LLAMA_FUNCTIONAL_MICROPHASE_NONE) {
+        return signature;
+    }
+
+    const llama_cognitive_plan_step * step = nullptr;
+    if (plan &&
+            plan->valid &&
+            plan->current_step_index >= 0 &&
+            plan->current_step_index < plan->step_count) {
+        step = &plan->steps[plan->current_step_index];
+    }
+
+    signature.valid = true;
+    signature.family = family;
+    signature.loop_origin = loop_origin;
+    signature.microphase = microphase;
+    signature.plan_mode = plan && plan->valid ? plan->mode : LLAMA_COG_PLAN_MODE_NONE;
+    signature.plan_step_kind = step ? step->kind : LLAMA_COG_PLAN_STEP_NONE;
+    if (step) {
+        signature.tool_kind = step->tool_kind;
+    } else if (tool_spec) {
+        signature.tool_kind = tool_spec->tool_kind;
+    } else {
+        signature.tool_kind = LLAMA_TOOL_KIND_NONE;
+    }
+    signature.source_family = step ? step->source_family : family;
+    signature.requires_tool_result = step ? step->requires_tool_result : false;
+    signature.transient_plan_id = plan && plan->valid ? plan->plan_id : -1;
+    signature.transient_step_index = plan && plan->valid ? plan->current_step_index : -1;
+    signature.transient_source_id = transient_source_id;
+    signature.scope_kind = step ? LLAMA_PROCESS_FUNCTIONAL_SCOPE_PROCESS_STEP : LLAMA_PROCESS_FUNCTIONAL_SCOPE_PROCESS;
+    if (tool_spec) {
+        std::snprintf(signature.tool_name, sizeof(signature.tool_name), "%s", tool_spec->name);
+    }
+
+    std::string semantic_key = std::string(loop_origin_label(loop_origin)) +
+            "/" + functional_microphase_name(microphase);
+    if (step) {
+        semantic_key += "/step_kind:" + std::to_string(step->kind);
+        semantic_key += "/src_family:" + std::to_string(step->source_family);
+    }
+    if (signature.tool_kind != LLAMA_TOOL_KIND_NONE) {
+        semantic_key += "/tool:";
+        if (signature.tool_name[0] != '\0') {
+            semantic_key += signature.tool_name;
+        } else {
+            semantic_key += std::to_string(signature.tool_kind);
+        }
+    }
+    std::snprintf(signature.semantic_key, sizeof(signature.semantic_key), "%s", semantic_key.c_str());
+
+    uint64_t hash = 1469598103934665603ULL;
+    hash = process_hash_mix(hash, (uint64_t) signature.scope_kind);
+    hash = process_hash_mix(hash, (uint64_t) family);
+    hash = process_hash_mix(hash, (uint64_t) loop_origin);
+    hash = process_hash_mix(hash, (uint64_t) microphase);
+    hash = process_hash_mix(hash, (uint64_t) signature.plan_mode);
+    hash = process_hash_mix(hash, (uint64_t) signature.plan_step_kind);
+    hash = process_hash_mix(hash, (uint64_t) signature.tool_kind);
+    hash = process_hash_mix(hash, (uint64_t) signature.source_family);
+    hash = process_hash_mix(hash, signature.requires_tool_result ? 1ULL : 0ULL);
+    for (const char * p = signature.tool_name; *p; ++p) {
+        hash = process_hash_mix(hash, (uint64_t) (uint8_t) *p);
+    }
+    signature.signature_hash = hash;
+    return signature;
+}
+
+llama_process_functional_signature rebind_process_signature_family(
+        const llama_process_functional_signature & base,
+        int32_t family) {
+    llama_process_functional_signature signature = {};
+    if (!base.valid || family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT) {
+        return signature;
+    }
+
+    signature = base;
+    signature.family = family;
+    if (signature.plan_step_kind == LLAMA_COG_PLAN_STEP_NONE) {
+        signature.source_family = family;
+    }
+
+    uint64_t hash = 1469598103934665603ULL;
+    hash = process_hash_mix(hash, (uint64_t) signature.scope_kind);
+    hash = process_hash_mix(hash, (uint64_t) family);
+    hash = process_hash_mix(hash, (uint64_t) signature.loop_origin);
+    hash = process_hash_mix(hash, (uint64_t) signature.microphase);
+    hash = process_hash_mix(hash, (uint64_t) signature.plan_mode);
+    hash = process_hash_mix(hash, (uint64_t) signature.plan_step_kind);
+    hash = process_hash_mix(hash, (uint64_t) signature.tool_kind);
+    hash = process_hash_mix(hash, (uint64_t) signature.source_family);
+    hash = process_hash_mix(hash, signature.requires_tool_result ? 1ULL : 0ULL);
+    for (const char * p = signature.tool_name; *p; ++p) {
+        hash = process_hash_mix(hash, (uint64_t) (uint8_t) *p);
+    }
+    signature.signature_hash = hash;
+    return signature;
+}
+
+int32_t primary_functional_family(const llama_functional_activation_decision & decision) {
+    if (decision.top_family >= 0 && decision.top_family < LLAMA_FUNCTIONAL_LORA_COUNT) {
+        return decision.top_family;
+    }
+    for (int32_t family = 0; family < LLAMA_FUNCTIONAL_LORA_COUNT; ++family) {
+        if ((decision.activated_mask & (1ull << family)) != 0) {
+            return family;
         }
     }
     return -1;
@@ -1732,6 +2049,12 @@ std::string remediation_prompt_for_family(int32_t family) {
             return "Prefer timing and follow-up choices that reduce social dissatisfaction without increasing broadcast inhibition.";
         case LLAMA_COUNTERFACTUAL_FAMILY_LORA_ABLATION:
             return "Bias responses toward lower-divergence behaviors retained in earlier runtime memory adapters when recent behavior is unstable.";
+        case LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_LOCAL:
+            return "Prefer nearby functional-bias perturbations that reduce favorable-state divergence without concentrating policy.";
+        case LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_HISTORY:
+            return "Prefer earlier archived functional-bias states when they outperform the current bias stance under DMN replay.";
+        case LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_ORTHOGONAL:
+            return "Prefer orthogonal functional-bias proposals that escape recent attractors while remaining robust under perturbation.";
         default:
             return "Prefer lower-divergence responses that move the system toward favorable self-state.";
     }
@@ -1863,15 +2186,12 @@ public:
         const auto * tool_backlog = find_dimension(profile, LLAMA_FAVORABLE_DIM_TOOL_BACKLOG);
         const auto * tool_readiness = find_dimension(profile, LLAMA_FAVORABLE_DIM_TOOL_READINESS);
         const auto * dissatisfaction = find_dimension(profile, LLAMA_FAVORABLE_DIM_SOCIAL_DISSATISFACTION);
-        const auto * continuation = find_dimension(profile, LLAMA_FAVORABLE_DIM_FOLLOWUP_CONTINUATION);
-
         const float contradiction_div = contradiction ? contradiction->divergence : 0.0f;
         const float uncertainty_div = uncertainty ? uncertainty->divergence : 0.0f;
         const float tool_div = std::max(
                 tool_backlog ? tool_backlog->divergence : 0.0f,
                 tool_readiness ? tool_readiness->divergence : 0.0f);
         const float dissatisfaction_div = dissatisfaction ? dissatisfaction->divergence : 0.0f;
-        const float continuation_div = continuation ? continuation->divergence : 0.0f;
         const float aggregate = clamp_unit(profile.aggregate_divergence);
 
         auto append_candidate = [&](int32_t family, int32_t risk_tier, int32_t subject_id, float expected_improvement, float confidence) {
@@ -1883,58 +2203,26 @@ public:
             candidate.family = family;
             candidate.risk_tier = risk_tier;
             candidate.subject_id = subject_id;
+            candidate.functional_target_kind = LLAMA_FUNCTIONAL_LORA_TARGET_FAMILY_ROOT;
+            candidate.functional_family = -1;
+            candidate.process_entry_slot = -1;
+            candidate.proposal_family = -1;
+            candidate.replay_mode = LLAMA_FUNCTIONAL_REPLAY_MODE_NONE;
+            candidate.snapshot_slot = -1;
             candidate.expected_improvement = clamp_unit(expected_improvement);
             candidate.confidence = clamp_unit(confidence);
+            candidate.fragility_penalty = 0.0f;
+            candidate.concentration_penalty = 0.0f;
+            candidate.robustness_score = 0.0f;
+            candidate.orthogonality = 0.0f;
+            candidate.realized_score = candidate.expected_improvement;
+            candidate.signed_advantage_vs_current = 0.0f;
         };
 
-        append_candidate(
-                LLAMA_COUNTERFACTUAL_FAMILY_MESSAGE_VARIANT,
-                LLAMA_COUNTERFACTUAL_RISK_LOW,
-                profile.priority_count > 0 ? profile.dimensions[profile.priority_order[0]].dimension_id : -1,
-                0.12f + 0.35f * aggregate + 0.20f * dissatisfaction_div + 0.18f * contradiction_div + 0.10f * uncertainty_div,
-                0.78f);
-        append_candidate(
-                LLAMA_COUNTERFACTUAL_FAMILY_TOOL_ARGUMENTS,
-                LLAMA_COUNTERFACTUAL_RISK_LOW,
-                LLAMA_FAVORABLE_DIM_TOOL_BACKLOG,
-                0.08f + 0.42f * tool_div + 0.18f * uncertainty_div + 0.10f * aggregate,
-                0.72f);
         llama_hard_memory_config hard_memory = {};
         const bool hard_memory_enabled =
                 ctx.hard_memory_get_config(&hard_memory) &&
                 hard_memory.enabled;
-        if (hard_memory_enabled) {
-            int32_t temporal_role = LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK;
-            const int32_t lora_count = ctx.serving_lora_stack_count();
-            for (int32_t i = 0; i < lora_count; ++i) {
-                llama_serving_lora_layer_info info = {};
-                if (ctx.serving_lora_stack_layer(i, &info) &&
-                        (info.role == LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK || info.role == LLAMA_ADAPTER_LORA_LAYER_ACTIVE)) {
-                    temporal_role = info.role;
-                    if (info.role == LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK) {
-                        break;
-                    }
-                }
-            }
-            append_candidate(
-                    LLAMA_COUNTERFACTUAL_FAMILY_HARD_MEMORY_QUERY,
-                    LLAMA_COUNTERFACTUAL_RISK_LOW,
-                    temporal_role,
-                    0.07f + 0.28f * aggregate + 0.18f * tool_div + 0.16f * dissatisfaction_div + 0.12f * uncertainty_div,
-                    0.70f);
-        }
-        append_candidate(
-                LLAMA_COUNTERFACTUAL_FAMILY_TOOL_CHOICE,
-                LLAMA_COUNTERFACTUAL_RISK_LOW,
-                LLAMA_FAVORABLE_DIM_TOOL_READINESS,
-                0.06f + 0.34f * tool_div + 0.24f * aggregate + 0.10f * contradiction_div,
-                0.68f);
-        append_candidate(
-                LLAMA_COUNTERFACTUAL_FAMILY_TIMING_SHIFT,
-                LLAMA_COUNTERFACTUAL_RISK_LOW,
-                LLAMA_FAVORABLE_DIM_FOLLOWUP_CONTINUATION,
-                0.05f + 0.26f * continuation_div + 0.26f * dissatisfaction_div + 0.16f * aggregate,
-                0.64f);
 
         float best_low_risk_improvement = 0.0f;
         for (int32_t i = 0; i < trace.candidate_count; ++i) {
@@ -1965,8 +2253,28 @@ public:
             return lhs.precedence < rhs.precedence;
         });
 
+        const int32_t functional_family = select_functional_bias_family(profile);
+        llama_process_functional_signature current_process_signature = {};
+        (void) ctx.process_functional_get_current_signature(&current_process_signature);
+        const llama_process_functional_signature compare_process_signature =
+                rebind_process_signature_family(current_process_signature, functional_family);
+        const int32_t process_entry_slot =
+                find_process_entry_slot_for_signature(ctx, compare_process_signature);
+        llama_functional_lora_snapshot_archive snapshot_archive = {};
+    const bool have_functional_history =
+            ctx.functional_lora_snapshot_archive_get(functional_family, &snapshot_archive) &&
+            snapshot_archive.count > 0;
+        const int32_t best_process_snapshot_slot = process_entry_slot >= 0 ?
+                select_best_process_snapshot_slot(ctx, process_entry_slot) :
+                -1;
+        const bool have_process_history = best_process_snapshot_slot >= 0;
+        const int32_t reserved_functional_slots =
+                2 + (have_functional_history ? 1 : 0) +
+                (process_entry_slot >= 0 ? (2 + (have_process_history ? 1 : 0)) : 0);
+        const int32_t reserved_escalation_slots = 2;
         for (const auto & layer : runtime_loras) {
-            if (trace.candidate_count >= LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+            if (trace.candidate_count >=
+                    LLAMA_COUNTERFACTUAL_MAX_CANDIDATES - reserved_functional_slots - reserved_escalation_slots) {
                 break;
             }
             const int32_t recency_rank = role_recency_rank(layer.role);
@@ -1980,6 +2288,295 @@ public:
                     expected,
                     confidence);
             best_low_risk_improvement = std::max(best_low_risk_improvement, clamp_unit(expected));
+        }
+
+        float fragility = 0.0f;
+        float concentration = 0.0f;
+        float robustness = 0.0f;
+        if (trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+            const float expected = score_functional_bias_candidate(
+                    ctx,
+                    profile,
+                    LLAMA_FUNCTIONAL_LORA_TARGET_FAMILY_ROOT,
+                    functional_family,
+                    -1,
+                    LLAMA_FUNCTIONAL_REPLAY_MODE_LOCAL_PERTURBED,
+                    -1,
+                    0.0f,
+                    &compare_process_signature,
+                    &fragility,
+                    &concentration,
+                    &robustness);
+            auto & candidate = trace.candidates[trace.candidate_count++];
+            candidate.family = LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_LOCAL;
+            candidate.risk_tier = LLAMA_COUNTERFACTUAL_RISK_LOW;
+            candidate.subject_id = functional_family;
+            candidate.functional_target_kind = LLAMA_FUNCTIONAL_LORA_TARGET_FAMILY_ROOT;
+            candidate.functional_family = functional_family;
+            candidate.process_entry_slot = -1;
+            candidate.proposal_family = LLAMA_FUNCTIONAL_BIAS_PROPOSAL_LOCAL;
+            candidate.replay_mode = LLAMA_FUNCTIONAL_REPLAY_MODE_LOCAL_PERTURBED;
+            candidate.snapshot_slot = -1;
+            candidate.expected_improvement = expected;
+            candidate.confidence = clamp_unit(0.52f + 0.20f * robustness);
+            candidate.fragility_penalty = fragility;
+            candidate.concentration_penalty = concentration;
+            candidate.robustness_score = robustness;
+            candidate.orthogonality = 0.0f;
+            candidate.realized_score = clamp_unit(expected - fragility - concentration);
+            candidate.signed_advantage_vs_current = clamp_signed_unit(candidate.realized_score - aggregate * 0.18f);
+            best_low_risk_improvement = std::max(best_low_risk_improvement, candidate.expected_improvement);
+        }
+
+        int32_t best_snapshot_slot = -1;
+        if (have_functional_history) {
+            for (int32_t slot = 0; slot < LLAMA_FUNCTIONAL_MAX_SNAPSHOTS_PER_FAMILY; ++slot) {
+                const auto & item = snapshot_archive.items[slot];
+                if (!item.valid) {
+                    continue;
+                }
+                if (best_snapshot_slot < 0) {
+                    best_snapshot_slot = slot;
+                    continue;
+                }
+                const auto & best_item = snapshot_archive.items[best_snapshot_slot];
+                if (item.robustness_score > best_item.robustness_score + 1.0e-6f ||
+                        (std::fabs(item.robustness_score - best_item.robustness_score) <= 1.0e-6f &&
+                         item.captured_at_us > best_item.captured_at_us)) {
+                    best_snapshot_slot = slot;
+                }
+            }
+        }
+        if (best_snapshot_slot >= 0 && trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+            const auto & item = snapshot_archive.items[best_snapshot_slot];
+            const float expected = score_functional_bias_candidate(
+                    ctx,
+                    profile,
+                    LLAMA_FUNCTIONAL_LORA_TARGET_FAMILY_ROOT,
+                    functional_family,
+                    -1,
+                    LLAMA_FUNCTIONAL_REPLAY_MODE_ARCHIVED,
+                    best_snapshot_slot,
+                    0.0f,
+                    &compare_process_signature,
+                    &fragility,
+                    &concentration,
+                    &robustness);
+            auto & candidate = trace.candidates[trace.candidate_count++];
+            candidate.family = LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_HISTORY;
+            candidate.risk_tier = LLAMA_COUNTERFACTUAL_RISK_LOW;
+            candidate.subject_id = best_snapshot_slot;
+            candidate.functional_target_kind = LLAMA_FUNCTIONAL_LORA_TARGET_FAMILY_ROOT;
+            candidate.functional_family = functional_family;
+            candidate.process_entry_slot = -1;
+            candidate.proposal_family = LLAMA_FUNCTIONAL_BIAS_PROPOSAL_HISTORICAL;
+            candidate.replay_mode = LLAMA_FUNCTIONAL_REPLAY_MODE_ARCHIVED;
+            candidate.snapshot_slot = best_snapshot_slot;
+            candidate.expected_improvement = expected;
+            candidate.confidence = clamp_unit(0.50f + 0.25f * robustness);
+            candidate.fragility_penalty = fragility;
+            candidate.concentration_penalty = concentration;
+            candidate.robustness_score = robustness;
+            candidate.orthogonality = item.dominant_direction_cosine;
+            candidate.realized_score = clamp_unit(expected - fragility - concentration);
+            candidate.signed_advantage_vs_current = clamp_signed_unit(candidate.realized_score - aggregate * 0.18f);
+            best_low_risk_improvement = std::max(best_low_risk_improvement, candidate.expected_improvement);
+        }
+
+        if (trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+            const float orthogonality = 0.05f;
+            const float expected = score_functional_bias_candidate(
+                    ctx,
+                    profile,
+                    LLAMA_FUNCTIONAL_LORA_TARGET_FAMILY_ROOT,
+                    functional_family,
+                    -1,
+                    LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL,
+                    -1,
+                    orthogonality,
+                    &compare_process_signature,
+                    &fragility,
+                    &concentration,
+                    &robustness);
+            auto & candidate = trace.candidates[trace.candidate_count++];
+            candidate.family = LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_ORTHOGONAL;
+            candidate.risk_tier = LLAMA_COUNTERFACTUAL_RISK_LOW;
+            candidate.subject_id = functional_family;
+            candidate.functional_target_kind = LLAMA_FUNCTIONAL_LORA_TARGET_FAMILY_ROOT;
+            candidate.functional_family = functional_family;
+            candidate.process_entry_slot = -1;
+            candidate.proposal_family = LLAMA_FUNCTIONAL_BIAS_PROPOSAL_ORTHOGONAL;
+            candidate.replay_mode = LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL;
+            candidate.snapshot_slot = -1;
+            candidate.expected_improvement = expected;
+            candidate.confidence = clamp_unit(0.48f + 0.22f * robustness);
+            candidate.fragility_penalty = fragility;
+            candidate.concentration_penalty = concentration;
+            candidate.robustness_score = robustness;
+            candidate.orthogonality = orthogonality;
+            candidate.realized_score = clamp_unit(expected - fragility - concentration);
+            candidate.signed_advantage_vs_current = clamp_signed_unit(candidate.realized_score - aggregate * 0.18f);
+            best_low_risk_improvement = std::max(best_low_risk_improvement, candidate.expected_improvement);
+        }
+
+        if (process_entry_slot >= 0 && trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+            const float expected = score_functional_bias_candidate(
+                    ctx,
+                    profile,
+                    LLAMA_FUNCTIONAL_LORA_TARGET_PROCESS_ENTRY,
+                    functional_family,
+                    process_entry_slot,
+                    LLAMA_FUNCTIONAL_REPLAY_MODE_LOCAL_PERTURBED,
+                    -1,
+                    0.0f,
+                    &compare_process_signature,
+                    &fragility,
+                    &concentration,
+                    &robustness);
+            auto & candidate = trace.candidates[trace.candidate_count++];
+            candidate.family = LLAMA_COUNTERFACTUAL_FAMILY_PROCESS_FUNCTIONAL_LOCAL;
+            candidate.risk_tier = LLAMA_COUNTERFACTUAL_RISK_LOW;
+            candidate.subject_id = process_entry_slot;
+            candidate.functional_target_kind = LLAMA_FUNCTIONAL_LORA_TARGET_PROCESS_ENTRY;
+            candidate.functional_family = functional_family;
+            candidate.process_entry_slot = process_entry_slot;
+            candidate.proposal_family = LLAMA_FUNCTIONAL_BIAS_PROPOSAL_LOCAL;
+            candidate.replay_mode = LLAMA_FUNCTIONAL_REPLAY_MODE_LOCAL_PERTURBED;
+            candidate.snapshot_slot = -1;
+            candidate.expected_improvement = expected;
+            candidate.confidence = clamp_unit(0.50f + 0.20f * robustness);
+            candidate.fragility_penalty = fragility;
+            candidate.concentration_penalty = concentration;
+            candidate.robustness_score = robustness;
+            candidate.orthogonality = 0.0f;
+            candidate.realized_score = clamp_unit(expected - fragility - concentration);
+            candidate.signed_advantage_vs_current = clamp_signed_unit(candidate.realized_score - aggregate * 0.18f);
+            best_low_risk_improvement = std::max(best_low_risk_improvement, candidate.expected_improvement);
+        }
+
+        if (have_process_history && trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+            llama_functional_lora_snapshot_info process_snapshot = {};
+            (void) ctx.process_functional_snapshot_info_get(process_entry_slot, best_process_snapshot_slot, &process_snapshot);
+            const float expected = score_functional_bias_candidate(
+                    ctx,
+                    profile,
+                    LLAMA_FUNCTIONAL_LORA_TARGET_PROCESS_ENTRY,
+                    functional_family,
+                    process_entry_slot,
+                    LLAMA_FUNCTIONAL_REPLAY_MODE_ARCHIVED,
+                    best_process_snapshot_slot,
+                    0.0f,
+                    &compare_process_signature,
+                    &fragility,
+                    &concentration,
+                    &robustness);
+            auto & candidate = trace.candidates[trace.candidate_count++];
+            candidate.family = LLAMA_COUNTERFACTUAL_FAMILY_PROCESS_FUNCTIONAL_HISTORY;
+            candidate.risk_tier = LLAMA_COUNTERFACTUAL_RISK_LOW;
+            candidate.subject_id = best_process_snapshot_slot;
+            candidate.functional_target_kind = LLAMA_FUNCTIONAL_LORA_TARGET_PROCESS_ENTRY;
+            candidate.functional_family = functional_family;
+            candidate.process_entry_slot = process_entry_slot;
+            candidate.proposal_family = LLAMA_FUNCTIONAL_BIAS_PROPOSAL_HISTORICAL;
+            candidate.replay_mode = LLAMA_FUNCTIONAL_REPLAY_MODE_ARCHIVED;
+            candidate.snapshot_slot = best_process_snapshot_slot;
+            candidate.expected_improvement = expected;
+            candidate.confidence = clamp_unit(0.48f + 0.24f * robustness);
+            candidate.fragility_penalty = fragility;
+            candidate.concentration_penalty = concentration;
+            candidate.robustness_score = robustness;
+            candidate.orthogonality = process_snapshot.dominant_direction_cosine;
+            candidate.realized_score = clamp_unit(expected - fragility - concentration);
+            candidate.signed_advantage_vs_current = clamp_signed_unit(candidate.realized_score - aggregate * 0.18f);
+            best_low_risk_improvement = std::max(best_low_risk_improvement, candidate.expected_improvement);
+        }
+
+        if (process_entry_slot >= 0 && trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+            const float orthogonality = 0.05f;
+            const float expected = score_functional_bias_candidate(
+                    ctx,
+                    profile,
+                    LLAMA_FUNCTIONAL_LORA_TARGET_PROCESS_ENTRY,
+                    functional_family,
+                    process_entry_slot,
+                    LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL,
+                    -1,
+                    orthogonality,
+                    &compare_process_signature,
+                    &fragility,
+                    &concentration,
+                    &robustness);
+            auto & candidate = trace.candidates[trace.candidate_count++];
+            candidate.family = LLAMA_COUNTERFACTUAL_FAMILY_PROCESS_FUNCTIONAL_ORTHOGONAL;
+            candidate.risk_tier = LLAMA_COUNTERFACTUAL_RISK_LOW;
+            candidate.subject_id = process_entry_slot;
+            candidate.functional_target_kind = LLAMA_FUNCTIONAL_LORA_TARGET_PROCESS_ENTRY;
+            candidate.functional_family = functional_family;
+            candidate.process_entry_slot = process_entry_slot;
+            candidate.proposal_family = LLAMA_FUNCTIONAL_BIAS_PROPOSAL_ORTHOGONAL;
+            candidate.replay_mode = LLAMA_FUNCTIONAL_REPLAY_MODE_ORTHOGONAL;
+            candidate.snapshot_slot = -1;
+            candidate.expected_improvement = expected;
+            candidate.confidence = clamp_unit(0.46f + 0.22f * robustness);
+            candidate.fragility_penalty = fragility;
+            candidate.concentration_penalty = concentration;
+            candidate.robustness_score = robustness;
+            candidate.orthogonality = orthogonality;
+            candidate.realized_score = clamp_unit(expected - fragility - concentration);
+            candidate.signed_advantage_vs_current = clamp_signed_unit(candidate.realized_score - aggregate * 0.18f);
+            best_low_risk_improvement = std::max(best_low_risk_improvement, candidate.expected_improvement);
+        }
+
+        const bool need_discrete_tool_fallback =
+                tool_div > 0.24f ||
+                uncertainty_div > 0.30f ||
+                best_low_risk_improvement < 0.18f;
+        if (need_discrete_tool_fallback) {
+            if (hard_memory_enabled && trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+                int32_t temporal_role = LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK;
+                const int32_t serving_layer_count = ctx.serving_lora_stack_count();
+                for (int32_t i = 0; i < serving_layer_count; ++i) {
+                    llama_serving_lora_layer_info info = {};
+                    if (ctx.serving_lora_stack_layer(i, &info) &&
+                            (info.role == LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK || info.role == LLAMA_ADAPTER_LORA_LAYER_ACTIVE)) {
+                        temporal_role = info.role;
+                        if (info.role == LLAMA_ADAPTER_LORA_LAYER_PAST_WEEK) {
+                            break;
+                        }
+                    }
+                }
+                append_candidate(
+                        LLAMA_COUNTERFACTUAL_FAMILY_HARD_MEMORY_QUERY,
+                        LLAMA_COUNTERFACTUAL_RISK_LOW,
+                        temporal_role,
+                        0.05f + 0.22f * aggregate + 0.20f * tool_div + 0.16f * uncertainty_div,
+                        0.62f);
+                best_low_risk_improvement = std::max(
+                        best_low_risk_improvement,
+                        trace.candidates[trace.candidate_count - 1].expected_improvement);
+            }
+            if (tool_div > 0.18f && trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+                append_candidate(
+                        LLAMA_COUNTERFACTUAL_FAMILY_TOOL_CHOICE,
+                        LLAMA_COUNTERFACTUAL_RISK_LOW,
+                        LLAMA_FAVORABLE_DIM_TOOL_READINESS,
+                        0.04f + 0.24f * tool_div + 0.12f * aggregate + 0.08f * contradiction_div,
+                        0.56f);
+                best_low_risk_improvement = std::max(
+                        best_low_risk_improvement,
+                        trace.candidates[trace.candidate_count - 1].expected_improvement);
+            }
+            if (tool_div > 0.28f && trace.candidate_count < LLAMA_COUNTERFACTUAL_MAX_CANDIDATES) {
+                append_candidate(
+                        LLAMA_COUNTERFACTUAL_FAMILY_TOOL_ARGUMENTS,
+                        LLAMA_COUNTERFACTUAL_RISK_LOW,
+                        LLAMA_FAVORABLE_DIM_TOOL_BACKLOG,
+                        0.04f + 0.26f * tool_div + 0.10f * uncertainty_div + 0.08f * aggregate,
+                        0.54f);
+                best_low_risk_improvement = std::max(
+                        best_low_risk_improvement,
+                        trace.candidates[trace.candidate_count - 1].expected_improvement);
+            }
         }
 
         if ((best_low_risk_improvement < 0.18f || aggregate > 0.55f || dissatisfaction_div > 0.45f) &&
@@ -2428,6 +3025,7 @@ bool llama_cognitive_loop::cognitive_command_complete(int32_t command_id, bool c
     }
 
     if (cancelled || command.kind != LLAMA_COG_COMMAND_INVOKE_TOOL) {
+        (void) ctx.process_functional_set_execution(llama_process_functional_signature {});
         (void) ctx.functional_lora_activate(make_inactive_functional_decision(command.origin));
         if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
             active_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
@@ -2592,6 +3190,33 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 planning_pressure_seed,
                 plan_complexity_seed,
                 plan_revision_seed);
+        const llama_cognitive_plan_trace * process_plan = nullptr;
+        if (trace.plan.valid) {
+            process_plan = &trace.plan;
+        } else if (active_plan.valid) {
+            process_plan = &active_plan;
+        }
+        int32_t process_tool_kind = LLAMA_TOOL_KIND_NONE;
+        if (process_plan &&
+                process_plan->valid &&
+                process_plan->current_step_index >= 0 &&
+                process_plan->current_step_index < process_plan->step_count) {
+            process_tool_kind = process_plan->steps[process_plan->current_step_index].tool_kind;
+        } else if (trace.tool_proposal.valid) {
+            process_tool_kind = trace.tool_proposal.tool_kind;
+        }
+        const llama_cognitive_tool_spec * process_tool_spec =
+                process_tool_kind != LLAMA_TOOL_KIND_NONE ?
+                        find_tool_spec(tool_specs, tool_spec_count, process_tool_kind, nullptr) :
+                        nullptr;
+        (void) ctx.process_functional_set_execution(
+                make_process_signature(
+                        LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                        primary_functional_family(decision),
+                        microphase,
+                        process_plan,
+                        process_tool_spec,
+                        trace.episode_id));
         (void) ctx.functional_lora_activate(decision);
         llama_functional_lora_trace functional_trace = {};
         trace.functional_activation =
@@ -2784,10 +3409,13 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 1,
                 true);
     } else {
+        const int32_t wait_status = waiting_on_tool ?
+                LLAMA_COG_PLAN_STEP_STATUS_PENDING :
+                LLAMA_COG_PLAN_STEP_STATUS_COMPLETED;
         (void) append_plan_step(
                 trace.plan,
                 LLAMA_COG_PLAN_STEP_WAIT,
-                waiting_on_tool ? LLAMA_COG_PLAN_STEP_STATUS_PENDING : LLAMA_COG_PLAN_STEP_STATUS_COMPLETED,
+                wait_status,
                 proposed_tool_kind,
                 -1,
                 trace.reason_mask,
@@ -2796,10 +3424,13 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 waiting_on_tool);
     }
     trace.plan.current_step_index = first_ready_plan_step(trace.plan);
-    trace.plan.status =
-            trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT ? LLAMA_COG_PLAN_STATUS_WAITING_TOOL :
-            trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_WAIT && !waiting_on_tool ? LLAMA_COG_PLAN_STATUS_COMPLETED :
-            LLAMA_COG_PLAN_STATUS_EXECUTING;
+    if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
+        trace.plan.status = LLAMA_COG_PLAN_STATUS_WAITING_TOOL;
+    } else if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_WAIT && !waiting_on_tool) {
+        trace.plan.status = LLAMA_COG_PLAN_STATUS_COMPLETED;
+    } else {
+        trace.plan.status = LLAMA_COG_PLAN_STATUS_EXECUTING;
+    }
     active_plan = trace.plan;
     active_runner.plan_id = trace.plan.plan_id;
     active_runner.plan_mode = trace.plan.mode;
@@ -3387,6 +4018,7 @@ bool llama_cognitive_loop::dmn_defer(uint64_t now_us, llama_dmn_tick_trace * out
     dmn_runner.max_steps = 1;
     dmn_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
     trace.functional_activation = make_inactive_functional_decision(LLAMA_COG_COMMAND_ORIGIN_DMN);
+    (void) ctx.process_functional_set_execution(llama_process_functional_signature {});
     (void) ctx.functional_lora_activate(trace.functional_activation);
     ++host_state.background_deferred_count;
     trace.tick_id = next_tick_id;
@@ -3462,6 +4094,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         trace.admitted = false;
         trace.burst_count = 0;
         trace.functional_activation = make_inactive_functional_decision(LLAMA_COG_COMMAND_ORIGIN_DMN);
+        (void) ctx.process_functional_set_execution(llama_process_functional_signature {});
         (void) ctx.functional_lora_activate(trace.functional_activation);
         set_loop_state(
                 trace.loop_state,
@@ -3507,6 +4140,33 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 planning_pressure_seed,
                 plan_complexity_seed,
                 plan_revision_seed);
+        const llama_cognitive_plan_trace * process_plan = nullptr;
+        if (trace.plan.valid) {
+            process_plan = &trace.plan;
+        } else if (dmn_plan.valid) {
+            process_plan = &dmn_plan;
+        }
+        int32_t process_tool_kind = LLAMA_TOOL_KIND_NONE;
+        if (process_plan &&
+                process_plan->valid &&
+                process_plan->current_step_index >= 0 &&
+                process_plan->current_step_index < process_plan->step_count) {
+            process_tool_kind = process_plan->steps[process_plan->current_step_index].tool_kind;
+        } else if (trace.tool_kind != LLAMA_TOOL_KIND_NONE) {
+            process_tool_kind = trace.tool_kind;
+        }
+        const llama_cognitive_tool_spec * process_tool_spec =
+                process_tool_kind != LLAMA_TOOL_KIND_NONE ?
+                        find_tool_spec(tool_specs, tool_spec_count, process_tool_kind, nullptr) :
+                        nullptr;
+        (void) ctx.process_functional_set_execution(
+                make_process_signature(
+                        LLAMA_COG_COMMAND_ORIGIN_DMN,
+                        primary_functional_family(decision),
+                        microphase,
+                        process_plan,
+                        process_tool_spec,
+                        trace.tick_id));
         (void) ctx.functional_lora_activate(decision);
         llama_functional_lora_trace functional_trace = {};
         trace.functional_activation =
@@ -3648,6 +4308,8 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     if (working_memory_count >= 4) {
         trace.maintenance_mask |= LLAMA_DMN_MAINTENANCE_COMPRESS_WORKING_MEMORY;
     }
+    (void) ctx.functional_lora_snapshot_maintain(now_us);
+    (void) ctx.process_functional_snapshot_maintain(now_us);
     if (ctx.past_lora_tick(now_us)) {
         trace.maintenance_mask |= LLAMA_DMN_MAINTENANCE_PAST_LORA_TICK;
     }
@@ -3723,13 +4385,15 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 1,
                 false);
     } else {
+        const int32_t governance_status =
+                last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DENY ||
+                last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DEFER ?
+                        LLAMA_COG_PLAN_STEP_STATUS_BLOCKED :
+                        LLAMA_COG_PLAN_STEP_STATUS_COMPLETED;
         (void) append_plan_step(
                 trace.plan,
                 LLAMA_COG_PLAN_STEP_WAIT,
-                last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DENY ||
-                        last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DEFER ?
-                                LLAMA_COG_PLAN_STEP_STATUS_BLOCKED :
-                                LLAMA_COG_PLAN_STEP_STATUS_COMPLETED,
+                governance_status,
                 LLAMA_TOOL_KIND_NONE,
                 last_remediation_plan.source_family,
                 selected_reason_mask,
@@ -4392,6 +5056,55 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                         " candidates " + std::to_string(last_counterfactual_trace.candidate_count));
     }
 
+    const llama_counterfactual_candidate * best_functional_candidate = nullptr;
+    for (int32_t i = 0; i < last_counterfactual_trace.candidate_count; ++i) {
+        const auto & candidate = last_counterfactual_trace.candidates[i];
+        if (candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_LOCAL &&
+                candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_HISTORY &&
+                candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_FUNCTIONAL_ORTHOGONAL &&
+                candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_PROCESS_FUNCTIONAL_LOCAL &&
+                candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_PROCESS_FUNCTIONAL_HISTORY &&
+                candidate.family != LLAMA_COUNTERFACTUAL_FAMILY_PROCESS_FUNCTIONAL_ORTHOGONAL) {
+            continue;
+        }
+        if (candidate.functional_family < 0 || candidate.replay_mode == LLAMA_FUNCTIONAL_REPLAY_MODE_NONE) {
+            continue;
+        }
+        if (!best_functional_candidate ||
+                candidate.realized_score > best_functional_candidate->realized_score + 1.0e-6f ||
+                (std::fabs(candidate.realized_score - best_functional_candidate->realized_score) <= 1.0e-6f &&
+                 candidate.robustness_score > best_functional_candidate->robustness_score + 1.0e-6f)) {
+            best_functional_candidate = &candidate;
+        }
+    }
+    if (best_functional_candidate) {
+        const float differential_magnitude = clamp_unit(
+                0.45f * std::fabs(best_functional_candidate->signed_advantage_vs_current) +
+                0.25f * best_functional_candidate->expected_improvement +
+                0.20f * best_functional_candidate->robustness_score +
+                0.10f * std::max(0.0f, 1.0f - best_functional_candidate->fragility_penalty));
+        if (best_functional_candidate->functional_target_kind == LLAMA_FUNCTIONAL_LORA_TARGET_PROCESS_ENTRY &&
+                best_functional_candidate->process_entry_slot >= 0) {
+            (void) ctx.process_functional_apply_differential_update(
+                    best_functional_candidate->process_entry_slot,
+                    best_functional_candidate->proposal_family,
+                    best_functional_candidate->replay_mode,
+                    best_functional_candidate->snapshot_slot,
+                    best_functional_candidate->signed_advantage_vs_current,
+                    differential_magnitude,
+                    best_functional_candidate->robustness_score);
+        } else {
+            (void) ctx.functional_lora_apply_differential_update(
+                    best_functional_candidate->functional_family,
+                    best_functional_candidate->proposal_family,
+                    best_functional_candidate->replay_mode,
+                    best_functional_candidate->snapshot_slot,
+                    best_functional_candidate->signed_advantage_vs_current,
+                    differential_magnitude,
+                    best_functional_candidate->robustness_score);
+        }
+    }
+
     if (compression_eligible) {
         const float memory_pressure = clamp_unit((float) working_memory_count / 8.0f);
         const float signed_outcome = clamp_signed_unit(
@@ -4453,6 +5166,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         dmn_runner.plan_status = dmn_plan.status == LLAMA_COG_PLAN_STATUS_BLOCKED ?
                 LLAMA_COG_PLAN_STATUS_BLOCKED :
                 LLAMA_COG_PLAN_STATUS_COMPLETED;
+        (void) ctx.process_functional_set_execution(llama_process_functional_signature {});
         (void) ctx.functional_lora_activate(make_inactive_functional_decision(LLAMA_COG_COMMAND_ORIGIN_DMN));
         dmn_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
     }
