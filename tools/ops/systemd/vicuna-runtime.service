@@ -1,0 +1,15 @@
+[Unit]
+Description=Vicuña GPU Runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tyler-araujo/Projects/vicuna
+ExecStart=/home/tyler-araujo/Projects/vicuna/tools/ops/run-vicuna-runtime.sh
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

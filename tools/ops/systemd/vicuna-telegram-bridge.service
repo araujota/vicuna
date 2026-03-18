@@ -1,0 +1,15 @@
+[Unit]
+Description=Vicuña Telegram Bridge
+After=network-online.target vicuna-runtime.service
+Wants=network-online.target vicuna-runtime.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tyler-araujo/Projects/vicuna
+ExecStart=/home/tyler-araujo/Projects/vicuna/tools/ops/run-telegram-bridge.sh
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

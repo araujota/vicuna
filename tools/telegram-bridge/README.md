@@ -35,6 +35,18 @@ Optional variables:
 npm run telegram-bridge:start
 ```
 
+## Managed Service
+
+For resilient host operation, use the repo-owned user service units:
+
+- [vicuna-runtime.service](/home/tyler-araujo/Projects/vicuna/tools/ops/systemd/vicuna-runtime.service)
+- [vicuna-telegram-bridge.service](/home/tyler-araujo/Projects/vicuna/tools/ops/systemd/vicuna-telegram-bridge.service)
+
+The launchers they use are:
+
+- [run-vicuna-runtime.sh](/home/tyler-araujo/Projects/vicuna/tools/ops/run-vicuna-runtime.sh)
+- [run-telegram-bridge.sh](/home/tyler-araujo/Projects/vicuna/tools/ops/run-telegram-bridge.sh)
+
 ## Behavior
 
 - `/start` registers the chat for proactive relay and returns a confirmation
