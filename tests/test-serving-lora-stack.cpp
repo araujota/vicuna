@@ -2,6 +2,7 @@
 #include "ggml.h"
 #include "llama.h"
 #include "llama-adapter.h"
+#include "../src/llama-active-lora.h"
 #include "llama-context.h"
 #include "llama-model.h"
 
@@ -55,6 +56,15 @@ static bool expect_layer(
     }
 
     return true;
+}
+
+static float layer_scale_or_die(const llama_context * ctx, int32_t index) {
+    llama_serving_lora_layer_info layer = {};
+    if (llama_serving_lora_stack_layer(ctx, index, &layer) != 0) {
+        std::fprintf(stderr, "failed to fetch serving layer %d\n", index);
+        std::exit(1);
+    }
+    return layer.scale;
 }
 
 int main(int argc, char ** argv) {
@@ -180,6 +190,14 @@ int main(int argc, char ** argv) {
     inactive.family_count = LLAMA_FUNCTIONAL_LORA_COUNT;
     inactive.top_family = -1;
 
+    llama_functional_gating_observation observation = {};
+    observation.loop_origin = decision.loop_origin;
+    observation.microphase = decision.microphase;
+    observation.eligible_mask = decision.eligible_mask;
+    observation.snapshot.answerability = 0.5f;
+    observation.snapshot.expected_steps_remaining = 0.4f;
+    observation.snapshot.expected_inference_cost_remaining = 0.4f;
+
     llama_functional_lora_replay_override replay = {};
     replay.active = true;
     replay.family = LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
@@ -234,9 +252,46 @@ int main(int argc, char ** argv) {
     process_signature.transient_step_index = 1;
     process_signature.transient_source_id = 11;
     std::snprintf(process_signature.tool_name, sizeof(process_signature.tool_name), "%s", "bash-cli");
+    std::snprintf(process_signature.capability_id, sizeof(process_signature.capability_id), "%s", "openclaw/local/exec");
+    std::snprintf(process_signature.provenance_namespace, sizeof(process_signature.provenance_namespace), "%s", "openclaw/local/exec");
     std::snprintf(process_signature.semantic_key, sizeof(process_signature.semantic_key), "%s", "dmn/counterfactual_compare/step_kind:4/tool:bash-cli");
     if (!ctx->process_functional_set_execution(process_signature)) {
         fprintf(stderr, "failed to seed process-functional execution signature\n");
+        return 1;
+    }
+
+    llama_functional_activation_decision predicted = {};
+    if (!ctx->functional_lora_predict_activation(observation, inactive, &predicted) ||
+        !ctx->functional_lora_activate(decision)) {
+        fprintf(stderr, "failed to establish baseline functional activation\n");
+        return 1;
+    }
+    const float baseline_functional_scale = layer_scale_or_die(ctx.get(), 6);
+    if (!ctx->functional_lora_activate(inactive)) {
+        fprintf(stderr, "failed to clear baseline functional activation\n");
+        return 1;
+    }
+
+    observation.extension_summary.active_count = 1;
+    observation.extension_summary.gain_count = 1;
+    observation.extension_summary.tool_count = 1;
+    observation.extension_summary.mean_confidence = 1.0f;
+    observation.extension_summary.max_salience = 1.0f;
+    observation.extension_summary.gain_signal = 1.0f;
+    observation.extension_summary.gain_signal_abs = 1.0f;
+    observation.extension_summary.context_activation = 1.0f;
+    if (!ctx->functional_lora_predict_activation(observation, inactive, &predicted) ||
+        !ctx->functional_lora_activate(decision)) {
+        fprintf(stderr, "failed to apply self-model gain modulation for functional activation\n");
+        return 1;
+    }
+    const float modulated_functional_scale = layer_scale_or_die(ctx.get(), 6);
+    if (modulated_functional_scale <= baseline_functional_scale) {
+        fprintf(stderr, "self-model gain did not amplify functional attachment scale\n");
+        return 1;
+    }
+    if (!ctx->functional_lora_activate(inactive)) {
+        fprintf(stderr, "failed to clear modulated functional activation\n");
         return 1;
     }
 
@@ -288,7 +343,9 @@ int main(int argc, char ** argv) {
     if (llama_process_functional_entry_count(ctx.get()) < 1 ||
         llama_process_functional_entry_get(ctx.get(), 0, &process_entry) != 0 ||
         !process_entry.valid ||
-        process_entry.signature.signature_hash != process_signature.signature_hash) {
+        process_entry.signature.signature_hash != process_signature.signature_hash ||
+        std::string(process_entry.signature.capability_id) != "openclaw/local/exec" ||
+        std::string(process_entry.signature.provenance_namespace) != "openclaw/local/exec") {
         fprintf(stderr, "process-functional entry was not created after repeated weak outcomes\n");
         return 1;
     }
@@ -335,11 +392,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    llama_process_functional_entry_info imported_process_entry = {};
     llama_functional_lora_snapshot_archive imported_process_archive = {};
     llama_functional_lora_snapshot_info imported_process_snapshot = {};
     if (llama_process_functional_snapshot_archive_get(ctx_import.get(), process_entry.slot, &imported_process_archive) != 0 ||
+        llama_process_functional_entry_get(ctx_import.get(), process_entry.slot, &imported_process_entry) != 0 ||
         llama_process_functional_snapshot_info_get(ctx_import.get(), process_entry.slot, 0, &imported_process_snapshot) != 0 ||
         imported_process_archive.count != 1 ||
+        std::string(imported_process_entry.signature.capability_id) != "openclaw/local/exec" ||
+        std::string(imported_process_entry.signature.provenance_namespace) != "openclaw/local/exec" ||
         !imported_process_snapshot.valid ||
         imported_process_snapshot.snapshot_id != process_snapshot.snapshot_id ||
         imported_process_snapshot.captured_at_us != process_snapshot.captured_at_us) {
@@ -353,6 +414,11 @@ int main(int argc, char ** argv) {
         !expect_layer(ctx.get(), baseline_stack_count, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_PROCESS_LEARNED, 0.0f) ||
         !expect_layer(ctx.get(), baseline_stack_count + 1, LLAMA_SERVING_LORA_LAYER_FUNCTIONAL_PROCESS_BOOTSTRAP)) {
         fprintf(stderr, "process-functional adapters were not attached for the matching process\n");
+        return 1;
+    }
+    const float modulated_process_scale = layer_scale_or_die(ctx.get(), baseline_stack_count);
+    if (modulated_process_scale <= baseline_functional_scale) {
+        fprintf(stderr, "self-model gain did not reach process-functional attachment\n");
         return 1;
     }
 

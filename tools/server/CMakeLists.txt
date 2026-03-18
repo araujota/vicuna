@@ -15,6 +15,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-openclaw-fabric.cpp
+    server-openclaw-fabric.h
 )
 
 if (BUILD_SHARED_LIBS)

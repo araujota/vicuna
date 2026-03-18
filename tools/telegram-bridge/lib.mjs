@@ -5,7 +5,10 @@ export const DEFAULT_STATE = {
   telegramOffset: 0,
   chatIds: [],
   proactiveResponseIds: [],
+  chatSessions: {},
 };
+
+export const DEFAULT_MAX_HISTORY_MESSAGES = 12;
 
 export function parseInteger(value, fallback) {
   const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -16,30 +19,61 @@ export function uniqueStrings(values) {
   return [...new Set((values ?? []).map((value) => String(value)))];
 }
 
-export function normalizeState(raw) {
+function normalizeTranscriptMessage(raw) {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const role = raw.role === 'assistant' ? 'assistant' : raw.role === 'user' ? 'user' : '';
+  const content = typeof raw.content === 'string' ? raw.content.trim() : '';
+  if (!role || !content) {
+    return null;
+  }
+  return { role, content };
+}
+
+function normalizeChatSessions(raw, maxHistoryMessages) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {};
+  }
+  const chatSessions = {};
+  for (const [chatId, session] of Object.entries(raw)) {
+    const messages = Array.isArray(session?.messages)
+      ? session.messages.map(normalizeTranscriptMessage).filter(Boolean).slice(-maxHistoryMessages)
+      : [];
+    if (messages.length > 0) {
+      chatSessions[String(chatId)] = { messages };
+    }
+  }
+  return chatSessions;
+}
+
+export function normalizeState(raw, options = {}) {
   const state = raw && typeof raw === 'object' ? raw : {};
+  const maxHistoryMessages = Math.max(1, parseInteger(options.maxHistoryMessages, DEFAULT_MAX_HISTORY_MESSAGES));
+  const chatSessions = normalizeChatSessions(state.chatSessions, maxHistoryMessages);
   return {
     telegramOffset: Math.max(0, parseInteger(state.telegramOffset, 0)),
-    chatIds: uniqueStrings(state.chatIds),
+    chatIds: uniqueStrings([...(state.chatIds ?? []), ...Object.keys(chatSessions)]),
     proactiveResponseIds: uniqueStrings(state.proactiveResponseIds).slice(-256),
+    chatSessions,
   };
 }
 
-export async function loadState(statePath) {
+export async function loadState(statePath, options = {}) {
   try {
     const contents = await readFile(statePath, 'utf8');
-    return normalizeState(JSON.parse(contents));
+    return normalizeState(JSON.parse(contents), options);
   } catch (error) {
     if (error && error.code === 'ENOENT') {
-      return { ...DEFAULT_STATE };
+      return normalizeState(DEFAULT_STATE, options);
     }
     throw error;
   }
 }
 
-export async function saveState(statePath, state) {
+export async function saveState(statePath, state, options = {}) {
   await mkdir(path.dirname(statePath), { recursive: true });
-  await writeFile(statePath, `${JSON.stringify(normalizeState(state), null, 2)}\n`, 'utf8');
+  await writeFile(statePath, `${JSON.stringify(normalizeState(state, options), null, 2)}\n`, 'utf8');
 }
 
 export function appendProactiveId(state, responseId) {
@@ -54,9 +88,10 @@ export function appendProactiveId(state, responseId) {
 }
 
 export function registerChat(state, chatId) {
+  const chatKey = String(chatId);
   return {
     ...state,
-    chatIds: uniqueStrings([...state.chatIds, String(chatId)]),
+    chatIds: uniqueStrings([...state.chatIds, chatKey]),
   };
 }
 
@@ -65,6 +100,36 @@ export function updateTelegramOffset(state, updateId) {
   return {
     ...state,
     telegramOffset: nextOffset,
+  };
+}
+
+export function getChatTranscript(state, chatId) {
+  const chatKey = String(chatId);
+  return Array.isArray(state?.chatSessions?.[chatKey]?.messages)
+    ? state.chatSessions[chatKey].messages
+    : [];
+}
+
+export function appendChatTranscriptMessage(state, chatId, role, content, options = {}) {
+  const normalized = normalizeTranscriptMessage({ role, content });
+  if (!normalized) {
+    return state;
+  }
+  const chatKey = String(chatId);
+  const maxHistoryMessages = Math.max(1, parseInteger(options.maxHistoryMessages, DEFAULT_MAX_HISTORY_MESSAGES));
+  const nextMessages = [
+    ...getChatTranscript(state, chatKey),
+    normalized,
+  ].slice(-maxHistoryMessages);
+
+  return {
+    ...registerChat(state, chatKey),
+    chatSessions: {
+      ...(state.chatSessions ?? {}),
+      [chatKey]: {
+        messages: nextMessages,
+      },
+    },
   };
 }
 

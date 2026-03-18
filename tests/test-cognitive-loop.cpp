@@ -68,14 +68,21 @@ static llama_process_functional_signature make_dmn_process_signature(
         for (int32_t i = 0; i < spec_count; ++i) {
             llama_cognitive_tool_spec spec = {};
             if (llama_cognitive_tool_spec_get(ctx, i, &spec) == 0 &&
-                spec.tool_kind == signature.tool_kind) {
+                ((step && step->tool_spec_index >= 0 && i == step->tool_spec_index) ||
+                 (!step && trace.tool_spec_index >= 0 && i == trace.tool_spec_index) ||
+                 (step && step->tool_spec_index < 0 && spec.tool_kind == signature.tool_kind) ||
+                 (!step && trace.tool_spec_index < 0 && spec.tool_kind == signature.tool_kind))) {
                 std::snprintf(signature.tool_name, sizeof(signature.tool_name), "%s", spec.name);
+                std::snprintf(signature.capability_id, sizeof(signature.capability_id), "%s", spec.capability_id);
+                std::snprintf(signature.provenance_namespace, sizeof(signature.provenance_namespace), "%s", spec.provenance_namespace);
                 break;
             }
         }
     }
 
-    std::string semantic_key = "dmn/self_forecast";
+    std::string semantic_key = signature.provenance_namespace[0] != '\0' ?
+            std::string(signature.provenance_namespace) :
+            std::string("dmn/self_forecast");
     if (step) {
         semantic_key += "/step_kind:" + std::to_string(step->kind);
         semantic_key += "/src_family:" + std::to_string(step->source_family);
@@ -101,6 +108,12 @@ static llama_process_functional_signature make_dmn_process_signature(
     hash = process_hash_mix(hash, (uint64_t) signature.source_family);
     hash = process_hash_mix(hash, signature.requires_tool_result ? 1ULL : 0ULL);
     for (const char * p = signature.tool_name; *p; ++p) {
+        hash = process_hash_mix(hash, (uint64_t) (uint8_t) *p);
+    }
+    for (const char * p = signature.capability_id; *p; ++p) {
+        hash = process_hash_mix(hash, (uint64_t) (uint8_t) *p);
+    }
+    for (const char * p = signature.provenance_namespace; *p; ++p) {
         hash = process_hash_mix(hash, (uint64_t) (uint8_t) *p);
     }
     signature.signature_hash = hash;
@@ -196,6 +209,13 @@ static llama_context * create_context(llama_model * model) {
     llama_past_lora_params past = llama_past_lora_default_params();
     configure_small_buckets(past);
     if (llama_past_lora_init(ctx, past) != 0) {
+        llama_free(ctx);
+        return nullptr;
+    }
+
+    llama_bash_tool_config bash = llama_bash_tool_default_config();
+    bash.enabled = true;
+    if (llama_bash_tool_configure(ctx, &bash) != 0) {
         llama_free(ctx);
         return nullptr;
     }

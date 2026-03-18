@@ -3,9 +3,11 @@ import https from 'node:https';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   appendProactiveId,
+  appendChatTranscriptMessage,
   extractChatCompletionText,
   extractResponseText,
   formatTelegramMessage,
+  getChatTranscript,
   loadState,
   parseInteger,
   parseSseChunk,
@@ -21,6 +23,7 @@ const env = {
   model: process.env.TELEGRAM_BRIDGE_MODEL ?? 'qwen2.5:7b-instruct-q8_0',
   statePath: process.env.TELEGRAM_BRIDGE_STATE_PATH ?? '/tmp/vicuna-telegram-bridge-state.json',
   pollTimeoutSeconds: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS, 30)),
+  maxHistoryMessages: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES, 12)),
   selfEmitAfter: Math.max(0, parseInteger(process.env.TELEGRAM_BRIDGE_SELF_EMIT_AFTER, 0)),
   vicunaApiKey: process.env.VICUNA_API_KEY ?? '',
 };
@@ -29,7 +32,7 @@ if (!env.telegramBotToken) {
   throw new Error('TELEGRAM_BOT_TOKEN is required');
 }
 
-let state = await loadState(env.statePath);
+let state = await loadState(env.statePath, { maxHistoryMessages: env.maxHistoryMessages });
 let selfEmitStreamActive = false;
 let selfEmitLastConnectedAt = 0;
 let selfEmitLastEventAt = 0;
@@ -103,23 +106,21 @@ async function broadcastToChats(text) {
   );
 }
 
-async function callVicunaForTelegramMessage(text) {
+async function callVicunaForTelegramMessage(chatId) {
+  const messages = [
+    {
+      role: 'system',
+      content: 'You are replying to a Telegram user through middleware. Keep responses clear and concise unless the user asks for depth. Maintain continuity across the provided transcript and, when the runtime makes it available, use the bash tool for direct command-execution requests instead of pretending a command ran.',
+    },
+    ...getChatTranscript(state, chatId),
+  ];
   const response = await fetch(`${env.vicunaBaseUrl}/v1/chat/completions`, {
     method: 'POST',
     headers: vicunaHeaders(),
     body: JSON.stringify({
       model: env.model,
       temperature: 0.2,
-      messages: [
-        {
-          role: 'system',
-          content: 'You are replying to a Telegram user through middleware. Keep responses clear and concise unless the user asks for depth.',
-        },
-        {
-          role: 'user',
-          content: text,
-        },
-      ],
+      messages,
     }),
   });
   const body = await response.json();
@@ -130,7 +131,7 @@ async function callVicunaForTelegramMessage(text) {
 }
 
 async function persistState() {
-  await saveState(env.statePath, state);
+  await saveState(env.statePath, state, { maxHistoryMessages: env.maxHistoryMessages });
 }
 
 async function handleTelegramMessage(message) {
@@ -159,10 +160,30 @@ async function handleTelegramMessage(message) {
     return;
   }
 
-  const reply = await callVicunaForTelegramMessage(text);
+  state = appendChatTranscriptMessage(
+    state,
+    message.chat.id,
+    'user',
+    text,
+    { maxHistoryMessages: env.maxHistoryMessages },
+  );
+  await persistState();
+
+  const reply = await callVicunaForTelegramMessage(message.chat.id);
+
+  const finalReply = reply || 'The runtime returned an empty response.';
+  state = appendChatTranscriptMessage(
+    state,
+    message.chat.id,
+    'assistant',
+    finalReply,
+    { maxHistoryMessages: env.maxHistoryMessages },
+  );
+  await persistState();
+
   await sendTelegramMessage(
     message.chat.id,
-    reply || 'The runtime returned an empty response.',
+    finalReply,
     { reply_to_message_id: message.message_id },
   );
 }
@@ -218,7 +239,17 @@ async function handleSelfEmitEvent(event) {
     await persistState();
     return;
   }
-  await broadcastToChats(formatTelegramMessage('System self-emission', text));
+  const relayedText = formatTelegramMessage('System self-emission', text);
+  await broadcastToChats(relayedText);
+  for (const chatId of state.chatIds) {
+    state = appendChatTranscriptMessage(
+      state,
+      chatId,
+      'assistant',
+      relayedText,
+      { maxHistoryMessages: env.maxHistoryMessages },
+    );
+  }
   state = appendProactiveId(state, responseId);
   await persistState();
 }

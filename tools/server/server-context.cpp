@@ -2,6 +2,7 @@
 #include "server-bash-tool.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-openclaw-fabric.h"
 #include "server-task.h"
 #include "server-queue.h"
 
@@ -90,6 +91,87 @@ static self_state_token_view make_self_state_token_view(const server_tokens & to
     view.data = view.owned_tokens.empty() ? nullptr : view.owned_tokens.data();
     view.size = view.owned_tokens.size();
     return view;
+}
+
+static bool admit_runtime_emit_tokens(
+        llama_context * ctx,
+        const llama_token * tokens,
+        size_t n_tokens,
+        int32_t loop_origin,
+        int32_t phase,
+        int32_t source_id,
+        int32_t plan_id,
+        uint32_t extra_flags = 0,
+        int32_t artifact_kind = LLAMA_SELF_COG_ARTIFACT_EXTERNAL_EVENT) {
+    if (!ctx || !tokens || n_tokens == 0) {
+        return false;
+    }
+
+    (void) llama_self_state_set_channel_state(ctx, LLAMA_SELF_STATE_CHANNEL_ACTIVE);
+
+    llama_self_state_event event = {
+        /*.tokens =*/ tokens,
+        /*.n_tokens =*/ n_tokens,
+        /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
+        /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+        /*.flags =*/ (uint32_t) (LLAMA_SELF_STATE_EVENT_ADMITTED | extra_flags),
+        /*.decoder_entropy =*/ 0.0f,
+        /*.decoder_top_margin =*/ 1.0f,
+        /*.artifact_kind =*/ artifact_kind,
+        /*.loop_origin =*/ loop_origin,
+        /*.phase =*/ phase,
+        /*.source_id =*/ source_id,
+        /*.plan_id =*/ plan_id,
+    };
+    llama_self_state_feature_vector pre = {};
+    llama_self_state_feature_vector post = {};
+    const bool admitted =
+            llama_self_state_build_prewrite_features(ctx, &event, &pre) == 0 &&
+            llama_self_state_apply_prewrite(ctx, &event, &pre) == 0 &&
+            llama_self_state_build_postwrite_features(ctx, &event, &post) == 0 &&
+            llama_self_state_apply_postwrite(ctx, &event, &post) == 0;
+    if (!admitted) {
+        return false;
+    }
+
+    return llama_active_lora_ingest_event(ctx, &event, &post) == 0;
+}
+
+static bool admit_runtime_emit_text(
+        llama_context * ctx,
+        const std::string & text,
+        int32_t loop_origin,
+        int32_t phase,
+        int32_t source_id,
+        int32_t plan_id,
+        uint32_t extra_flags = 0,
+        int32_t artifact_kind = LLAMA_SELF_COG_ARTIFACT_EXTERNAL_EVENT) {
+    if (!ctx) {
+        return false;
+    }
+
+    const std::string trimmed = string_strip(text);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = model ? llama_model_get_vocab(model) : nullptr;
+    if (!vocab) {
+        return false;
+    }
+
+    const llama_tokens tokens = common_tokenize(vocab, trimmed, true, true);
+    return admit_runtime_emit_tokens(
+            ctx,
+            tokens.empty() ? nullptr : tokens.data(),
+            tokens.size(),
+            loop_origin,
+            phase,
+            source_id,
+            plan_id,
+            extra_flags,
+            artifact_kind);
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -871,6 +953,8 @@ static json process_trace_summary_to_json(const llama_process_functional_trace &
             {"source_family", trace.signature.source_family},
             {"requires_tool_result", trace.signature.requires_tool_result},
             {"tool_name", bounded_cstr_to_string(trace.signature.tool_name)},
+            {"capability_id", bounded_cstr_to_string(trace.signature.capability_id)},
+            {"provenance_namespace", bounded_cstr_to_string(trace.signature.provenance_namespace)},
             {"semantic_key", bounded_cstr_to_string(trace.signature.semantic_key)},
         }},
     };
@@ -904,14 +988,19 @@ static json active_trace_summary_to_json(const llama_active_loop_trace & trace) 
             {"expected_steps", trace.tool_proposal.expected_steps},
             {"expected_observation_gain", trace.tool_proposal.expected_observation_gain},
             {"job_id", trace.tool_proposal.job_id},
+            {"capability_id", bounded_cstr_to_string(trace.tool_proposal.capability_id)},
+            {"provenance_namespace", bounded_cstr_to_string(trace.tool_proposal.provenance_namespace)},
         }},
         {"observation", {
             {"valid", trace.observation.valid},
             {"tool_kind", trace.observation.tool_kind},
+            {"spec_index", trace.observation.spec_index},
             {"job_id", trace.observation.job_id},
             {"status", trace.observation.status},
             {"signal", trace.observation.signal},
             {"followup_affinity", trace.observation.followup_affinity},
+            {"capability_id", bounded_cstr_to_string(trace.observation.capability_id)},
+            {"provenance_namespace", bounded_cstr_to_string(trace.observation.provenance_namespace)},
         }},
     };
 }
@@ -940,6 +1029,7 @@ static json dmn_trace_summary_to_json(const llama_dmn_tick_trace & trace) {
         {"burst_count", trace.burst_count},
         {"maintenance_mask", trace.maintenance_mask},
         {"tool_kind", trace.tool_kind},
+        {"tool_spec_index", trace.tool_spec_index},
         {"tool_job_id", trace.tool_job_id},
         {"favorable_divergence", trace.favorable_divergence},
         {"functional_activation", functional_activation_to_json(trace.functional_activation)},
@@ -1632,6 +1722,7 @@ private:
 
     server_state state = SERVER_STATE_LOADING_MODEL;
     bool sleeping = false;
+    server_openclaw_fabric openclaw_fabric;
     vicuna_external_work_queue bash_work;
     vicuna_external_work_queue hard_memory_work;
     std::thread bash_worker;
@@ -2160,6 +2251,16 @@ private:
                 }
                 SRV_WRN("proactive emit command %d produced an empty message\n", command.command_id);
             } else {
+                if (!admit_runtime_emit_text(
+                            ctx,
+                            message,
+                            command.origin,
+                            LLAMA_FUNCTIONAL_MICROPHASE_NONE,
+                            command.command_id,
+                            -1,
+                            LLAMA_SELF_STATE_EVENT_EMIT_FOLLOWUP)) {
+                    SRV_WRN("failed to admit proactive emit command %d into self-state\n", command.command_id);
+                }
                 published = true;
                 mark_runtime_state_dirty("proactive-self-emit");
             }
@@ -2178,6 +2279,16 @@ private:
             return;
         }
         if (proactive_mailbox_publish(startup_text, "startup")) {
+            if (!admit_runtime_emit_text(
+                        ctx,
+                        startup_text,
+                        LLAMA_COG_COMMAND_ORIGIN_DMN,
+                        LLAMA_FUNCTIONAL_MICROPHASE_NONE,
+                        -1,
+                        -1,
+                        LLAMA_SELF_STATE_EVENT_EMIT_FOLLOWUP)) {
+                SRV_WRN("%s\n", "failed to admit startup self-emit into self-state");
+            }
             mark_runtime_state_dirty("startup-self-emit");
         }
     }
@@ -2465,6 +2576,8 @@ private:
                             {"transient_step_index", info.signature.transient_step_index},
                             {"transient_source_id", info.signature.transient_source_id},
                             {"tool_name", info.signature.tool_name},
+                            {"capability_id", info.signature.capability_id},
+                            {"provenance_namespace", info.signature.provenance_namespace},
                             {"semantic_key", info.signature.semantic_key},
                     };
                     entry["blob_b64"] = base64::encode((const char *) blob.data(), blob.size());
@@ -2763,6 +2876,8 @@ private:
                     info.signature.transient_step_index = json_value(signature, "transient_step_index", -1);
                     info.signature.transient_source_id = json_value(signature, "transient_source_id", -1);
                     std::snprintf(info.signature.tool_name, sizeof(info.signature.tool_name), "%s", json_value(signature, "tool_name", std::string()).c_str());
+                    std::snprintf(info.signature.capability_id, sizeof(info.signature.capability_id), "%s", json_value(signature, "capability_id", std::string()).c_str());
+                    std::snprintf(info.signature.provenance_namespace, sizeof(info.signature.provenance_namespace), "%s", json_value(signature, "provenance_namespace", std::string()).c_str());
                     std::snprintf(info.signature.semantic_key, sizeof(info.signature.semantic_key), "%s", json_value(signature, "semantic_key", std::string()).c_str());
                     const std::string blob = base64::decode(entry.at("blob_b64").get<std::string>());
                     if (!info.valid ||
@@ -2912,6 +3027,33 @@ private:
             return false;
         }
 
+        auto submit_bash_error = [&](const llama_cognitive_command & command, const char * error_text) {
+            llama_bash_tool_result result = {};
+            result.command_id = command.command_id;
+            result.tool_job_id = command.tool_job_id;
+            result.launch_failed = true;
+            result.exit_code = 127;
+            std::snprintf(result.error_text, sizeof(result.error_text), "%s", error_text);
+            if (llama_cognitive_bash_tool_submit_result(ctx, &result, nullptr) == 0) {
+                mark_runtime_state_dirty("bash-tool-immediate-result");
+                capture_tool_result_provenance("bash_tool_immediate", bash_result_to_json(result), nullptr);
+            }
+        };
+
+        auto submit_hard_memory_error = [&](const llama_cognitive_command & command, int32_t status_code, const char * error_text) {
+            llama_cognitive_hard_memory_result result = {};
+            result.command_id = command.command_id;
+            result.tool_job_id = command.tool_job_id;
+            result.result.ok = false;
+            result.result.tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_QUERY;
+            result.result.status_code = status_code;
+            std::snprintf(result.result.error, sizeof(result.result.error), "%s", error_text);
+            if (llama_cognitive_hard_memory_submit_result(ctx, &result, nullptr) == 0) {
+                mark_runtime_state_dirty("hard-memory-immediate-result");
+                capture_tool_result_provenance("hard_memory_immediate", hard_memory_result_to_json(result), nullptr);
+            }
+        };
+
         bool dispatched = false;
         const int32_t command_count = llama_cognitive_command_count(ctx);
         for (int32_t i = 0; i < command_count; ++i) {
@@ -2920,8 +3062,7 @@ private:
                 continue;
             }
             if (command.kind != LLAMA_COG_COMMAND_INVOKE_TOOL ||
-                command.status != LLAMA_COG_COMMAND_STATUS_PENDING ||
-                (command.tool_kind != LLAMA_TOOL_KIND_BASH_CLI && command.tool_kind != LLAMA_TOOL_KIND_HARD_MEMORY_QUERY)) {
+                command.status != LLAMA_COG_COMMAND_STATUS_PENDING) {
                 continue;
             }
             if (origin_filter >= 0 && command.origin != origin_filter) {
@@ -2932,7 +3073,34 @@ private:
                 continue;
             }
 
-            if (command.tool_kind == LLAMA_TOOL_KIND_BASH_CLI) {
+            server_openclaw_dispatch_backend backend = SERVER_OPENCLAW_DISPATCH_NONE;
+            if (openclaw_fabric.enabled()) {
+                std::string resolve_error;
+                const server_openclaw_capability_runtime * capability =
+                        openclaw_fabric.resolve_command(command, &resolve_error);
+                if (!capability) {
+                    SRV_WRN("rejecting unresolved tool command %d: %s\n",
+                            command.command_id,
+                            resolve_error.c_str());
+                    if (command.tool_kind == LLAMA_TOOL_KIND_BASH_CLI) {
+                        submit_bash_error(command, resolve_error.c_str());
+                    } else if (command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
+                        submit_hard_memory_error(command, 400, resolve_error.c_str());
+                    } else {
+                        (void) llama_cognitive_command_complete(ctx, command.command_id, true);
+                    }
+                    continue;
+                }
+                backend = capability->backend;
+            } else if (command.tool_kind == LLAMA_TOOL_KIND_BASH_CLI) {
+                backend = SERVER_OPENCLAW_DISPATCH_LEGACY_BASH;
+            } else if (command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
+                backend = SERVER_OPENCLAW_DISPATCH_LEGACY_HARD_MEMORY;
+            } else {
+                continue;
+            }
+
+            if (backend == SERVER_OPENCLAW_DISPATCH_LEGACY_BASH) {
                 llama_bash_tool_request request = {};
                 if (llama_cognitive_bash_tool_get_request(ctx, command.command_id, &request) != 0) {
                     SRV_WRN("bash tool command %d did not have a pending request\n", command.command_id);
@@ -2943,19 +3111,9 @@ private:
                 llama_bash_tool_config config = llama_bash_tool_default_config();
                 (void) llama_bash_tool_get_config(ctx, &config);
                 if (!config.enabled || !request.command_ready || request.command_text[0] == '\0') {
-                    llama_bash_tool_result result = {};
-                    result.command_id = request.command_id;
-                    result.tool_job_id = request.tool_job_id;
-                    result.launch_failed = true;
-                    result.exit_code = 127;
-	                    std::snprintf(result.error_text, sizeof(result.error_text), "%s",
-	                            !config.enabled ? "bash tool is disabled" : "bash tool request did not include a command");
-	                    if (llama_cognitive_bash_tool_submit_result(ctx, &result, nullptr) == 0) {
-	                        mark_runtime_state_dirty("bash-tool-immediate-result");
-	                        capture_tool_result_provenance("bash_tool_immediate", bash_result_to_json(result), nullptr);
-	                    }
-	                    continue;
-	                }
+                    submit_bash_error(command, !config.enabled ? "bash tool is disabled" : "bash tool request did not include a command");
+                    continue;
+                }
 
                 vicuna_external_work_item work = {};
                 work.command_id = command.command_id;
@@ -2973,7 +3131,7 @@ private:
                             command.origin,
                             request.tool_job_id);
                 }
-            } else {
+            } else if (backend == SERVER_OPENCLAW_DISPATCH_LEGACY_HARD_MEMORY) {
                 llama_cognitive_hard_memory_request request = {};
                 if (llama_cognitive_hard_memory_get_request(ctx, command.command_id, &request) != 0) {
                     SRV_WRN("hard-memory command %d did not have a pending request\n", command.command_id);
@@ -2984,20 +3142,10 @@ private:
                 llama_hard_memory_config config = llama_hard_memory_default_config();
                 (void) llama_hard_memory_get_config(ctx, &config);
                 if (!config.enabled || request.query.query[0] == '\0') {
-                    llama_cognitive_hard_memory_result result = {};
-                    result.command_id = request.command_id;
-                    result.tool_job_id = request.tool_job_id;
-                    result.result.ok = false;
-                    result.result.tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_QUERY;
-                    result.result.status_code = !config.enabled ? 503 : 400;
-	                    std::snprintf(result.result.error, sizeof(result.result.error), "%s",
-	                            !config.enabled ? "hard memory is disabled" : "hard memory request did not include a query");
-	                    if (llama_cognitive_hard_memory_submit_result(ctx, &result, nullptr) == 0) {
-	                        mark_runtime_state_dirty("hard-memory-immediate-result");
-	                        capture_tool_result_provenance("hard_memory_immediate", hard_memory_result_to_json(result), nullptr);
-	                    }
-	                    continue;
-	                }
+                    submit_hard_memory_error(command, !config.enabled ? 503 : 400,
+                            !config.enabled ? "hard memory is disabled" : "hard memory request did not include a query");
+                    continue;
+                }
 
                 vicuna_external_work_item work = {};
                 work.command_id = command.command_id;
@@ -3016,6 +3164,14 @@ private:
                             command.origin,
                             request.tool_job_id,
                             request.query.query);
+                }
+            } else {
+                if (command.tool_kind == LLAMA_TOOL_KIND_BASH_CLI) {
+                    submit_bash_error(command, "registered capability has no supported executor backend");
+                } else if (command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
+                    submit_hard_memory_error(command, 501, "registered capability has no supported executor backend");
+                } else {
+                    (void) llama_cognitive_command_complete(ctx, command.command_id, true);
                 }
             }
         }
@@ -3344,6 +3500,9 @@ private:
             }
         }
 
+        bool hard_memory_enabled = false;
+        bool bash_tool_enabled = false;
+
         {
             const char * hard_memory_url = getenv("VICUNA_HARD_MEMORY_URL");
             const char * hard_memory_token = getenv("VICUNA_HARD_MEMORY_TOKEN");
@@ -3381,6 +3540,7 @@ private:
                 }
 
                 if (llama_hard_memory_configure(ctx, hard_memory) == 0) {
+                    hard_memory_enabled = hard_memory.enabled;
                     SRV_INF("hard memory enabled: url=%s container=%s runtime=%s\n",
                             hard_memory.base_url,
                             hard_memory.container_tag,
@@ -3460,6 +3620,7 @@ private:
             }
 
             if (llama_bash_tool_configure(ctx, &bash_tool) == 0) {
+                bash_tool_enabled = bash_tool.enabled;
                 if (bash_tool.enabled) {
                     SRV_INF("bash tool enabled: bash=%s cwd=%s timeout_ms=%d stdout=%d stderr=%d login=%d inherit_env=%d reject_meta=%d cpu_s=%d max_children=%d max_open_files=%d max_file_size=%d allow=%s block=%s env=%s\n",
                             bash_tool.bash_path,
@@ -3480,6 +3641,22 @@ private:
                 }
             } else {
                 SRV_WRN("%s\n", "failed to configure bash tool");
+            }
+        }
+
+        {
+            std::string fabric_error;
+            if (!openclaw_fabric.configure(bash_tool_enabled, hard_memory_enabled, &fabric_error)) {
+                SRV_WRN("failed to configure OpenClaw tool fabric: %s\n", fabric_error.c_str());
+            } else if (openclaw_fabric.enabled()) {
+                std::vector<llama_cognitive_tool_spec> specs;
+                if (openclaw_fabric.build_cognitive_specs(&specs) &&
+                        !specs.empty() &&
+                        llama_cognitive_tool_spec_set(ctx, specs.data(), (int32_t) specs.size()) == 0) {
+                    SRV_INF("OpenClaw tool fabric enabled with %zu capabilities\n", specs.size());
+                } else {
+                    SRV_WRN("%s\n", "failed to install OpenClaw tool catalog into cognitive runtime");
+                }
             }
         }
 
@@ -4409,9 +4586,25 @@ private:
 
         res->generation_params = slot.task->params; // copy the parameters
 
+        if (slot.n_sent_text > 0) {
+            const std::string & emitted_buffer = !res->content.empty() ? res->content : slot.generated_text;
+            const std::string emitted_text = emitted_buffer.substr(0, std::min(slot.n_sent_text, emitted_buffer.size()));
+            if (!admit_runtime_emit_text(
+                        ctx,
+                        emitted_text,
+                        LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                        LLAMA_FUNCTIONAL_MICROPHASE_NONE,
+                        slot.id,
+                        slot.task && slot.task->has_active_trace ? slot.task->active_trace.plan.plan_id : -1)) {
+                SLT_WRN(slot, "%s\n", "failed to admit emitted assistant text into self-state");
+            }
+        }
+
         if (slot.task->has_active_trace && slot.n_sent_text > 0) {
             (void) llama_active_loop_note_emit(ctx, slot.task->active_trace.episode_id, slot.n_sent_text);
             mark_runtime_state_dirty("active-loop-emit");
+        } else if (slot.n_sent_text > 0) {
+            mark_runtime_state_dirty("foreground-emit");
         }
 
         queue_results.send(std::move(res));

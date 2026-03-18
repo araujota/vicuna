@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 
 import {
   appendProactiveId,
+  appendChatTranscriptMessage,
   extractChatCompletionText,
   extractResponseText,
+  getChatTranscript,
   normalizeState,
   parseSseChunk,
   splitSseBuffer,
@@ -74,11 +76,24 @@ test('normalizeState bounds and deduplicates persisted values', () => {
     telegramOffset: '12',
     chatIds: ['1', 1, '2'],
     proactiveResponseIds: ['a', 'a', 'b'],
+    chatSessions: {
+      1: {
+        messages: [
+          { role: 'user', content: ' first ' },
+          { role: 'assistant', content: 'second' },
+          { role: 'tool', content: 'ignored' },
+        ],
+      },
+    },
   });
 
   assert.equal(state.telegramOffset, 12);
   assert.deepEqual(state.chatIds, ['1', '2']);
   assert.deepEqual(state.proactiveResponseIds, ['a', 'b']);
+  assert.deepEqual(state.chatSessions['1'].messages, [
+    { role: 'user', content: 'first' },
+    { role: 'assistant', content: 'second' },
+  ]);
 });
 
 test('appendProactiveId maintains bounded dedupe ids', () => {
@@ -88,4 +103,22 @@ test('appendProactiveId maintains bounded dedupe ids', () => {
   state = appendProactiveId(state, 'resp_2');
 
   assert.deepEqual(state.proactiveResponseIds, ['resp_1', 'resp_2']);
+});
+
+test('appendChatTranscriptMessage isolates chats and trims bounded history', () => {
+  let state = normalizeState({});
+  state = appendChatTranscriptMessage(state, 1, 'user', 'hello', { maxHistoryMessages: 3 });
+  state = appendChatTranscriptMessage(state, 1, 'assistant', 'hi', { maxHistoryMessages: 3 });
+  state = appendChatTranscriptMessage(state, 2, 'user', 'other chat', { maxHistoryMessages: 3 });
+  state = appendChatTranscriptMessage(state, 1, 'user', 'follow-up', { maxHistoryMessages: 3 });
+  state = appendChatTranscriptMessage(state, 1, 'assistant', 'answer', { maxHistoryMessages: 3 });
+
+  assert.deepEqual(getChatTranscript(state, 1), [
+    { role: 'assistant', content: 'hi' },
+    { role: 'user', content: 'follow-up' },
+    { role: 'assistant', content: 'answer' },
+  ]);
+  assert.deepEqual(getChatTranscript(state, 2), [
+    { role: 'user', content: 'other chat' },
+  ]);
 });
