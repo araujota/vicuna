@@ -28,6 +28,7 @@ Optional variables:
 - `TELEGRAM_BRIDGE_STATE_PATH` default: `/tmp/vicuna-telegram-bridge-state.json`
 - `TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS` default: `30`
 - `TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES` default: `12`
+- `TELEGRAM_BRIDGE_MAX_TOKENS` default: `200`
 - `VICUNA_API_KEY` if the server runs with bearer auth enabled
 
 ## Start
@@ -67,6 +68,8 @@ default for managed operation. Override these if needed:
   assistant reply is sent back to the same Telegram chat
 - each Telegram chat keeps its own bounded persisted transcript keyed by
   Telegram `chat_id`, so follow-up turns reuse recent context after restarts
+- each forwarded Telegram turn now logs transcript length and role sequence to
+  the bridge journal for continuity debugging
 - proactive runtime self-emits are consumed from `/v1/responses/stream` and
   sent to all registered chats while also being recorded into each chat's local
   transcript window

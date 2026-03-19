@@ -671,6 +671,8 @@ extern "C" {
         int32_t candidate_count;
         float signed_outcome;
         float magnitude;
+        uint64_t source_token_hash;
+        int32_t source_token_count;
         float metrics[6];
         float meta_loss;
         float allostatic_distance_before;
@@ -948,6 +950,7 @@ extern "C" {
         LLAMA_TOOL_KIND_HARD_MEMORY_QUERY = 2,
         LLAMA_TOOL_KIND_HARD_MEMORY_WRITE = 3,
         LLAMA_TOOL_KIND_BASH_CLI          = 4,
+        LLAMA_TOOL_KIND_CODEX_CLI         = 5,
     };
 
     enum llama_self_model_extension_kind {
@@ -1783,6 +1786,15 @@ extern "C" {
         LLAMA_BASH_TOOL_STDOUT_MAX_CHARS = 4096,
         LLAMA_BASH_TOOL_STDERR_MAX_CHARS = 4096,
         LLAMA_BASH_TOOL_ERROR_MAX_CHARS = 256,
+        LLAMA_CODEX_TOOL_PATH_MAX_CHARS = 256,
+        LLAMA_CODEX_TOOL_CWD_MAX_CHARS = 256,
+        LLAMA_CODEX_TOOL_PROMPT_MAX_CHARS = 4096,
+        LLAMA_CODEX_TOOL_SUMMARY_MAX_CHARS = 2048,
+        LLAMA_CODEX_TOOL_MANUAL_MAX_CHARS = 1024,
+        LLAMA_CODEX_TOOL_FILES_MAX_CHARS = 2048,
+        LLAMA_CODEX_TOOL_STDOUT_MAX_CHARS = 8192,
+        LLAMA_CODEX_TOOL_STDERR_MAX_CHARS = 8192,
+        LLAMA_CODEX_TOOL_ERROR_MAX_CHARS = 512,
         LLAMA_SELF_STATE_MAX_DELTA_DIMS = 8,
         LLAMA_COGNITIVE_MAX_TOOL_SPECS = 8,
         LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS = 48,
@@ -2126,6 +2138,61 @@ extern "C" {
         char stdout_text[LLAMA_BASH_TOOL_STDOUT_MAX_CHARS];
         char stderr_text[LLAMA_BASH_TOOL_STDERR_MAX_CHARS];
         char error_text[LLAMA_BASH_TOOL_ERROR_MAX_CHARS];
+    };
+
+    struct llama_codex_tool_config {
+        bool enabled;
+        bool dangerous_no_approval;
+        bool rebuild_after_changes;
+        bool verify_tool_access_after_rebuild;
+        int32_t timeout_ms;
+        int32_t max_stdout_bytes;
+        int32_t max_stderr_bytes;
+        char codex_path[LLAMA_CODEX_TOOL_PATH_MAX_CHARS];
+        char working_directory[LLAMA_CODEX_TOOL_CWD_MAX_CHARS];
+        char rebuild_script_path[LLAMA_CODEX_TOOL_PATH_MAX_CHARS];
+        char rebuild_helper_path[LLAMA_CODEX_TOOL_PATH_MAX_CHARS];
+        char completion_message_path[LLAMA_CODEX_TOOL_PATH_MAX_CHARS];
+    };
+
+    struct llama_codex_tool_request {
+        int32_t command_id;
+        int32_t origin;
+        int32_t tool_job_id;
+        int32_t timeout_ms;
+        int32_t max_stdout_bytes;
+        int32_t max_stderr_bytes;
+        bool dangerous_no_approval;
+        bool rebuild_after_changes;
+        bool verify_tool_access_after_rebuild;
+        bool command_ready;
+        char codex_path[LLAMA_CODEX_TOOL_PATH_MAX_CHARS];
+        char working_directory[LLAMA_CODEX_TOOL_CWD_MAX_CHARS];
+        char rebuild_script_path[LLAMA_CODEX_TOOL_PATH_MAX_CHARS];
+        char rebuild_helper_path[LLAMA_CODEX_TOOL_PATH_MAX_CHARS];
+        char completion_message_path[LLAMA_CODEX_TOOL_PATH_MAX_CHARS];
+        char intent_text[LLAMA_CODEX_TOOL_PROMPT_MAX_CHARS];
+        char task_prompt[LLAMA_CODEX_TOOL_PROMPT_MAX_CHARS];
+    };
+
+    struct llama_codex_tool_result {
+        int32_t command_id;
+        int32_t tool_job_id;
+        int32_t exit_code;
+        int32_t runtime_ms;
+        bool launch_failed;
+        bool repo_changed;
+        bool rebuild_attempted;
+        bool rebuild_succeeded;
+        bool accessibility_verified;
+        bool truncated_stdout;
+        bool truncated_stderr;
+        char stdout_text[LLAMA_CODEX_TOOL_STDOUT_MAX_CHARS];
+        char stderr_text[LLAMA_CODEX_TOOL_STDERR_MAX_CHARS];
+        char error_text[LLAMA_CODEX_TOOL_ERROR_MAX_CHARS];
+        char summary_text[LLAMA_CODEX_TOOL_SUMMARY_MAX_CHARS];
+        char manual_requirements[LLAMA_CODEX_TOOL_MANUAL_MAX_CHARS];
+        char changed_files_excerpt[LLAMA_CODEX_TOOL_FILES_MAX_CHARS];
     };
 
     struct llama_cognitive_hard_memory_request {
@@ -3131,6 +3198,16 @@ extern "C" {
     LLAMA_API int32_t llama_bash_tool_get_last_result(
             const struct llama_context * ctx,
             struct llama_bash_tool_result * out_result);
+    LLAMA_API struct llama_codex_tool_config llama_codex_tool_default_config(void);
+    LLAMA_API int32_t llama_codex_tool_configure(
+            struct llama_context * ctx,
+            const struct llama_codex_tool_config * config);
+    LLAMA_API int32_t llama_codex_tool_get_config(
+            const struct llama_context * ctx,
+            struct llama_codex_tool_config * out_config);
+    LLAMA_API int32_t llama_codex_tool_get_last_result(
+            const struct llama_context * ctx,
+            struct llama_codex_tool_result * out_result);
 
     LLAMA_API int32_t llama_cognitive_tool_spec_count(
             const struct llama_context * ctx);
@@ -3155,18 +3232,52 @@ extern "C" {
             struct llama_context * ctx,
             int32_t command_id,
             bool cancelled);
+    LLAMA_API int32_t llama_cognitive_command_begin_external_wait(
+            struct llama_context * ctx,
+            int32_t command_id);
+    LLAMA_API int32_t llama_cognitive_command_rebind_tool(
+            struct llama_context * ctx,
+            int32_t command_id,
+            int32_t tool_spec_index);
+    LLAMA_API int32_t llama_cognitive_active_tool_emission_note(
+            struct llama_context * ctx,
+            int32_t command_id,
+            const llama_token * tokens,
+            size_t n_tokens);
+    LLAMA_API int32_t llama_cognitive_active_planner_reasoning_note(
+            struct llama_context * ctx,
+            int32_t episode_id,
+            const llama_token * tokens,
+            size_t n_tokens);
     LLAMA_API int32_t llama_cognitive_bash_tool_get_request(
             const struct llama_context * ctx,
             int32_t command_id,
             struct llama_bash_tool_request * out_request);
+    LLAMA_API int32_t llama_cognitive_bash_tool_set_request(
+            struct llama_context * ctx,
+            const struct llama_bash_tool_request * request);
     LLAMA_API int32_t llama_cognitive_bash_tool_submit_result(
             struct llama_context * ctx,
             const struct llama_bash_tool_result * result,
+            struct llama_active_loop_trace * out_active_trace);
+    LLAMA_API int32_t llama_cognitive_codex_tool_get_request(
+            const struct llama_context * ctx,
+            int32_t command_id,
+            struct llama_codex_tool_request * out_request);
+    LLAMA_API int32_t llama_cognitive_codex_tool_set_request(
+            struct llama_context * ctx,
+            const struct llama_codex_tool_request * request);
+    LLAMA_API int32_t llama_cognitive_codex_tool_submit_result(
+            struct llama_context * ctx,
+            const struct llama_codex_tool_result * result,
             struct llama_active_loop_trace * out_active_trace);
     LLAMA_API int32_t llama_cognitive_hard_memory_get_request(
             const struct llama_context * ctx,
             int32_t command_id,
             struct llama_cognitive_hard_memory_request * out_request);
+    LLAMA_API int32_t llama_cognitive_hard_memory_set_request(
+            struct llama_context * ctx,
+            const struct llama_cognitive_hard_memory_request * request);
     LLAMA_API int32_t llama_cognitive_hard_memory_submit_result(
             struct llama_context * ctx,
             const struct llama_cognitive_hard_memory_result * result,
@@ -4018,6 +4129,7 @@ extern "C" {
 
     // Print system information
     LLAMA_API const char * llama_print_system_info(void);
+    LLAMA_API const char * llama_vicuna_core_system_prompt_default(void);
 
     // Set callback for all future logging events.
     // If this is not called, or NULL is supplied, everything is output on stderr.

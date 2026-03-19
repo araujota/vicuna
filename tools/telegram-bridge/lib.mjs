@@ -133,6 +133,30 @@ export function appendChatTranscriptMessage(state, chatId, role, content, option
   };
 }
 
+export function sanitizeAssistantRelayText(text) {
+  const input = String(text ?? '');
+  if (!input.trim()) {
+    return '';
+  }
+
+  const patterns = [
+    /<vicuna_tool_call\b[\s\S]*?<\/vicuna_tool_call>/gi,
+    /<minimax:tool_call\b[\s\S]*?<\/minimax:tool_call>/gi,
+    /<tool_call\b[\s\S]*?<\/tool_call>/gi,
+  ];
+
+  let sanitized = input;
+  for (const pattern of patterns) {
+    sanitized = sanitized.replace(pattern, '');
+  }
+
+  sanitized = sanitized
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n');
+
+  return sanitized.trim();
+}
+
 export function extractResponseText(response) {
   if (!response || typeof response !== 'object') {
     return '';
@@ -152,19 +176,19 @@ export function extractResponseText(response) {
       }
     }
   }
-  return parts.join('\n\n').trim();
+  return sanitizeAssistantRelayText(parts.join('\n\n'));
 }
 
 export function extractChatCompletionText(body) {
   const content = body?.choices?.[0]?.message?.content;
   if (typeof content === 'string') {
-    return content.trim();
+    return sanitizeAssistantRelayText(content);
   }
   if (Array.isArray(content)) {
-    return content
+    return sanitizeAssistantRelayText(content
       .map((part) => (typeof part?.text === 'string' ? part.text : ''))
       .join('\n')
-      .trim();
+    );
   }
   return '';
 }

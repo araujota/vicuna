@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, readFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 
 import {
   appendProactiveId,
@@ -7,8 +10,11 @@ import {
   extractChatCompletionText,
   extractResponseText,
   getChatTranscript,
+  loadState,
   normalizeState,
   parseSseChunk,
+  saveState,
+  sanitizeAssistantRelayText,
   splitSseBuffer,
 } from './lib.mjs';
 
@@ -40,6 +46,28 @@ test('extractChatCompletionText reads assistant content', () => {
   });
 
   assert.equal(text, 'reply');
+});
+
+test('extractChatCompletionText strips vicuna tool-call xml', () => {
+  const text = extractChatCompletionText({
+    choices: [
+      {
+        message: {
+          content: 'I should search.\n<vicuna_tool_call tool="web_search"><arg name="query" type="string">GDP</arg></vicuna_tool_call>',
+        },
+      },
+    ],
+  });
+
+  assert.equal(text, 'I should search.');
+});
+
+test('sanitizeAssistantRelayText strips known tool-call xml blocks', () => {
+  const text = sanitizeAssistantRelayText(
+    'prefix\n<tool_call>{"name":"search"}</tool_call>\n<minimax:tool_call><invoke name="x"></invoke></minimax:tool_call>\nsuffix',
+  );
+
+  assert.equal(text, 'prefix\n\nsuffix');
 });
 
 test('parseSseChunk parses response events', () => {
@@ -120,5 +148,27 @@ test('appendChatTranscriptMessage isolates chats and trims bounded history', () 
   ]);
   assert.deepEqual(getChatTranscript(state, 2), [
     { role: 'user', content: 'other chat' },
+  ]);
+});
+
+test('saveState persists chatSessions transcript history', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'vicuna-telegram-bridge-'));
+  const statePath = path.join(dir, 'state.json');
+
+  let state = normalizeState({});
+  state = appendChatTranscriptMessage(state, 7502424413, 'user', 'first', { maxHistoryMessages: 4 });
+  state = appendChatTranscriptMessage(state, 7502424413, 'assistant', 'second', { maxHistoryMessages: 4 });
+
+  await saveState(statePath, state, { maxHistoryMessages: 4 });
+  const persisted = JSON.parse(await readFile(statePath, 'utf8'));
+  const reloaded = await loadState(statePath, { maxHistoryMessages: 4 });
+
+  assert.deepEqual(persisted.chatSessions['7502424413'].messages, [
+    { role: 'user', content: 'first' },
+    { role: 'assistant', content: 'second' },
+  ]);
+  assert.deepEqual(getChatTranscript(reloaded, 7502424413), [
+    { role: 'user', content: 'first' },
+    { role: 'assistant', content: 'second' },
   ]);
 });

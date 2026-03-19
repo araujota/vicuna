@@ -57,6 +57,20 @@ json format_error_response(const std::string & message, const enum error_type ty
     };
 }
 
+static std::string trim_copy(const std::string & value) {
+    size_t begin = 0;
+    while (begin < value.size() && std::isspace((unsigned char) value[begin])) {
+        ++begin;
+    }
+
+    size_t end = value.size();
+    while (end > begin && std::isspace((unsigned char) value[end - 1])) {
+        --end;
+    }
+
+    return value.substr(begin, end - begin);
+}
+
 int32_t classify_foreground_role(const json & body) {
     if (!body.contains("messages") || !body.at("messages").is_array()) {
         return LLAMA_SELF_STATE_EVENT_USER;
@@ -75,6 +89,87 @@ int32_t classify_foreground_role(const json & body) {
     }
 
     return LLAMA_SELF_STATE_EVENT_USER;
+}
+
+std::string extract_foreground_message_text(const json & body) {
+    auto extract_text_content = [](const json & content) -> std::string {
+        if (content.is_string()) {
+            return trim_copy(content.get<std::string>());
+        }
+        if (!content.is_array()) {
+            return {};
+        }
+
+        std::string text;
+        for (const auto & part : content) {
+            if (part.is_string()) {
+                const std::string piece = trim_copy(part.get<std::string>());
+                if (!piece.empty()) {
+                    if (!text.empty()) {
+                        text += "\n";
+                    }
+                    text += piece;
+                }
+                continue;
+            }
+            if (!part.is_object()) {
+                continue;
+            }
+            const std::string type = json_value(part, "type", std::string());
+            if (type == "text" || type.empty()) {
+                const std::string piece = trim_copy(json_value(part, "text", std::string()));
+                if (!piece.empty()) {
+                    if (!text.empty()) {
+                        text += "\n";
+                    }
+                    text += piece;
+                }
+            }
+        }
+        return text;
+    };
+
+    if (!body.contains("messages") || !body.at("messages").is_array()) {
+        if (!body.contains("prompt")) {
+            return {};
+        }
+        return extract_text_content(body.at("prompt"));
+    }
+
+    const json & messages = body.at("messages");
+    for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+        const std::string role = json_value(*it, "role", std::string());
+        if (role == "assistant" || role == "system" || role.empty()) {
+            continue;
+        }
+
+        if (!it->contains("content")) {
+            return {};
+        }
+
+        return extract_text_content(it->at("content"));
+    }
+
+    return {};
+}
+
+common_chat_params build_chat_completion_params(
+        const server_chat_params & opt,
+        const std::vector<common_chat_msg> & messages,
+        const std::vector<common_chat_tool> & tools,
+        common_chat_tool_choice tool_choice,
+        bool add_generation_prompt) {
+    common_chat_templates_inputs inputs;
+    inputs.messages = messages;
+    inputs.tools = tools;
+    inputs.tool_choice = tools.empty() ? COMMON_CHAT_TOOL_CHOICE_NONE : tool_choice;
+    inputs.use_jinja = opt.use_jinja;
+    inputs.parallel_tool_calls = false;
+    inputs.add_generation_prompt = add_generation_prompt;
+    inputs.reasoning_format = opt.reasoning_format;
+    inputs.enable_thinking = opt.enable_thinking;
+    inputs.chat_template_kwargs = opt.chat_template_kwargs;
+    return common_chat_templates_apply(opt.tmpls.get(), inputs);
 }
 
 //

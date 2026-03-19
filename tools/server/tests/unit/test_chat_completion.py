@@ -3,11 +3,30 @@ from openai import OpenAI
 from utils import *
 
 server: ServerProcess
+CORE_SYSTEM_PROMPT = "You are an experimental intelligence designed to self-regulate, learn, self-improve, and be useful."
+CORE_SYSTEM_PREFIX = f"System:\n{CORE_SYSTEM_PROMPT}\n\n"
 
 @pytest.fixture(autouse=True)
 def create_server():
     global server
     server = ServerPreset.tinyllama2()
+    server.extra_env = {"VICUNA_ACTIVE_LOOP_ENABLED": "0"}
+
+
+def assert_prefixed_chat_template(messages, expected_prompt):
+    global server
+    apply_res = server.make_request("POST", "/apply-template", data={
+        "messages": messages,
+    })
+    assert apply_res.status_code == 200
+    assert apply_res.body["prompt"] == expected_prompt
+
+    completion_res = server.make_request("POST", "/completion", data={
+        "n_predict": 8,
+        "prompt": apply_res.body["prompt"],
+    })
+    assert completion_res.status_code == 200
+    assert completion_res.body["prompt"] == CORE_SYSTEM_PREFIX + "<s> " + expected_prompt
 
 
 @pytest.mark.parametrize(
@@ -43,7 +62,7 @@ def test_chat_completion(model, system_prompt, user_prompt, max_tokens, re_conte
     assert res.body["system_fingerprint"].startswith("b")
     # we no longer reflect back the model name, see https://github.com/ggml-org/llama.cpp/pull/17668
     # assert res.body["model"] == model if model is not None else server.model_alias
-    assert res.body["usage"]["prompt_tokens"] == n_prompt
+    assert res.body["usage"]["prompt_tokens"] > n_prompt
     assert res.body["usage"]["completion_tokens"] == n_predicted
     choice = res.body["choices"][0]
     assert "assistant" == choice["message"]["role"]
@@ -94,7 +113,7 @@ def test_chat_completion_stream(system_prompt, user_prompt, max_tokens, re_conte
                 assert choice["finish_reason"] is None
                 content += choice["delta"]["content"] or ''
         else:
-            assert data["usage"]["prompt_tokens"] == n_prompt
+            assert data["usage"]["prompt_tokens"] > n_prompt
             assert data["usage"]["completion_tokens"] == n_predicted
 
 
@@ -121,18 +140,14 @@ def test_chat_completion_with_openai_library():
 def test_chat_template():
     global server
     server.chat_template = "llama3"
-    server.debug = True  # to get the "__verbose" object in the response
     server.start()
-    res = server.make_request("POST", "/chat/completions", data={
-        "max_tokens": 8,
-        "messages": [
+    assert_prefixed_chat_template(
+        [
             {"role": "system", "content": "Book"},
             {"role": "user", "content": "What is the best book"},
-        ]
-    })
-    assert res.status_code == 200
-    assert "__verbose" in res.body
-    assert res.body["__verbose"]["prompt"] == "<s> <|start_header_id|>system<|end_header_id|>\n\nBook<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the best book<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        ],
+        "<|start_header_id|>system<|end_header_id|>\n\nBook<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the best book<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+    )
 
 
 @pytest.mark.parametrize("prefill,re_prefill", [
@@ -142,19 +157,35 @@ def test_chat_template():
 def test_chat_template_assistant_prefill(prefill, re_prefill):
     global server
     server.chat_template = "llama3"
-    server.debug = True  # to get the "__verbose" object in the response
     server.start()
-    res = server.make_request("POST", "/chat/completions", data={
-        "max_tokens": 8,
-        "messages": [
+    assert_prefixed_chat_template(
+        [
             {"role": "system", "content": "Book"},
             {"role": "user", "content": "What is the best book"},
             {"role": "assistant", "content": prefill},
+        ],
+        f"<|start_header_id|>system<|end_header_id|>\n\nBook<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the best book<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{re_prefill}",
+    )
+
+
+def test_chat_template_includes_core_system_prefix():
+    global server
+    server.chat_template = "llama3"
+    server.start()
+    apply_res = server.make_request("POST", "/apply-template", data={
+        "messages": [
+            {"role": "system", "content": "Book"},
+            {"role": "user", "content": "What is the best book"},
         ]
     })
-    assert res.status_code == 200
-    assert "__verbose" in res.body
-    assert res.body["__verbose"]["prompt"] == f"<s> <|start_header_id|>system<|end_header_id|>\n\nBook<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the best book<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{re_prefill}"
+    assert apply_res.status_code == 200
+
+    completion_res = server.make_request("POST", "/completion", data={
+        "n_predict": 8,
+        "prompt": apply_res.body["prompt"],
+    })
+    assert completion_res.status_code == 200
+    assert completion_res.body["prompt"].startswith(CORE_SYSTEM_PREFIX)
 
 
 def test_apply_chat_template():

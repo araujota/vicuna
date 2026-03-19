@@ -42,6 +42,29 @@ For build and development guidance, start with:
 - [docs/build.md](docs/build.md)
 - [tools/server/README-dev.md](tools/server/README-dev.md)
 
+## Workstation Access
+
+As of 2026-03-19, this workstation reports:
+- hostname: `tyler-araujo-MS-7E12`
+- primary LAN IPv4: `10.0.0.20`
+- repo path: `/home/tyler-araujo/Projects/vicuna`
+- default user: `tyler-araujo`
+
+Remote SSH target, once SSH is enabled on the workstation:
+- `ssh tyler-araujo@10.0.0.20`
+
+Current caveat:
+- SSH is not currently reachable on this host. At the time this note was written, neither `ssh.service` nor `sshd.service` existed and no listener was present on TCP port `22`.
+
+Remote rebuild/deploy workflow after SSH is enabled:
+- `ssh tyler-araujo@10.0.0.20`
+- `cd /home/tyler-araujo/Projects/vicuna`
+- `bash tools/ops/rebuild-vicuna-runtime.sh`
+
+Runtime verification after rebuild:
+- `curl http://127.0.0.1:8080/health`
+- `journalctl --user -u vicuna-runtime.service --no-pager -n 120`
+
 ## Active Technologies
 - C++17 with the existing `llama.cpp`/Vicuña runtime and C API surfaces + Existing Active LoRA manager, cognitive loop runtime, self-state and server serialization surfaces (044-process-functional-lora)
 - In-memory runtime bank plus existing server export/import and typed state surfaces (044-process-functional-lora)

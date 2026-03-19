@@ -52,6 +52,18 @@ float clamp_signed_unit(float value) {
     return clamp_range(value, -1.0f, 1.0f);
 }
 
+uint64_t hash_event_tokens(const llama_self_state_event & event) {
+    if (!event.tokens || event.n_tokens == 0) {
+        return 0;
+    }
+    uint64_t hash = 1469598103934665603ULL;
+    for (size_t i = 0; i < event.n_tokens; ++i) {
+        hash ^= (uint64_t) (uint32_t) event.tokens[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
 float decayed_std(float initial_std, float min_std, uint64_t count, uint32_t decay_horizon) {
     const float init = std::max(0.0f, initial_std);
     const float floor = std::max(0.0f, std::min(init, min_std));
@@ -4712,6 +4724,8 @@ bool llama_active_lora_manager::functional_apply_update(
     update.candidate_count = candidate_count;
     update.signed_outcome = signed_outcome;
     update.magnitude = magnitude;
+    update.source_token_hash = hash_event_tokens(event);
+    update.source_token_count = (int32_t) std::min<size_t>(event.n_tokens, (size_t) std::numeric_limits<int32_t>::max());
     update.before_snapshot = before;
     update.after_snapshot = after;
     for (size_t i = 0; i < std::min(metric_count, sizeof(update.metrics)/sizeof(update.metrics[0])); ++i) {

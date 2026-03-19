@@ -49,7 +49,7 @@ llama_bash_tool_config llama_bash_tool_default_config(void) {
     config.max_stdout_bytes = LLAMA_BASH_TOOL_STDOUT_MAX_CHARS - 1;
     config.max_stderr_bytes = LLAMA_BASH_TOOL_STDERR_MAX_CHARS - 1;
     copy_bounded_cstr(config.bash_path, sizeof(config.bash_path), "/bin/bash");
-    copy_bounded_cstr(config.allowed_commands, sizeof(config.allowed_commands), "pwd,ls,find,rg,cat,head,tail,grep,git");
+    copy_bounded_cstr(config.allowed_commands, sizeof(config.allowed_commands), "pwd,ls,find,rg,cat,head,tail,grep,git,tavily-web-search,tools/openclaw-harness/bin/tavily-web-search");
     copy_bounded_cstr(config.blocked_patterns, sizeof(config.blocked_patterns), "rm -rf,:(){:|:&};:,mkfs,dd if=,chmod -R,chown -R,shutdown,reboot");
     copy_bounded_cstr(config.allowed_env, sizeof(config.allowed_env), "PATH,HOME,LANG,LC_ALL,LC_CTYPE");
     return config;
@@ -214,4 +214,10 @@ int32_t llama_cognitive_bash_tool_get_request(
         int32_t command_id,
         struct llama_bash_tool_request * out_request) {
     return ctx && out_request && ctx->cognitive_bash_tool_get_request(command_id, out_request) ? 0 : -1;
+}
+
+int32_t llama_cognitive_bash_tool_set_request(
+        struct llama_context * ctx,
+        const struct llama_bash_tool_request * request) {
+    return ctx && request && ctx->bash_tool_set_request(*request) ? 0 : -1;
 }

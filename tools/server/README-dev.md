@@ -96,6 +96,117 @@ active-loop or DMN runner continue. Unsupported hosts, disabled execution,
 timeouts, and launch failures are surfaced through typed result fields instead
 of silent shell fallbacks.
 
+### Core System Prompt
+
+Vicuña carries one explicit core system prompt across its inference paths.
+
+- default text: `You are an experimental intelligence designed to self-regulate, learn, self-improve, and be useful.`
+- runtime override: `VICUNA_CORE_SYSTEM_PROMPT`
+- server-config fallback: `--system-prompt`
+
+`server_context` resolves that text once during model load, canonicalizes it as
+`System:\n<core prompt>\n\n`, and prepends those tokens to every completion and
+chat task before decode. The internal cognitive simulated-user decode path
+prepends the same text so runtime-internal LLM invocations share the same
+baseline instruction.
+
+The prefix is intentionally pinned under sliding-window context shift. After
+injecting the prefix, host code raises `task.params.n_keep` to at least the
+core-prefix token count, so the existing compaction path treats those tokens as
+non-evictable while shifting the rest of the prompt.
+
+### Cognitive Codex Tool Path
+
+The server now exposes a first-class `LLAMA_TOOL_KIND_CODEX_CLI` runtime tool
+for one-shot repository development performed by the locally installed OpenAI
+Codex CLI. This path is intentionally narrow and reuses the same typed
+request/result pattern as the bash and hard-memory tools:
+
+- the cognitive runtime emits a typed `llama_codex_tool_request` containing the
+  user-visible task plus a host-authored instruction suffix
+- `server_context` runs `codex exec` from the repository root so Codex can edit
+  the full checkout in place
+- the invocation uses unrestricted host execution for that Codex session only:
+  `--dangerously-bypass-approvals-and-sandbox --sandbox danger-full-access`
+- Codex is expected to perform the requested change in one shot, run whatever
+  validation it needs, and end with a plain-text summary that includes a
+  `Manual requirements:` line
+- if the repository changed, the worker returns a typed result first; then the
+  server's normal post-result path persists runtime state, schedules the
+  standard rebuild helper, and emits the final user-facing completion after the
+  restarted runtime comes back up
+
+Runtime configuration is explicit and host-visible:
+
+- `VICUNA_CODEX_TOOL_ENABLED`: enable or disable the Codex core tool
+- `VICUNA_CODEX_TOOL_PATH`: absolute path to the `codex` executable
+- `VICUNA_CODEX_TOOL_WORKDIR`: repository-root working directory passed to
+  `codex exec -C`
+- `VICUNA_CODEX_TOOL_TIMEOUT_MS`: total Codex session timeout budget
+- `VICUNA_CODEX_TOOL_MAX_STDOUT_BYTES`: bounded stdout capture budget
+- `VICUNA_CODEX_TOOL_MAX_STDERR_BYTES`: bounded stderr capture budget
+- `VICUNA_CODEX_TOOL_REBUILD_AFTER_CHANGES`: schedule a rebuild when Codex
+  changed tracked files
+- `VICUNA_CODEX_TOOL_VERIFY_ACCESS_AFTER_REBUILD`: after restart, confirm the
+  Codex tool is still present in the rebuilt tool registry
+- `VICUNA_CODEX_TOOL_REBUILD_SCRIPT`: rebuild entrypoint, normally
+  `tools/ops/rebuild-vicuna-runtime.sh`
+- `VICUNA_CODEX_TOOL_REBUILD_HELPER`: detached helper that runs the rebuild
+  after the current runtime stops
+- `VICUNA_CODEX_TOOL_COMPLETION_MESSAGE_PATH`: restart bridge file used to
+  carry the final completion text across the rebuild boundary
+
+The persistence rule for self-modification is explicit: once the Codex worker
+has finished and returned its typed result into the server's normal drain path,
+the server admits maintenance text into self-state, marks runtime state dirty,
+and persists the runtime snapshot before stopping for the rebuild. That keeps
+the runtime's memory of ongoing self-work alive across the rebuild, rather than
+depending on the old process to survive long enough to finish the tool call.
+
+`tools/ops/complete-codex-rebuild.sh` is the only special helper in this path.
+It runs the existing rebuild script, writes `REBUILD_STATUS=ok|failed` plus the
+Codex-authored summary into the completion message file, and exits. On startup,
+`server_context` drains that file, verifies whether the Codex tool is
+accessible in the rebuilt registry, and publishes the final user-visible
+message. The message should include any required manual follow-up such as API
+keys or secrets copied from Codex's `Manual requirements:` line.
+
+### ReAct Tool-Call XML Contract
+
+For active-loop ReAct tool steps, host code now enforces one canonical tool
+surface for model output:
+
+- emit at most one short visible sentence before the tool call
+- then emit exactly one `<vicuna_tool_call>` block with no trailing assistant
+  content after the closing tag
+- encode each argument as `<arg name="..." type="...">...</arg>`
+- restrict argument `type` to `string`, `integer`, `number`, `boolean`, `null`,
+  or `json`
+- reject undeclared arguments, duplicate arguments, missing required arguments,
+  malformed XML, and schema/type mismatches
+
+`server-openclaw-fabric.cpp` derives these contracts from the registered tool
+schema, injects the contract into the tool-step system prompt, parses only the
+canonical XML form back into typed `common_chat_tool_call` state, and strips any
+rejected tool-call markup from assistant text before it can leak to user-facing
+surfaces such as Telegram.
+
+Functional tool LoRAs are only loaded while generating this XML-bearing tool
+step. Once the host begins external execution, the runtime unloads the
+tool-selection layer and restores planner-only composition while waiting for the
+result. Credit assignment is now split by ownership:
+
+- tool-family learning consumes only the canonical emitted
+  `<vicuna_tool_call>` block for that pending command
+- planner-family learning consumes planner-visible reasoning text such as the
+  short pre-call sentence and later post-result next-step analysis
+- both families still use the same self-state/allostatic outcome modulation;
+  only the source text routed into the update differs
+
+Host code should not synthesize alternate mixed summaries for either learning
+path, and planner reasoning must not be concatenated back into the tool-family
+payload.
+
 ### Tool-Authored Self-Model Extensions
 
 Vicuña now supports a bounded self-model extension registry above the authored

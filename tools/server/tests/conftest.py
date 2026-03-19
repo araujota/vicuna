@@ -1,5 +1,18 @@
+import os
+
 import pytest
 from utils import *
+
+
+@pytest.fixture(scope="session", autouse=True)
+def disable_active_loop_for_server_tests():
+    previous = os.environ.get("VICUNA_ACTIVE_LOOP_ENABLED")
+    os.environ["VICUNA_ACTIVE_LOOP_ENABLED"] = "0"
+    yield
+    if previous is None:
+        os.environ.pop("VICUNA_ACTIVE_LOOP_ENABLED", None)
+    else:
+        os.environ["VICUNA_ACTIVE_LOOP_ENABLED"] = previous
 
 
 # ref: https://stackoverflow.com/questions/22627659/run-code-before-and-after-each-test-in-py-test
