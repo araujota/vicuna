@@ -70,12 +70,15 @@ struct self_state_token_view {
     size_t size = 0;
 };
 
-static self_state_token_view make_self_state_token_view(const server_tokens & tokens) {
+static self_state_token_view make_self_state_token_view(
+        const server_tokens & tokens,
+        size_t trim_prefix_tokens = 0) {
     self_state_token_view view;
     if (!tokens.has_mtmd) {
         const llama_tokens & text_tokens = tokens.get_text_tokens();
-        view.data = text_tokens.empty() ? nullptr : text_tokens.data();
-        view.size = text_tokens.size();
+        const size_t offset = std::min(trim_prefix_tokens, text_tokens.size());
+        view.data = offset >= text_tokens.size() ? nullptr : text_tokens.data() + offset;
+        view.size = text_tokens.size() - offset;
         return view;
     }
 
@@ -88,14 +91,16 @@ static self_state_token_view make_self_state_token_view(const server_tokens & to
             view.owned_tokens.push_back(token);
         }
     }
-    view.data = view.owned_tokens.empty() ? nullptr : view.owned_tokens.data();
-    view.size = view.owned_tokens.size();
+    const size_t offset = std::min(trim_prefix_tokens, view.owned_tokens.size());
+    view.data = offset >= view.owned_tokens.size() ? nullptr : view.owned_tokens.data() + offset;
+    view.size = view.owned_tokens.size() - offset;
     return view;
 }
 
 static self_state_token_view make_self_state_token_view(
         const server_tokens & tokens,
-        const llama_tokens * foreground_tokens) {
+        const llama_tokens * foreground_tokens,
+        size_t trim_prefix_tokens = 0) {
     if (foreground_tokens && !foreground_tokens->empty()) {
         self_state_token_view view;
         view.owned_tokens = *foreground_tokens;
@@ -104,7 +109,7 @@ static self_state_token_view make_self_state_token_view(
         return view;
     }
 
-    return make_self_state_token_view(tokens);
+    return make_self_state_token_view(tokens, trim_prefix_tokens);
 }
 
 static bool admit_runtime_emit_tokens(
@@ -693,6 +698,7 @@ struct server_metrics {
 enum vicuna_external_work_kind {
     VICUNA_EXTERNAL_WORK_BASH = 0,
     VICUNA_EXTERNAL_WORK_HARD_MEMORY = 1,
+    VICUNA_EXTERNAL_WORK_CODEX = 2,
 };
 
 struct vicuna_external_work_item {
@@ -703,6 +709,7 @@ struct vicuna_external_work_item {
     llama_bash_tool_request bash_request = {};
     llama_cognitive_hard_memory_request hard_memory_request = {};
     llama_hard_memory_config hard_memory_config = {};
+    llama_codex_tool_request codex_request = {};
     int64_t enqueued_ms = 0;
 };
 
@@ -713,6 +720,8 @@ struct vicuna_external_work_result {
     vicuna_external_work_kind kind = VICUNA_EXTERNAL_WORK_BASH;
     llama_bash_tool_result bash_result = {};
     llama_cognitive_hard_memory_result hard_memory_result = {};
+    llama_codex_tool_request codex_request = {};
+    llama_codex_tool_result codex_result = {};
     int64_t completed_ms = 0;
 };
 
@@ -780,6 +789,9 @@ struct vicuna_external_observability {
     uint64_t hard_memory_dispatch_total = 0;
     uint64_t hard_memory_complete_total = 0;
     uint64_t hard_memory_fail_total = 0;
+    uint64_t codex_dispatch_total = 0;
+    uint64_t codex_complete_total = 0;
+    uint64_t codex_fail_total = 0;
 };
 
 struct vicuna_mailbox_event {
@@ -1142,6 +1154,22 @@ static json hard_memory_result_to_json(const llama_cognitive_hard_memory_result 
     };
 }
 
+static json codex_result_to_json(const llama_codex_tool_result & result) {
+    return {
+        {"command_id", result.command_id},
+        {"tool_job_id", result.tool_job_id},
+        {"exit_code", result.exit_code},
+        {"runtime_ms", result.runtime_ms},
+        {"launch_failed", result.launch_failed},
+        {"repo_changed", result.repo_changed},
+        {"rebuild_attempted", result.rebuild_attempted},
+        {"rebuild_succeeded", result.rebuild_succeeded},
+        {"accessibility_verified", result.accessibility_verified},
+        {"truncated_stdout", result.truncated_stdout},
+        {"truncated_stderr", result.truncated_stderr},
+    };
+}
+
 static std::string trim_ascii_copy(const std::string & value) {
     size_t begin = 0;
     while (begin < value.size() && std::isspace((unsigned char) value[begin])) {
@@ -1219,6 +1247,48 @@ static std::string format_react_hard_memory_observation(const llama_cognitive_ha
     return safe_json_to_str(payload);
 }
 
+static std::string format_react_codex_observation(const llama_codex_tool_result & result) {
+    std::ostringstream oss;
+    oss << "status=";
+    if (result.launch_failed) {
+        oss << "launch_failed";
+    } else if (result.exit_code == 0) {
+        oss << "ok";
+    } else {
+        oss << "error";
+    }
+    oss << "\nexit_code=" << result.exit_code;
+    if (result.runtime_ms > 0) {
+        oss << "\nruntime_ms=" << result.runtime_ms;
+    }
+    if (result.repo_changed) {
+        oss << "\nrepo_changed=true";
+    }
+    if (result.rebuild_attempted) {
+        oss << "\nrebuild=" << (result.rebuild_succeeded ? "ok" : "scheduled_or_failed");
+    }
+    if (result.accessibility_verified) {
+        oss << "\naccessibility_verified=true";
+    }
+    const std::string summary = trim_ascii_copy(result.summary_text);
+    const std::string manual = trim_ascii_copy(result.manual_requirements);
+    const std::string changed = trim_ascii_copy(result.changed_files_excerpt);
+    const std::string error = trim_ascii_copy(result.error_text);
+    if (!summary.empty()) {
+        oss << "\nsummary:\n" << summary;
+    }
+    if (!manual.empty()) {
+        oss << "\nmanual_requirements:\n" << manual;
+    }
+    if (!changed.empty()) {
+        oss << "\nchanged_files:\n" << changed;
+    }
+    if (!error.empty()) {
+        oss << "\nerror:\n" << error;
+    }
+    return oss.str();
+}
+
 static bool parse_env_flag(const char * value, bool fallback) {
     if (!value) {
         return fallback;
@@ -1247,6 +1317,152 @@ static uint64_t parse_uint64_param(const std::string & value, uint64_t fallback 
     } catch (...) {
         return fallback;
     }
+}
+
+static std::string string_to_lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return (char) std::tolower(ch);
+    });
+    return value;
+}
+
+static std::string shell_quote(const std::string & value) {
+    std::string quoted = "'";
+    for (char ch : value) {
+        if (ch == '\'') {
+            quoted += "'\"'\"'";
+        } else {
+            quoted.push_back(ch);
+        }
+    }
+    quoted.push_back('\'');
+    return quoted;
+}
+
+static bool write_text_file(
+        const std::filesystem::path & path,
+        const std::string & text,
+        std::string * out_error = nullptr) {
+    try {
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            if (out_error) {
+                *out_error = "failed to open file for write";
+            }
+            return false;
+        }
+        out << text;
+        return true;
+    } catch (const std::exception & err) {
+        if (out_error) {
+            *out_error = err.what();
+        }
+        return false;
+    }
+}
+
+static std::string read_text_file_bounded(const std::filesystem::path & path, size_t cap) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    std::string text;
+    text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    if (text.size() > cap) {
+        text.resize(cap);
+    }
+    return text;
+}
+
+static bool run_permissive_bash_command(
+        const std::string & working_directory,
+        const std::string & command_text,
+        int32_t timeout_ms,
+        int32_t max_stdout_bytes,
+        int32_t max_stderr_bytes,
+        llama_bash_tool_result * out_result) {
+    if (!out_result) {
+        return false;
+    }
+    llama_bash_tool_request request = {};
+    request.command_id = 1;
+    request.tool_job_id = 1;
+    request.timeout_ms = std::max(100, timeout_ms);
+    request.cpu_time_limit_secs = std::max(1, timeout_ms / 1000 + 30);
+    request.max_child_processes = 32;
+    request.max_open_files = 128;
+    request.max_file_size_bytes = 8 * 1024 * 1024;
+    request.max_stdout_bytes = std::max(1, std::min(max_stdout_bytes, LLAMA_BASH_TOOL_STDOUT_MAX_CHARS - 1));
+    request.max_stderr_bytes = std::max(1, std::min(max_stderr_bytes, LLAMA_BASH_TOOL_STDERR_MAX_CHARS - 1));
+    request.inherit_env = true;
+    request.login_shell = false;
+    request.reject_shell_metacharacters = false;
+    request.command_ready = true;
+    std::snprintf(request.bash_path, sizeof(request.bash_path), "%s", "/bin/bash");
+    std::snprintf(request.working_directory, sizeof(request.working_directory), "%s", working_directory.c_str());
+    std::snprintf(request.command_text, sizeof(request.command_text), "%s", command_text.c_str());
+    request.allowed_commands[0] = '\0';
+    request.blocked_patterns[0] = '\0';
+    request.allowed_env[0] = '\0';
+    return server_bash_tool_execute(request, out_result);
+}
+
+static std::string parse_manual_requirements_line(const std::string & text) {
+    std::istringstream input(text);
+    std::string line;
+    while (std::getline(input, line)) {
+        const std::string trimmed = trim_ascii_copy(line);
+        const std::string lower = string_to_lower(trimmed);
+        if (lower.rfind("manual requirements:", 0) == 0) {
+            return trim_ascii_copy(trimmed.substr(std::strlen("Manual requirements:")));
+        }
+    }
+    return {};
+}
+
+static std::string remove_manual_requirements_line(const std::string & text) {
+    std::istringstream input(text);
+    std::ostringstream output;
+    std::string line;
+    bool first = true;
+    while (std::getline(input, line)) {
+        const std::string trimmed = trim_ascii_copy(line);
+        if (string_to_lower(trimmed).rfind("manual requirements:", 0) == 0) {
+            continue;
+        }
+        if (!first) {
+            output << '\n';
+        }
+        output << line;
+        first = false;
+    }
+    return trim_ascii_copy(output.str());
+}
+
+static std::string resolve_vicuna_core_system_prompt(const common_params & params_base) {
+    const char * env_prompt = std::getenv("VICUNA_CORE_SYSTEM_PROMPT");
+    if (env_prompt && env_prompt[0] != '\0') {
+        const std::string trimmed = trim_ascii_copy(env_prompt);
+        if (!trimmed.empty()) {
+            return trimmed;
+        }
+    }
+
+    const std::string configured = trim_ascii_copy(params_base.system_prompt);
+    if (!configured.empty()) {
+        return configured;
+    }
+
+    return trim_ascii_copy(llama_vicuna_core_system_prompt_default());
+}
+
+static std::string compose_vicuna_core_system_prefix(const std::string & core_prompt) {
+    const std::string trimmed = trim_ascii_copy(core_prompt);
+    if (trimmed.empty()) {
+        return {};
+    }
+    return "System:\n" + trimmed + "\n\n";
 }
 
 static std::string proactive_mailbox_message(
@@ -1804,8 +2020,10 @@ private:
     server_openclaw_fabric openclaw_fabric;
     vicuna_external_work_queue bash_work;
     vicuna_external_work_queue hard_memory_work;
+    vicuna_external_work_queue codex_work;
     std::thread bash_worker;
     std::thread hard_memory_worker;
+    std::thread codex_worker;
     mutable std::mutex runtime_state_mutex;
     std::unordered_map<int32_t, server_task> waiting_active_tasks;
     vicuna_runtime_persistence_state runtime_persistence;
@@ -1815,6 +2033,11 @@ private:
     bool runtime_state_dirty = false;
     bool bash_tool_enabled = false;
     bool hard_memory_enabled = false;
+    bool codex_tool_enabled = false;
+    bool active_loop_enabled = true;
+    std::string core_system_prompt;
+    std::string core_system_prompt_prefix;
+    llama_tokens core_system_prompt_prefix_tokens;
 
     static int32_t count_pending_external_work(const vicuna_external_work_queue & queue) {
         std::lock_guard<std::mutex> lock(queue.mutex);
@@ -1828,6 +2051,40 @@ private:
 
     bool react_task_ready(const server_task & task) const {
         return task.react_enabled && !task.react_messages.empty();
+    }
+
+    void apply_core_system_prompt_prefix(server_task & task) const {
+        if (core_system_prompt_prefix_tokens.empty()) {
+            return;
+        }
+
+        server_tokens prefixed(core_system_prompt_prefix_tokens, task.tokens.has_mtmd);
+        prefixed.push_back(task.tokens);
+        task.tokens = std::move(prefixed);
+        task.params.n_keep = std::max(task.params.n_keep, (int32_t) core_system_prompt_prefix_tokens.size());
+    }
+
+    std::vector<int32_t> react_selected_spec_indexes(const server_task & task) const {
+        std::vector<int32_t> spec_indexes;
+        if (task.has_active_trace &&
+                task.active_trace.tool_proposal.valid &&
+                task.active_trace.tool_proposal.spec_index >= 0) {
+            spec_indexes.push_back(task.active_trace.tool_proposal.spec_index);
+            return spec_indexes;
+        }
+
+        if (task.has_active_trace &&
+                task.active_trace.plan.valid &&
+                task.active_trace.plan.current_step_index >= 0 &&
+                task.active_trace.plan.current_step_index < task.active_trace.plan.step_count) {
+            const int32_t spec_index =
+                    task.active_trace.plan.steps[task.active_trace.plan.current_step_index].tool_spec_index;
+            if (spec_index >= 0) {
+                spec_indexes.push_back(spec_index);
+            }
+        }
+
+        return spec_indexes;
     }
 
     void seed_react_transcript(server_task & task) const {
@@ -1869,6 +2126,7 @@ private:
         }
 
         task.tokens = std::move(prompts.front());
+        apply_core_system_prompt_prefix(task);
         task.params.sampling.grammar = chat_completion.grammar;
         task.params.sampling.grammar_lazy = chat_completion.grammar_lazy;
         task.params.sampling.grammar_triggers = chat_completion.grammar_triggers;
@@ -1902,15 +2160,25 @@ private:
                 task.active_trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT;
 
         task.react_tools.clear();
-        if (tool_phase && !openclaw_fabric.build_chat_tools(&task.react_tools, nullptr)) {
-            return false;
+        std::string xml_guidance;
+        if (tool_phase) {
+            const std::vector<int32_t> selected_spec_indexes = react_selected_spec_indexes(task);
+            if (selected_spec_indexes.empty()) {
+                return false;
+            }
+            if (!openclaw_fabric.build_chat_tools(&task.react_tools, &selected_spec_indexes)) {
+                return false;
+            }
+            if (!openclaw_fabric.render_tool_call_xml_guidance(&xml_guidance, &selected_spec_indexes)) {
+                return false;
+            }
         }
 
         std::vector<common_chat_msg> prompt_messages = task.react_messages;
         common_chat_msg phase_system;
         phase_system.role = "system";
         phase_system.content = tool_phase ?
-                "A tool is available for this step. Start with a short first-move sentence naming the tool you will use, then emit the tool call with arguments." :
+                "A tool is available for this step. Start with a short first-move sentence naming the tool you will use, then emit the tool-call XML exactly as specified below.\n\n" + xml_guidance :
                 "This is the answer phase. Use the tool observations already in the conversation and answer the user directly. Do not emit tool calls or tool-call markup.";
         prompt_messages.push_back(std::move(phase_system));
 
@@ -1925,9 +2193,46 @@ private:
         return apply_chat_prompt_to_task(task, chat_completion);
     }
 
-    bool parse_generated_chat_message(const server_task & task, const std::string & text, common_chat_msg * out_msg) const {
+    bool parse_generated_chat_message(
+            const server_task & task,
+            const std::string & text,
+            common_chat_msg * out_msg,
+            std::string * out_tool_xml = nullptr,
+            std::string * out_planner_reasoning = nullptr) const {
         if (!out_msg) {
             return false;
+        }
+        if (!task.react_tools.empty()) {
+            server_openclaw_parsed_tool_call parsed = {};
+            const std::vector<int32_t> selected_spec_indexes = react_selected_spec_indexes(task);
+            std::string xml_error;
+            if (openclaw_fabric.parse_tool_call_xml(
+                        text,
+                        &parsed,
+                        selected_spec_indexes.empty() ? nullptr : &selected_spec_indexes,
+                        &xml_error)) {
+                *out_msg = parsed.message;
+                if (out_tool_xml) {
+                    *out_tool_xml = parsed.captured_tool_xml;
+                }
+                if (out_planner_reasoning) {
+                    *out_planner_reasoning = parsed.captured_planner_reasoning;
+                }
+                return !out_msg->empty();
+            }
+
+            const std::string sanitized = openclaw_fabric.strip_tool_call_xml_markup(text);
+            if (sanitized != trim_ascii_copy(text)) {
+                out_msg->role = "assistant";
+                out_msg->content = sanitized;
+                if (out_tool_xml) {
+                    out_tool_xml->clear();
+                }
+                if (out_planner_reasoning) {
+                    *out_planner_reasoning = sanitized;
+                }
+                return !out_msg->empty();
+            }
         }
         task_result_state state(task.params.chat_parser_params);
         std::vector<common_chat_msg_diff> diffs;
@@ -1968,6 +2273,12 @@ private:
                     (void) parse_fallback_call(trimmed, nullptr);
                 }
             }
+        }
+        if (out_tool_xml) {
+            out_tool_xml->clear();
+        }
+        if (out_planner_reasoning) {
+            *out_planner_reasoning = trim_ascii_copy(out_msg->content);
         }
         return !out_msg->empty();
     }
@@ -2021,9 +2332,9 @@ private:
                 return false;
             }
             const int32_t selected_spec_index = (int32_t) (capability - openclaw_fabric.capabilities().data());
-            if (llama_cognitive_command_rebind_tool(ctx, runner.pending_command_id, selected_spec_index) != 0) {
+            if (selected_spec_index != runner.pending_tool_spec_index) {
                 if (out_error) {
-                    *out_error = "failed to rebind pending tool command to planner-selected tool";
+                    *out_error = "tool-call XML selected a tool other than the planner-selected capability";
                 }
                 return false;
             }
@@ -2123,6 +2434,38 @@ private:
                 }
                 return false;
             }
+        } else if (capability->backend == SERVER_OPENCLAW_DISPATCH_LEGACY_CODEX) {
+            llama_codex_tool_request request = {};
+            if (llama_cognitive_codex_tool_get_request(ctx, runner.pending_command_id, &request) != 0) {
+                if (out_error) {
+                    *out_error = "pending codex tool request is missing";
+                }
+                return false;
+            }
+            std::string task_text = trim_ascii_copy(json_value(arguments, "task", std::string()));
+            if (task_text.empty()) {
+                task_text = trim_ascii_copy(request.intent_text);
+            }
+            if (task_text.empty()) {
+                if (out_error) {
+                    *out_error = "codex tool call did not include a task";
+                }
+                return false;
+            }
+            std::snprintf(request.intent_text, sizeof(request.intent_text), "%s", task_text.c_str());
+            const std::string full_prompt =
+                    task_text +
+                    "\n\nApply the requested repository change directly in this checkout. Run the commands and tests you need. "
+                    "When you finish, end with a brief plain-text summary that includes a line beginning with "
+                    "'Manual requirements:' followed by either 'none' or the secrets / API keys the user must still add manually.";
+            std::snprintf(request.task_prompt, sizeof(request.task_prompt), "%s", full_prompt.c_str());
+            request.command_ready = true;
+            if (llama_cognitive_codex_tool_set_request(ctx, &request) != 0) {
+                if (out_error) {
+                    *out_error = "failed to install updated codex tool request";
+                }
+                return false;
+            }
         } else {
             if (out_error) {
                 *out_error = "selected capability does not have a supported dispatch backend";
@@ -2151,9 +2494,13 @@ private:
                 break;
             }
         }
-        tool_msg.content = result.kind == VICUNA_EXTERNAL_WORK_HARD_MEMORY ?
-                format_react_hard_memory_observation(result.hard_memory_result) :
-                format_react_bash_observation(result.bash_result);
+        if (result.kind == VICUNA_EXTERNAL_WORK_HARD_MEMORY) {
+            tool_msg.content = format_react_hard_memory_observation(result.hard_memory_result);
+        } else if (result.kind == VICUNA_EXTERNAL_WORK_CODEX) {
+            tool_msg.content = format_react_codex_observation(result.codex_result);
+        } else {
+            tool_msg.content = format_react_bash_observation(result.bash_result);
+        }
         task.react_messages.push_back(std::move(tool_msg));
     }
 
@@ -2163,6 +2510,190 @@ private:
         if (reason && reason[0] != '\0') {
             SRV_DBG("runtime state dirty: %s\n", reason);
         }
+    }
+
+    bool tool_registry_has_codex() const {
+        if (!ctx) {
+            return false;
+        }
+        const int32_t spec_count = llama_cognitive_tool_spec_count(ctx);
+        for (int32_t i = 0; i < spec_count; ++i) {
+            llama_cognitive_tool_spec spec = {};
+            if (llama_cognitive_tool_spec_get(ctx, i, &spec) == 0 &&
+                    spec.tool_kind == LLAMA_TOOL_KIND_CODEX_CLI) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::string compose_codex_completion_message(
+            const std::string & base_text,
+            bool rebuild_succeeded,
+            bool accessibility_verified) const {
+        std::string message = trim_ascii_copy(base_text);
+        if (message.empty()) {
+            message = "Codex completed a repository change.";
+        }
+        if (rebuild_succeeded) {
+            message += accessibility_verified ?
+                    "\n\nRebuild completed and the Codex tool is accessible in the restarted runtime." :
+                    "\n\nRebuild completed, but the restarted runtime did not confirm that the Codex tool is accessible.";
+        } else {
+            message += "\n\nThe rebuild did not complete successfully. Inspect the runtime and rebuild logs before trusting the change.";
+        }
+        return message;
+    }
+
+    void drain_codex_completion_messages() {
+        if (!ctx) {
+            return;
+        }
+        llama_codex_tool_config config = llama_codex_tool_default_config();
+        if (llama_codex_tool_get_config(ctx, &config) != 0 ||
+                config.completion_message_path[0] == '\0') {
+            return;
+        }
+        const std::filesystem::path message_path(config.completion_message_path);
+        if (!std::filesystem::exists(message_path)) {
+            return;
+        }
+
+        const std::string raw = read_text_file_bounded(message_path, 32 * 1024);
+        if (raw.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(message_path, ec);
+            return;
+        }
+
+        std::error_code ec;
+        std::filesystem::remove(message_path, ec);
+
+        const bool rebuild_succeeded = raw.find("REBUILD_STATUS=ok") != std::string::npos;
+        std::string base_text = raw;
+        const std::string ok_prefix = "REBUILD_STATUS=ok\n";
+        const std::string fail_prefix = "REBUILD_STATUS=failed\n";
+        if (base_text.rfind(ok_prefix, 0) == 0) {
+            base_text.erase(0, ok_prefix.size());
+        } else if (base_text.rfind(fail_prefix, 0) == 0) {
+            base_text.erase(0, fail_prefix.size());
+        }
+        const bool accessibility_verified = tool_registry_has_codex();
+        const std::string message = compose_codex_completion_message(base_text, rebuild_succeeded, accessibility_verified);
+        if (proactive_mailbox_publish(message, "codex-rebuild")) {
+            (void) admit_runtime_emit_text(
+                    ctx,
+                    message,
+                    LLAMA_COG_COMMAND_ORIGIN_DMN,
+                    LLAMA_FUNCTIONAL_MICROPHASE_NONE,
+                    -1,
+                    -1,
+                    LLAMA_SELF_STATE_EVENT_EMIT_FOLLOWUP);
+            mark_runtime_state_dirty("codex-rebuild-completion");
+        }
+    }
+
+    bool schedule_codex_rebuild_after_completion(
+            const llama_codex_tool_request & request,
+            llama_codex_tool_result * result) {
+        if (!ctx || !result) {
+            return false;
+        }
+
+        if (result->launch_failed ||
+                result->exit_code != 0 ||
+                !result->repo_changed ||
+                !request.rebuild_after_changes ||
+                request.rebuild_script_path[0] == '\0' ||
+                request.rebuild_helper_path[0] == '\0' ||
+                request.completion_message_path[0] == '\0') {
+            return true;
+        }
+
+        const std::string maintenance_text =
+                "I am having work done on myself through the Codex tool and will rebuild to apply the change.";
+        (void) admit_runtime_emit_text(
+                ctx,
+                maintenance_text,
+                request.origin,
+                LLAMA_FUNCTIONAL_MICROPHASE_NONE,
+                request.command_id,
+                -1,
+                LLAMA_SELF_STATE_EVENT_EMIT_FOLLOWUP);
+        mark_runtime_state_dirty("codex-tool-pre-rebuild");
+        (void) persist_runtime_state("codex-tool-pre-rebuild");
+
+        std::string pending_message = trim_ascii_copy(result->summary_text);
+        if (!trim_ascii_copy(result->changed_files_excerpt).empty()) {
+            pending_message += "\n\nChanged files:\n";
+            pending_message += trim_ascii_copy(result->changed_files_excerpt);
+        }
+        if (!trim_ascii_copy(result->manual_requirements).empty()) {
+            pending_message += "\n\nManual requirements: ";
+            pending_message += trim_ascii_copy(result->manual_requirements);
+        }
+
+        const std::filesystem::path completion_path(request.completion_message_path);
+        const std::filesystem::path pending_path = completion_path.string() + ".pending";
+        std::string pending_error;
+        if (!write_text_file(pending_path, pending_message, &pending_error)) {
+            std::snprintf(result->error_text, sizeof(result->error_text), "%s", pending_error.c_str());
+            std::snprintf(result->summary_text, sizeof(result->summary_text), "%s",
+                    "Codex applied changes, but the rebuild handoff file could not be written.");
+            result->rebuild_attempted = false;
+            result->rebuild_succeeded = false;
+            return false;
+        }
+
+        std::string launch_command;
+        const char * systemd_run_paths[] = { "/usr/bin/systemd-run", "/bin/systemd-run" };
+        const char * systemd_run_path = nullptr;
+        for (const char * candidate : systemd_run_paths) {
+            if (std::filesystem::exists(candidate)) {
+                systemd_run_path = candidate;
+                break;
+            }
+        }
+        if (systemd_run_path) {
+            launch_command =
+                    shell_quote(systemd_run_path) +
+                    " --user --unit " + shell_quote("vicuna-codex-rebuild-" + std::to_string(request.tool_job_id)) +
+                    " " + shell_quote(request.rebuild_helper_path) +
+                    " --pending-message-file " + shell_quote(pending_path.string()) +
+                    " --final-message-file " + shell_quote(request.completion_message_path) +
+                    " --rebuild-script " + shell_quote(request.rebuild_script_path);
+        } else {
+            launch_command =
+                    "nohup " + shell_quote(request.rebuild_helper_path) +
+                    " --pending-message-file " + shell_quote(pending_path.string()) +
+                    " --final-message-file " + shell_quote(request.completion_message_path) +
+                    " --rebuild-script " + shell_quote(request.rebuild_script_path) +
+                    " >/dev/null 2>&1 &";
+        }
+
+        const std::string repo_root = trim_ascii_copy(request.working_directory);
+        llama_bash_tool_result launch_result = {};
+        (void) run_permissive_bash_command(
+                repo_root,
+                launch_command,
+                10000,
+                LLAMA_BASH_TOOL_STDOUT_MAX_CHARS - 1,
+                LLAMA_BASH_TOOL_STDERR_MAX_CHARS - 1,
+                &launch_result);
+        result->rebuild_attempted = true;
+        result->rebuild_succeeded =
+                !launch_result.launch_failed && launch_result.exit_code == 0;
+        if (result->rebuild_succeeded) {
+            std::snprintf(result->summary_text, sizeof(result->summary_text), "%s",
+                    "Codex applied repository changes after completing the tool call and scheduled a rebuild. A completion message will be emitted after restart.");
+        } else {
+            std::snprintf(result->summary_text, sizeof(result->summary_text), "%s",
+                    "Codex applied repository changes, but scheduling the post-completion rebuild failed.");
+            if (launch_result.error_text[0] != '\0') {
+                std::snprintf(result->error_text, sizeof(result->error_text), "%s", launch_result.error_text);
+            }
+        }
+        return result->rebuild_succeeded;
     }
 
     bool collect_progress_snapshot(
@@ -2728,12 +3259,107 @@ private:
         llama_batch_free(batch);
     }
 
+    bool execute_codex_tool_request(
+            const llama_codex_tool_request & request,
+            llama_codex_tool_result * out_result) {
+        if (!out_result) {
+            return false;
+        }
+
+        *out_result = {};
+        out_result->command_id = request.command_id;
+        out_result->tool_job_id = request.tool_job_id;
+
+        const std::string repo_root = trim_ascii_copy(request.working_directory);
+        const std::string codex_path = trim_ascii_copy(request.codex_path);
+        const std::string task_prompt = trim_ascii_copy(request.task_prompt);
+        if (repo_root.empty() || codex_path.empty() || task_prompt.empty() || !request.command_ready) {
+            out_result->launch_failed = true;
+            out_result->exit_code = 127;
+            std::snprintf(out_result->error_text, sizeof(out_result->error_text), "%s", "codex tool request was incomplete");
+            std::snprintf(out_result->summary_text, sizeof(out_result->summary_text), "%s", "Codex tool request was incomplete.");
+            return true;
+        }
+
+        const std::filesystem::path temp_root =
+                std::filesystem::temp_directory_path() /
+                std::filesystem::path("vicuna-codex-" + std::to_string((long long) request.tool_job_id) + "-" + random_string());
+        const std::filesystem::path prompt_path = temp_root / "prompt.txt";
+        const std::filesystem::path summary_path = temp_root / "last-message.txt";
+
+        std::string write_error;
+        if (!write_text_file(prompt_path, task_prompt, &write_error)) {
+            out_result->launch_failed = true;
+            out_result->exit_code = 127;
+            std::snprintf(out_result->error_text, sizeof(out_result->error_text), "%s", write_error.c_str());
+            std::snprintf(out_result->summary_text, sizeof(out_result->summary_text), "%s", "Failed to prepare Codex prompt file.");
+            return true;
+        }
+
+        const std::string codex_command =
+                shell_quote(codex_path) +
+                " exec --dangerously-bypass-approvals-and-sandbox --sandbox danger-full-access" +
+                " -C " + shell_quote(repo_root) +
+                " -o " + shell_quote(summary_path.string()) +
+                " - < " + shell_quote(prompt_path.string());
+
+        llama_bash_tool_result exec_result = {};
+        (void) run_permissive_bash_command(
+                repo_root,
+                codex_command,
+                request.timeout_ms,
+                std::min(request.max_stdout_bytes, LLAMA_BASH_TOOL_STDOUT_MAX_CHARS - 1),
+                std::min(request.max_stderr_bytes, LLAMA_BASH_TOOL_STDERR_MAX_CHARS - 1),
+                &exec_result);
+
+        out_result->launch_failed = exec_result.launch_failed;
+        out_result->exit_code = exec_result.exit_code;
+        out_result->runtime_ms = exec_result.runtime_ms;
+        out_result->truncated_stdout = exec_result.truncated_stdout;
+        out_result->truncated_stderr = exec_result.truncated_stderr;
+        std::snprintf(out_result->stdout_text, sizeof(out_result->stdout_text), "%s", exec_result.stdout_text);
+        std::snprintf(out_result->stderr_text, sizeof(out_result->stderr_text), "%s", exec_result.stderr_text);
+        std::snprintf(out_result->error_text, sizeof(out_result->error_text), "%s", exec_result.error_text);
+
+        const std::string last_message = read_text_file_bounded(summary_path, LLAMA_CODEX_TOOL_SUMMARY_MAX_CHARS - 1);
+        const std::string manual_requirements = parse_manual_requirements_line(last_message);
+        const std::string summary_text = remove_manual_requirements_line(last_message);
+        std::snprintf(out_result->summary_text, sizeof(out_result->summary_text), "%s",
+                (!summary_text.empty() ? summary_text : "Codex run completed.").c_str());
+        if (!manual_requirements.empty() &&
+                string_to_lower(manual_requirements) != "none") {
+            std::snprintf(out_result->manual_requirements, sizeof(out_result->manual_requirements), "%s", manual_requirements.c_str());
+        }
+
+        llama_bash_tool_result status_result = {};
+        (void) run_permissive_bash_command(
+                repo_root,
+                "git status --short",
+                10000,
+                LLAMA_BASH_TOOL_STDOUT_MAX_CHARS - 1,
+                LLAMA_BASH_TOOL_STDERR_MAX_CHARS - 1,
+                &status_result);
+        const std::string status_text = trim_ascii_copy(status_result.stdout_text);
+        out_result->repo_changed = !status_text.empty();
+        if (!status_text.empty()) {
+            std::snprintf(out_result->changed_files_excerpt, sizeof(out_result->changed_files_excerpt), "%s", status_text.c_str());
+        }
+
+        std::error_code cleanup_ec;
+        std::filesystem::remove(summary_path, cleanup_ec);
+        std::filesystem::remove(prompt_path, cleanup_ec);
+        std::filesystem::remove(temp_root, cleanup_ec);
+        return true;
+    }
+
     static void run_external_worker(
             vicuna_external_work_queue * queue,
             vicuna_external_work_kind kind,
-            server_queue * task_queue) {
+            server_queue * task_queue,
+            server_context_impl * self) {
         GGML_ASSERT(queue != nullptr);
         GGML_ASSERT(task_queue != nullptr);
+        GGML_ASSERT(self != nullptr);
         while (true) {
             vicuna_external_work_item work = {};
             {
@@ -2756,12 +3382,15 @@ private:
 
             if (kind == VICUNA_EXTERNAL_WORK_BASH) {
                 (void) server_bash_tool_execute(work.bash_request, &result.bash_result);
-            } else {
+            } else if (kind == VICUNA_EXTERNAL_WORK_HARD_MEMORY) {
                 llama_hard_memory helper;
                 (void) helper.configure(work.hard_memory_config);
                 result.hard_memory_result.command_id = work.command_id;
                 result.hard_memory_result.tool_job_id = work.hard_memory_request.tool_job_id;
                 (void) helper.query(work.hard_memory_request.query, &result.hard_memory_result.result);
+            } else {
+                result.codex_request = work.codex_request;
+                (void) self->execute_codex_tool_request(work.codex_request, &result.codex_result);
             }
             result.completed_ms = ggml_time_ms();
 
@@ -2786,8 +3415,13 @@ private:
             std::lock_guard<std::mutex> lock(hard_memory_work.mutex);
             hard_memory_work.stop = false;
         }
-        bash_worker = std::thread(&server_context_impl::run_external_worker, &bash_work, VICUNA_EXTERNAL_WORK_BASH, &queue_tasks);
-        hard_memory_worker = std::thread(&server_context_impl::run_external_worker, &hard_memory_work, VICUNA_EXTERNAL_WORK_HARD_MEMORY, &queue_tasks);
+        {
+            std::lock_guard<std::mutex> lock(codex_work.mutex);
+            codex_work.stop = false;
+        }
+        bash_worker = std::thread(&server_context_impl::run_external_worker, &bash_work, VICUNA_EXTERNAL_WORK_BASH, &queue_tasks, this);
+        hard_memory_worker = std::thread(&server_context_impl::run_external_worker, &hard_memory_work, VICUNA_EXTERNAL_WORK_HARD_MEMORY, &queue_tasks, this);
+        codex_worker = std::thread(&server_context_impl::run_external_worker, &codex_work, VICUNA_EXTERNAL_WORK_CODEX, &queue_tasks, this);
     }
 
     void stop_external_workers() {
@@ -2814,6 +3448,17 @@ private:
         if (hard_memory_worker.joinable()) {
             hard_memory_worker.join();
         }
+        {
+            std::lock_guard<std::mutex> lock(codex_work.mutex);
+            codex_work.stop = true;
+            codex_work.pending.clear();
+            codex_work.completed.clear();
+            codex_work.inflight_ids.clear();
+        }
+        codex_work.cv.notify_all();
+        if (codex_worker.joinable()) {
+            codex_worker.join();
+        }
     }
 
     void reload_openclaw_catalog_if_needed() {
@@ -2826,6 +3471,7 @@ private:
         if (!openclaw_fabric.maybe_reload(
                     bash_tool_enabled,
                     hard_memory_enabled,
+                    codex_tool_enabled,
                     &reloaded,
                     &reload_error)) {
             SRV_WRN("failed to reload OpenClaw tool fabric: %s\n", reload_error.c_str());
@@ -3525,6 +4171,20 @@ private:
             }
         };
 
+        auto submit_codex_error = [&](const llama_cognitive_command & command, const char * error_text) {
+            llama_codex_tool_result result = {};
+            result.command_id = command.command_id;
+            result.tool_job_id = command.tool_job_id;
+            result.launch_failed = true;
+            result.exit_code = 127;
+            std::snprintf(result.error_text, sizeof(result.error_text), "%s", error_text);
+            std::snprintf(result.summary_text, sizeof(result.summary_text), "%s", "Codex tool launch failed.");
+            if (llama_cognitive_codex_tool_submit_result(ctx, &result, nullptr) == 0) {
+                mark_runtime_state_dirty("codex-tool-immediate-result");
+                capture_tool_result_provenance("codex_tool_immediate", codex_result_to_json(result), nullptr);
+            }
+        };
+
         bool dispatched = false;
         const int32_t command_count = llama_cognitive_command_count(ctx);
         for (int32_t i = 0; i < command_count; ++i) {
@@ -3557,6 +4217,8 @@ private:
                         submit_bash_error(command, resolve_error.c_str());
                     } else if (command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
                         submit_hard_memory_error(command, 400, resolve_error.c_str());
+                    } else if (command.tool_kind == LLAMA_TOOL_KIND_CODEX_CLI) {
+                        submit_codex_error(command, resolve_error.c_str());
                     } else {
                         (void) llama_cognitive_command_complete(ctx, command.command_id, true);
                     }
@@ -3567,6 +4229,8 @@ private:
                 backend = SERVER_OPENCLAW_DISPATCH_LEGACY_BASH;
             } else if (command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
                 backend = SERVER_OPENCLAW_DISPATCH_LEGACY_HARD_MEMORY;
+            } else if (command.tool_kind == LLAMA_TOOL_KIND_CODEX_CLI) {
+                backend = SERVER_OPENCLAW_DISPATCH_LEGACY_CODEX;
             } else {
                 continue;
             }
@@ -3594,6 +4258,9 @@ private:
                 work.bash_request = request;
                 work.enqueued_ms = ggml_time_ms();
                 if (enqueue_external_work(bash_work, std::move(work))) {
+                    if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+                        (void) llama_cognitive_command_begin_external_wait(ctx, command.command_id);
+                    }
                     std::lock_guard<std::mutex> lock(runtime_state_mutex);
                     external_observability.bash_dispatch_total++;
                     dispatched = true;
@@ -3629,6 +4296,9 @@ private:
                 work.hard_memory_config = config;
                 work.enqueued_ms = ggml_time_ms();
                 if (enqueue_external_work(hard_memory_work, std::move(work))) {
+                    if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+                        (void) llama_cognitive_command_begin_external_wait(ctx, command.command_id);
+                    }
                     std::lock_guard<std::mutex> lock(runtime_state_mutex);
                     external_observability.hard_memory_dispatch_total++;
                     dispatched = true;
@@ -3638,11 +4308,47 @@ private:
                             request.tool_job_id,
                             request.query.query);
                 }
+            } else if (backend == SERVER_OPENCLAW_DISPATCH_LEGACY_CODEX) {
+                llama_codex_tool_request request = {};
+                if (llama_cognitive_codex_tool_get_request(ctx, command.command_id, &request) != 0) {
+                    SRV_WRN("codex command %d did not have a pending request\n", command.command_id);
+                    (void) llama_cognitive_command_complete(ctx, command.command_id, true);
+                    continue;
+                }
+
+                llama_codex_tool_config config = llama_codex_tool_default_config();
+                (void) llama_codex_tool_get_config(ctx, &config);
+                if (!config.enabled || !request.command_ready || request.task_prompt[0] == '\0') {
+                    submit_codex_error(command, !config.enabled ? "codex tool is disabled" : "codex tool request did not include a task");
+                    continue;
+                }
+
+                vicuna_external_work_item work = {};
+                work.command_id = command.command_id;
+                work.origin = command.origin;
+                work.tool_kind = command.tool_kind;
+                work.kind = VICUNA_EXTERNAL_WORK_CODEX;
+                work.codex_request = request;
+                work.enqueued_ms = ggml_time_ms();
+                if (enqueue_external_work(codex_work, std::move(work))) {
+                    if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+                        (void) llama_cognitive_command_begin_external_wait(ctx, command.command_id);
+                    }
+                    std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                    external_observability.codex_dispatch_total++;
+                    dispatched = true;
+                    SRV_INF("queued codex command %d origin=%d job=%d\n",
+                            command.command_id,
+                            command.origin,
+                            request.tool_job_id);
+                }
             } else {
                 if (command.tool_kind == LLAMA_TOOL_KIND_BASH_CLI) {
                     submit_bash_error(command, "registered capability has no supported executor backend");
                 } else if (command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
                     submit_hard_memory_error(command, 501, "registered capability has no supported executor backend");
+                } else if (command.tool_kind == LLAMA_TOOL_KIND_CODEX_CLI) {
+                    submit_codex_error(command, "registered capability has no supported executor backend");
                 } else {
                     (void) llama_cognitive_command_complete(ctx, command.command_id, true);
                 }
@@ -3677,7 +4383,26 @@ private:
 
                 drained = true;
                 llama_active_loop_trace active_trace = {};
+                std::string active_tool_xml;
+                if (result.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+                    std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                    auto it = waiting_active_tasks.find(result.command_id);
+                    if (it != waiting_active_tasks.end()) {
+                        active_tool_xml = it->second.react_last_tool_xml_payload;
+                    }
+                }
+                if (!active_tool_xml.empty()) {
+                    const std::vector<llama_token> payload_tokens = common_tokenize(vocab, active_tool_xml, true, true);
+                    if (!payload_tokens.empty()) {
+                        (void) llama_cognitive_active_tool_emission_note(
+                                ctx,
+                                result.command_id,
+                                payload_tokens.data(),
+                                payload_tokens.size());
+                    }
+                }
                 bool ok = false;
+                bool codex_post_completion_ok = true;
                 if (kind == VICUNA_EXTERNAL_WORK_BASH) {
                     ok = llama_cognitive_bash_tool_submit_result(
                             ctx,
@@ -3688,7 +4413,7 @@ private:
                     if (!ok || result.bash_result.launch_failed || result.bash_result.exit_code != 0 || result.bash_result.timed_out) {
                         external_observability.bash_fail_total++;
                     }
-                } else {
+                } else if (kind == VICUNA_EXTERNAL_WORK_HARD_MEMORY) {
                     ok = llama_cognitive_hard_memory_submit_result(
                             ctx,
                             &result.hard_memory_result,
@@ -3697,6 +4422,19 @@ private:
                     external_observability.hard_memory_complete_total++;
                     if (!ok || !result.hard_memory_result.result.ok) {
                         external_observability.hard_memory_fail_total++;
+                    }
+                } else {
+                    codex_post_completion_ok = schedule_codex_rebuild_after_completion(
+                            result.codex_request,
+                            &result.codex_result);
+                    ok = llama_cognitive_codex_tool_submit_result(
+                            ctx,
+                            &result.codex_result,
+                            result.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE ? &active_trace : nullptr) == 0;
+                    std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                    external_observability.codex_complete_total++;
+                    if (!ok || !codex_post_completion_ok || result.codex_result.launch_failed || result.codex_result.exit_code != 0) {
+                        external_observability.codex_fail_total++;
                     }
                 }
 
@@ -3707,16 +4445,24 @@ private:
 	                    continue;
 	                }
 	
-	                mark_runtime_state_dirty(kind == VICUNA_EXTERNAL_WORK_BASH ? "bash-tool-result" : "hard-memory-result");
+	                mark_runtime_state_dirty(
+                            kind == VICUNA_EXTERNAL_WORK_BASH ? "bash-tool-result" :
+                            kind == VICUNA_EXTERNAL_WORK_HARD_MEMORY ? "hard-memory-result" :
+                            "codex-tool-result");
 	                if (kind == VICUNA_EXTERNAL_WORK_BASH) {
 	                    capture_tool_result_provenance(
 	                            "bash_tool",
 	                            bash_result_to_json(result.bash_result),
 	                            result.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE ? &active_trace : nullptr);
-	                } else {
+	                } else if (kind == VICUNA_EXTERNAL_WORK_HARD_MEMORY) {
 	                    capture_tool_result_provenance(
 	                            "hard_memory",
 	                            hard_memory_result_to_json(result.hard_memory_result),
+	                            result.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE ? &active_trace : nullptr);
+	                } else {
+	                    capture_tool_result_provenance(
+	                            "codex_tool",
+	                            codex_result_to_json(result.codex_result),
 	                            result.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE ? &active_trace : nullptr);
 	                }
 	
@@ -3759,19 +4505,29 @@ private:
                             result.bash_result.error_text,
                             result.bash_result.stderr_text,
                             result.bash_result.stdout_text);
-                } else {
+                } else if (kind == VICUNA_EXTERNAL_WORK_HARD_MEMORY) {
                     SRV_INF("hard-memory command %d origin=%d ok=%d status=%d count=%d\n",
                             result.command_id,
                             result.origin,
                             result.hard_memory_result.result.ok ? 1 : 0,
                             result.hard_memory_result.result.status_code,
                             result.hard_memory_result.result.result_count);
+                } else {
+                    SRV_INF("codex command %d origin=%d exit=%d launch_failed=%d repo_changed=%d rebuild_attempted=%d rebuild_succeeded=%d\n",
+                            result.command_id,
+                            result.origin,
+                            result.codex_result.exit_code,
+                            result.codex_result.launch_failed ? 1 : 0,
+                            result.codex_result.repo_changed ? 1 : 0,
+                            result.codex_result.rebuild_attempted ? 1 : 0,
+                            result.codex_result.rebuild_succeeded ? 1 : 0);
                 }
             }
         };
 
         drain_queue(bash_work, VICUNA_EXTERNAL_WORK_BASH);
         drain_queue(hard_memory_work, VICUNA_EXTERNAL_WORK_HARD_MEMORY);
+        drain_queue(codex_work, VICUNA_EXTERNAL_WORK_CODEX);
         return drained;
     }
 
@@ -4034,6 +4790,10 @@ private:
         }
 
         {
+            if (const char * active_loop_env = getenv("VICUNA_ACTIVE_LOOP_ENABLED")) {
+                active_loop_enabled = parse_env_flag(active_loop_env, active_loop_enabled);
+            }
+
             llama_bash_tool_config bash_tool = llama_bash_tool_default_config();
             const char * bash_enabled = getenv("VICUNA_BASH_TOOL_ENABLED");
             const char * bash_path = getenv("VICUNA_BASH_TOOL_PATH");
@@ -4127,8 +4887,76 @@ private:
         }
 
         {
+            llama_codex_tool_config codex_tool = llama_codex_tool_default_config();
+            const char * codex_enabled = getenv("VICUNA_CODEX_TOOL_ENABLED");
+            const char * codex_path = getenv("VICUNA_CODEX_TOOL_PATH");
+            const char * codex_workdir = getenv("VICUNA_CODEX_TOOL_WORKDIR");
+            const char * codex_timeout = getenv("VICUNA_CODEX_TOOL_TIMEOUT_MS");
+            const char * codex_stdout = getenv("VICUNA_CODEX_TOOL_MAX_STDOUT_BYTES");
+            const char * codex_stderr = getenv("VICUNA_CODEX_TOOL_MAX_STDERR_BYTES");
+            const char * codex_rebuild = getenv("VICUNA_CODEX_TOOL_REBUILD_AFTER_CHANGES");
+            const char * codex_verify = getenv("VICUNA_CODEX_TOOL_VERIFY_ACCESS_AFTER_REBUILD");
+            const char * codex_rebuild_script = getenv("VICUNA_CODEX_TOOL_REBUILD_SCRIPT");
+            const char * codex_rebuild_helper = getenv("VICUNA_CODEX_TOOL_REBUILD_HELPER");
+            const char * codex_completion_message = getenv("VICUNA_CODEX_TOOL_COMPLETION_MESSAGE_PATH");
+
+            if (codex_enabled) {
+                codex_tool.enabled = atoi(codex_enabled) != 0;
+            }
+            if (codex_path) {
+                std::snprintf(codex_tool.codex_path, sizeof(codex_tool.codex_path), "%s", codex_path);
+            }
+            if (codex_workdir) {
+                std::snprintf(codex_tool.working_directory, sizeof(codex_tool.working_directory), "%s", codex_workdir);
+            }
+            if (codex_timeout) {
+                codex_tool.timeout_ms = std::max(1000, atoi(codex_timeout));
+            }
+            if (codex_stdout) {
+                codex_tool.max_stdout_bytes = std::max(1, atoi(codex_stdout));
+            }
+            if (codex_stderr) {
+                codex_tool.max_stderr_bytes = std::max(1, atoi(codex_stderr));
+            }
+            if (codex_rebuild) {
+                codex_tool.rebuild_after_changes = parse_env_flag(codex_rebuild, codex_tool.rebuild_after_changes);
+            }
+            if (codex_verify) {
+                codex_tool.verify_tool_access_after_rebuild = parse_env_flag(codex_verify, codex_tool.verify_tool_access_after_rebuild);
+            }
+            if (codex_rebuild_script) {
+                std::snprintf(codex_tool.rebuild_script_path, sizeof(codex_tool.rebuild_script_path), "%s", codex_rebuild_script);
+            }
+            if (codex_rebuild_helper) {
+                std::snprintf(codex_tool.rebuild_helper_path, sizeof(codex_tool.rebuild_helper_path), "%s", codex_rebuild_helper);
+            }
+            if (codex_completion_message) {
+                std::snprintf(codex_tool.completion_message_path, sizeof(codex_tool.completion_message_path), "%s", codex_completion_message);
+            }
+
+            if (llama_codex_tool_configure(ctx, &codex_tool) == 0) {
+                codex_tool_enabled = codex_tool.enabled && codex_tool.codex_path[0] != '\0' && codex_tool.working_directory[0] != '\0';
+                if (codex_tool_enabled) {
+                    SRV_INF("codex tool enabled: codex=%s cwd=%s timeout_ms=%d stdout=%d stderr=%d rebuild=%d verify=%d rebuild_script=%s helper=%s completion=%s\n",
+                            codex_tool.codex_path,
+                            codex_tool.working_directory,
+                            codex_tool.timeout_ms,
+                            codex_tool.max_stdout_bytes,
+                            codex_tool.max_stderr_bytes,
+                            codex_tool.rebuild_after_changes ? 1 : 0,
+                            codex_tool.verify_tool_access_after_rebuild ? 1 : 0,
+                            codex_tool.rebuild_script_path,
+                            codex_tool.rebuild_helper_path,
+                            codex_tool.completion_message_path);
+                }
+            } else {
+                SRV_WRN("%s\n", "failed to configure codex tool");
+            }
+        }
+
+        {
             std::string fabric_error;
-            if (!openclaw_fabric.configure(bash_tool_enabled, hard_memory_enabled, &fabric_error)) {
+            if (!openclaw_fabric.configure(bash_tool_enabled, hard_memory_enabled, codex_tool_enabled, &fabric_error)) {
                 SRV_WRN("failed to configure OpenClaw tool fabric: %s\n", fabric_error.c_str());
             } else if (openclaw_fabric.enabled()) {
                 std::vector<llama_cognitive_tool_spec> specs;
@@ -4249,6 +5077,11 @@ private:
 
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
+        core_system_prompt = resolve_vicuna_core_system_prompt(params_base);
+        core_system_prompt_prefix = compose_vicuna_core_system_prefix(core_system_prompt);
+        core_system_prompt_prefix_tokens = core_system_prompt_prefix.empty() ?
+                llama_tokens() :
+                common_tokenize(vocab, core_system_prompt_prefix, false, true);
 
         if (!restore_runtime_state()) {
             SRV_WRN("%s", "runtime restore failed; health will report degraded persistence\n");
@@ -4283,6 +5116,12 @@ private:
 
         metrics.init();
         start_external_workers();
+
+        if (!core_system_prompt.empty()) {
+            SRV_INF("core system prompt enabled: chars=%zu keep_tokens=%zu\n",
+                    core_system_prompt.size(),
+                    core_system_prompt_prefix_tokens.size());
+        }
 
         // populate webui settings
         {
@@ -4668,7 +5507,10 @@ private:
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
         {
-            const auto loop_tokens = make_self_state_token_view(task.tokens, &task.active_loop_tokens);
+            const auto loop_tokens = make_self_state_token_view(
+                    task.tokens,
+                    &task.active_loop_tokens,
+                    core_system_prompt_prefix_tokens.size());
             const llama_self_state_event loop_event = {
                 /*.tokens =*/ loop_tokens.data,
                 /*.n_tokens =*/ loop_tokens.size,
@@ -5012,10 +5854,12 @@ private:
 
     void send_final_response(server_slot & slot) {
         common_chat_msg final_msg;
+        std::string tool_xml_payload;
+        std::string planner_reasoning;
         const bool parsed_final_msg =
                 slot.task &&
                 react_task_ready(*slot.task) &&
-                parse_generated_chat_message(*slot.task, slot.generated_text, &final_msg);
+                parse_generated_chat_message(*slot.task, slot.generated_text, &final_msg, &tool_xml_payload, &planner_reasoning);
 
         if (slot.task &&
                 react_task_ready(*slot.task) &&
@@ -5025,6 +5869,7 @@ private:
             server_task resumed_task = std::move(*slot.task);
             resumed_task.react_messages.push_back(final_msg);
             append_react_visible_prefix(resumed_task, final_msg);
+            resumed_task.react_last_planner_reasoning = trim_ascii_copy(planner_reasoning);
 
             int32_t pending_command_id = -1;
             int32_t pending_tool_kind = LLAMA_TOOL_KIND_NONE;
@@ -5039,7 +5884,20 @@ private:
                         pending_command_id > 0;
             }
 
+            if (!resumed_task.react_last_planner_reasoning.empty()) {
+                const std::vector<llama_token> reasoning_tokens =
+                        common_tokenize(vocab, resumed_task.react_last_planner_reasoning, true, true);
+                if (!reasoning_tokens.empty()) {
+                    (void) llama_cognitive_active_planner_reasoning_note(
+                            ctx,
+                            resumed_task.active_trace.episode_id,
+                            reasoning_tokens.data(),
+                            reasoning_tokens.size());
+                }
+            }
+
             if (have_pending_command) {
+                resumed_task.react_last_tool_xml_payload = tool_xml_payload;
                 {
                     std::lock_guard<std::mutex> lock(runtime_state_mutex);
                     waiting_active_tasks[pending_command_id] = std::move(resumed_task);
@@ -5057,6 +5915,22 @@ private:
                 waiting_active_tasks.erase(pending_command_id);
             } else {
                 SRV_WRN("react tool step could not queue tool dispatch: %s\n", request_error.c_str());
+            }
+        } else if (slot.task &&
+                react_task_ready(*slot.task) &&
+                slot.task->has_active_trace &&
+                parsed_final_msg) {
+            const std::string visible_reasoning = trim_ascii_copy(planner_reasoning);
+            if (!visible_reasoning.empty()) {
+                const std::vector<llama_token> reasoning_tokens =
+                        common_tokenize(vocab, visible_reasoning, true, true);
+                if (!reasoning_tokens.empty()) {
+                    (void) llama_cognitive_active_planner_reasoning_note(
+                            ctx,
+                            slot.task->active_trace.episode_id,
+                            reasoning_tokens.data(),
+                            reasoning_tokens.size());
+                }
             }
         }
 
@@ -5239,6 +6113,7 @@ private:
             } else {
                 task.tokens = std::move(tokenize_input_prompts(vocab, mctx, prompt, true, true)[0]);
             }
+            apply_core_system_prompt_prefix(task);
             task.cli_prompt.clear();
             task.cli_files.clear();
         } catch (const std::exception & e) {
@@ -5322,7 +6197,10 @@ private:
                     }
 
                     if (!task.skip_active_loop_preflight && !task.is_child()) {
-                        const auto loop_tokens = make_self_state_token_view(task.tokens, &task.active_loop_tokens);
+                        const auto loop_tokens = make_self_state_token_view(
+                                task.tokens,
+                                &task.active_loop_tokens,
+                                core_system_prompt_prefix_tokens.size());
                         const llama_self_state_event loop_event = {
                             /*.tokens =*/ loop_tokens.data,
                             /*.n_tokens =*/ loop_tokens.size,
@@ -5689,6 +6567,7 @@ private:
     void update_slots() {
         (void) llama_past_lora_tick(ctx, ggml_time_us());
         (void) drain_completed_external_work(-1);
+        drain_codex_completion_messages();
 
         // check if all slots are idle
         {
@@ -5730,10 +6609,12 @@ private:
                 (void) dispatch_pending_self_emit_commands(-1);
                 (void) dispatch_pending_tool_commands(-1);
                 (void) drain_completed_external_work(-1);
+                drain_codex_completion_messages();
                 reload_openclaw_catalog_if_needed();
                 if (!has_waiting_active_tasks() &&
                     count_pending_external_work(bash_work) == 0 &&
-                    count_pending_external_work(hard_memory_work) == 0) {
+                    count_pending_external_work(hard_memory_work) == 0 &&
+                    count_pending_external_work(codex_work) == 0) {
                     (void) persist_runtime_state("idle");
                 }
                 SRV_INF("%s", "all slots are idle\n");
@@ -6934,6 +7815,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->slot_n_ctx,
                     data);
+            ctx_server.apply_core_system_prompt_prefix(task);
+            task.skip_active_loop_preflight = !ctx_server.active_loop_enabled;
             task.foreground_role = classify_foreground_role(data);
             const std::string foreground_text = extract_foreground_message_text(data);
             if (!foreground_text.empty()) {

@@ -1,19 +1,25 @@
 #include "server-openclaw-fabric.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <set>
 #include <sstream>
 
 namespace {
 
+constexpr const char * SERVER_OPENCLAW_XML_ROOT = "vicuna_tool_call";
+constexpr const char * SERVER_OPENCLAW_XML_ARG = "arg";
+
 struct builtin_capability_registration {
     const char * tool_id;
     server_openclaw_dispatch_backend backend;
-    bool (*is_available)(bool bash_enabled, bool hard_memory_enabled);
+    bool (*is_available)(bool bash_enabled, bool hard_memory_enabled, bool codex_enabled);
     openclaw_tool_capability_descriptor (*build_descriptor)();
 };
 
@@ -69,6 +75,459 @@ void set_error(std::string * out_error, const std::string & value) {
     }
 }
 
+std::string trim_ascii_copy_local(const std::string & value) {
+    size_t begin = 0;
+    size_t end = value.size();
+    while (begin < end && std::isspace((unsigned char) value[begin]) != 0) {
+        ++begin;
+    }
+    while (end > begin && std::isspace((unsigned char) value[end - 1]) != 0) {
+        --end;
+    }
+    return value.substr(begin, end - begin);
+}
+
+bool skip_ws(const std::string & text, size_t * pos) {
+    if (!pos) {
+        return false;
+    }
+    while (*pos < text.size() && std::isspace((unsigned char) text[*pos]) != 0) {
+        ++(*pos);
+    }
+    return true;
+}
+
+bool parse_xml_name(const std::string & text, size_t * pos, std::string * out_name) {
+    if (!pos || !out_name || *pos >= text.size()) {
+        return false;
+    }
+    const size_t begin = *pos;
+    while (*pos < text.size()) {
+        const unsigned char ch = (unsigned char) text[*pos];
+        if (std::isalnum(ch) || ch == '_' || ch == '-' || ch == ':' || ch == '.') {
+            ++(*pos);
+            continue;
+        }
+        break;
+    }
+    if (*pos == begin) {
+        return false;
+    }
+    *out_name = text.substr(begin, *pos - begin);
+    return true;
+}
+
+bool parse_xml_quoted_value(const std::string & text, size_t * pos, std::string * out_value) {
+    if (!pos || !out_value || *pos >= text.size()) {
+        return false;
+    }
+    const char quote = text[*pos];
+    if (quote != '"' && quote != '\'') {
+        return false;
+    }
+    ++(*pos);
+    const size_t begin = *pos;
+    while (*pos < text.size() && text[*pos] != quote) {
+        ++(*pos);
+    }
+    if (*pos >= text.size()) {
+        return false;
+    }
+    *out_value = text.substr(begin, *pos - begin);
+    ++(*pos);
+    return true;
+}
+
+bool parse_xml_start_tag(
+        const std::string & text,
+        size_t * pos,
+        std::string * out_tag_name,
+        std::map<std::string, std::string> * out_attrs) {
+    if (!pos || !out_tag_name || !out_attrs || *pos >= text.size() || text[*pos] != '<') {
+        return false;
+    }
+    ++(*pos);
+    if (!parse_xml_name(text, pos, out_tag_name)) {
+        return false;
+    }
+    out_attrs->clear();
+    while (*pos < text.size()) {
+        skip_ws(text, pos);
+        if (*pos >= text.size()) {
+            return false;
+        }
+        if (text[*pos] == '>') {
+            ++(*pos);
+            return true;
+        }
+        if (text[*pos] == '/' && *pos + 1 < text.size() && text[*pos + 1] == '>') {
+            return false;
+        }
+        std::string attr_name;
+        if (!parse_xml_name(text, pos, &attr_name)) {
+            return false;
+        }
+        skip_ws(text, pos);
+        if (*pos >= text.size() || text[*pos] != '=') {
+            return false;
+        }
+        ++(*pos);
+        skip_ws(text, pos);
+        std::string attr_value;
+        if (!parse_xml_quoted_value(text, pos, &attr_value)) {
+            return false;
+        }
+        (*out_attrs)[attr_name] = attr_value;
+    }
+    return false;
+}
+
+bool parse_xml_end_tag(const std::string & text, size_t * pos, const std::string & expected_name) {
+    if (!pos || *pos >= text.size() || text[*pos] != '<' || *pos + 1 >= text.size() || text[*pos + 1] != '/') {
+        return false;
+    }
+    *pos += 2;
+    std::string tag_name;
+    if (!parse_xml_name(text, pos, &tag_name)) {
+        return false;
+    }
+    skip_ws(text, pos);
+    if (*pos >= text.size() || text[*pos] != '>' || tag_name != expected_name) {
+        return false;
+    }
+    ++(*pos);
+    return true;
+}
+
+bool decode_xml_entities(const std::string & value, std::string * out_decoded) {
+    if (!out_decoded) {
+        return false;
+    }
+    out_decoded->clear();
+    out_decoded->reserve(value.size());
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] != '&') {
+            out_decoded->push_back(value[i]);
+            continue;
+        }
+        if (value.compare(i, 4, "&lt;") == 0) {
+            out_decoded->push_back('<');
+            i += 3;
+        } else if (value.compare(i, 4, "&gt;") == 0) {
+            out_decoded->push_back('>');
+            i += 3;
+        } else if (value.compare(i, 5, "&amp;") == 0) {
+            out_decoded->push_back('&');
+            i += 4;
+        } else if (value.compare(i, 6, "&quot;") == 0) {
+            out_decoded->push_back('"');
+            i += 5;
+        } else if (value.compare(i, 6, "&apos;") == 0) {
+            out_decoded->push_back('\'');
+            i += 5;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint32_t xml_type_mask_from_schema_type(const nlohmann::json & type_json) {
+    auto accumulate_type = [](const std::string & type_name, uint32_t * io_mask) {
+        if (!io_mask) {
+            return;
+        }
+        if (type_name == "string") {
+            *io_mask |= SERVER_OPENCLAW_XML_ARG_STRING;
+        } else if (type_name == "integer") {
+            *io_mask |= SERVER_OPENCLAW_XML_ARG_INTEGER;
+        } else if (type_name == "number") {
+            *io_mask |= SERVER_OPENCLAW_XML_ARG_NUMBER;
+        } else if (type_name == "boolean") {
+            *io_mask |= SERVER_OPENCLAW_XML_ARG_BOOLEAN;
+        } else if (type_name == "null") {
+            *io_mask |= SERVER_OPENCLAW_XML_ARG_NULL;
+        } else if (type_name == "object" || type_name == "array") {
+            *io_mask |= SERVER_OPENCLAW_XML_ARG_JSON;
+        }
+    };
+
+    uint32_t mask = 0;
+    if (type_json.is_string()) {
+        accumulate_type(type_json.get<std::string>(), &mask);
+    } else if (type_json.is_array()) {
+        for (const auto & entry : type_json) {
+            if (entry.is_string()) {
+                accumulate_type(entry.get<std::string>(), &mask);
+            }
+        }
+    }
+    return mask;
+}
+
+std::string xml_type_label(uint32_t mask) {
+    std::vector<std::string> labels;
+    if ((mask & SERVER_OPENCLAW_XML_ARG_STRING) != 0) {
+        labels.push_back("string");
+    }
+    if ((mask & SERVER_OPENCLAW_XML_ARG_INTEGER) != 0) {
+        labels.push_back("integer");
+    }
+    if ((mask & SERVER_OPENCLAW_XML_ARG_NUMBER) != 0) {
+        labels.push_back("number");
+    }
+    if ((mask & SERVER_OPENCLAW_XML_ARG_BOOLEAN) != 0) {
+        labels.push_back("boolean");
+    }
+    if ((mask & SERVER_OPENCLAW_XML_ARG_NULL) != 0) {
+        labels.push_back("null");
+    }
+    if ((mask & SERVER_OPENCLAW_XML_ARG_JSON) != 0) {
+        labels.push_back("json");
+    }
+    std::ostringstream out;
+    for (size_t i = 0; i < labels.size(); ++i) {
+        if (i > 0) {
+            out << "|";
+        }
+        out << labels[i];
+    }
+    return out.str();
+}
+
+uint32_t xml_type_mask_from_label(const std::string & value) {
+    if (value == "string") {
+        return SERVER_OPENCLAW_XML_ARG_STRING;
+    }
+    if (value == "integer") {
+        return SERVER_OPENCLAW_XML_ARG_INTEGER;
+    }
+    if (value == "number") {
+        return SERVER_OPENCLAW_XML_ARG_NUMBER;
+    }
+    if (value == "boolean") {
+        return SERVER_OPENCLAW_XML_ARG_BOOLEAN;
+    }
+    if (value == "null") {
+        return SERVER_OPENCLAW_XML_ARG_NULL;
+    }
+    if (value == "json") {
+        return SERVER_OPENCLAW_XML_ARG_JSON;
+    }
+    return 0;
+}
+
+bool build_xml_tool_contract_from_capability(
+        const server_openclaw_capability_runtime & capability,
+        server_openclaw_xml_tool_contract * out_contract,
+        std::string * out_error) {
+    if (!out_contract) {
+        set_error(out_error, "xml contract output is required");
+        return false;
+    }
+
+    nlohmann::json schema;
+    try {
+        schema = nlohmann::json::parse(capability.descriptor.input_schema_json);
+    } catch (const std::exception & err) {
+        set_error(out_error, std::string("failed to parse tool schema: ") + err.what());
+        return false;
+    }
+    if (!schema.is_object() || schema.value("type", "") != "object") {
+        set_error(out_error, "tool schema must be a top-level object");
+        return false;
+    }
+
+    out_contract->tool_name = capability.descriptor.tool_name;
+    out_contract->capability_id = capability.descriptor.capability_id;
+    out_contract->description = capability.descriptor.description;
+    out_contract->args.clear();
+
+    std::set<std::string> required_args;
+    if (schema.contains("required") && schema.at("required").is_array()) {
+        for (const auto & entry : schema.at("required")) {
+            if (entry.is_string()) {
+                required_args.insert(entry.get<std::string>());
+            }
+        }
+    }
+
+    const nlohmann::json properties = schema.value("properties", nlohmann::json::object());
+    if (!properties.is_object()) {
+        set_error(out_error, "tool schema properties must be an object");
+        return false;
+    }
+
+    for (auto it = properties.begin(); it != properties.end(); ++it) {
+        server_openclaw_xml_arg_requirement arg;
+        arg.name = it.key();
+        arg.required = required_args.count(arg.name) > 0;
+        arg.allowed_types = xml_type_mask_from_schema_type(it.value().value("type", nlohmann::json()));
+        if (arg.allowed_types == 0) {
+            set_error(out_error, "tool schema property \"" + arg.name + "\" has no supported XML type");
+            return false;
+        }
+        out_contract->args.push_back(std::move(arg));
+    }
+
+    return true;
+}
+
+bool append_contracts_for_indexes(
+        const std::vector<server_openclaw_capability_runtime> & capabilities,
+        const std::vector<int32_t> * spec_indexes,
+        std::vector<server_openclaw_xml_tool_contract> * out_contracts,
+        std::string * out_error) {
+    if (!out_contracts) {
+        set_error(out_error, "xml contracts output is required");
+        return false;
+    }
+    out_contracts->clear();
+
+    auto append_contract = [&](const server_openclaw_capability_runtime & capability) -> bool {
+        server_openclaw_xml_tool_contract contract;
+        if (!build_xml_tool_contract_from_capability(capability, &contract, out_error)) {
+            return false;
+        }
+        out_contracts->push_back(std::move(contract));
+        return true;
+    };
+
+    if (!spec_indexes || spec_indexes->empty()) {
+        out_contracts->reserve(capabilities.size());
+        for (const auto & capability : capabilities) {
+            if (!append_contract(capability)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    out_contracts->reserve(spec_indexes->size());
+    for (int32_t spec_index : *spec_indexes) {
+        if (spec_index < 0 || spec_index >= (int32_t) capabilities.size()) {
+            set_error(out_error, "tool spec index is out of range for XML contract");
+            return false;
+        }
+        if (!append_contract(capabilities[(size_t) spec_index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool parse_integer_exact(const std::string & value, int64_t * out_value) {
+    if (!out_value) {
+        return false;
+    }
+    errno = 0;
+    char * end = nullptr;
+    const long long parsed = std::strtoll(value.c_str(), &end, 10);
+    if (errno != 0 || !end || *end != '\0') {
+        return false;
+    }
+    *out_value = (int64_t) parsed;
+    return true;
+}
+
+bool parse_number_exact(const std::string & value, double * out_value) {
+    if (!out_value) {
+        return false;
+    }
+    errno = 0;
+    char * end = nullptr;
+    const double parsed = std::strtod(value.c_str(), &end);
+    if (errno != 0 || !end || *end != '\0') {
+        return false;
+    }
+    *out_value = parsed;
+    return true;
+}
+
+bool parse_arg_value_json(
+        const std::string & raw_value,
+        uint32_t declared_type,
+        nlohmann::json * out_json,
+        std::string * out_error) {
+    if (!out_json) {
+        set_error(out_error, "argument json output is required");
+        return false;
+    }
+
+    if (declared_type == SERVER_OPENCLAW_XML_ARG_STRING) {
+        std::string decoded;
+        if (!decode_xml_entities(raw_value, &decoded)) {
+            set_error(out_error, "failed to decode XML entities for string argument");
+            return false;
+        }
+        *out_json = decoded;
+        return true;
+    }
+    if (declared_type == SERVER_OPENCLAW_XML_ARG_INTEGER) {
+        int64_t parsed = 0;
+        if (!parse_integer_exact(trim_ascii_copy_local(raw_value), &parsed)) {
+            set_error(out_error, "invalid integer argument");
+            return false;
+        }
+        *out_json = parsed;
+        return true;
+    }
+    if (declared_type == SERVER_OPENCLAW_XML_ARG_NUMBER) {
+        double parsed = 0.0;
+        if (!parse_number_exact(trim_ascii_copy_local(raw_value), &parsed)) {
+            set_error(out_error, "invalid number argument");
+            return false;
+        }
+        *out_json = parsed;
+        return true;
+    }
+    if (declared_type == SERVER_OPENCLAW_XML_ARG_BOOLEAN) {
+        const std::string normalized = trim_ascii_copy_local(raw_value);
+        if (normalized == "true") {
+            *out_json = true;
+            return true;
+        }
+        if (normalized == "false") {
+            *out_json = false;
+            return true;
+        }
+        set_error(out_error, "invalid boolean argument");
+        return false;
+    }
+    if (declared_type == SERVER_OPENCLAW_XML_ARG_NULL) {
+        if (trim_ascii_copy_local(raw_value) != "null") {
+            set_error(out_error, "null arguments must contain the literal null");
+            return false;
+        }
+        *out_json = nullptr;
+        return true;
+    }
+    if (declared_type == SERVER_OPENCLAW_XML_ARG_JSON) {
+        try {
+            *out_json = nlohmann::json::parse(raw_value);
+        } catch (const std::exception & err) {
+            set_error(out_error, std::string("invalid json argument: ") + err.what());
+            return false;
+        }
+        if (!out_json->is_object() && !out_json->is_array()) {
+            set_error(out_error, "json arguments must parse to an object or array");
+            return false;
+        }
+        return true;
+    }
+
+    set_error(out_error, "unsupported declared XML argument type");
+    return false;
+}
+
+std::string join_payload(const std::string & prefix, const std::string & xml_block) {
+    const std::string trimmed_prefix = trim_ascii_copy_local(prefix);
+    if (trimmed_prefix.empty()) {
+        return xml_block;
+    }
+    return trimmed_prefix + "\n" + xml_block;
+}
+
 server_openclaw_capability_runtime make_runtime(
         const openclaw_tool_capability_descriptor & descriptor,
         server_openclaw_dispatch_backend backend) {
@@ -103,16 +562,26 @@ bool dispatch_backend_from_string(
         }
         return true;
     }
+    if (value == "legacy_codex") {
+        if (out_backend) {
+            *out_backend = SERVER_OPENCLAW_DISPATCH_LEGACY_CODEX;
+        }
+        return true;
+    }
     set_error(out_error, "unsupported dispatch_backend: " + value);
     return false;
 }
 
-bool exec_available(bool bash_enabled, bool /*hard_memory_enabled*/) {
+bool exec_available(bool bash_enabled, bool /*hard_memory_enabled*/, bool /*codex_enabled*/) {
     return bash_enabled;
 }
 
-bool hard_memory_available(bool /*bash_enabled*/, bool hard_memory_enabled) {
+bool hard_memory_available(bool /*bash_enabled*/, bool hard_memory_enabled, bool /*codex_enabled*/) {
     return hard_memory_enabled;
+}
+
+bool codex_available(bool /*bash_enabled*/, bool /*hard_memory_enabled*/, bool codex_enabled) {
+    return codex_enabled;
 }
 
 openclaw_tool_capability_descriptor build_exec_descriptor() {
@@ -167,6 +636,32 @@ openclaw_tool_capability_descriptor build_hard_memory_descriptor() {
     return memory;
 }
 
+openclaw_tool_capability_descriptor build_codex_descriptor() {
+    openclaw_tool_capability_descriptor codex = {};
+    codex.capability_id = "openclaw.vicuna.codex_cli";
+    codex.tool_surface_id = "vicuna.codex.main";
+    codex.capability_kind = "tool";
+    codex.owner_plugin_id = "vicuna-runtime";
+    codex.tool_name = "codex";
+    codex.description = "Use the local Codex CLI to implement a repository change and rebuild the runtime";
+    codex.input_schema_json = R"({"type":"object","required":["task"],"properties":{"task":{"type":"string"}}})";
+    codex.output_contract = "pending_then_result";
+    codex.side_effect_class = "self_modification";
+    codex.approval_mode = "none";
+    codex.execution_modes = {"background"};
+    codex.provenance_namespace = "openclaw/vicuna-runtime/tool/codex";
+    codex.tool_kind = LLAMA_TOOL_KIND_CODEX_CLI;
+    codex.tool_flags =
+            LLAMA_COG_TOOL_ACTIVE_ELIGIBLE |
+            LLAMA_COG_TOOL_DMN_ELIGIBLE |
+            LLAMA_COG_TOOL_REMEDIATION_SAFE |
+            LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT;
+    codex.latency_class = LLAMA_COG_TOOL_LATENCY_HIGH;
+    codex.max_steps_reserved = 3;
+    codex.dispatch_backend = "legacy_codex";
+    return codex;
+}
+
 const builtin_capability_registration * builtin_capability_registrations(size_t * out_count) {
     static const builtin_capability_registration registrations[] = {
         {
@@ -181,6 +676,12 @@ const builtin_capability_registration * builtin_capability_registrations(size_t 
             hard_memory_available,
             build_hard_memory_descriptor,
         },
+        {
+            "codex",
+            SERVER_OPENCLAW_DISPATCH_LEGACY_CODEX,
+            codex_available,
+            build_codex_descriptor,
+        },
     };
     if (out_count) {
         *out_count = sizeof(registrations) / sizeof(registrations[0]);
@@ -190,7 +691,7 @@ const builtin_capability_registration * builtin_capability_registrations(size_t 
 
 }  // namespace
 
-bool server_openclaw_fabric::configure(bool bash_enabled, bool hard_memory_enabled, std::string * out_error) {
+bool server_openclaw_fabric::configure(bool bash_enabled, bool hard_memory_enabled, bool codex_enabled, std::string * out_error) {
     configured_enabled = env_flag_enabled("VICUNA_OPENCLAW_TOOL_FABRIC_ENABLED", false);
     catalog_state = {};
     capability_state.clear();
@@ -211,6 +712,7 @@ bool server_openclaw_fabric::configure(bool bash_enabled, bool hard_memory_enabl
     if (!rebuild_catalog(
                 bash_enabled,
                 hard_memory_enabled,
+                codex_enabled,
                 &next_catalog,
                 &next_capabilities,
                 out_error)) {
@@ -232,6 +734,7 @@ bool server_openclaw_fabric::configure(bool bash_enabled, bool hard_memory_enabl
 bool server_openclaw_fabric::maybe_reload(
         bool bash_enabled,
         bool hard_memory_enabled,
+        bool codex_enabled,
         bool * out_reloaded,
         std::string * out_error) {
     if (out_reloaded) {
@@ -251,6 +754,7 @@ bool server_openclaw_fabric::maybe_reload(
     if (!rebuild_catalog(
                 bash_enabled,
                 hard_memory_enabled,
+                codex_enabled,
                 &next_catalog,
                 &next_capabilities,
                 out_error)) {
@@ -326,6 +830,297 @@ bool server_openclaw_fabric::build_chat_tools(
     return true;
 }
 
+bool server_openclaw_fabric::build_xml_tool_contracts(
+        std::vector<server_openclaw_xml_tool_contract> * out_contracts,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    return append_contracts_for_indexes(capability_state, spec_indexes, out_contracts, out_error);
+}
+
+bool server_openclaw_fabric::render_tool_call_xml_guidance(
+        std::string * out_guidance,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_guidance) {
+        set_error(out_error, "tool-call XML guidance output is required");
+        return false;
+    }
+
+    std::vector<server_openclaw_xml_tool_contract> contracts;
+    if (!build_xml_tool_contracts(&contracts, spec_indexes, out_error)) {
+        return false;
+    }
+    if (contracts.empty()) {
+        set_error(out_error, "tool-call XML guidance requires at least one tool");
+        return false;
+    }
+
+    std::ostringstream out;
+    out << "Tool-call output contract for this step:\n";
+    out << "- Emit at most one short visible sentence before the XML block.\n";
+    out << "- Then emit exactly one <" << SERVER_OPENCLAW_XML_ROOT << "> block and nothing after it.\n";
+    out << "- Do not use JSON tool calls, markdown code fences, or alternate tool markup.\n";
+    out << "- Each argument must be an <" << SERVER_OPENCLAW_XML_ARG << "> tag with quoted name and type attributes.\n";
+    out << "- Allowed argument types are string, integer, number, boolean, null, and json.\n";
+    out << "- String arguments must XML-escape special characters.\n";
+    out << "- json arguments must contain valid JSON object or array text.\n";
+    out << "Allowed tools for this step:\n";
+
+    for (const auto & contract : contracts) {
+        out << "- tool=\"" << contract.tool_name << "\"";
+        if (!contract.capability_id.empty()) {
+            out << " capability=\"" << contract.capability_id << "\"";
+        }
+        if (!contract.description.empty()) {
+            out << " description=\"" << contract.description << "\"";
+        }
+        out << "\n";
+        for (const auto & arg : contract.args) {
+            out << "  - " << arg.name << ": " << xml_type_label(arg.allowed_types);
+            if (arg.required) {
+                out << " (required)";
+            }
+            out << "\n";
+        }
+    }
+
+    const auto & example = contracts.front();
+    out << "Canonical example:\n";
+    out << "<" << SERVER_OPENCLAW_XML_ROOT << " tool=\"" << example.tool_name << "\">\n";
+    for (const auto & arg : example.args) {
+        out << "  <" << SERVER_OPENCLAW_XML_ARG << " name=\"" << arg.name << "\" type=\"";
+        if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_STRING) != 0) {
+            out << "string";
+        } else if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_INTEGER) != 0) {
+            out << "integer";
+        } else if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_NUMBER) != 0) {
+            out << "number";
+        } else if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_BOOLEAN) != 0) {
+            out << "boolean";
+        } else if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_JSON) != 0) {
+            out << "json";
+        } else {
+            out << "null";
+        }
+        out << "\">";
+        if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_STRING) != 0) {
+            out << "example";
+        } else if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_INTEGER) != 0) {
+            out << "1";
+        } else if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_NUMBER) != 0) {
+            out << "1.0";
+        } else if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_BOOLEAN) != 0) {
+            out << "true";
+        } else if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_JSON) != 0) {
+            out << "{\"key\":\"value\"}";
+        } else {
+            out << "null";
+        }
+        out << "</" << SERVER_OPENCLAW_XML_ARG << ">\n";
+    }
+    out << "</" << SERVER_OPENCLAW_XML_ROOT << ">";
+
+    *out_guidance = out.str();
+    return true;
+}
+
+bool server_openclaw_fabric::parse_tool_call_xml(
+        const std::string & text,
+        server_openclaw_parsed_tool_call * out_parsed,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_parsed) {
+        set_error(out_error, "tool-call XML parse requires output storage");
+        return false;
+    }
+
+    std::vector<server_openclaw_xml_tool_contract> contracts;
+    if (!build_xml_tool_contracts(&contracts, spec_indexes, out_error)) {
+        return false;
+    }
+    if (contracts.empty()) {
+        set_error(out_error, "tool-call XML parse requires at least one available contract");
+        return false;
+    }
+
+    const size_t root_start = text.find(std::string("<") + SERVER_OPENCLAW_XML_ROOT);
+    if (root_start == std::string::npos) {
+        set_error(out_error, "tool-call XML root was not found");
+        return false;
+    }
+    const size_t root_end = text.rfind(std::string("</") + SERVER_OPENCLAW_XML_ROOT + ">");
+    if (root_end == std::string::npos || root_end < root_start) {
+        set_error(out_error, "tool-call XML closing tag was not found");
+        return false;
+    }
+    const size_t root_close_end = root_end + std::strlen(SERVER_OPENCLAW_XML_ROOT) + 3;
+    const std::string visible_prefix = trim_ascii_copy_local(text.substr(0, root_start));
+    const std::string xml_block = text.substr(root_start, root_close_end - root_start);
+    if (!trim_ascii_copy_local(text.substr(root_close_end)).empty()) {
+        set_error(out_error, "tool-call XML must not have trailing content after the closing tag");
+        return false;
+    }
+
+    size_t pos = 0;
+    std::string tag_name;
+    std::map<std::string, std::string> attrs;
+    if (!parse_xml_start_tag(xml_block, &pos, &tag_name, &attrs) || tag_name != SERVER_OPENCLAW_XML_ROOT) {
+        set_error(out_error, "invalid tool-call XML root tag");
+        return false;
+    }
+    const auto root_tool_it = attrs.find("tool");
+    if (root_tool_it == attrs.end() || trim_ascii_copy_local(root_tool_it->second).empty()) {
+        set_error(out_error, "tool-call XML root is missing a quoted tool attribute");
+        return false;
+    }
+    const std::string tool_name = trim_ascii_copy_local(root_tool_it->second);
+
+    const server_openclaw_xml_tool_contract * contract = nullptr;
+    for (const auto & candidate : contracts) {
+        if (candidate.tool_name == tool_name) {
+            contract = &candidate;
+            break;
+        }
+    }
+    if (!contract) {
+        set_error(out_error, "tool-call XML selected an unknown or disallowed tool: " + tool_name);
+        return false;
+    }
+
+    std::map<std::string, server_openclaw_xml_arg_requirement> arg_requirements;
+    for (const auto & arg : contract->args) {
+        arg_requirements[arg.name] = arg;
+    }
+
+    nlohmann::json arguments = nlohmann::json::object();
+    std::set<std::string> seen_args;
+
+    while (true) {
+        skip_ws(xml_block, &pos);
+        if (pos >= xml_block.size()) {
+            set_error(out_error, "unterminated tool-call XML");
+            return false;
+        }
+        if (xml_block.compare(pos, std::strlen("</") + std::strlen(SERVER_OPENCLAW_XML_ROOT), std::string("</") + SERVER_OPENCLAW_XML_ROOT) == 0) {
+            break;
+        }
+
+        std::string arg_tag_name;
+        std::map<std::string, std::string> arg_attrs;
+        if (!parse_xml_start_tag(xml_block, &pos, &arg_tag_name, &arg_attrs) || arg_tag_name != SERVER_OPENCLAW_XML_ARG) {
+            set_error(out_error, "tool-call XML may contain only arg children inside the root");
+            return false;
+        }
+
+        const auto arg_name_it = arg_attrs.find("name");
+        const auto arg_type_it = arg_attrs.find("type");
+        if (arg_name_it == arg_attrs.end() || arg_type_it == arg_attrs.end()) {
+            set_error(out_error, "each arg element requires quoted name and type attributes");
+            return false;
+        }
+        const std::string arg_name = trim_ascii_copy_local(arg_name_it->second);
+        const std::string arg_type_label = trim_ascii_copy_local(arg_type_it->second);
+        if (arg_name.empty()) {
+            set_error(out_error, "arg name must not be empty");
+            return false;
+        }
+        if (seen_args.count(arg_name) > 0) {
+            set_error(out_error, "duplicate argument in tool-call XML: " + arg_name);
+            return false;
+        }
+        const auto requirement_it = arg_requirements.find(arg_name);
+        if (requirement_it == arg_requirements.end()) {
+            set_error(out_error, "tool-call XML used an undeclared argument: " + arg_name);
+            return false;
+        }
+
+        const uint32_t declared_type = xml_type_mask_from_label(arg_type_label);
+        if (declared_type == 0) {
+            set_error(out_error, "tool-call XML used an unsupported arg type: " + arg_type_label);
+            return false;
+        }
+        if ((requirement_it->second.allowed_types & declared_type) == 0) {
+            set_error(out_error, "tool-call XML type mismatch for argument: " + arg_name);
+            return false;
+        }
+
+        const size_t value_start = pos;
+        const size_t value_end = xml_block.find(std::string("</") + SERVER_OPENCLAW_XML_ARG + ">", pos);
+        if (value_end == std::string::npos) {
+            set_error(out_error, "arg element is missing a closing tag");
+            return false;
+        }
+        const std::string raw_value = xml_block.substr(value_start, value_end - value_start);
+        if (declared_type != SERVER_OPENCLAW_XML_ARG_JSON && raw_value.find('<') != std::string::npos) {
+            set_error(out_error, "arg payload contains nested markup");
+            return false;
+        }
+        pos = value_end;
+        if (!parse_xml_end_tag(xml_block, &pos, SERVER_OPENCLAW_XML_ARG)) {
+            set_error(out_error, "invalid arg closing tag");
+            return false;
+        }
+
+        nlohmann::json parsed_value;
+        if (!parse_arg_value_json(raw_value, declared_type, &parsed_value, out_error)) {
+            return false;
+        }
+        arguments[arg_name] = std::move(parsed_value);
+        seen_args.insert(arg_name);
+    }
+
+    if (!parse_xml_end_tag(xml_block, &pos, SERVER_OPENCLAW_XML_ROOT)) {
+        set_error(out_error, "invalid tool-call XML root closing tag");
+        return false;
+    }
+    skip_ws(xml_block, &pos);
+    if (pos != xml_block.size()) {
+        set_error(out_error, "tool-call XML contains trailing bytes after the root close");
+        return false;
+    }
+
+    for (const auto & arg : contract->args) {
+        if (arg.required && seen_args.count(arg.name) == 0) {
+            set_error(out_error, "tool-call XML is missing required argument: " + arg.name);
+            return false;
+        }
+    }
+
+    out_parsed->message = {};
+    out_parsed->message.role = "assistant";
+    out_parsed->message.content = visible_prefix;
+    out_parsed->message.tool_calls = { common_chat_tool_call { tool_name, arguments.dump(), "" } };
+    out_parsed->visible_prefix = visible_prefix;
+    out_parsed->xml_block = xml_block;
+    out_parsed->captured_planner_reasoning = visible_prefix;
+    out_parsed->captured_tool_xml = xml_block;
+    out_parsed->captured_payload = join_payload(visible_prefix, xml_block);
+    return true;
+}
+
+std::string server_openclaw_fabric::strip_tool_call_xml_markup(const std::string & text) const {
+    const std::string root_open = std::string("<") + SERVER_OPENCLAW_XML_ROOT;
+    const std::string root_close = std::string("</") + SERVER_OPENCLAW_XML_ROOT + ">";
+    size_t start = text.find(root_open);
+    if (start == std::string::npos) {
+        return trim_ascii_copy_local(text);
+    }
+    size_t end = text.find(root_close, start);
+    if (end == std::string::npos) {
+        return trim_ascii_copy_local(text.substr(0, start));
+    }
+    end += root_close.size();
+    const std::string prefix = trim_ascii_copy_local(text.substr(0, start));
+    const std::string suffix = trim_ascii_copy_local(text.substr(end));
+    if (prefix.empty()) {
+        return suffix;
+    }
+    if (suffix.empty()) {
+        return prefix;
+    }
+    return prefix + "\n" + suffix;
+}
+
 const server_openclaw_capability_runtime * server_openclaw_fabric::capability_by_spec_index(int32_t spec_index) const {
     if (spec_index < 0 || spec_index >= (int32_t) capability_state.size()) {
         return nullptr;
@@ -348,6 +1143,7 @@ const server_openclaw_capability_runtime * server_openclaw_fabric::capability_by
 bool server_openclaw_fabric::rebuild_catalog(
         bool bash_enabled,
         bool hard_memory_enabled,
+        bool codex_enabled,
         openclaw_tool_capability_catalog * out_catalog,
         std::vector<server_openclaw_capability_runtime> * out_capabilities,
         std::string * out_error) const {
@@ -368,7 +1164,7 @@ bool server_openclaw_fabric::rebuild_catalog(
         if (!env_list_contains("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS", registration.tool_id, true)) {
             continue;
         }
-        if (!registration.is_available(bash_enabled, hard_memory_enabled)) {
+        if (!registration.is_available(bash_enabled, hard_memory_enabled, codex_enabled)) {
             continue;
         }
         out_capabilities->push_back(make_runtime(
@@ -382,6 +1178,7 @@ bool server_openclaw_fabric::rebuild_catalog(
                     external_catalog_path,
                     bash_enabled,
                     hard_memory_enabled,
+                    codex_enabled,
                     out_capabilities,
                     out_error)) {
             return false;
@@ -404,6 +1201,7 @@ bool server_openclaw_fabric::load_external_catalog(
         const std::string & path,
         bool bash_enabled,
         bool hard_memory_enabled,
+        bool codex_enabled,
         std::vector<server_openclaw_capability_runtime> * out_capabilities,
         std::string * out_error) const {
     if (!out_capabilities) {
@@ -437,6 +1235,9 @@ bool server_openclaw_fabric::load_external_catalog(
                 continue;
             }
             if (backend == SERVER_OPENCLAW_DISPATCH_LEGACY_HARD_MEMORY && !hard_memory_enabled) {
+                continue;
+            }
+            if (backend == SERVER_OPENCLAW_DISPATCH_LEGACY_CODEX && !codex_enabled) {
                 continue;
             }
             out_capabilities->push_back(make_runtime(descriptor, backend));

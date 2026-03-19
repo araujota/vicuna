@@ -14,6 +14,7 @@ import {
   normalizeState,
   parseSseChunk,
   saveState,
+  sanitizeAssistantRelayText,
   splitSseBuffer,
 } from './lib.mjs';
 
@@ -45,6 +46,28 @@ test('extractChatCompletionText reads assistant content', () => {
   });
 
   assert.equal(text, 'reply');
+});
+
+test('extractChatCompletionText strips vicuna tool-call xml', () => {
+  const text = extractChatCompletionText({
+    choices: [
+      {
+        message: {
+          content: 'I should search.\n<vicuna_tool_call tool="web_search"><arg name="query" type="string">GDP</arg></vicuna_tool_call>',
+        },
+      },
+    ],
+  });
+
+  assert.equal(text, 'I should search.');
+});
+
+test('sanitizeAssistantRelayText strips known tool-call xml blocks', () => {
+  const text = sanitizeAssistantRelayText(
+    'prefix\n<tool_call>{"name":"search"}</tool_call>\n<minimax:tool_call><invoke name="x"></invoke></minimax:tool_call>\nsuffix',
+  );
+
+  assert.equal(text, 'prefix\n\nsuffix');
 });
 
 test('parseSseChunk parses response events', () => {

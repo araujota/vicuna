@@ -31,6 +31,15 @@ static uint64_t process_hash_mix(uint64_t seed, uint64_t value) {
     return seed;
 }
 
+static uint64_t token_hash_or_die(const std::vector<llama_token> & tokens) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (llama_token token : tokens) {
+        hash ^= (uint64_t) (uint32_t) token;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
 static llama_process_functional_signature make_dmn_process_signature(
         llama_context * ctx,
         const llama_dmn_tick_trace & trace,
@@ -602,7 +611,7 @@ int main(int argc, char ** argv) {
         }
 
         llama_cognitive_tool_spec spec = {};
-        if (llama_cognitive_tool_spec_count(ctx) < 4 ||
+        if (llama_cognitive_tool_spec_count(ctx) < 5 ||
             llama_cognitive_tool_spec_get(ctx, 0, &spec) != 0 ||
             spec.tool_kind != LLAMA_TOOL_KIND_GENERIC ||
             spec.name[0] == '\0') {
@@ -615,6 +624,14 @@ int main(int argc, char ** argv) {
             spec.tool_kind != LLAMA_TOOL_KIND_BASH_CLI ||
             spec.name[0] == '\0') {
             std::fprintf(stderr, "bash cognitive tool registry entry was not populated\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (llama_cognitive_tool_spec_get(ctx, 2, &spec) != 0 ||
+            spec.tool_kind != LLAMA_TOOL_KIND_CODEX_CLI ||
+            spec.name[0] == '\0') {
+            std::fprintf(stderr, "codex cognitive tool registry entry was not populated\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -663,7 +680,7 @@ int main(int argc, char ** argv) {
         }
         if (trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_FINISH ||
             trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_ANSWER_READY ||
-            trace.loop_state.tool_registry_count < 4 ||
+            trace.loop_state.tool_registry_count < 5 ||
             trace.tool_proposal.valid ||
             !trace.observation.valid ||
             trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ||
@@ -940,7 +957,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
         llama_bash_tool_request request = {};
-        if (!expect_bash_request("active-act-request", ctx, command, "find build .", &request)) {
+        if (!expect_bash_request("active-act-request", ctx, command, "find . -maxdepth", &request)) {
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -1042,6 +1059,136 @@ int main(int argc, char ** argv) {
             return 1;
         }
         if (!expect_functional_family_state("active-tool-followup-functional-cleared", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, false)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(ctx);
+    }
+
+    {
+        g_contradiction_score = 0.10f;
+        g_uncertainty_score = 0.10f;
+        g_broadcast_score = 0.05f;
+
+        llama_context * ctx = create_context(model);
+        if (!ctx) {
+            std::fprintf(stderr, "failed to create active external-wait learning context\n");
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> goal_tokens = tokenize_or_die(vocab, "Inspect the repository and run the appropriate tools.");
+        if (llama_self_state_upsert_goal(ctx, 5, goal_tokens.data(), goal_tokens.size(), 1.0f) != 0 ||
+            llama_self_state_upsert_tool_job(ctx, 10, LLAMA_SELF_TOOL_JOB_PENDING, 1.0f) != 0) {
+            std::fprintf(stderr, "failed to seed active external-wait learning state\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> tokens = tokenize_or_die(vocab, "Please inspect the repository root before answering.");
+        const llama_self_state_event event = {
+            /*.tokens =*/ tokens.data(),
+            /*.n_tokens =*/ tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.1f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+
+        llama_active_loop_trace trace = {};
+        if (!expect_active_action("active-act-external-wait-learning", ctx, event, LLAMA_ACTIVE_LOOP_ACTION_ACT, &trace)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_command command = {};
+        llama_cognitive_active_runner_status runner = {};
+        if (!expect_single_command("active-act-external-wait-learning-command", ctx, LLAMA_COG_COMMAND_ORIGIN_ACTIVE, LLAMA_COG_COMMAND_INVOKE_TOOL, &command) ||
+            command.tool_job_id <= 0 ||
+            !expect_bash_request("active-act-external-wait-learning-request", ctx, command, "find . -maxdepth")) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        if (llama_cognitive_command_begin_external_wait(ctx, command.command_id) != 0) {
+            std::fprintf(stderr, "failed to begin active external wait\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_process_functional_signature preserved_signature = {};
+        if (llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
+            !runner.active ||
+            !runner.waiting_on_tool ||
+            runner.pending_command_id != command.command_id ||
+            runner.functional_microphase != LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE ||
+            !expect_functional_family_state("active-external-wait-tool-functional-ablated", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, false) ||
+            !expect_functional_family_state("active-external-wait-planner-functional-preserved", ctx, LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION, true, LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE, 0.10f) ||
+            llama_process_functional_get_current_signature(ctx, &preserved_signature) != 0 ||
+            !preserved_signature.valid ||
+            preserved_signature.family != LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION ||
+            preserved_signature.microphase != LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE) {
+            std::fprintf(stderr, "active external wait did not preserve planner state while unloading the tool LoRA\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::string planner_text = "I should inspect the repository first.";
+        const std::string tool_xml =
+                "<vicuna_tool_call tool=\"exec\"><arg name=\"command\" type=\"string\">pwd</arg></vicuna_tool_call>";
+        const std::vector<llama_token> planner_tokens = tokenize_or_die(vocab, planner_text);
+        const std::vector<llama_token> tool_xml_tokens = tokenize_or_die(vocab, tool_xml);
+        if (llama_cognitive_active_planner_reasoning_note(ctx, trace.episode_id, planner_tokens.data(), planner_tokens.size()) != 0) {
+            std::fprintf(stderr, "failed to note active planner reasoning tokens\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (llama_cognitive_active_tool_emission_note(ctx, command.command_id, tool_xml_tokens.data(), tool_xml_tokens.size()) != 0) {
+            std::fprintf(stderr, "failed to note active tool XML tokens\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_bash_tool_result result = {};
+        result.command_id = command.command_id;
+        result.tool_job_id = command.tool_job_id;
+        result.exit_code = 0;
+        result.runtime_ms = 4;
+        std::snprintf(result.stdout_text, sizeof(result.stdout_text), "%s", "/Users/tyleraraujo/vicuna");
+
+        if (llama_cognitive_bash_tool_submit_result(ctx, &result, &trace) != 0) {
+            std::fprintf(stderr, "failed to submit active external-wait bash result\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_functional_lora_update_info update = {};
+        if (llama_functional_lora_get_last_update(ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, &update) != 0 ||
+            !update.valid ||
+            update.source_token_count != (int32_t) tool_xml_tokens.size() ||
+            update.source_token_hash != token_hash_or_die(tool_xml_tokens)) {
+            std::fprintf(stderr, "active external-wait learning did not preserve the exact tool XML payload\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        if (llama_functional_lora_get_last_update(ctx, LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION, &update) != 0 ||
+            !update.valid ||
+            update.source_token_count != (int32_t) planner_tokens.size() ||
+            update.source_token_hash != token_hash_or_die(planner_tokens)) {
+            std::fprintf(stderr, "active external-wait learning did not preserve the exact planner reasoning payload\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -2138,7 +2285,7 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
-        if (!expect_bash_request("dmn-invoke-tool-request", ctx, command, "find . -maxdepth 3")) {
+        if (!expect_bash_request("dmn-invoke-tool-request", ctx, command, "find . -maxdepth")) {
             llama_free(ctx);
             llama_model_free(model);
             return 1;

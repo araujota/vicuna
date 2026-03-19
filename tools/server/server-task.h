@@ -156,6 +156,8 @@ struct server_task {
     int32_t react_iteration = 0;
     size_t react_initial_message_count = 0;
     std::string react_visible_prefix;
+    std::string react_last_planner_reasoning;
+    std::string react_last_tool_xml_payload;
     std::vector<common_chat_msg> react_messages;
     std::vector<common_chat_tool> react_tools;
 
@@ -254,6 +256,8 @@ struct server_task {
         copy.react_iteration = react_iteration;
         copy.react_initial_message_count = react_initial_message_count;
         copy.react_visible_prefix = react_visible_prefix;
+        copy.react_last_planner_reasoning = react_last_planner_reasoning;
+        copy.react_last_tool_xml_payload = react_last_tool_xml_payload;
         copy.react_messages = react_messages;
         copy.react_tools = react_tools;
         copy.id_slot   = -1; // child tasks cannot specify slot

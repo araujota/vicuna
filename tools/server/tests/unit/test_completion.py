@@ -7,6 +7,8 @@ from openai import OpenAI
 from utils import *
 
 server = ServerPreset.tinyllama2()
+CORE_SYSTEM_PROMPT = "You are an experimental intelligence designed to self-regulate, learn, self-improve, and be useful."
+CORE_SYSTEM_PREFIX = f"System:\n{CORE_SYSTEM_PROMPT}\n\n"
 
 JSON_MULTIMODAL_KEY = "multimodal_data"
 JSON_PROMPT_STRING_KEY = "prompt_string"
@@ -15,6 +17,7 @@ JSON_PROMPT_STRING_KEY = "prompt_string"
 def create_server():
     global server
     server = ServerPreset.tinyllama2()
+    server.extra_env = {"VICUNA_ACTIVE_LOOP_ENABLED": "0"}
 
 @pytest.mark.parametrize("prompt,n_predict,re_content,n_prompt,n_predicted,truncated,return_tokens", [
     ("I believe the meaning of life is", 8, "(going|bed)+", 18, 8, False, False),
@@ -29,9 +32,11 @@ def test_completion(prompt: str, n_predict: int, re_content: str, n_prompt: int,
         "return_tokens": return_tokens,
     })
     assert res.status_code == 200
-    assert res.body["timings"]["prompt_n"] == n_prompt
+    assert res.body["timings"]["prompt_n"] + res.body["timings"]["cache_n"] > n_prompt
     assert res.body["timings"]["predicted_n"] == n_predicted
     assert res.body["truncated"] == truncated
+    assert res.body["prompt"].startswith(CORE_SYSTEM_PREFIX)
+    assert res.body["generation_settings"]["n_keep"] > 0
     assert type(res.body["has_new_line"]) == bool
     assert match_regex(re_content, res.body["content"])
     if return_tokens:
@@ -57,7 +62,7 @@ def test_completion_stream(prompt: str, n_predict: int, re_content: str, n_promp
     for data in res:
         assert "stop" in data and type(data["stop"]) == bool
         if data["stop"]:
-            assert data["timings"]["prompt_n"] == n_prompt
+            assert data["timings"]["prompt_n"] + data["timings"]["cache_n"] > n_prompt
             assert data["timings"]["predicted_n"] == n_predicted
             assert data["truncated"] == truncated
             assert data["stop_type"] == "limit"

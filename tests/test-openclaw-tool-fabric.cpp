@@ -86,7 +86,7 @@ int main() {
     unsetenv("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS");
 
     server_openclaw_fabric fabric;
-    if (!expect(fabric.configure(true, true, &error), error.c_str())) {
+    if (!expect(fabric.configure(true, true, true, &error), error.c_str())) {
         return 1;
     }
     if (!expect(fabric.enabled(), "fabric should be enabled")) {
@@ -97,13 +97,89 @@ int main() {
     if (!expect(fabric.build_cognitive_specs(&specs), "failed to build cognitive specs")) {
         return 1;
     }
-    if (!expect(specs.size() == 2, "expected exec and hard-memory capabilities")) {
+    if (!expect(specs.size() == 3, "expected exec, hard-memory, and codex capabilities")) {
         return 1;
     }
     if (!expect(fabric.capability_by_tool_name("exec") != nullptr, "expected exec tool lookup to succeed")) {
         return 1;
     }
+    if (!expect(fabric.capability_by_tool_name("codex") != nullptr, "expected codex tool lookup to succeed")) {
+        return 1;
+    }
     if (!expect(fabric.capability_by_tool_name("missing") == nullptr, "expected unknown tool lookup to fail")) {
+        return 1;
+    }
+
+    std::vector<int32_t> exec_only = { 0 };
+    std::vector<server_openclaw_xml_tool_contract> contracts;
+    if (!expect(fabric.build_xml_tool_contracts(&contracts, &exec_only, &error), error.c_str())) {
+        return 1;
+    }
+    if (!expect(contracts.size() == 1, "expected one XML contract for the selected tool")) {
+        return 1;
+    }
+    if (!expect(contracts[0].tool_name == "exec", "expected exec XML contract")) {
+        return 1;
+    }
+    if (!expect(!contracts[0].args.empty(), "expected schema-derived XML args")) {
+        return 1;
+    }
+
+    std::string guidance;
+    if (!expect(fabric.render_tool_call_xml_guidance(&guidance, &exec_only, &error), error.c_str())) {
+        return 1;
+    }
+    if (!expect(guidance.find("<vicuna_tool_call tool=\"exec\">") != std::string::npos,
+                "expected canonical XML guidance example")) {
+        return 1;
+    }
+
+    server_openclaw_parsed_tool_call parsed = {};
+    const std::string valid_tool_xml =
+            "I should inspect the filesystem first.\n"
+            "<vicuna_tool_call tool=\"exec\">\n"
+            "  <arg name=\"command\" type=\"string\">pwd</arg>\n"
+            "</vicuna_tool_call>";
+    if (!expect(fabric.parse_tool_call_xml(valid_tool_xml, &parsed, &exec_only, &error), error.c_str())) {
+        return 1;
+    }
+    if (!expect(parsed.message.tool_calls.size() == 1, "expected one parsed tool call")) {
+        return 1;
+    }
+    if (!expect(parsed.message.tool_calls[0].name == "exec", "expected exec parsed tool name")) {
+        return 1;
+    }
+    if (!expect(parsed.message.tool_calls[0].arguments == "{\"command\":\"pwd\"}",
+                "expected typed JSON arguments from XML")) {
+        return 1;
+    }
+    if (!expect(parsed.captured_planner_reasoning == "I should inspect the filesystem first.",
+                "expected planner reasoning capture to preserve only the visible prefix")) {
+        return 1;
+    }
+    if (!expect(parsed.captured_tool_xml ==
+                    "<vicuna_tool_call tool=\"exec\">\n"
+                    "  <arg name=\"command\" type=\"string\">pwd</arg>\n"
+                    "</vicuna_tool_call>",
+                "expected tool XML capture to preserve only the canonical XML block")) {
+        return 1;
+    }
+    if (!expect(parsed.captured_payload == valid_tool_xml, "expected captured payload to preserve thought plus XML")) {
+        return 1;
+    }
+
+    const std::string invalid_tool_xml =
+            "<vicuna_tool_call tool=\"exec\">"
+            "<arg name=\"unknown\" type=\"string\">pwd</arg>"
+            "</vicuna_tool_call>";
+    if (!expect(!fabric.parse_tool_call_xml(invalid_tool_xml, &parsed, &exec_only, &error),
+                "expected undeclared argument to be rejected")) {
+        return 1;
+    }
+
+    const std::string stripped = fabric.strip_tool_call_xml_markup(valid_tool_xml);
+    if (!expect(stripped == "I should inspect the filesystem first.",
+                "expected XML markup stripping to preserve only visible prefix")) {
         return 1;
     }
 
@@ -162,7 +238,7 @@ int main() {
     }
 
     server_openclaw_fabric reloadable_fabric;
-    if (!expect(reloadable_fabric.configure(true, true, &error), error.c_str())) {
+    if (!expect(reloadable_fabric.configure(true, true, true, &error), error.c_str())) {
         return 1;
     }
 
@@ -204,7 +280,7 @@ int main() {
     }
 
     bool reloaded = false;
-    if (!expect(reloadable_fabric.maybe_reload(true, true, &reloaded, &error), error.c_str())) {
+    if (!expect(reloadable_fabric.maybe_reload(true, true, true, &reloaded, &error), error.c_str())) {
         return 1;
     }
     if (!expect(reloaded, "expected external catalog reload to occur")) {
@@ -215,15 +291,15 @@ int main() {
     if (!expect(reloadable_fabric.build_cognitive_specs(&specs), "failed to build reloaded cognitive specs")) {
         return 1;
     }
-    if (!expect(specs.size() == 3, "expected built-ins plus one externally loaded capability")) {
+    if (!expect(specs.size() == 4, "expected built-ins plus one externally loaded capability")) {
         return 1;
     }
 
     llama_cognitive_command external_command = {};
     external_command.kind = LLAMA_COG_COMMAND_INVOKE_TOOL;
-    external_command.tool_kind = specs[2].tool_kind;
-    external_command.tool_spec_index = 2;
-    std::snprintf(external_command.capability_id, sizeof(external_command.capability_id), "%s", specs[2].capability_id);
+    external_command.tool_kind = specs[3].tool_kind;
+    external_command.tool_spec_index = 3;
+    std::snprintf(external_command.capability_id, sizeof(external_command.capability_id), "%s", specs[3].capability_id);
     if (!expect(reloadable_fabric.resolve_command(external_command, &error) != nullptr, error.c_str())) {
         return 1;
     }

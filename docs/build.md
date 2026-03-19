@@ -70,6 +70,39 @@ cmake --build build --config Release
   - **Fedora / RHEL / Rocky / Alma:** `sudo dnf install openssl-devel`
   - **Arch / Manjaro:** `sudo pacman -S openssl`
 
+## Vicuña Runtime Tool Environment
+
+The Vicuña runtime ships helper scripts under `tools/ops/` for running the
+local server with its first-class host tools enabled. Source
+`tools/ops/runtime-env.sh` before launching the runtime if you want the default
+tool environment and rebuild helpers loaded into the process environment.
+
+That helper also sets the runtime-wide core system prompt through
+`VICUNA_CORE_SYSTEM_PROMPT`. The default text is:
+
+- `You are an experimental intelligence designed to self-regulate, learn, self-improve, and be useful.`
+
+`llama-server` prepends that text as a literal `System:` prefix to each
+inference request and raises `n_keep` so the prefix remains pinned when context
+shifting compacts the sliding window.
+
+The Codex core tool expects the OpenAI Codex CLI to be installed on the same
+host as the runtime. By default `tools/ops/runtime-env.sh` configures:
+
+- `VICUNA_CODEX_TOOL_PATH` from `command -v codex`
+- `VICUNA_CODEX_TOOL_WORKDIR` to the repository root
+- `VICUNA_CODEX_TOOL_REBUILD_SCRIPT` to
+  `tools/ops/rebuild-vicuna-runtime.sh`
+- `VICUNA_CODEX_TOOL_REBUILD_HELPER` to
+  `tools/ops/complete-codex-rebuild.sh`
+
+When the Codex tool is used for a self-modifying change, the worker finishes
+first and returns a typed result into the server's normal drain path. Only
+after that does the server persist state, hand off to the detached rebuild
+helper, and restart the system. The helper returns the final completion message
+through `VICUNA_CODEX_TOOL_COMPLETION_MESSAGE_PATH`, which lets the runtime
+preserve its memory of ongoing maintenance work across the rebuild boundary.
+
 ## BLAS Build
 
 Building the program with BLAS support may lead to some performance improvements in prompt processing using batch sizes higher than 32 (the default is 512). Using BLAS doesn't affect the generation performance. There are currently several different BLAS implementations available for build and use:

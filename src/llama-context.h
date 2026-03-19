@@ -277,7 +277,13 @@ struct llama_context {
     bool bash_tool_clear_request(int32_t command_id);
     bool bash_tool_submit_result(const llama_bash_tool_result & result);
     bool bash_tool_get_last_result(llama_bash_tool_result * out_result) const;
+    bool codex_tool_configure(const llama_codex_tool_config & config);
+    bool codex_tool_get_config(llama_codex_tool_config * out_config) const;
+    bool codex_tool_get_last_result(llama_codex_tool_result * out_result) const;
     bool cognitive_bash_tool_get_request(int32_t command_id, llama_bash_tool_request * out_request) const;
+    bool cognitive_codex_tool_get_request(int32_t command_id, llama_codex_tool_request * out_request) const;
+    bool cognitive_codex_tool_set_request(const llama_codex_tool_request & request);
+    bool cognitive_codex_tool_submit_result(const llama_codex_tool_result & result, llama_active_loop_trace * out_active_trace);
     bool cognitive_bash_tool_submit_result(const llama_bash_tool_result & result, llama_active_loop_trace * out_active_trace);
     bool cognitive_hard_memory_get_request(int32_t command_id, llama_cognitive_hard_memory_request * out_request) const;
     bool cognitive_hard_memory_submit_result(const llama_cognitive_hard_memory_result & result, llama_active_loop_trace * out_active_trace);
@@ -288,7 +294,10 @@ struct llama_context {
     bool cognitive_command_get(int32_t index, llama_cognitive_command * out_command) const;
     bool cognitive_command_ack(int32_t command_id);
     bool cognitive_command_complete(int32_t command_id, bool cancelled);
+    bool cognitive_command_begin_external_wait(int32_t command_id);
     bool cognitive_command_rebind_tool(int32_t command_id, int32_t tool_spec_index);
+    bool cognitive_active_tool_emission_note(int32_t command_id, const llama_token * tokens, size_t n_tokens);
+    bool cognitive_active_planner_reasoning_note(int32_t episode_id, const llama_token * tokens, size_t n_tokens);
     bool cognitive_active_runner_get(llama_cognitive_active_runner_status * out_status) const;
     bool cognitive_dmn_runner_get(llama_cognitive_dmn_runner_status * out_status) const;
     bool active_loop_process(const llama_self_state_event & event, llama_active_loop_trace * out_trace);

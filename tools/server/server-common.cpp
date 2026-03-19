@@ -92,22 +92,7 @@ int32_t classify_foreground_role(const json & body) {
 }
 
 std::string extract_foreground_message_text(const json & body) {
-    if (!body.contains("messages") || !body.at("messages").is_array()) {
-        return {};
-    }
-
-    const json & messages = body.at("messages");
-    for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
-        const std::string role = json_value(*it, "role", std::string());
-        if (role == "assistant" || role == "system" || role.empty()) {
-            continue;
-        }
-
-        if (!it->contains("content")) {
-            return {};
-        }
-
-        const json & content = it->at("content");
+    auto extract_text_content = [](const json & content) -> std::string {
         if (content.is_string()) {
             return trim_copy(content.get<std::string>());
         }
@@ -142,6 +127,27 @@ std::string extract_foreground_message_text(const json & body) {
             }
         }
         return text;
+    };
+
+    if (!body.contains("messages") || !body.at("messages").is_array()) {
+        if (!body.contains("prompt")) {
+            return {};
+        }
+        return extract_text_content(body.at("prompt"));
+    }
+
+    const json & messages = body.at("messages");
+    for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+        const std::string role = json_value(*it, "role", std::string());
+        if (role == "assistant" || role == "system" || role.empty()) {
+            continue;
+        }
+
+        if (!it->contains("content")) {
+            return {};
+        }
+
+        return extract_text_content(it->at("content"));
     }
 
     return {};

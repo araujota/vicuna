@@ -1,12 +1,19 @@
-# Add a new model architecture to `llama.cpp`
+# Add a new base model architecture to Vicuña
 
-Adding a model requires few steps:
+Vicuña still follows essentially the same high-level process as upstream
+`llama.cpp` when adding support for a new base model:
 
 1. Convert the model to GGUF
-2. Define the model architecture in `llama.cpp`
-3. Build the GGML graph implementation
+2. Define the architecture and runtime metadata
+3. Build and register the GGML graph implementation
 
-After following these steps, you can open PR.
+The main difference is file layout. The upstream workflow is still the right
+mental model, but Vicuña's current source tree spreads the work across
+`src/llama-arch.*`, `src/llama-model-loader.cpp`, `src/llama-model.cpp`, and
+`src/models/*.cpp` instead of putting all graph code in one file.
+
+After following these steps and validating the affected tools/backends, you can
+open a PR.
 
 Also, it is important to check that the examples and main ggml backends (CUDA, METAL, CPU) are working with the new architecture, especially:
 - [cli](/tools/cli/)
@@ -91,28 +98,50 @@ Depending on the model configuration, tokenizer, code and tensors layout, you wi
 
 NOTE: Tensor names must end with `.weight` or `.bias` suffixes, that is the convention and several tools like `quantize` expect this to proceed the weights.
 
-### 2. Define the model architecture in `llama.cpp`
+### 2. Define the model architecture and runtime metadata
 
-The model params and tensors layout must be defined in `llama.cpp` source files:
+The model params and tensor layout are still defined in the same core runtime
+areas used by `llama.cpp`, but in Vicuña the important integration points are:
+
 1. Define a new `llm_arch` enum value in `src/llama-arch.h`.
 2. In `src/llama-arch.cpp`:
     - Add the architecture name to the `LLM_ARCH_NAMES` map.
     - Add the list of model tensors to `llm_get_tensor_names` (you may also need to update `LLM_TENSOR_NAMES`)
 3. Add any non-standard metadata loading in the `llama_model_loader` constructor in `src/llama-model-loader.cpp`.
-4. If the model has a RoPE operation, add a case for the architecture in `llama_model_rope_type` function in `src/llama-model.cpp`.
+4. Wire any architecture-specific tensor creation or runtime switches in `src/llama-model.cpp`.
+5. If the model has a RoPE operation, add a case for the architecture in `llama_model_rope_type` in `src/llama-model.cpp`.
 
 NOTE: The dimensions in `ggml` are typically in the reverse order of the `pytorch` dimensions.
 
 ### 3. Build the GGML graph implementation
 
-This is the funniest part, you have to provide the inference graph implementation of the new model architecture in `src/llama-model.cpp`.
-Create a new struct that inherits from `llm_graph_context` and implement the graph-building logic in its constructor.
-Have a look at existing implementations like `llm_build_llama`, `llm_build_dbrx` or `llm_build_bert`.
-Then, in the `llama_model::build_graph` method, add a case for your architecture to instantiate your new graph-building struct.
+This is still the core implementation step, but in Vicuña the graph builders
+live under `src/models/`.
+
+1. Add a new model-specific graph builder declaration to `src/models/models.h`.
+2. Implement the graph builder in a new `src/models/<model>.cpp` file.
+3. Add the new source file to `src/CMakeLists.txt` so it is compiled.
+4. In `llama_model::build_graph` in `src/llama-model.cpp`, add a case for your architecture to instantiate the new graph-building struct.
+
+Have a look at existing implementations like `src/models/llama.cpp`,
+`src/models/dbrx.cpp`, or `src/models/bert.cpp`.
 
 Some `ggml` backends do not support all operations. Backend implementations can be added in a separate PR.
 
 Note: to debug the inference graph: you can use [llama-eval-callback](/examples/eval-callback/).
+
+## Validation before opening a PR
+
+At minimum, confirm the new architecture works in the tools and backends that
+exercise the path you changed. The usual checklist is:
+
+- `tools/cli`
+- `tools/completion`
+- `tools/imatrix`
+- `tools/quantize`
+- `tools/server`
+- CPU plus any backend you expect to support immediately, especially CUDA and
+  METAL when relevant
 
 ## GGUF specification
 
