@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
+exec node "$REPO_ROOT/tools/openclaw-harness/dist/tavily-search.js" \
+  --secrets-path="$REPO_ROOT/.cache/vicuna/openclaw-tool-secrets.json" \
+  "$@"

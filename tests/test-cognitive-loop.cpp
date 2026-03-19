@@ -932,7 +932,8 @@ int main(int argc, char ** argv) {
             !runner.waiting_on_tool ||
             runner.pending_command_id != command.command_id ||
             runner.functional_microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP ||
-            !expect_functional_family_state("active-act-functional", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, true, LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, 0.10f)) {
+            !expect_functional_family_state("active-act-functional", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, true, LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, 0.10f) ||
+            !expect_functional_family_state("active-act-planner-functional", ctx, LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION, true, LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, 0.10f)) {
             std::fprintf(stderr, "active act runner did not retain waiting tool command\n");
             llama_free(ctx);
             llama_model_free(model);
@@ -940,6 +941,18 @@ int main(int argc, char ** argv) {
         }
         llama_bash_tool_request request = {};
         if (!expect_bash_request("active-act-request", ctx, command, "find build .", &request)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        uint64_t active_act_process_hash = 0;
+        if (!expect_process_trace(
+                    "active-act-process-trace",
+                    ctx,
+                    LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION,
+                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP,
+                    LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                    &active_act_process_hash)) {
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -1029,6 +1042,252 @@ int main(int argc, char ** argv) {
             return 1;
         }
         if (!expect_functional_family_state("active-tool-followup-functional-cleared", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, false)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(ctx);
+    }
+
+    {
+        g_contradiction_score = 0.10f;
+        g_uncertainty_score = 0.10f;
+        g_broadcast_score = 0.05f;
+
+        llama_context * ctx = create_context(model);
+        if (!ctx) {
+            std::fprintf(stderr, "failed to create active tool-dispatch ablation context\n");
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> goal_tokens = tokenize_or_die(vocab, "Inspect the repository and run the appropriate tools.");
+        if (llama_self_state_upsert_goal(ctx, 4, goal_tokens.data(), goal_tokens.size(), 1.0f) != 0 ||
+            llama_self_state_upsert_tool_job(ctx, 9, LLAMA_SELF_TOOL_JOB_PENDING, 1.0f) != 0) {
+            std::fprintf(stderr, "failed to seed active tool-dispatch ablation state\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> tokens = tokenize_or_die(vocab, "Please search the repository and inspect the build logs.");
+        const llama_self_state_event event = {
+            /*.tokens =*/ tokens.data(),
+            /*.n_tokens =*/ tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.1f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+
+        llama_active_loop_trace trace = {};
+        if (!expect_active_action("active-act-dispatch-ablation", ctx, event, LLAMA_ACTIVE_LOOP_ACTION_ACT, &trace)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_command command = {};
+        llama_cognitive_active_runner_status runner = {};
+        if (!expect_single_command("active-act-dispatch-command", ctx, LLAMA_COG_COMMAND_ORIGIN_ACTIVE, LLAMA_COG_COMMAND_INVOKE_TOOL, &command) ||
+            llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
+            !runner.active ||
+            !runner.waiting_on_tool ||
+            runner.pending_command_id != command.command_id ||
+            !expect_functional_family_state("active-act-dispatch-functional", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, true, LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, 0.10f) ||
+            !expect_functional_family_state("active-act-dispatch-planner-functional", ctx, LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION, true, LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, 0.10f)) {
+            std::fprintf(stderr, "active tool-dispatch ablation setup was not active before command completion\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        if (llama_cognitive_command_complete(ctx, command.command_id, false) != 0) {
+            std::fprintf(stderr, "failed to complete active tool dispatch command\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_process_functional_signature preserved_signature = {};
+        if (llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
+            !runner.active ||
+            !runner.waiting_on_tool ||
+            runner.pending_command_id != -1 ||
+            runner.functional_microphase != LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE ||
+            !expect_functional_family_state("active-act-functional-ablated", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, false) ||
+            !expect_functional_family_state("active-act-planner-functional-preserved", ctx, LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION, true, LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE, 0.10f) ||
+            llama_process_functional_get_current_signature(ctx, &preserved_signature) != 0 ||
+            !preserved_signature.valid ||
+            preserved_signature.family != LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION ||
+            preserved_signature.microphase != LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE) {
+            std::fprintf(stderr, "active tool dispatch did not preserve planner LoRA state while ablating the tool layer\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(ctx);
+    }
+
+    {
+        g_contradiction_score = 0.10f;
+        g_uncertainty_score = 0.10f;
+        g_broadcast_score = 0.05f;
+
+        llama_context * ctx = create_context(model);
+        if (!ctx) {
+            std::fprintf(stderr, "failed to create Tavily tool context\n");
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_tool_spec tavily_spec = {};
+        tavily_spec.tool_kind = LLAMA_TOOL_KIND_BASH_CLI;
+        tavily_spec.flags = LLAMA_COG_TOOL_ACTIVE_ELIGIBLE | LLAMA_COG_TOOL_DMN_ELIGIBLE;
+        tavily_spec.latency_class = LLAMA_COG_TOOL_LATENCY_MEDIUM;
+        tavily_spec.max_steps_reserved = 2;
+        std::snprintf(tavily_spec.name, sizeof(tavily_spec.name), "%s", "web_search");
+        std::snprintf(tavily_spec.description, sizeof(tavily_spec.description), "%s", "Search the live web through Tavily");
+        std::snprintf(tavily_spec.capability_id, sizeof(tavily_spec.capability_id), "%s", "openclaw.tavily.web_search");
+        std::snprintf(tavily_spec.owner_plugin_id, sizeof(tavily_spec.owner_plugin_id), "%s", "openclaw-tavily");
+        std::snprintf(tavily_spec.provenance_namespace, sizeof(tavily_spec.provenance_namespace), "%s", "openclaw/openclaw-tavily/tool/web_search");
+        if (llama_cognitive_tool_spec_set(ctx, &tavily_spec, 1) != 0) {
+            std::fprintf(stderr, "failed to install Tavily cognitive tool spec\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> goal_tokens = tokenize_or_die(vocab, "Search the live web when fresh external context is needed.");
+        if (llama_self_state_upsert_goal(ctx, 2, goal_tokens.data(), goal_tokens.size(), 1.0f) != 0 ||
+            llama_self_state_upsert_tool_job(ctx, 8, LLAMA_SELF_TOOL_JOB_PENDING, 1.0f) != 0) {
+            std::fprintf(stderr, "failed to seed Tavily tool state\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> tokens = tokenize_or_die(vocab, "Please search the live web for the latest Tavily API search docs.");
+        const llama_self_state_event event = {
+            /*.tokens =*/ tokens.data(),
+            /*.n_tokens =*/ tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.1f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+
+        llama_active_loop_trace trace = {};
+        if (!expect_active_action("active-tavily-act", ctx, event, LLAMA_ACTIVE_LOOP_ACTION_ACT, &trace)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (!trace.tool_proposal.valid ||
+            trace.tool_proposal.tool_kind != LLAMA_TOOL_KIND_BASH_CLI) {
+            std::fprintf(stderr, "Tavily trace did not expose a bash tool proposal\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_command command = {};
+        if (!expect_single_command("active-tavily-command", ctx, LLAMA_COG_COMMAND_ORIGIN_ACTIVE, LLAMA_COG_COMMAND_INVOKE_TOOL, &command)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_bash_tool_request request = {};
+        if (!expect_bash_request("active-tavily-request", ctx, command, "tavily-web-search --query-url=", &request) ||
+            std::strstr(request.command_text, "find . -maxdepth 3") != nullptr ||
+            std::strstr(request.command_text, "latest%20Tavily%20API%20search%20docs.") == nullptr) {
+            std::fprintf(stderr, "Tavily bash request was not synthesized correctly: %s\n", request.command_text);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(ctx);
+    }
+
+    {
+        g_contradiction_score = 0.05f;
+        g_uncertainty_score = 0.05f;
+        g_broadcast_score = 0.05f;
+
+        llama_context * ctx = create_context(model);
+        if (!ctx) {
+            std::fprintf(stderr, "failed to create Tavily current-info context\n");
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_tool_spec tavily_spec = {};
+        tavily_spec.tool_kind = LLAMA_TOOL_KIND_BASH_CLI;
+        tavily_spec.flags = LLAMA_COG_TOOL_ACTIVE_ELIGIBLE | LLAMA_COG_TOOL_DMN_ELIGIBLE;
+        tavily_spec.latency_class = LLAMA_COG_TOOL_LATENCY_MEDIUM;
+        tavily_spec.max_steps_reserved = 2;
+        std::snprintf(tavily_spec.name, sizeof(tavily_spec.name), "%s", "web_search");
+        std::snprintf(tavily_spec.description, sizeof(tavily_spec.description), "%s", "Search the live web through Tavily");
+        std::snprintf(tavily_spec.capability_id, sizeof(tavily_spec.capability_id), "%s", "openclaw.tavily.web_search");
+        std::snprintf(tavily_spec.owner_plugin_id, sizeof(tavily_spec.owner_plugin_id), "%s", "openclaw-tavily");
+        std::snprintf(tavily_spec.provenance_namespace, sizeof(tavily_spec.provenance_namespace), "%s", "openclaw/openclaw-tavily/tool/web_search");
+        if (llama_cognitive_tool_spec_set(ctx, &tavily_spec, 1) != 0) {
+            std::fprintf(stderr, "failed to install Tavily current-info tool spec\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> goal_tokens = tokenize_or_die(vocab, "Use tools to gather current external information before answering.");
+        if (llama_self_state_upsert_goal(ctx, 3, goal_tokens.data(), goal_tokens.size(), 1.0f) != 0) {
+            std::fprintf(stderr, "failed to seed Tavily current-info goal\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> tokens = tokenize_or_die(vocab, "Who is the president of Albania today?");
+        const llama_self_state_event event = {
+            /*.tokens =*/ tokens.data(),
+            /*.n_tokens =*/ tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.05f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+
+        llama_active_loop_trace trace = {};
+        if (!expect_active_action("active-tavily-current-info", ctx, event, LLAMA_ACTIVE_LOOP_ACTION_ACT, &trace)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (!trace.tool_proposal.valid ||
+            trace.tool_proposal.tool_kind != LLAMA_TOOL_KIND_BASH_CLI) {
+            std::fprintf(stderr, "Tavily current-info trace did not produce a bash tool proposal\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_command command = {};
+        if (!expect_single_command("active-tavily-current-info-command", ctx, LLAMA_COG_COMMAND_ORIGIN_ACTIVE, LLAMA_COG_COMMAND_INVOKE_TOOL, &command)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_bash_tool_request request = {};
+        if (!expect_bash_request("active-tavily-current-info-request", ctx, command, "tavily-web-search --query-url=", &request) ||
+            std::strstr(request.command_text, "president%20of%20Albania%20today") == nullptr) {
+            std::fprintf(stderr, "Tavily current-info request was not synthesized correctly: %s\n", request.command_text);
             llama_free(ctx);
             llama_model_free(model);
             return 1;

@@ -4,6 +4,8 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
 
 namespace {
@@ -61,6 +63,12 @@ void set_bounded(char * dst, size_t dst_size, const std::string & src) {
     dst[copy_len] = '\0';
 }
 
+void set_error(std::string * out_error, const std::string & value) {
+    if (out_error) {
+        *out_error = value;
+    }
+}
+
 server_openclaw_capability_runtime make_runtime(
         const openclaw_tool_capability_descriptor & descriptor,
         server_openclaw_dispatch_backend backend) {
@@ -79,10 +87,24 @@ server_openclaw_capability_runtime make_runtime(
     return runtime;
 }
 
-void set_error(std::string * out_error, const std::string & value) {
-    if (out_error) {
-        *out_error = value;
+bool dispatch_backend_from_string(
+        const std::string & value,
+        server_openclaw_dispatch_backend * out_backend,
+        std::string * out_error) {
+    if (value == "legacy_bash") {
+        if (out_backend) {
+            *out_backend = SERVER_OPENCLAW_DISPATCH_LEGACY_BASH;
+        }
+        return true;
     }
+    if (value == "legacy_hard_memory") {
+        if (out_backend) {
+            *out_backend = SERVER_OPENCLAW_DISPATCH_LEGACY_HARD_MEMORY;
+        }
+        return true;
+    }
+    set_error(out_error, "unsupported dispatch_backend: " + value);
+    return false;
 }
 
 bool exec_available(bool bash_enabled, bool /*hard_memory_enabled*/) {
@@ -172,43 +194,75 @@ bool server_openclaw_fabric::configure(bool bash_enabled, bool hard_memory_enabl
     configured_enabled = env_flag_enabled("VICUNA_OPENCLAW_TOOL_FABRIC_ENABLED", false);
     catalog_state = {};
     capability_state.clear();
+    external_catalog_path.clear();
+    catalog_source_signature.clear();
 
     if (!configured_enabled) {
         return true;
     }
 
-    size_t registration_count = 0;
-    const builtin_capability_registration * registrations =
-            builtin_capability_registrations(&registration_count);
-    for (size_t i = 0; i < registration_count; ++i) {
-        const auto & registration = registrations[i];
-        if (!env_list_contains("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS", registration.tool_id, true)) {
-            continue;
-        }
-        if (!registration.is_available(bash_enabled, hard_memory_enabled)) {
-            continue;
-        }
-        capability_state.push_back(make_runtime(
-                registration.build_descriptor(),
-                registration.backend));
+    const char * catalog_path_env = std::getenv("VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH");
+    if (catalog_path_env && catalog_path_env[0] != '\0') {
+        external_catalog_path = catalog_path_env;
     }
 
-    catalog_state.catalog_version = 1;
-    for (const auto & capability : capability_state) {
-        catalog_state.capabilities.push_back(capability.descriptor);
-    }
-
-    std::string validation_error;
-    if (!openclaw_tool_capability_catalog_validate(catalog_state, &validation_error)) {
+    openclaw_tool_capability_catalog next_catalog = {};
+    std::vector<server_openclaw_capability_runtime> next_capabilities;
+    if (!rebuild_catalog(
+                bash_enabled,
+                hard_memory_enabled,
+                &next_catalog,
+                &next_capabilities,
+                out_error)) {
         configured_enabled = false;
-        set_error(out_error, validation_error);
         return false;
     }
 
-    if (capability_state.empty()) {
+    if (next_capabilities.empty()) {
         configured_enabled = false;
         set_error(out_error, "OpenClaw tool fabric enabled without any routable capabilities");
         return false;
+    }
+    catalog_state = std::move(next_catalog);
+    capability_state = std::move(next_capabilities);
+    catalog_source_signature = current_external_catalog_signature();
+    return true;
+}
+
+bool server_openclaw_fabric::maybe_reload(
+        bool bash_enabled,
+        bool hard_memory_enabled,
+        bool * out_reloaded,
+        std::string * out_error) {
+    if (out_reloaded) {
+        *out_reloaded = false;
+    }
+    if (!configured_enabled || external_catalog_path.empty()) {
+        return true;
+    }
+
+    const std::string next_signature = current_external_catalog_signature();
+    if (next_signature == catalog_source_signature) {
+        return true;
+    }
+
+    openclaw_tool_capability_catalog next_catalog = {};
+    std::vector<server_openclaw_capability_runtime> next_capabilities;
+    if (!rebuild_catalog(
+                bash_enabled,
+                hard_memory_enabled,
+                &next_catalog,
+                &next_capabilities,
+                out_error)) {
+        catalog_source_signature = next_signature;
+        return false;
+    }
+
+    catalog_state = std::move(next_catalog);
+    capability_state = std::move(next_capabilities);
+    catalog_source_signature = next_signature;
+    if (out_reloaded) {
+        *out_reloaded = true;
     }
     return true;
 }
@@ -235,6 +289,176 @@ bool server_openclaw_fabric::build_cognitive_specs(std::vector<llama_cognitive_t
         out_specs->push_back(capability.tool_spec);
     }
     return true;
+}
+
+bool server_openclaw_fabric::build_chat_tools(
+        std::vector<common_chat_tool> * out_tools,
+        const std::vector<int32_t> * spec_indexes) const {
+    if (!out_tools) {
+        return false;
+    }
+    out_tools->clear();
+
+    auto append_tool = [&](const server_openclaw_capability_runtime & capability) {
+        common_chat_tool tool;
+        tool.name = capability.descriptor.tool_name;
+        tool.description = capability.descriptor.description;
+        tool.parameters = capability.descriptor.input_schema_json;
+        out_tools->push_back(std::move(tool));
+    };
+
+    if (!spec_indexes || spec_indexes->empty()) {
+        out_tools->reserve(capability_state.size());
+        for (const auto & capability : capability_state) {
+            append_tool(capability);
+        }
+        return true;
+    }
+
+    out_tools->reserve(spec_indexes->size());
+    for (int32_t spec_index : *spec_indexes) {
+        const server_openclaw_capability_runtime * capability = capability_by_spec_index(spec_index);
+        if (!capability) {
+            continue;
+        }
+        append_tool(*capability);
+    }
+    return true;
+}
+
+const server_openclaw_capability_runtime * server_openclaw_fabric::capability_by_spec_index(int32_t spec_index) const {
+    if (spec_index < 0 || spec_index >= (int32_t) capability_state.size()) {
+        return nullptr;
+    }
+    return &capability_state[(size_t) spec_index];
+}
+
+const server_openclaw_capability_runtime * server_openclaw_fabric::capability_by_tool_name(const std::string & tool_name) const {
+    if (tool_name.empty()) {
+        return nullptr;
+    }
+    for (const auto & capability : capability_state) {
+        if (capability.descriptor.tool_name == tool_name) {
+            return &capability;
+        }
+    }
+    return nullptr;
+}
+
+bool server_openclaw_fabric::rebuild_catalog(
+        bool bash_enabled,
+        bool hard_memory_enabled,
+        openclaw_tool_capability_catalog * out_catalog,
+        std::vector<server_openclaw_capability_runtime> * out_capabilities,
+        std::string * out_error) const {
+    if (!out_catalog || !out_capabilities) {
+        set_error(out_error, "catalog rebuild requires output storage");
+        return false;
+    }
+
+    out_catalog->catalog_version = 1;
+    out_catalog->capabilities.clear();
+    out_capabilities->clear();
+
+    size_t registration_count = 0;
+    const builtin_capability_registration * registrations =
+            builtin_capability_registrations(&registration_count);
+    for (size_t i = 0; i < registration_count; ++i) {
+        const auto & registration = registrations[i];
+        if (!env_list_contains("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS", registration.tool_id, true)) {
+            continue;
+        }
+        if (!registration.is_available(bash_enabled, hard_memory_enabled)) {
+            continue;
+        }
+        out_capabilities->push_back(make_runtime(
+                registration.build_descriptor(),
+                registration.backend));
+    }
+
+    if (!external_catalog_path.empty() &&
+            std::filesystem::exists(external_catalog_path)) {
+        if (!load_external_catalog(
+                    external_catalog_path,
+                    bash_enabled,
+                    hard_memory_enabled,
+                    out_capabilities,
+                    out_error)) {
+            return false;
+        }
+    }
+
+    for (const auto & capability : *out_capabilities) {
+        out_catalog->capabilities.push_back(capability.descriptor);
+    }
+
+    std::string validation_error;
+    if (!openclaw_tool_capability_catalog_validate(*out_catalog, &validation_error)) {
+        set_error(out_error, validation_error);
+        return false;
+    }
+    return true;
+}
+
+bool server_openclaw_fabric::load_external_catalog(
+        const std::string & path,
+        bool bash_enabled,
+        bool hard_memory_enabled,
+        std::vector<server_openclaw_capability_runtime> * out_capabilities,
+        std::string * out_error) const {
+    if (!out_capabilities) {
+        set_error(out_error, "external catalog load requires capability storage");
+        return false;
+    }
+
+    try {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("failed to open external catalog");
+        }
+        nlohmann::json data;
+        in >> data;
+
+        openclaw_tool_capability_catalog external_catalog = {};
+        std::string parse_error;
+        if (!openclaw_tool_capability_catalog_from_json(data, &external_catalog, &parse_error)) {
+            set_error(out_error, parse_error);
+            return false;
+        }
+
+        for (const auto & descriptor : external_catalog.capabilities) {
+            server_openclaw_dispatch_backend backend = SERVER_OPENCLAW_DISPATCH_NONE;
+            std::string backend_error;
+            if (!dispatch_backend_from_string(descriptor.dispatch_backend, &backend, &backend_error)) {
+                set_error(out_error, backend_error);
+                return false;
+            }
+            if (backend == SERVER_OPENCLAW_DISPATCH_LEGACY_BASH && !bash_enabled) {
+                continue;
+            }
+            if (backend == SERVER_OPENCLAW_DISPATCH_LEGACY_HARD_MEMORY && !hard_memory_enabled) {
+                continue;
+            }
+            out_capabilities->push_back(make_runtime(descriptor, backend));
+        }
+    } catch (const std::exception & err) {
+        set_error(out_error, err.what());
+        return false;
+    }
+
+    return true;
+}
+
+std::string server_openclaw_fabric::current_external_catalog_signature() const {
+    if (external_catalog_path.empty()) {
+        return "builtin-only";
+    }
+    if (!std::filesystem::exists(external_catalog_path)) {
+        return external_catalog_path + "|missing";
+    }
+    const auto write_time = std::filesystem::last_write_time(external_catalog_path);
+    const auto ticks = write_time.time_since_epoch().count();
+    return external_catalog_path + "|" + std::to_string((long long) ticks);
 }
 
 const server_openclaw_capability_runtime * server_openclaw_fabric::resolve_command(

@@ -144,11 +144,20 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;
+    llama_tokens active_loop_tokens;
     int32_t foreground_role = LLAMA_SELF_STATE_EVENT_USER;
     uint32_t foreground_flags = 0;
     llama_active_loop_trace active_trace = {};
     bool has_active_trace = false;
     bool skip_active_loop_preflight = false;
+    bool react_enabled = false;
+    bool react_transcript_seeded = false;
+    bool react_waiting_for_final_answer = false;
+    int32_t react_iteration = 0;
+    size_t react_initial_message_count = 0;
+    std::string react_visible_prefix;
+    std::vector<common_chat_msg> react_messages;
+    std::vector<common_chat_tool> react_tools;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -236,8 +245,17 @@ struct server_task {
         copy.params    = params;
         copy.type      = type;
         copy.tokens    = tokens.clone();
+        copy.active_loop_tokens = active_loop_tokens;
         copy.foreground_role = foreground_role;
         copy.foreground_flags = foreground_flags;
+        copy.react_enabled = react_enabled;
+        copy.react_transcript_seeded = react_transcript_seeded;
+        copy.react_waiting_for_final_answer = react_waiting_for_final_answer;
+        copy.react_iteration = react_iteration;
+        copy.react_initial_message_count = react_initial_message_count;
+        copy.react_visible_prefix = react_visible_prefix;
+        copy.react_messages = react_messages;
+        copy.react_tools = react_tools;
         copy.id_slot   = -1; // child tasks cannot specify slot
 
         // use different sampling seed for each child

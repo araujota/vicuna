@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+
+if [[ -f "$REPO_ROOT/.envrc" ]]; then
+    # shellcheck disable=SC1091
+    source "$REPO_ROOT/.envrc"
+fi
+
+export PATH="/usr/local/cuda-12.8/bin:$PATH"
+export CUDACXX="${CUDACXX:-/usr/local/cuda-12.8/bin/nvcc}"
+export LD_LIBRARY_PATH="/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-}"
+
+export VICUNA_RUNTIME_STATE_PATH="${VICUNA_RUNTIME_STATE_PATH:-$REPO_ROOT/.cache/vicuna/runtime-state.json}"
+export VICUNA_RUNTIME_STATE_BACKUP_DIR="${VICUNA_RUNTIME_STATE_BACKUP_DIR:-$REPO_ROOT/.cache/vicuna/runtime-state-backups}"
+export VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH="${VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH:-$REPO_ROOT/.cache/vicuna/openclaw-catalog.json}"
+
+export VICUNA_BASH_TOOL_ENABLED="${VICUNA_BASH_TOOL_ENABLED:-1}"
+export VICUNA_BASH_TOOL_PATH="${VICUNA_BASH_TOOL_PATH:-$(command -v bash)}"
+export VICUNA_BASH_TOOL_WORKDIR="${VICUNA_BASH_TOOL_WORKDIR:-$REPO_ROOT}"
+export VICUNA_BASH_TOOL_TIMEOUT_MS="${VICUNA_BASH_TOOL_TIMEOUT_MS:-15000}"
+export VICUNA_BASH_TOOL_MAX_STDOUT_BYTES="${VICUNA_BASH_TOOL_MAX_STDOUT_BYTES:-16384}"
+export VICUNA_BASH_TOOL_MAX_STDERR_BYTES="${VICUNA_BASH_TOOL_MAX_STDERR_BYTES:-8192}"
+export VICUNA_BASH_TOOL_LOGIN_SHELL="${VICUNA_BASH_TOOL_LOGIN_SHELL:-1}"
+export VICUNA_BASH_TOOL_INHERIT_ENV="${VICUNA_BASH_TOOL_INHERIT_ENV:-1}"
+export VICUNA_BASH_TOOL_ALLOWED_COMMANDS="${VICUNA_BASH_TOOL_ALLOWED_COMMANDS:-pwd,ls,find,rg,cat,head,tail,grep,git,tavily-web-search,tools/openclaw-harness/bin/tavily-web-search}"

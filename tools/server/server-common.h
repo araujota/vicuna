@@ -15,6 +15,8 @@
 
 using json = nlohmann::ordered_json;
 
+struct server_chat_params;
+
 #define SLT_INF(slot, fmt, ...) LOG_INF("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
 #define SLT_CNT(slot, fmt, ...) LOG_CNT(""                                 fmt,                                                                __VA_ARGS__)
 #define SLT_WRN(slot, fmt, ...) LOG_WRN("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
@@ -85,6 +87,13 @@ struct server_grammar_trigger {
 json format_error_response(const std::string & message, const enum error_type type);
 
 int32_t classify_foreground_role(const json & body);
+std::string extract_foreground_message_text(const json & body);
+common_chat_params build_chat_completion_params(
+        const server_chat_params & opt,
+        const std::vector<common_chat_msg> & messages,
+        const std::vector<common_chat_tool> & tools = {},
+        common_chat_tool_choice tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE,
+        bool add_generation_prompt = true);
 
 //
 // random string / id

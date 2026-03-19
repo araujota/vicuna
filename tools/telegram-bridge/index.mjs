@@ -24,6 +24,7 @@ const env = {
   statePath: process.env.TELEGRAM_BRIDGE_STATE_PATH ?? '/tmp/vicuna-telegram-bridge-state.json',
   pollTimeoutSeconds: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS, 30)),
   maxHistoryMessages: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES, 12)),
+  maxTokens: Math.max(32, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_TOKENS, 200)),
   selfEmitAfter: Math.max(0, parseInteger(process.env.TELEGRAM_BRIDGE_SELF_EMIT_AFTER, 0)),
   vicunaApiKey: process.env.VICUNA_API_KEY ?? '',
 };
@@ -49,6 +50,16 @@ function log(message, extra = undefined) {
     return;
   }
   console.log(`${prefix} ${message}`, extra);
+}
+
+function transcriptSummary(chatId) {
+  const transcript = getChatTranscript(state, chatId);
+  return {
+    chatId: String(chatId),
+    messageCount: transcript.length,
+    roles: transcript.map((entry) => entry.role).join(','),
+    lastPreview: transcript.length > 0 ? transcript[transcript.length - 1].content.slice(0, 120) : '',
+  };
 }
 
 function vicunaHeaders() {
@@ -107,12 +118,19 @@ async function broadcastToChats(text) {
 }
 
 async function callVicunaForTelegramMessage(chatId) {
+  const transcript = getChatTranscript(state, chatId);
+  log('forwarding Telegram transcript to Vicuna', {
+    chatId: String(chatId),
+    messageCount: transcript.length,
+    roles: transcript.map((entry) => entry.role),
+    maxTokens: env.maxTokens,
+  });
   const messages = [
     {
       role: 'system',
-      content: 'You are replying to a Telegram user through middleware. Keep responses clear and concise unless the user asks for depth. Maintain continuity across the provided transcript and, when the runtime makes it available, use the bash tool for direct command-execution requests instead of pretending a command ran.',
+      content: 'You are replying to a Telegram user through middleware. Keep responses clear and concise unless the user asks for depth. Maintain continuity across the provided transcript. When the user explicitly asks to search the web or needs fresh current information, prefer the web search tool if the runtime makes it available. Use direct command-execution tools only when appropriate instead of pretending a command ran.',
     },
-    ...getChatTranscript(state, chatId),
+    ...transcript,
   ];
   const response = await fetch(`${env.vicunaBaseUrl}/v1/chat/completions`, {
     method: 'POST',
@@ -121,6 +139,7 @@ async function callVicunaForTelegramMessage(chatId) {
       model: env.model,
       temperature: 0.2,
       messages,
+      max_tokens: env.maxTokens,
     }),
   });
   const body = await response.json();
@@ -168,6 +187,7 @@ async function handleTelegramMessage(message) {
     { maxHistoryMessages: env.maxHistoryMessages },
   );
   await persistState();
+  log('appended Telegram user turn', transcriptSummary(message.chat.id));
 
   const reply = await callVicunaForTelegramMessage(message.chat.id);
 
@@ -180,6 +200,7 @@ async function handleTelegramMessage(message) {
     { maxHistoryMessages: env.maxHistoryMessages },
   );
   await persistState();
+  log('appended Telegram assistant turn', transcriptSummary(message.chat.id));
 
   await sendTelegramMessage(
     message.chat.id,
@@ -377,8 +398,13 @@ async function watchdogLoop() {
 
 async function main() {
   await ensureTelegramLongPolling();
+  await persistState();
   log(`starting bridge with state ${env.statePath}`);
   log(`vicuna base url ${env.vicunaBaseUrl}`);
+  log(`bridge transcript settings history=${env.maxHistoryMessages} max_tokens=${env.maxTokens}`, {
+    chatCount: state.chatIds.length,
+    sessionCount: Object.keys(state.chatSessions ?? {}).length,
+  });
   await Promise.all([
     pollTelegramLoop(),
     runSelfEmitStreamLoop(),

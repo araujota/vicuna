@@ -93,6 +93,20 @@ static self_state_token_view make_self_state_token_view(const server_tokens & to
     return view;
 }
 
+static self_state_token_view make_self_state_token_view(
+        const server_tokens & tokens,
+        const llama_tokens * foreground_tokens) {
+    if (foreground_tokens && !foreground_tokens->empty()) {
+        self_state_token_view view;
+        view.owned_tokens = *foreground_tokens;
+        view.data = view.owned_tokens.data();
+        view.size = view.owned_tokens.size();
+        return view;
+    }
+
+    return make_self_state_token_view(tokens);
+}
+
 static bool admit_runtime_emit_tokens(
         llama_context * ctx,
         const llama_token * tokens,
@@ -203,8 +217,8 @@ struct server_slot {
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
-    std::unique_ptr<const server_task> task;
-    std::unique_ptr<const server_task> task_prev; // used for debugging
+    std::unique_ptr<server_task> task;
+    std::unique_ptr<server_task> task_prev; // used for debugging
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
@@ -1128,6 +1142,83 @@ static json hard_memory_result_to_json(const llama_cognitive_hard_memory_result 
     };
 }
 
+static std::string trim_ascii_copy(const std::string & value) {
+    size_t begin = 0;
+    while (begin < value.size() && std::isspace((unsigned char) value[begin])) {
+        ++begin;
+    }
+    size_t end = value.size();
+    while (end > begin && std::isspace((unsigned char) value[end - 1])) {
+        --end;
+    }
+    return value.substr(begin, end - begin);
+}
+
+static std::string percent_encode_query(const std::string & text) {
+    static const char hex[] = "0123456789ABCDEF";
+    std::string encoded;
+    encoded.reserve(text.size() * 3);
+    for (unsigned char ch : text) {
+        if ((ch >= 'A' && ch <= 'Z') ||
+                (ch >= 'a' && ch <= 'z') ||
+                (ch >= '0' && ch <= '9') ||
+                ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+            encoded.push_back((char) ch);
+        } else {
+            encoded.push_back('%');
+            encoded.push_back(hex[(ch >> 4) & 0x0F]);
+            encoded.push_back(hex[ch & 0x0F]);
+        }
+    }
+    return encoded;
+}
+
+static std::string format_react_bash_observation(const llama_bash_tool_result & result) {
+    std::ostringstream oss;
+    oss << "status=";
+    if (result.launch_failed) {
+        oss << "launch_failed";
+    } else if (result.timed_out) {
+        oss << "timed_out";
+    } else if (result.exit_code == 0) {
+        oss << "ok";
+    } else {
+        oss << "error";
+    }
+    oss << "\nexit_code=" << result.exit_code;
+    if (result.runtime_ms > 0) {
+        oss << "\nruntime_ms=" << result.runtime_ms;
+    }
+    const std::string stdout_text = trim_ascii_copy(result.stdout_text);
+    const std::string stderr_text = trim_ascii_copy(result.stderr_text);
+    const std::string error_text = trim_ascii_copy(result.error_text);
+    if (!stdout_text.empty()) {
+        oss << "\nstdout:\n" << stdout_text;
+    }
+    if (!stderr_text.empty()) {
+        oss << "\nstderr:\n" << stderr_text;
+    }
+    if (!error_text.empty()) {
+        oss << "\nerror:\n" << error_text;
+    }
+    return oss.str();
+}
+
+static std::string format_react_hard_memory_observation(const llama_cognitive_hard_memory_result & result) {
+    json payload = {
+        {"ok", result.result.ok},
+        {"status_code", result.result.status_code},
+        {"result_count", result.result.result_count},
+        {"mean_similarity", result.result.retrieval_summary.mean_similarity},
+        {"gain_support", result.result.retrieval_summary.gain_support},
+        {"allostatic_support", result.result.retrieval_summary.allostatic_support},
+    };
+    if (result.result.error[0] != '\0') {
+        payload["error"] = result.result.error;
+    }
+    return safe_json_to_str(payload);
+}
+
 static bool parse_env_flag(const char * value, bool fallback) {
     if (!value) {
         return fallback;
@@ -1156,18 +1247,6 @@ static uint64_t parse_uint64_param(const std::string & value, uint64_t fallback 
     } catch (...) {
         return fallback;
     }
-}
-
-static std::string trim_ascii_copy(const std::string & value) {
-    size_t begin = 0;
-    size_t end = value.size();
-    while (begin < end && std::isspace((unsigned char) value[begin])) {
-        ++begin;
-    }
-    while (end > begin && std::isspace((unsigned char) value[end - 1])) {
-        --end;
-    }
-    return value.substr(begin, end - begin);
 }
 
 static std::string proactive_mailbox_message(
@@ -1734,6 +1813,8 @@ private:
     vicuna_external_observability external_observability;
     mutable vicuna_proactive_mailbox proactive_mailbox;
     bool runtime_state_dirty = false;
+    bool bash_tool_enabled = false;
+    bool hard_memory_enabled = false;
 
     static int32_t count_pending_external_work(const vicuna_external_work_queue & queue) {
         std::lock_guard<std::mutex> lock(queue.mutex);
@@ -1743,6 +1824,337 @@ private:
     bool has_waiting_active_tasks() const {
         std::lock_guard<std::mutex> lock(runtime_state_mutex);
         return !waiting_active_tasks.empty();
+    }
+
+    bool react_task_ready(const server_task & task) const {
+        return task.react_enabled && !task.react_messages.empty();
+    }
+
+    void seed_react_transcript(server_task & task) const {
+        if (task.react_transcript_seeded) {
+            return;
+        }
+
+        const std::string guidance =
+                "Active engagement runs as a stepwise ReAct loop. "
+                "When a tool is available for this step, begin with a short first-move sentence that says what you are trying to do and which tool you are using, then emit the tool call. "
+                "After a tool result arrives, continue in the same conversation until you are satisfied with the answer. "
+                "Keep planning concise and never claim a tool ran unless you emitted the tool call.";
+
+        if (!task.react_messages.empty() && task.react_messages.front().role == "system") {
+            if (!task.react_messages.front().content.empty()) {
+                task.react_messages.front().content += "\n\n";
+            }
+            task.react_messages.front().content += guidance;
+        } else {
+            common_chat_msg system_msg;
+            system_msg.role = "system";
+            system_msg.content = guidance;
+            task.react_messages.insert(task.react_messages.begin(), std::move(system_msg));
+        }
+
+        task.react_initial_message_count = task.react_messages.size();
+        task.react_transcript_seeded = true;
+    }
+
+    bool apply_chat_prompt_to_task(server_task & task, const common_chat_params & chat_completion) {
+        std::vector<server_tokens> prompts = tokenize_input_prompts(
+                vocab,
+                nullptr,
+                json(chat_completion.prompt),
+                true,
+                true);
+        if (prompts.empty()) {
+            return false;
+        }
+
+        task.tokens = std::move(prompts.front());
+        task.params.sampling.grammar = chat_completion.grammar;
+        task.params.sampling.grammar_lazy = chat_completion.grammar_lazy;
+        task.params.sampling.grammar_triggers = chat_completion.grammar_triggers;
+        task.params.sampling.preserved_tokens.clear();
+        for (const auto & preserved : chat_completion.preserved_tokens) {
+            const auto ids = common_tokenize(vocab, preserved, false, true);
+            if (ids.size() == 1) {
+                task.params.sampling.preserved_tokens.insert(ids[0]);
+            }
+        }
+
+        task.params.chat_parser_params.format = chat_completion.format;
+        task.params.chat_parser_params.parser = {};
+        if (!chat_completion.parser.empty()) {
+            task.params.chat_parser_params.parser.load(chat_completion.parser);
+        }
+        task.params.chat_parser_params.thinking_forced_open = chat_completion.thinking_forced_open;
+        task.params.chat_parser_params.parse_tool_calls = !task.react_tools.empty();
+        return true;
+    }
+
+    bool prepare_react_prompt(server_task & task) {
+        if (!react_task_ready(task)) {
+            return false;
+        }
+
+        seed_react_transcript(task);
+
+        const bool tool_phase =
+                task.has_active_trace &&
+                task.active_trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT;
+
+        task.react_tools.clear();
+        if (tool_phase && !openclaw_fabric.build_chat_tools(&task.react_tools, nullptr)) {
+            return false;
+        }
+
+        std::vector<common_chat_msg> prompt_messages = task.react_messages;
+        common_chat_msg phase_system;
+        phase_system.role = "system";
+        phase_system.content = tool_phase ?
+                "A tool is available for this step. Start with a short first-move sentence naming the tool you will use, then emit the tool call with arguments." :
+                "This is the answer phase. Use the tool observations already in the conversation and answer the user directly. Do not emit tool calls or tool-call markup.";
+        prompt_messages.push_back(std::move(phase_system));
+
+        const common_chat_params chat_completion = build_chat_completion_params(
+                chat_params,
+                prompt_messages,
+                task.react_tools,
+                tool_phase ? COMMON_CHAT_TOOL_CHOICE_AUTO : COMMON_CHAT_TOOL_CHOICE_NONE,
+                true);
+        task.react_iteration += 1;
+        task.react_waiting_for_final_answer = !tool_phase;
+        return apply_chat_prompt_to_task(task, chat_completion);
+    }
+
+    bool parse_generated_chat_message(const server_task & task, const std::string & text, common_chat_msg * out_msg) const {
+        if (!out_msg) {
+            return false;
+        }
+        task_result_state state(task.params.chat_parser_params);
+        std::vector<common_chat_msg_diff> diffs;
+        *out_msg = state.update_chat_msg(text, false, diffs);
+        if (out_msg->tool_calls.empty() && !task.react_tools.empty()) {
+            const std::string trimmed = trim_ascii_copy(text);
+            const auto parse_fallback_call = [&](const std::string & candidate, std::string * out_prefix) -> bool {
+                for (const auto & tool : task.react_tools) {
+                    const std::string prefix = tool.name + "(";
+                    if (!string_starts_with(candidate, prefix) || candidate.size() <= prefix.size() + 1 || candidate.back() != ')') {
+                        continue;
+                    }
+                    const std::string arguments = trim_ascii_copy(candidate.substr(prefix.size(), candidate.size() - prefix.size() - 1));
+                    if (arguments.empty()) {
+                        continue;
+                    }
+                    try {
+                        (void) json::parse(arguments);
+                    } catch (const std::exception &) {
+                        continue;
+                    }
+                    out_msg->role = "assistant";
+                    out_msg->content = out_prefix ? trim_ascii_copy(*out_prefix) : std::string();
+                    out_msg->tool_calls = { common_chat_tool_call { tool.name, arguments, "" } };
+                    return true;
+                }
+                return false;
+            };
+
+            std::string prefix_content;
+            if (!trimmed.empty()) {
+                const size_t last_break = trimmed.find_last_of('\n');
+                if (last_break != std::string::npos) {
+                    prefix_content = trim_ascii_copy(trimmed.substr(0, last_break));
+                    const std::string last_line = trim_ascii_copy(trimmed.substr(last_break + 1));
+                    (void) parse_fallback_call(last_line, &prefix_content);
+                } else {
+                    (void) parse_fallback_call(trimmed, nullptr);
+                }
+            }
+        }
+        return !out_msg->empty();
+    }
+
+    void append_react_visible_prefix(server_task & task, const common_chat_msg & assistant_msg) const {
+        const std::string visible = trim_ascii_copy(assistant_msg.content);
+        if (visible.empty()) {
+            return;
+        }
+        if (!task.react_visible_prefix.empty()) {
+            task.react_visible_prefix += "\n\n";
+        }
+        task.react_visible_prefix += visible;
+    }
+
+    std::string latest_react_tool_call_id(const server_task & task) const {
+        for (auto it = task.react_messages.rbegin(); it != task.react_messages.rend(); ++it) {
+            if (!it->tool_calls.empty() && !it->tool_calls.front().id.empty()) {
+                return it->tool_calls.front().id;
+            }
+        }
+        return {};
+    }
+
+    bool configure_active_tool_request_from_chat_call(
+            const common_chat_msg & assistant_msg,
+            int32_t * out_command_id,
+            std::string * out_error) {
+        if (out_command_id) {
+            *out_command_id = -1;
+        }
+
+        llama_cognitive_active_runner_status runner = {};
+        if (llama_cognitive_active_runner_get(ctx, &runner) != 0 || runner.pending_command_id <= 0) {
+            if (out_error) {
+                *out_error = "active runner does not have a pending tool command";
+            }
+            return false;
+        }
+
+        const common_chat_tool_call * tool_call =
+                assistant_msg.tool_calls.empty() ? nullptr : &assistant_msg.tool_calls.front();
+        std::string emitted_tool_name = tool_call ? trim_ascii_copy(tool_call->name) : std::string();
+        const server_openclaw_capability_runtime * capability = nullptr;
+        if (!emitted_tool_name.empty()) {
+            capability = openclaw_fabric.capability_by_tool_name(emitted_tool_name);
+            if (!capability) {
+                if (out_error) {
+                    *out_error = "planner selected an unknown tool: " + emitted_tool_name;
+                }
+                return false;
+            }
+            const int32_t selected_spec_index = (int32_t) (capability - openclaw_fabric.capabilities().data());
+            if (llama_cognitive_command_rebind_tool(ctx, runner.pending_command_id, selected_spec_index) != 0) {
+                if (out_error) {
+                    *out_error = "failed to rebind pending tool command to planner-selected tool";
+                }
+                return false;
+            }
+        } else {
+            capability = openclaw_fabric.capability_by_spec_index(runner.pending_tool_spec_index);
+        }
+        if (!capability) {
+            if (out_error) {
+                *out_error = "pending tool capability could not be resolved";
+            }
+            return false;
+        }
+
+        json arguments = json::object();
+        if (tool_call && !tool_call->arguments.empty()) {
+            try {
+                arguments = json::parse(tool_call->arguments);
+            } catch (const std::exception &) {
+                arguments = json::object();
+            }
+        }
+
+        if (capability->backend == SERVER_OPENCLAW_DISPATCH_LEGACY_BASH) {
+            llama_bash_tool_request request = {};
+            if (llama_cognitive_bash_tool_get_request(ctx, runner.pending_command_id, &request) != 0) {
+                if (out_error) {
+                    *out_error = "pending bash tool request is missing";
+                }
+                return false;
+            }
+
+            std::string command_text = request.command_text;
+            if (capability->descriptor.capability_id == "openclaw.exec.command") {
+                command_text = trim_ascii_copy(json_value(arguments, "command", std::string()));
+                const std::string workdir = trim_ascii_copy(json_value(arguments, "workdir", std::string()));
+                if (!workdir.empty()) {
+                    std::snprintf(request.working_directory, sizeof(request.working_directory), "%s", workdir.c_str());
+                }
+            } else if (capability->descriptor.capability_id == "openclaw.tavily.web_search") {
+                std::string query = trim_ascii_copy(json_value(arguments, "query", std::string()));
+                if (query.empty()) {
+                    query = trim_ascii_copy(request.intent_text);
+                }
+                command_text = "tools/openclaw-harness/bin/tavily-web-search --query-url=" + percent_encode_query(query);
+                request.login_shell = false;
+                std::snprintf(request.allowed_commands, sizeof(request.allowed_commands), "%s", "tavily-web-search");
+                const std::string topic = trim_ascii_copy(json_value(arguments, "topic", std::string()));
+                const std::string search_depth = trim_ascii_copy(json_value(arguments, "search_depth", std::string()));
+                const int32_t max_results = json_value(arguments, "max_results", 0);
+                if (!topic.empty()) {
+                    command_text += " --topic=" + topic;
+                }
+                if (!search_depth.empty()) {
+                    command_text += " --search-depth=" + search_depth;
+                }
+                if (max_results > 0) {
+                    command_text += " --max-results=" + std::to_string(max_results);
+                }
+            }
+
+            command_text = trim_ascii_copy(command_text);
+            if (command_text.empty()) {
+                if (out_error) {
+                    *out_error = "planner step did not yield a runnable bash command";
+                }
+                return false;
+            }
+
+            request.command_ready = true;
+            std::snprintf(request.command_text, sizeof(request.command_text), "%s", command_text.c_str());
+            if (!assistant_msg.content.empty()) {
+                std::snprintf(request.intent_text, sizeof(request.intent_text), "%s", assistant_msg.content.c_str());
+            }
+            if (llama_cognitive_bash_tool_set_request(ctx, &request) != 0) {
+                if (out_error) {
+                    *out_error = "failed to install updated bash tool request";
+                }
+                return false;
+            }
+        } else if (capability->backend == SERVER_OPENCLAW_DISPATCH_LEGACY_HARD_MEMORY) {
+            llama_cognitive_hard_memory_request request = {};
+            if (llama_cognitive_hard_memory_get_request(ctx, runner.pending_command_id, &request) != 0) {
+                request.command_id = runner.pending_command_id;
+                request.origin = LLAMA_COG_COMMAND_ORIGIN_ACTIVE;
+            }
+            const std::string query = trim_ascii_copy(json_value(arguments, "query", std::string()));
+            if (query.empty()) {
+                if (out_error) {
+                    *out_error = "hard-memory tool call did not include a query";
+                }
+                return false;
+            }
+            std::snprintf(request.query.query, sizeof(request.query.query), "%s", query.c_str());
+            if (llama_cognitive_hard_memory_set_request(ctx, &request) != 0) {
+                if (out_error) {
+                    *out_error = "failed to install updated hard-memory request";
+                }
+                return false;
+            }
+        } else {
+            if (out_error) {
+                *out_error = "selected capability does not have a supported dispatch backend";
+            }
+            return false;
+        }
+
+        if (out_command_id) {
+            *out_command_id = runner.pending_command_id;
+        }
+        SRV_INF("react rebound command=%d tool=\"%s\" backend=%d capability=\"%s\"\n",
+                runner.pending_command_id,
+                emitted_tool_name.empty() ? capability->descriptor.tool_name.c_str() : emitted_tool_name.c_str(),
+                (int) capability->backend,
+                capability->descriptor.capability_id.c_str());
+        return true;
+    }
+
+    void append_react_tool_result(server_task & task, const vicuna_external_work_result & result) const {
+        common_chat_msg tool_msg;
+        tool_msg.role = "tool";
+        tool_msg.tool_call_id = latest_react_tool_call_id(task);
+        for (auto it = task.react_messages.rbegin(); it != task.react_messages.rend(); ++it) {
+            if (!it->tool_calls.empty()) {
+                tool_msg.tool_name = it->tool_calls.front().name;
+                break;
+            }
+        }
+        tool_msg.content = result.kind == VICUNA_EXTERNAL_WORK_HARD_MEMORY ?
+                format_react_hard_memory_observation(result.hard_memory_result) :
+                format_react_bash_observation(result.bash_result);
+        task.react_messages.push_back(std::move(tool_msg));
     }
 
     void mark_runtime_state_dirty(const char * reason) {
@@ -2402,6 +2814,65 @@ private:
         if (hard_memory_worker.joinable()) {
             hard_memory_worker.join();
         }
+    }
+
+    void reload_openclaw_catalog_if_needed() {
+        if (!ctx || !openclaw_fabric.enabled()) {
+            return;
+        }
+
+        bool reloaded = false;
+        std::string reload_error;
+        if (!openclaw_fabric.maybe_reload(
+                    bash_tool_enabled,
+                    hard_memory_enabled,
+                    &reloaded,
+                    &reload_error)) {
+            SRV_WRN("failed to reload OpenClaw tool fabric: %s\n", reload_error.c_str());
+            return;
+        }
+        if (!reloaded) {
+            return;
+        }
+
+        std::vector<llama_cognitive_tool_spec> specs;
+        if (openclaw_fabric.build_cognitive_specs(&specs) &&
+                !specs.empty() &&
+                llama_cognitive_tool_spec_set(ctx, specs.data(), (int32_t) specs.size()) == 0) {
+            SRV_INF("OpenClaw tool fabric reloaded with %zu capabilities\n", specs.size());
+        } else {
+            SRV_WRN("%s\n", "failed to install reloaded OpenClaw tool catalog into cognitive runtime");
+        }
+    }
+
+    void log_active_preflight_summary(const server_task & task, const char * phase_label) {
+        if (!task.has_active_trace) {
+            SRV_INF("active preflight %s task=%d trace=0 role=%d flags=%u prompt_tokens=%zu foreground_tokens=%zu\n",
+                    phase_label ? phase_label : "unknown",
+                    task.id,
+                    task.foreground_role,
+                    task.foreground_flags,
+                    task.tokens.size(),
+                    task.active_loop_tokens.size());
+            return;
+        }
+
+        const llama_active_loop_trace & trace = task.active_trace;
+        SRV_INF("active preflight %s task=%d trace=1 winner=%d score=%.3f runner=%d runner_score=%.3f emit=%d tool_followup=%d tool_valid=%d tool_kind=%d spec_index=%d reason=0x%x prompt_tokens=%zu foreground_tokens=%zu\n",
+                phase_label ? phase_label : "unknown",
+                task.id,
+                trace.winner_action,
+                trace.winner_score,
+                trace.runner_up_action,
+                trace.runner_up_score,
+                trace.emit_allowed ? 1 : 0,
+                trace.tool_followup_expected ? 1 : 0,
+                trace.tool_proposal.valid ? 1 : 0,
+                trace.tool_proposal.tool_kind,
+                trace.tool_proposal.spec_index,
+                trace.reason_mask,
+                task.tokens.size(),
+                task.active_loop_tokens.size());
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -3126,10 +3597,12 @@ private:
                     std::lock_guard<std::mutex> lock(runtime_state_mutex);
                     external_observability.bash_dispatch_total++;
                     dispatched = true;
-                    SRV_INF("queued bash tool command %d origin=%d job=%d\n",
+                    SRV_INF("queued bash tool command %d origin=%d job=%d cmd=\"%s\" intent=\"%s\"\n",
                             command.command_id,
                             command.origin,
-                            request.tool_job_id);
+                            request.tool_job_id,
+                            request.command_text,
+                            request.intent_text);
                 }
             } else if (backend == SERVER_OPENCLAW_DISPATCH_LEGACY_HARD_MEMORY) {
                 llama_cognitive_hard_memory_request request = {};
@@ -3263,6 +3736,12 @@ private:
                         resumed_task.active_trace = active_trace;
                         resumed_task.has_active_trace = true;
                         resumed_task.skip_active_loop_preflight = true;
+                        if (react_task_ready(resumed_task)) {
+                            append_react_tool_result(resumed_task, result);
+                            if (!prepare_react_prompt(resumed_task)) {
+                                SRV_WRN("failed to prepare resumed ReAct prompt for command %d\n", result.command_id);
+                            }
+                        }
                         queue_tasks.post(std::move(resumed_task), true);
                     } else {
                         SRV_WRN("missing waiting active task for command %d\n", result.command_id);
@@ -3270,13 +3749,16 @@ private:
                 }
 
                 if (kind == VICUNA_EXTERNAL_WORK_BASH) {
-                    SRV_INF("bash tool command %d origin=%d exit=%d signal=%d timeout=%d launch_failed=%d\n",
+                    SRV_INF("bash tool command %d origin=%d exit=%d signal=%d timeout=%d launch_failed=%d error=\"%s\" stderr=\"%s\" stdout=\"%s\"\n",
                             result.command_id,
                             result.origin,
                             result.bash_result.exit_code,
                             result.bash_result.term_signal,
                             result.bash_result.timed_out ? 1 : 0,
-                            result.bash_result.launch_failed ? 1 : 0);
+                            result.bash_result.launch_failed ? 1 : 0,
+                            result.bash_result.error_text,
+                            result.bash_result.stderr_text,
+                            result.bash_result.stdout_text);
                 } else {
                     SRV_INF("hard-memory command %d origin=%d ok=%d status=%d count=%d\n",
                             result.command_id,
@@ -3500,8 +3982,8 @@ private:
             }
         }
 
-        bool hard_memory_enabled = false;
-        bool bash_tool_enabled = false;
+        hard_memory_enabled = false;
+        bash_tool_enabled = false;
 
         {
             const char * hard_memory_url = getenv("VICUNA_HARD_MEMORY_URL");
@@ -4186,7 +4668,7 @@ private:
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
         {
-            const auto loop_tokens = make_self_state_token_view(task.tokens);
+            const auto loop_tokens = make_self_state_token_view(task.tokens, &task.active_loop_tokens);
             const llama_self_state_event loop_event = {
                 /*.tokens =*/ loop_tokens.data,
                 /*.n_tokens =*/ loop_tokens.size,
@@ -4200,6 +4682,7 @@ private:
             if (!task.skip_active_loop_preflight) {
                 task.has_active_trace = llama_active_loop_process(ctx, &loop_event, &task.active_trace) == 0;
             }
+            log_active_preflight_summary(task, "slot");
             if (task.has_active_trace) {
                 if (ran_active_loop_here) {
                     capture_active_loop_provenance("active_loop", task.active_trace);
@@ -4261,7 +4744,7 @@ private:
             slot.smpl.reset();
         }
 
-        slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.task = std::make_unique<server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -4528,6 +5011,63 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        common_chat_msg final_msg;
+        const bool parsed_final_msg =
+                slot.task &&
+                react_task_ready(*slot.task) &&
+                parse_generated_chat_message(*slot.task, slot.generated_text, &final_msg);
+
+        if (slot.task &&
+                react_task_ready(*slot.task) &&
+                slot.task->has_active_trace &&
+                slot.task->active_trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT &&
+                parsed_final_msg) {
+            server_task resumed_task = std::move(*slot.task);
+            resumed_task.react_messages.push_back(final_msg);
+            append_react_visible_prefix(resumed_task, final_msg);
+
+            int32_t pending_command_id = -1;
+            int32_t pending_tool_kind = LLAMA_TOOL_KIND_NONE;
+            std::string request_error;
+            bool have_pending_command = active_runner_waiting_on_tool(&pending_command_id, &pending_tool_kind);
+            if (!final_msg.tool_calls.empty()) {
+                have_pending_command =
+                        configure_active_tool_request_from_chat_call(
+                                final_msg,
+                                &pending_command_id,
+                                &request_error) &&
+                        pending_command_id > 0;
+            }
+
+            if (have_pending_command) {
+                {
+                    std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                    waiting_active_tasks[pending_command_id] = std::move(resumed_task);
+                }
+                const bool dispatched = dispatch_pending_tool_commands(LLAMA_COG_COMMAND_ORIGIN_ACTIVE);
+                SRV_INF("react tool step queued command=%d dispatched=%d tool_calls=%zu error=\"%s\"\n",
+                        pending_command_id,
+                        dispatched ? 1 : 0,
+                        final_msg.tool_calls.size(),
+                        request_error.c_str());
+                if (dispatched) {
+                    return;
+                }
+                std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                waiting_active_tasks.erase(pending_command_id);
+            } else {
+                SRV_WRN("react tool step could not queue tool dispatch: %s\n", request_error.c_str());
+            }
+        }
+
+        if (slot.task &&
+                react_task_ready(*slot.task) &&
+                parsed_final_msg &&
+                final_msg.tool_calls.empty() &&
+                !slot.task->react_visible_prefix.empty()) {
+            slot.generated_text = slot.task->react_visible_prefix + "\n\n" + slot.generated_text;
+        }
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -4782,7 +5322,7 @@ private:
                     }
 
                     if (!task.skip_active_loop_preflight && !task.is_child()) {
-                        const auto loop_tokens = make_self_state_token_view(task.tokens);
+                        const auto loop_tokens = make_self_state_token_view(task.tokens, &task.active_loop_tokens);
                         const llama_self_state_event loop_event = {
                             /*.tokens =*/ loop_tokens.data,
                             /*.n_tokens =*/ loop_tokens.size,
@@ -4792,24 +5332,37 @@ private:
                             /*.decoder_entropy =*/ 0.0f,
                             /*.decoder_top_margin =*/ 1.0f,
                         };
-	                        task.has_active_trace = llama_active_loop_process(ctx, &loop_event, &task.active_trace) == 0;
-	                        task.skip_active_loop_preflight = true;
-	                        if (task.has_active_trace) {
-	                            mark_runtime_state_dirty("active-loop-preflight");
-	                            capture_active_loop_provenance("active_preflight", task.active_trace);
-	                            (void) dispatch_pending_tool_commands(LLAMA_COG_COMMAND_ORIGIN_ACTIVE);
-	                            (void) llama_active_loop_get_last_trace(ctx, &task.active_trace);
+                        task.has_active_trace = llama_active_loop_process(ctx, &loop_event, &task.active_trace) == 0;
+                        task.skip_active_loop_preflight = true;
+                        log_active_preflight_summary(task, "queue");
+                        if (task.has_active_trace) {
+                            mark_runtime_state_dirty("active-loop-preflight");
+                            capture_active_loop_provenance("active_preflight", task.active_trace);
+                            (void) llama_active_loop_get_last_trace(ctx, &task.active_trace);
 
-                            int32_t pending_command_id = -1;
-                            int32_t pending_tool_kind = LLAMA_TOOL_KIND_NONE;
-                            if (active_runner_waiting_on_tool(&pending_command_id, &pending_tool_kind)) {
-                                std::lock_guard<std::mutex> lock(runtime_state_mutex);
-                                waiting_active_tasks[pending_command_id] = std::move(task);
-                                SRV_INF("parked active task for external tool: command=%d tool=%d waiting=%zu\n",
-                                        pending_command_id,
-                                        pending_tool_kind,
-                                        waiting_active_tasks.size());
-                                break;
+                            const bool use_react_step =
+                                    react_task_ready(task) &&
+                                    (task.active_trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT ||
+                                     task.react_iteration > 0);
+                            if (use_react_step) {
+                                if (!prepare_react_prompt(task)) {
+                                    send_error(task, "Failed to prepare planner transcript prompt", ERROR_TYPE_SERVER);
+                                    break;
+                                }
+                            } else {
+                                (void) dispatch_pending_tool_commands(LLAMA_COG_COMMAND_ORIGIN_ACTIVE);
+
+                                int32_t pending_command_id = -1;
+                                int32_t pending_tool_kind = LLAMA_TOOL_KIND_NONE;
+                                if (active_runner_waiting_on_tool(&pending_command_id, &pending_tool_kind)) {
+                                    std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                                    waiting_active_tasks[pending_command_id] = std::move(task);
+                                    SRV_INF("parked active task for external tool: command=%d tool=%d waiting=%zu\n",
+                                            pending_command_id,
+                                            pending_tool_kind,
+                                            waiting_active_tasks.size());
+                                    break;
+                                }
                             }
                         }
                     }
@@ -5177,6 +5730,7 @@ private:
                 (void) dispatch_pending_self_emit_commands(-1);
                 (void) dispatch_pending_tool_commands(-1);
                 (void) drain_completed_external_work(-1);
+                reload_openclaw_catalog_if_needed();
                 if (!has_waiting_active_tasks() &&
                     count_pending_external_work(bash_work) == 0 &&
                     count_pending_external_work(hard_memory_work) == 0) {
@@ -6381,6 +6935,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->slot_n_ctx,
                     data);
             task.foreground_role = classify_foreground_role(data);
+            const std::string foreground_text = extract_foreground_message_text(data);
+            if (!foreground_text.empty()) {
+                task.active_loop_tokens = common_tokenize(ctx_server.vocab, foreground_text, true, true);
+            }
             if (task.foreground_role == LLAMA_SELF_STATE_EVENT_TOOL) {
                 task.foreground_flags |= LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED;
             }
@@ -6390,6 +6948,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+
+            if (!task.params.stream &&
+                    data.contains("messages") &&
+                    data.at("messages").is_array() &&
+                    res_type != TASK_RESPONSE_TYPE_OAI_CMPL &&
+                    ctx_server.openclaw_fabric.enabled()) {
+                task.react_enabled = true;
+                task.react_messages = common_chat_msgs_parse_oaicompat(data.at("messages"));
+            }
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {

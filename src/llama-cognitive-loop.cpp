@@ -99,6 +99,7 @@ struct lexical_signals {
     float tool = 0.0f;
     float followup = 0.0f;
     float uncertainty = 0.0f;
+    float web = 0.0f;
 };
 
 std::vector<llama_token> tokenize_text(const llama_vocab * vocab, const std::string & text);
@@ -111,6 +112,7 @@ llama_process_functional_signature make_process_signature(
         int32_t transient_source_id);
 int32_t primary_functional_family(const llama_functional_activation_decision & decision);
 void set_bounded_cstr(char * dst, size_t dst_size, const char * src);
+bool is_tavily_web_search_capability(const llama_cognitive_tool_spec * spec);
 
 lexical_signals analyze_event_lexicon(const llama_vocab * vocab, const llama_self_state_event & event) {
     lexical_signals out = {};
@@ -120,6 +122,7 @@ lexical_signals analyze_event_lexicon(const llama_vocab * vocab, const llama_sel
 
     static const char * const question_terms[] = { "?", "what", "which", "clarify", "why", "how" };
     static const char * const tool_terms[] = { "search", "find", "lookup", "look", "inspect", "tool", "call", "run", "fetch" };
+    static const char * const web_terms[] = { "web", "internet", "online", "latest", "current", "today", "news", "president" };
     static const char * const followup_terms[] = { "follow", "continue", "again", "also", "more", "next" };
     static const char * const uncertainty_terms[] = { "?", "maybe", "unsure", "uncertain", "unknown", "clarify" };
 
@@ -139,6 +142,9 @@ lexical_signals analyze_event_lexicon(const llama_vocab * vocab, const llama_sel
         if (contains_any(piece, tool_terms, sizeof(tool_terms)/sizeof(tool_terms[0]))) {
             out.tool += 0.35f;
         }
+        if (contains_any(piece, web_terms, sizeof(web_terms)/sizeof(web_terms[0]))) {
+            out.web += 0.30f;
+        }
         if (contains_any(piece, followup_terms, sizeof(followup_terms)/sizeof(followup_terms[0]))) {
             out.followup += 0.30f;
         }
@@ -149,9 +155,48 @@ lexical_signals analyze_event_lexicon(const llama_vocab * vocab, const llama_sel
 
     out.question = clamp_unit(out.question);
     out.tool = clamp_unit(out.tool);
+    out.web = clamp_unit(out.web);
     out.followup = clamp_unit(out.followup);
     out.uncertainty = clamp_unit(out.uncertainty);
     return out;
+}
+
+bool is_explicit_web_search_intent(const std::string & intent) {
+    return normalized_word_overlap(intent, "search web internet online latest current today news look up lookup browse") > 0.0f;
+}
+
+bool should_prefer_active_planner(
+        const llama_self_state_event & event,
+        const lexical_signals & lex,
+        float goal_relevance,
+        float answerability,
+        float uncertainty,
+        float tool_affinity,
+        float tool_readiness,
+        int32_t tool_spec_count,
+        bool tool_completed,
+        bool explicit_web_search) {
+    if (event.role != LLAMA_SELF_STATE_EVENT_USER || tool_completed || tool_spec_count <= 0) {
+        return false;
+    }
+    if (explicit_web_search) {
+        return true;
+    }
+    if (lex.uncertainty >= 0.30f || uncertainty >= 0.55f) {
+        return false;
+    }
+
+    const float planner_pressure = clamp_unit(
+            0.26f +
+            0.24f * lex.question +
+            0.22f * lex.tool +
+            0.18f * lex.web +
+            0.14f * lex.followup +
+            0.18f * goal_relevance +
+            0.20f * tool_affinity +
+            0.14f * tool_readiness +
+            0.12f * (1.0f - answerability));
+    return planner_pressure >= 0.42f;
 }
 
 float get_scalar_register(const llama_context & ctx, int32_t register_id) {
@@ -373,6 +418,14 @@ llama_functional_activation_decision make_functional_policy_seed(
             break;
         case LLAMA_FUNCTIONAL_MICROPHASE_TOOL_CLASS_SELECTION:
         case LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP:
+            set_family(
+                    LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION,
+                    LLAMA_FUNCTIONAL_HOLD_PHASE_EXIT,
+                    1,
+                    LLAMA_FUNCTIONAL_ROUTE_REASON_TOOL_AFFINITY |
+                            LLAMA_FUNCTIONAL_ROUTE_REASON_HOLD_CONTINUITY);
+            decision.top_family = LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
+            [[fallthrough]];
         case LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION:
             set_family(
                     LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION,
@@ -702,6 +755,21 @@ llama_functional_activation_decision make_inactive_functional_decision(int32_t l
     decision.microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
     decision.top_family = -1;
     decision.family_count = LLAMA_FUNCTIONAL_LORA_COUNT;
+    return decision;
+}
+
+llama_functional_activation_decision make_planner_only_functional_decision(
+        int32_t loop_origin,
+        int32_t microphase = LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE) {
+    llama_functional_activation_decision decision = {};
+    decision.loop_origin = loop_origin;
+    decision.microphase = microphase;
+    decision.top_family = LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION;
+    decision.family_count = LLAMA_FUNCTIONAL_LORA_COUNT;
+    decision.eligible_mask = (1ull << LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION);
+    decision.activated_mask = (1ull << LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION);
+    decision.gains[LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION] = 1.0f;
+    decision.predicted_gains[LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION] = 1.0f;
     return decision;
 }
 
@@ -1574,6 +1642,7 @@ float tool_spec_select_score(
     float score = 0.20f;
     const bool is_memory = spec.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY;
     const bool has_side_effects = (spec.flags & LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT) != 0;
+    const bool explicit_web_search = is_explicit_web_search_intent(intent);
     if (prefer_memory && is_memory) {
         score += 0.45f;
     }
@@ -1589,6 +1658,9 @@ float tool_spec_select_score(
             std::string(spec.description) + " " +
             std::string(spec.capability_id);
     score += 0.35f * normalized_word_overlap(descriptor_text, intent);
+    if (explicit_web_search && is_memory) {
+        score -= 0.65f;
+    }
     if (spec.tool_kind == LLAMA_TOOL_KIND_BASH_CLI) {
         score += 0.05f;
     }
@@ -2042,10 +2114,41 @@ bool looks_shell_command(const std::string & text) {
     return false;
 }
 
-std::string infer_bash_command(const std::string & intent_text) {
+bool is_tavily_web_search_capability(const llama_cognitive_tool_spec * spec) {
+    return spec != nullptr &&
+            std::string(spec->capability_id) == "openclaw.tavily.web_search";
+}
+
+std::string percent_encode_unreserved(const std::string & text) {
+    static const char hex[] = "0123456789ABCDEF";
+    std::string encoded;
+    encoded.reserve(text.size() * 3);
+    for (unsigned char ch : text) {
+        if ((ch >= 'A' && ch <= 'Z') ||
+                (ch >= 'a' && ch <= 'z') ||
+                (ch >= '0' && ch <= '9') ||
+                ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+            encoded.push_back((char) ch);
+            continue;
+        }
+        encoded.push_back('%');
+        encoded.push_back(hex[(ch >> 4) & 0x0F]);
+        encoded.push_back(hex[ch & 0x0F]);
+    }
+    return encoded;
+}
+
+std::string infer_bash_command(
+        const std::string & intent_text,
+        const llama_cognitive_tool_spec * tool_spec = nullptr) {
     const std::string trimmed = trim_ascii(intent_text);
     if (trimmed.empty()) {
         return "";
+    }
+
+    if (is_tavily_web_search_capability(tool_spec)) {
+        return "tools/openclaw-harness/bin/tavily-web-search --query-url=" +
+                percent_encode_unreserved(trimmed);
     }
 
     std::string extracted = extract_backtick_command(trimmed);
@@ -2060,12 +2163,12 @@ std::string infer_bash_command(const std::string & intent_text) {
 
     const std::string lower = lower_ascii(trimmed);
     if (lower.find("build") != std::string::npos && lower.find("log") != std::string::npos) {
-        return "pwd && find build . -maxdepth 4 -type f 2>/dev/null | sort | head -n 200";
+        return "find . -maxdepth 4 -type f";
     }
     if (lower.find("repo") != std::string::npos || lower.find("repository") != std::string::npos ||
             lower.find("file") != std::string::npos || lower.find("inspect") != std::string::npos ||
             lower.find("search") != std::string::npos) {
-        return "pwd && find . -maxdepth 3 -type f | sort | head -n 200";
+        return "find . -maxdepth 3 -type f";
     }
 
     return "";
@@ -3152,6 +3255,38 @@ bool llama_cognitive_loop::cognitive_command_ack(int32_t command_id) {
     return true;
 }
 
+bool llama_cognitive_loop::cognitive_command_rebind_tool(int32_t command_id, int32_t tool_spec_index) {
+    if (tool_spec_index < 0 || tool_spec_index >= tool_spec_count) {
+        return false;
+    }
+
+    const int32_t index = find_command_index(command_queue, command_count, command_id);
+    if (index < 0) {
+        return false;
+    }
+
+    llama_cognitive_command & command = command_queue[index];
+    if (command.kind != LLAMA_COG_COMMAND_INVOKE_TOOL ||
+            command.status != LLAMA_COG_COMMAND_STATUS_PENDING) {
+        return false;
+    }
+
+    const llama_cognitive_tool_spec & spec = tool_specs[tool_spec_index];
+    command.tool_kind = spec.tool_kind;
+    command.tool_spec_index = tool_spec_index;
+    set_bounded_cstr(command.capability_id, sizeof(command.capability_id), spec.capability_id);
+
+    if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE &&
+            active_runner.pending_command_id == command_id) {
+        active_runner.pending_tool_spec_index = tool_spec_index;
+    } else if (command.origin == LLAMA_COG_COMMAND_ORIGIN_DMN &&
+            dmn_runner.pending_command_id == command_id) {
+        dmn_runner.pending_tool_spec_index = tool_spec_index;
+    }
+
+    return true;
+}
+
 bool llama_cognitive_loop::cognitive_command_complete(int32_t command_id, bool cancelled) {
     const int32_t index = find_command_index(command_queue, command_count, command_id);
     if (index < 0) {
@@ -3231,13 +3366,41 @@ bool llama_cognitive_loop::cognitive_command_complete(int32_t command_id, bool c
         tool_selection_uncertainty = 0.0f;
     }
 
-    if (cancelled || command.kind != LLAMA_COG_COMMAND_INVOKE_TOOL) {
-        (void) ctx.process_functional_set_execution(llama_process_functional_signature {});
-        (void) ctx.functional_lora_activate(make_inactive_functional_decision(command.origin));
-        if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
-            active_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
-        } else if (command.origin == LLAMA_COG_COMMAND_ORIGIN_DMN) {
-            dmn_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
+    // Clear tool-specific bias before waiting on external I/O, but keep the
+    // planner family active across the foreground ReAct loop so the next
+    // assistant/tool-observation step remains under planner composition.
+    {
+        const bool preserve_active_planner =
+                !cancelled &&
+                command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE &&
+                command.kind == LLAMA_COG_COMMAND_INVOKE_TOOL &&
+                active_plan.valid;
+        if (preserve_active_planner) {
+            const llama_cognitive_tool_spec * tool_spec =
+                    command.tool_spec_index >= 0 && command.tool_spec_index < tool_spec_count ?
+                            &tool_specs[command.tool_spec_index] :
+                            nullptr;
+            (void) ctx.process_functional_set_execution(
+                    make_process_signature(
+                            command.origin,
+                            LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION,
+                            LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE,
+                            &active_plan,
+                            tool_spec,
+                            active_runner.episode_id));
+            (void) ctx.functional_lora_activate(
+                    make_planner_only_functional_decision(
+                            command.origin,
+                            LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE));
+            active_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE;
+        } else {
+            (void) ctx.process_functional_set_execution(llama_process_functional_signature {});
+            (void) ctx.functional_lora_activate(make_inactive_functional_decision(command.origin));
+            if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+                active_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
+            } else if (command.origin == LLAMA_COG_COMMAND_ORIGIN_DMN) {
+                dmn_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
+            }
         }
     }
 
@@ -3389,7 +3552,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 trace.prewrite_features.memory_write_pressure,
                 trace.postwrite_features.memory_write_pressure));
         const float continuation_seed = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_FOLLOWUP_CONTINUATION));
-        const llama_functional_activation_decision decision = route_functional_activation(
+        llama_functional_activation_decision decision = route_functional_activation(
                 ctx,
                 LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
                 microphase,
@@ -3401,6 +3564,11 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 planning_pressure_seed,
                 plan_complexity_seed,
                 plan_revision_seed);
+        if ((microphase == LLAMA_FUNCTIONAL_MICROPHASE_TOOL_CLASS_SELECTION ||
+                    microphase == LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP) &&
+                (decision.activated_mask & (1ull << LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION)) != 0) {
+            decision.top_family = LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
+        }
         const llama_cognitive_plan_trace * process_plan = nullptr;
         if (trace.plan.valid) {
             process_plan = &trace.plan;
@@ -3466,9 +3634,26 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
             0.18f * (tool_completed ? 1.0f : 0.0f));
     const float tool_affinity = clamp_unit(
             0.45f * lex.tool +
+            0.25f * lex.web +
             0.30f * trace.postwrite_features.tool_pending_pressure +
             0.15f * tool_affordance +
             0.10f * (tool_state.pending_jobs > 0 ? 1.0f : 0.0f));
+    const float direct_answer_signal = clamp_unit(
+            answerability *
+            (1.0f - std::max(lex.tool, lex.web)) *
+            (1.0f - 0.5f * lex.question));
+    const bool explicit_web_search = is_explicit_web_search_intent(event_text(vocab, mutable_event));
+    const bool planner_first_active = should_prefer_active_planner(
+            mutable_event,
+            lex,
+            goal_relevance,
+            answerability,
+            uncertainty,
+            tool_affinity,
+            trace.postwrite_features.tool_readiness_score,
+            tool_spec_count,
+            tool_completed,
+            explicit_web_search);
 
     const uint32_t base_reason = build_active_reason_mask(mutable_event, lex, uncertainty, inhibition, tool_completed);
 
@@ -3476,7 +3661,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     fill_active_candidate(
             trace.candidates[0],
             LLAMA_ACTIVE_LOOP_ACTION_ANSWER,
-            0.10f + 0.34f * user_relevance + 0.10f * broadcast_pressure + 0.18f * answerability + 0.10f * (1.0f - uncertainty) + 0.14f * (tool_completed ? 1.0f : 0.0f) + 0.06f * (1.0f - inhibition) + 0.04f * satisfaction_risk,
+            0.10f + 0.34f * user_relevance + 0.10f * broadcast_pressure + 0.18f * answerability + 0.10f * (1.0f - uncertainty) + 0.14f * (tool_completed ? 1.0f : 0.0f) + 0.06f * (1.0f - inhibition) + 0.04f * satisfaction_risk + 0.24f * direct_answer_signal - (explicit_web_search ? 0.12f : 0.0f) - (planner_first_active ? (0.16f + 0.10f * tool_affinity) : 0.0f),
             user_relevance,
             latency_pressure,
             tool_affinity,
@@ -3494,7 +3679,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     fill_active_candidate(
             trace.candidates[2],
             LLAMA_ACTIVE_LOOP_ACTION_ACT,
-            0.14f + 0.56f * tool_affinity + 0.16f * (tool_state.pending_jobs > 0 ? 1.0f : trace.postwrite_features.tool_readiness_score) + 0.10f * lex.question + 0.08f * goal_relevance + 0.06f * recovery_urgency,
+            0.14f + 0.56f * tool_affinity + 0.16f * (tool_state.pending_jobs > 0 ? 1.0f : trace.postwrite_features.tool_readiness_score) + 0.10f * lex.question + 0.08f * goal_relevance + 0.06f * recovery_urgency + (explicit_web_search ? 0.22f : 0.0f) + (planner_first_active ? (0.20f + 0.08f * (1.0f - answerability)) : 0.0f) - 0.24f * uncertainty - 0.10f * lex.uncertainty - 0.28f * direct_answer_signal,
             user_relevance,
             latency_pressure,
             tool_affinity,
@@ -3510,36 +3695,13 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
             inhibition,
             base_reason | LLAMA_COG_REASON_HIGH_INHIBITION);
 
-    int32_t best = -1;
-    int32_t second = -1;
-    pick_top_two(trace.candidates, trace.candidate_count, &best, &second);
-    if (best < 0) {
-        return false;
-    }
-
-    trace.winner_action = trace.candidates[best].action;
-    trace.winner_score = trace.candidates[best].score;
-    trace.runner_up_action = second >= 0 ? trace.candidates[second].action : trace.candidates[best].action;
-    trace.runner_up_score = second >= 0 ? trace.candidates[second].score : trace.candidates[best].score;
-    trace.reason_mask = trace.candidates[best].reason_mask;
-    trace.emit_allowed = trace.winner_action != LLAMA_ACTIVE_LOOP_ACTION_WAIT && trace.winner_score >= clamp_unit(0.15f + 0.40f * inhibition);
-    trace.emit_noted = false;
-    trace.tool_followup_expected = trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT;
-
-    const llama_cognitive_runtime_impl runtime(ctx);
-    const llama_dmn_pressure_vector dmn_pressure = runtime.compute_pressure();
-    trace.deferred_background = pressure_crossed(dmn_pressure);
-    if (trace.deferred_background) {
-        ++host_state.background_deferred_count;
-    }
-
     const std::string intent_text = event_text(vocab, mutable_event);
     int32_t proposed_spec_index = -1;
     const bool prefer_memory_tool =
-            normalized_word_overlap(intent_text, "memory remember previous earlier prior history search") > 0.0f;
-    const bool prefer_side_effects = trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT;
+            normalized_word_overlap(intent_text, "memory remember previous earlier prior history recall") > 0.0f;
+    const bool prefer_side_effects = planner_first_active;
     const llama_cognitive_tool_spec * proposed_spec =
-            (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT || mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL) ?
+            (planner_first_active || mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL) ?
                     select_best_tool_spec(
                             ctx,
                             tool_specs,
@@ -3551,9 +3713,54 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                             &proposed_spec_index) :
                     nullptr;
     const int32_t proposed_tool_kind = proposed_spec ? proposed_spec->tool_kind : LLAMA_TOOL_KIND_NONE;
+
+    int32_t best = -1;
+    int32_t second = -1;
+    pick_top_two(trace.candidates, trace.candidate_count, &best, &second);
+    if (best < 0) {
+        return false;
+    }
+    const bool self_contained_answer_turn =
+            mutable_event.role == LLAMA_SELF_STATE_EVENT_USER &&
+            !planner_first_active &&
+            !explicit_web_search &&
+            std::max(lex.tool, lex.web) < 0.10f &&
+            uncertainty <= 0.25f;
+    if (self_contained_answer_turn && best != 0) {
+        second = best;
+        best = 0;
+    }
+    if (planner_first_active && proposed_spec) {
+        const int32_t act_index = 2;
+        const float planner_override_margin = explicit_web_search ? 0.18f : 0.06f;
+        if (trace.candidates[act_index].score + planner_override_margin >= trace.candidates[best].score &&
+                best != act_index) {
+            second = best;
+            best = act_index;
+        }
+    }
+
+    trace.winner_action = trace.candidates[best].action;
+    trace.winner_score = trace.candidates[best].score;
+    trace.runner_up_action = second >= 0 ? trace.candidates[second].action : trace.candidates[best].action;
+    trace.runner_up_score = second >= 0 ? trace.candidates[second].score : trace.candidates[best].score;
+    trace.reason_mask = trace.candidates[best].reason_mask;
+    if (planner_first_active && trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
+        trace.reason_mask |= LLAMA_COG_REASON_TOOL_AFFORDANCE;
+    }
     if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT && !proposed_spec) {
         trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_ASK;
         trace.reason_mask |= LLAMA_COG_REASON_HIGH_UNCERTAINTY;
+    }
+    trace.emit_allowed = trace.winner_action != LLAMA_ACTIVE_LOOP_ACTION_WAIT && trace.winner_score >= clamp_unit(0.15f + 0.40f * inhibition);
+    trace.emit_noted = false;
+    trace.tool_followup_expected = trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT;
+
+    const llama_cognitive_runtime_impl runtime(ctx);
+    const llama_dmn_pressure_vector dmn_pressure = runtime.compute_pressure();
+    trace.deferred_background = pressure_crossed(dmn_pressure);
+    if (trace.deferred_background) {
+        ++host_state.background_deferred_count;
     }
     const bool waiting_on_tool =
             trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT ||
@@ -3774,7 +3981,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
             if (proposed_tool_kind == LLAMA_TOOL_KIND_BASH_CLI &&
                     ctx.bash_tool_get_config(&bash_config)) {
                 activate_microphase(LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, tool_affinity);
-                const std::string command_text = infer_bash_command(intent_text);
+                const std::string command_text = infer_bash_command(intent_text, proposed_spec);
                 llama_bash_tool_request request = {};
                 init_bash_request(
                         request,
@@ -4383,7 +4590,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                                    float planning_pressure_seed = 0.0f,
                                    float plan_complexity_seed = 0.0f,
                                    float plan_revision_seed = 0.0f) {
-        const llama_functional_activation_decision decision = route_functional_activation(
+        llama_functional_activation_decision decision = route_functional_activation(
                 ctx,
                 LLAMA_COG_COMMAND_ORIGIN_DMN,
                 microphase,
@@ -4395,6 +4602,11 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 planning_pressure_seed,
                 plan_complexity_seed,
                 plan_revision_seed);
+        if ((microphase == LLAMA_FUNCTIONAL_MICROPHASE_TOOL_CLASS_SELECTION ||
+                    microphase == LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP) &&
+                (decision.activated_mask & (1ull << LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION)) != 0) {
+            decision.top_family = LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
+        }
         const llama_cognitive_plan_trace * process_plan = nullptr;
         if (trace.plan.valid) {
             process_plan = &trace.plan;
@@ -4911,6 +5123,10 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 if (trace.tool_kind == LLAMA_TOOL_KIND_BASH_CLI &&
                         ctx.bash_tool_get_config(&bash_config)) {
                     llama_bash_tool_request request = {};
+                    llama_cognitive_tool_spec resolved_spec = {};
+                    const llama_cognitive_tool_spec * spec =
+                            llama_cognitive_tool_spec_get(&ctx, dmn_runner.pending_tool_spec_index, &resolved_spec) == 0 ?
+                            &resolved_spec : nullptr;
                     init_bash_request(
                             request,
                             bash_config,
@@ -4918,7 +5134,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                             LLAMA_COG_COMMAND_ORIGIN_DMN,
                             trace.tool_job_id,
                             "inspect repository and runtime state",
-                            "pwd && find . -maxdepth 3 -type f | sort | head -n 200");
+                            infer_bash_command("inspect repository and runtime state", spec));
                     (void) ctx.bash_tool_set_request(request);
                 } else if (trace.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
                     llama_cognitive_hard_memory_request request = {};
@@ -5053,7 +5269,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                         LLAMA_COG_COMMAND_ORIGIN_DMN,
                         trace.tool_job_id,
                         "inspect repository and runtime state",
-                        "pwd && find . -maxdepth 3 -type f | sort | head -n 200");
+                        infer_bash_command("inspect repository and runtime state", spec));
                 (void) ctx.bash_tool_set_request(request);
             } else if (trace.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
                 activate_microphase(
@@ -5670,6 +5886,10 @@ bool llama_context::cognitive_command_complete(int32_t command_id, bool cancelle
     return cognitive_loop && cognitive_loop->cognitive_command_complete(command_id, cancelled);
 }
 
+bool llama_context::cognitive_command_rebind_tool(int32_t command_id, int32_t tool_spec_index) {
+    return cognitive_loop && cognitive_loop->cognitive_command_rebind_tool(command_id, tool_spec_index);
+}
+
 bool llama_context::cognitive_bash_tool_submit_result(const llama_bash_tool_result & result, llama_active_loop_trace * out_active_trace) {
     return cognitive_loop && cognitive_loop->cognitive_bash_tool_submit_result(result, out_active_trace);
 }
@@ -5780,6 +6000,13 @@ int32_t llama_cognitive_command_complete(
     return ctx && ctx->cognitive_command_complete(command_id, cancelled) ? 0 : -1;
 }
 
+int32_t llama_cognitive_command_rebind_tool(
+        struct llama_context * ctx,
+        int32_t command_id,
+        int32_t tool_spec_index) {
+    return ctx && ctx->cognitive_command_rebind_tool(command_id, tool_spec_index) ? 0 : -1;
+}
+
 int32_t llama_cognitive_bash_tool_submit_result(
         struct llama_context * ctx,
         const struct llama_bash_tool_result * result,
@@ -5792,6 +6019,12 @@ int32_t llama_cognitive_hard_memory_get_request(
         int32_t command_id,
         struct llama_cognitive_hard_memory_request * out_request) {
     return ctx && out_request && ctx->cognitive_hard_memory_get_request(command_id, out_request) ? 0 : -1;
+}
+
+int32_t llama_cognitive_hard_memory_set_request(
+        struct llama_context * ctx,
+        const struct llama_cognitive_hard_memory_request * request) {
+    return ctx && request && ctx->hard_memory_set_request(*request) ? 0 : -1;
 }
 
 int32_t llama_cognitive_hard_memory_submit_result(

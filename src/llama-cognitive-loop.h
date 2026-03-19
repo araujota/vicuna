@@ -18,6 +18,7 @@ public:
     bool cognitive_command_get(int32_t index, llama_cognitive_command * out_command) const;
     bool cognitive_command_ack(int32_t command_id);
     bool cognitive_command_complete(int32_t command_id, bool cancelled);
+    bool cognitive_command_rebind_tool(int32_t command_id, int32_t tool_spec_index);
     bool cognitive_bash_tool_submit_result(const llama_bash_tool_result & result, llama_active_loop_trace * out_active_trace);
     bool cognitive_hard_memory_submit_result(const llama_cognitive_hard_memory_result & result, llama_active_loop_trace * out_active_trace);
     bool cognitive_active_runner_get(llama_cognitive_active_runner_status * out_status) const;

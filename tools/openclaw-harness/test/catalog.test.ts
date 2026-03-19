@@ -1,8 +1,13 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildCatalog } from "../src/catalog.js";
+import { buildCatalog, buildRuntimeCatalog } from "../src/catalog.js";
+import { loadToolSecrets, saveToolSecrets, upsertTavilyApiKey } from "../src/config.js";
 import { resolveInvocation } from "../src/invoke.js";
+import { writeRuntimeCatalog } from "../src/runtime-catalog.js";
 
 test("default catalog includes exec and hard-memory", () => {
   const catalog = buildCatalog();
@@ -58,5 +63,39 @@ test("tool surface and capability id must match exactly", () => {
       deadline_ms: 1000,
       provenance_request_id: "prov_2"
     })
+  );
+});
+
+test("runtime catalog includes Tavily only when the OpenClaw secret is present", () => {
+  assert.equal(buildRuntimeCatalog().capabilities.length, 0);
+  const catalog = buildRuntimeCatalog({
+    secrets: {
+      tools: {
+        tavily: {
+          api_key: "test-key"
+        }
+      }
+    }
+  });
+  assert.deepEqual(
+    catalog.capabilities.map((capability) => capability.capability_id),
+    ["openclaw.tavily.web_search"]
+  );
+});
+
+test("OpenClaw secrets persist Tavily config and emit a runtime catalog", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vicuna-openclaw-harness-"));
+  const secretsPath = path.join(tempDir, "openclaw-tool-secrets.json");
+  const runtimeCatalogPath = path.join(tempDir, "openclaw-catalog.json");
+
+  const secrets = upsertTavilyApiKey({}, "test-key");
+  saveToolSecrets(secretsPath, secrets);
+  assert.equal(loadToolSecrets(secretsPath).tools?.tavily?.api_key, "test-key");
+
+  writeRuntimeCatalog(runtimeCatalogPath, secretsPath);
+  const runtimeCatalog = JSON.parse(fs.readFileSync(runtimeCatalogPath, "utf8"));
+  assert.deepEqual(
+    runtimeCatalog.capabilities.map((capability: { capability_id: string }) => capability.capability_id),
+    ["openclaw.tavily.web_search"]
   );
 });

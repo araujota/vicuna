@@ -3155,10 +3155,17 @@ extern "C" {
             struct llama_context * ctx,
             int32_t command_id,
             bool cancelled);
+    LLAMA_API int32_t llama_cognitive_command_rebind_tool(
+            struct llama_context * ctx,
+            int32_t command_id,
+            int32_t tool_spec_index);
     LLAMA_API int32_t llama_cognitive_bash_tool_get_request(
             const struct llama_context * ctx,
             int32_t command_id,
             struct llama_bash_tool_request * out_request);
+    LLAMA_API int32_t llama_cognitive_bash_tool_set_request(
+            struct llama_context * ctx,
+            const struct llama_bash_tool_request * request);
     LLAMA_API int32_t llama_cognitive_bash_tool_submit_result(
             struct llama_context * ctx,
             const struct llama_bash_tool_result * result,
@@ -3167,6 +3174,9 @@ extern "C" {
             const struct llama_context * ctx,
             int32_t command_id,
             struct llama_cognitive_hard_memory_request * out_request);
+    LLAMA_API int32_t llama_cognitive_hard_memory_set_request(
+            struct llama_context * ctx,
+            const struct llama_cognitive_hard_memory_request * request);
     LLAMA_API int32_t llama_cognitive_hard_memory_submit_result(
             struct llama_context * ctx,
             const struct llama_cognitive_hard_memory_result * result,
