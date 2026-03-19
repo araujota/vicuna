@@ -1409,6 +1409,7 @@ struct llama_active_lora_manager::impl {
     llama_process_functional_signature current_process_signature = {};
     llama_process_functional_trace last_process_trace = {};
     llama_functional_snapshot_maintenance_trace process_snapshot_trace = {};
+    llama_self_model_extension_summary last_extension_summary = {};
     int32_t current_process_entry_slot = -1;
     std::vector<ggml_tensor *> targets;
     active_lora_embedding last_embedding;
@@ -1683,6 +1684,7 @@ struct llama_active_lora_manager::impl {
         }
 
         llama_functional_activation_decision decision = policy_seed;
+        last_extension_summary = observation.extension_summary;
         decision.loop_origin = observation.loop_origin;
         decision.microphase = observation.microphase;
         decision.family_count = LLAMA_FUNCTIONAL_LORA_COUNT;
@@ -2519,6 +2521,43 @@ struct llama_active_lora_manager::impl {
                 owner.detach_adapter_runtime(functional_snapshots[family][slot].adapter.get());
             }
         }
+    }
+
+    bool process_uses_external_tool_context() const {
+        return current_process_signature.valid &&
+                (current_process_signature.tool_kind != LLAMA_TOOL_KIND_NONE ||
+                 current_process_signature.capability_id[0] != '\0' ||
+                 current_process_signature.provenance_namespace[0] != '\0');
+    }
+
+    float self_model_runtime_gain_scale(int32_t family) const {
+        const auto & summary = last_extension_summary;
+        if (summary.active_count <= 0 || summary.gain_count <= 0) {
+            return 1.0f;
+        }
+
+        const bool tool_context =
+                family == LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ||
+                process_uses_external_tool_context();
+        const float activation = clamp_unit(std::max(summary.context_activation, summary.gain_signal_abs));
+        const float signed_gain = clamp_signed_unit(summary.gain_signal);
+        const float direction = tool_context ? signed_gain : 0.50f * signed_gain;
+        const float strength = tool_context ?
+                (0.35f + 0.45f * activation) :
+                (0.20f + 0.25f * activation);
+        return clamp_range(1.0f + direction * strength, 0.25f, 1.75f);
+    }
+
+    float apply_self_model_runtime_gain(int32_t family, float gain) const {
+        if (family < 0 || family >= LLAMA_FUNCTIONAL_LORA_COUNT || gain <= 0.0f) {
+            return 0.0f;
+        }
+
+        const float scaled_gain = gain * self_model_runtime_gain_scale(family);
+        return clamp_range(
+                scaled_gain,
+                functional_configs[family].gain_clip_min,
+                functional_configs[family].gain_clip_max);
     }
 
     void apply_functional_runtime_scale(int32_t family, float gain, float bootstrap_perturbation) {
@@ -4475,9 +4514,10 @@ bool llama_active_lora_manager::functional_activate(const llama_functional_activ
             hold.microphase_current = decision.microphase;
         }
 
-        const float gain = hold.active ? hold.gain : 0.0f;
+        const float gain = hold.active ? pimpl->apply_self_model_runtime_gain(family, hold.gain) : 0.0f;
         const float bootstrap_perturbation = hold.active ? hold.bootstrap_perturbation : 0.0f;
         pimpl->apply_functional_runtime_scale(family, gain, bootstrap_perturbation);
+        applied.gains[family] = gain;
 
         state.family = family;
         state.enabled = pimpl->functional_configs[family].enabled && !family_disabled;

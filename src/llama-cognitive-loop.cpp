@@ -56,6 +56,44 @@ bool contains_any(const std::string & piece, const char * const * patterns, size
     return false;
 }
 
+std::vector<std::string> split_normalized_words(const std::string & text) {
+    std::vector<std::string> out;
+    std::string current;
+    for (char ch : text) {
+        const unsigned char uch = (unsigned char) ch;
+        if (std::isalnum(uch) || ch == '_') {
+            current.push_back((char) std::tolower(uch));
+        } else if (!current.empty()) {
+            out.push_back(current);
+            current.clear();
+        }
+    }
+    if (!current.empty()) {
+        out.push_back(current);
+    }
+    return out;
+}
+
+float normalized_word_overlap(const std::string & haystack, const std::string & needle) {
+    const std::vector<std::string> hay_words = split_normalized_words(haystack);
+    const std::vector<std::string> needle_words = split_normalized_words(needle);
+    if (hay_words.empty() || needle_words.empty()) {
+        return 0.0f;
+    }
+    int32_t matches = 0;
+    for (const auto & needle_word : needle_words) {
+        for (const auto & hay_word : hay_words) {
+            if (hay_word == needle_word ||
+                    hay_word.find(needle_word) != std::string::npos ||
+                    needle_word.find(hay_word) != std::string::npos) {
+                ++matches;
+                break;
+            }
+        }
+    }
+    return clamp_unit((float) matches / (float) needle_words.size());
+}
+
 struct lexical_signals {
     float question = 0.0f;
     float tool = 0.0f;
@@ -72,6 +110,7 @@ llama_process_functional_signature make_process_signature(
         const llama_cognitive_tool_spec * tool_spec,
         int32_t transient_source_id);
 int32_t primary_functional_family(const llama_functional_activation_decision & decision);
+void set_bounded_cstr(char * dst, size_t dst_size, const char * src);
 
 lexical_signals analyze_event_lexicon(const llama_vocab * vocab, const llama_self_state_event & event) {
     lexical_signals out = {};
@@ -801,7 +840,9 @@ bool append_plan_step(
         uint32_t reason_mask,
         float priority,
         int32_t expected_steps,
-        bool requires_tool_result) {
+        bool requires_tool_result,
+        const llama_cognitive_tool_spec * spec = nullptr,
+        int32_t tool_spec_index = -1) {
     if (plan.step_count >= LLAMA_COGNITIVE_MAX_PLAN_STEPS) {
         return false;
     }
@@ -809,11 +850,16 @@ bool append_plan_step(
     step.kind = kind;
     step.status = status;
     step.tool_kind = tool_kind;
+    step.tool_spec_index = tool_spec_index;
     step.source_family = source_family;
     step.reason_mask = reason_mask;
     step.priority = clamp_unit(priority);
     step.expected_steps = expected_steps;
     step.requires_tool_result = requires_tool_result;
+    if (spec) {
+        set_bounded_cstr(step.capability_id, sizeof(step.capability_id), spec->capability_id);
+        set_bounded_cstr(step.provenance_namespace, sizeof(step.provenance_namespace), spec->provenance_namespace);
+    }
     return true;
 }
 
@@ -881,10 +927,20 @@ llama_process_functional_signature make_process_signature(
     signature.scope_kind = step ? LLAMA_PROCESS_FUNCTIONAL_SCOPE_PROCESS_STEP : LLAMA_PROCESS_FUNCTIONAL_SCOPE_PROCESS;
     if (tool_spec) {
         std::snprintf(signature.tool_name, sizeof(signature.tool_name), "%s", tool_spec->name);
+        std::snprintf(signature.capability_id, sizeof(signature.capability_id), "%s", tool_spec->capability_id);
+        std::snprintf(signature.provenance_namespace, sizeof(signature.provenance_namespace), "%s", tool_spec->provenance_namespace);
+    } else if (step) {
+        std::snprintf(signature.capability_id, sizeof(signature.capability_id), "%s", step->capability_id);
+        std::snprintf(signature.provenance_namespace, sizeof(signature.provenance_namespace), "%s", step->provenance_namespace);
     }
 
-    std::string semantic_key = std::string(loop_origin_label(loop_origin)) +
-            "/" + functional_microphase_name(microphase);
+    std::string semantic_key;
+    if (signature.provenance_namespace[0] != '\0') {
+        semantic_key = signature.provenance_namespace;
+    } else {
+        semantic_key = std::string(loop_origin_label(loop_origin)) +
+                "/" + functional_microphase_name(microphase);
+    }
     if (step) {
         semantic_key += "/step_kind:" + std::to_string(step->kind);
         semantic_key += "/src_family:" + std::to_string(step->source_family);
@@ -910,6 +966,12 @@ llama_process_functional_signature make_process_signature(
     hash = process_hash_mix(hash, (uint64_t) signature.source_family);
     hash = process_hash_mix(hash, signature.requires_tool_result ? 1ULL : 0ULL);
     for (const char * p = signature.tool_name; *p; ++p) {
+        hash = process_hash_mix(hash, (uint64_t) (uint8_t) *p);
+    }
+    for (const char * p = signature.capability_id; *p; ++p) {
+        hash = process_hash_mix(hash, (uint64_t) (uint8_t) *p);
+    }
+    for (const char * p = signature.provenance_namespace; *p; ++p) {
         hash = process_hash_mix(hash, (uint64_t) (uint8_t) *p);
     }
     signature.signature_hash = hash;
@@ -941,6 +1003,12 @@ llama_process_functional_signature rebind_process_signature_family(
     hash = process_hash_mix(hash, (uint64_t) signature.source_family);
     hash = process_hash_mix(hash, signature.requires_tool_result ? 1ULL : 0ULL);
     for (const char * p = signature.tool_name; *p; ++p) {
+        hash = process_hash_mix(hash, (uint64_t) (uint8_t) *p);
+    }
+    for (const char * p = signature.capability_id; *p; ++p) {
+        hash = process_hash_mix(hash, (uint64_t) (uint8_t) *p);
+    }
+    for (const char * p = signature.provenance_namespace; *p; ++p) {
         hash = process_hash_mix(hash, (uint64_t) (uint8_t) *p);
     }
     signature.signature_hash = hash;
@@ -1270,13 +1338,21 @@ llama_cognitive_tool_spec make_tool_spec(
         uint32_t flags,
         int32_t latency_class,
         int32_t max_steps_reserved,
-        const char * name) {
+        const char * name,
+        const char * description = nullptr,
+        const char * capability_id = nullptr,
+        const char * owner_plugin_id = nullptr,
+        const char * provenance_namespace = nullptr) {
     llama_cognitive_tool_spec spec = {};
     spec.tool_kind = tool_kind;
     spec.flags = flags;
     spec.latency_class = latency_class;
     spec.max_steps_reserved = max_steps_reserved;
     set_bounded_cstr(spec.name, sizeof(spec.name), name);
+    set_bounded_cstr(spec.description, sizeof(spec.description), description);
+    set_bounded_cstr(spec.capability_id, sizeof(spec.capability_id), capability_id);
+    set_bounded_cstr(spec.owner_plugin_id, sizeof(spec.owner_plugin_id), owner_plugin_id);
+    set_bounded_cstr(spec.provenance_namespace, sizeof(spec.provenance_namespace), provenance_namespace);
     return spec;
 }
 
@@ -1341,22 +1417,33 @@ void set_tool_proposal(
     proposal.expected_steps = expected_steps;
     proposal.expected_observation_gain = clamp_unit(expected_observation_gain);
     proposal.job_id = job_id;
+    if (spec) {
+        set_bounded_cstr(proposal.capability_id, sizeof(proposal.capability_id), spec->capability_id);
+        set_bounded_cstr(proposal.provenance_namespace, sizeof(proposal.provenance_namespace), spec->provenance_namespace);
+    }
 }
 
 void set_observation(
         llama_cognitive_observation & observation,
         bool valid,
         int32_t tool_kind,
+        int32_t spec_index,
         int32_t job_id,
         int32_t status,
         float signal,
-        float followup_affinity) {
+        float followup_affinity,
+        const llama_cognitive_tool_spec * spec = nullptr) {
     observation.valid = valid;
     observation.tool_kind = tool_kind;
+    observation.spec_index = spec_index;
     observation.job_id = job_id;
     observation.status = status;
     observation.signal = clamp_unit(signal);
     observation.followup_affinity = clamp_unit(followup_affinity);
+    if (spec) {
+        set_bounded_cstr(observation.capability_id, sizeof(observation.capability_id), spec->capability_id);
+        set_bounded_cstr(observation.provenance_namespace, sizeof(observation.provenance_namespace), spec->provenance_namespace);
+    }
 }
 
 int32_t find_command_index(
@@ -1419,11 +1506,13 @@ void init_command(
         int32_t episode_id,
         int32_t tick_id,
         int32_t tool_kind,
+        int32_t tool_spec_index,
         int32_t tool_job_id,
         uint32_t reason_mask,
         float priority,
         int32_t source_family,
-        int32_t loop_phase) {
+        int32_t loop_phase,
+        const llama_cognitive_tool_spec * spec = nullptr) {
     command.command_id = command_id;
     command.origin = origin;
     command.kind = kind;
@@ -1431,11 +1520,105 @@ void init_command(
     command.episode_id = episode_id;
     command.tick_id = tick_id;
     command.tool_kind = tool_kind;
+    command.tool_spec_index = tool_spec_index;
     command.tool_job_id = tool_job_id;
     command.reason_mask = reason_mask;
     command.priority = clamp_unit(priority);
     command.source_family = source_family;
     command.loop_phase = loop_phase;
+    if (spec) {
+        set_bounded_cstr(command.capability_id, sizeof(command.capability_id), spec->capability_id);
+    }
+}
+
+bool tool_spec_origin_eligible(const llama_cognitive_tool_spec & spec, int32_t origin) {
+    if (origin == LLAMA_COG_COMMAND_ORIGIN_DMN) {
+        return (spec.flags & LLAMA_COG_TOOL_DMN_ELIGIBLE) != 0;
+    }
+    return (spec.flags & LLAMA_COG_TOOL_ACTIVE_ELIGIBLE) != 0;
+}
+
+bool tool_spec_runtime_available(
+        llama_context & ctx,
+        const llama_cognitive_tool_spec & spec) {
+    switch (spec.tool_kind) {
+        case LLAMA_TOOL_KIND_BASH_CLI: {
+            llama_bash_tool_config config = {};
+            return ctx.bash_tool_get_config(&config) && config.enabled;
+        }
+        case LLAMA_TOOL_KIND_HARD_MEMORY_QUERY: {
+            llama_hard_memory_config config = {};
+            return ctx.hard_memory_get_config(&config) && config.enabled;
+        }
+        case LLAMA_TOOL_KIND_HARD_MEMORY_WRITE: {
+            llama_hard_memory_config config = {};
+            return ctx.hard_memory_get_config(&config) && config.enabled && config.archive_enabled;
+        }
+        default:
+            return true;
+    }
+}
+
+float tool_spec_select_score(
+        llama_context & ctx,
+        const llama_cognitive_tool_spec & spec,
+        int32_t origin,
+        const std::string & intent,
+        bool prefer_memory,
+        bool prefer_side_effects) {
+    if (!tool_spec_origin_eligible(spec, origin) ||
+            !tool_spec_runtime_available(ctx, spec)) {
+        return -1.0f;
+    }
+
+    float score = 0.20f;
+    const bool is_memory = spec.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY;
+    const bool has_side_effects = (spec.flags & LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT) != 0;
+    if (prefer_memory && is_memory) {
+        score += 0.45f;
+    }
+    if (prefer_side_effects && has_side_effects) {
+        score += 0.25f;
+    }
+    if (!prefer_side_effects && !has_side_effects) {
+        score += 0.10f;
+    }
+
+    const std::string descriptor_text =
+            std::string(spec.name) + " " +
+            std::string(spec.description) + " " +
+            std::string(spec.capability_id);
+    score += 0.35f * normalized_word_overlap(descriptor_text, intent);
+    if (spec.tool_kind == LLAMA_TOOL_KIND_BASH_CLI) {
+        score += 0.05f;
+    }
+    return score;
+}
+
+const llama_cognitive_tool_spec * select_best_tool_spec(
+        llama_context & ctx,
+        const llama_cognitive_tool_spec * specs,
+        int32_t spec_count,
+        int32_t origin,
+        const std::string & intent,
+        bool prefer_memory,
+        bool prefer_side_effects,
+        int32_t * out_index) {
+    const llama_cognitive_tool_spec * best = nullptr;
+    int32_t best_index = -1;
+    float best_score = -1.0f;
+    for (int32_t i = 0; i < spec_count; ++i) {
+        const float score = tool_spec_select_score(ctx, specs[i], origin, intent, prefer_memory, prefer_side_effects);
+        if (score > best_score) {
+            best = &specs[i];
+            best_index = i;
+            best_score = score;
+        }
+    }
+    if (out_index) {
+        *out_index = best_index;
+    }
+    return best;
 }
 
 std::vector<llama_token> tokenize_text(const llama_vocab * vocab, const std::string & text) {
@@ -2008,6 +2191,24 @@ std::string summarize_hard_memory_result(const llama_hard_memory_result & result
     }
     if (result.result_count > 0 && result.results[0].title[0] != '\0') {
         summary += " top_hit: " + trim_ascii(result.results[0].title);
+    }
+    if (result.result_count > 0) {
+        const int32_t narrative_limit = std::min(result.result_count, 2);
+        for (int32_t i = 0; i < narrative_limit; ++i) {
+            const auto & hit = result.results[i];
+            const std::string title = trim_ascii(hit.title);
+            std::string content = trim_ascii(hit.content);
+            if (content.size() > 120) {
+                content.resize(120);
+                content = trim_ascii(content) + "...";
+            }
+            if (!title.empty()) {
+                summary += " hit[" + std::to_string(i) + "] title=\"" + title + "\".";
+            }
+            if (!content.empty()) {
+                summary += " hit[" + std::to_string(i) + "] summary=\"" + content + "\".";
+            }
+        }
     }
 
     return summary;
@@ -2919,6 +3120,10 @@ bool llama_cognitive_loop::cognitive_tool_spec_set(const llama_cognitive_tool_sp
     for (int32_t i = 0; i < count; ++i) {
         tool_specs[i] = specs[i];
         tool_specs[i].name[LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS - 1] = '\0';
+        tool_specs[i].description[LLAMA_COGNITIVE_TOOL_DESCRIPTION_MAX_CHARS - 1] = '\0';
+        tool_specs[i].capability_id[LLAMA_OPENCLAW_CAPABILITY_ID_MAX_CHARS - 1] = '\0';
+        tool_specs[i].owner_plugin_id[LLAMA_OPENCLAW_PLUGIN_ID_MAX_CHARS - 1] = '\0';
+        tool_specs[i].provenance_namespace[LLAMA_OPENCLAW_NAMESPACE_MAX_CHARS - 1] = '\0';
         tool_specs[i].max_steps_reserved = std::max(0, tool_specs[i].max_steps_reserved);
     }
     return true;
@@ -2959,6 +3164,7 @@ bool llama_cognitive_loop::cognitive_command_complete(int32_t command_id, bool c
     if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE &&
             active_runner.pending_command_id == command_id) {
         active_runner.pending_command_id = -1;
+        active_runner.pending_tool_spec_index = -1;
         active_runner.last_command_id = command_id;
         if (command.kind == LLAMA_COG_COMMAND_INVOKE_TOOL) {
             if (cancelled && host_state.pending_tool_followup_count > 0) {
@@ -2985,6 +3191,7 @@ bool llama_cognitive_loop::cognitive_command_complete(int32_t command_id, bool c
     if (command.origin == LLAMA_COG_COMMAND_ORIGIN_DMN &&
             dmn_runner.pending_command_id == command_id) {
         dmn_runner.pending_command_id = -1;
+        dmn_runner.pending_tool_spec_index = -1;
         dmn_runner.last_command_id = command_id;
         if (command.kind == LLAMA_COG_COMMAND_EMIT_BACKGROUND && host_state.pending_dmn_emits > 0) {
             int32_t emit_count = 1;
@@ -3059,7 +3266,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
         return false;
     }
 
-    auto enqueue_command = [&](int32_t kind, int32_t episode_id, int32_t tool_kind, int32_t tool_job_id, uint32_t reason_mask, float priority, int32_t source_family, int32_t loop_phase) -> int32_t {
+    auto enqueue_command = [&](int32_t kind, int32_t episode_id, int32_t tool_kind, int32_t tool_spec_index, int32_t tool_job_id, uint32_t reason_mask, float priority, int32_t source_family, int32_t loop_phase, const llama_cognitive_tool_spec * spec) -> int32_t {
         compact_command_queue(command_queue, &command_count);
         if (command_count >= LLAMA_COGNITIVE_MAX_PENDING_COMMANDS) {
             return -1;
@@ -3074,11 +3281,13 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 episode_id,
                 0,
                 tool_kind,
+                tool_spec_index,
                 tool_job_id,
                 reason_mask,
                 priority,
                 source_family,
-                loop_phase);
+                loop_phase,
+                spec);
         return command_id;
     };
 
@@ -3102,6 +3311,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     if (resuming_active_tool) {
         active_runner.waiting_on_tool = false;
         active_runner.pending_command_id = -1;
+        active_runner.pending_tool_spec_index = -1;
         active_runner.completed = false;
         active_runner.planning_active = true;
     } else {
@@ -3110,6 +3320,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
         active_runner.active = true;
         active_runner.max_steps = 3;
         active_runner.pending_command_id = -1;
+        active_runner.pending_tool_spec_index = -1;
         active_runner.last_command_id = -1;
         active_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
         active_runner.plan_id = -1;
@@ -3197,15 +3408,20 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
             process_plan = &active_plan;
         }
         int32_t process_tool_kind = LLAMA_TOOL_KIND_NONE;
+        int32_t process_tool_spec_index = -1;
         if (process_plan &&
                 process_plan->valid &&
                 process_plan->current_step_index >= 0 &&
                 process_plan->current_step_index < process_plan->step_count) {
             process_tool_kind = process_plan->steps[process_plan->current_step_index].tool_kind;
+            process_tool_spec_index = process_plan->steps[process_plan->current_step_index].tool_spec_index;
         } else if (trace.tool_proposal.valid) {
             process_tool_kind = trace.tool_proposal.tool_kind;
+            process_tool_spec_index = trace.tool_proposal.spec_index;
         }
         const llama_cognitive_tool_spec * process_tool_spec =
+                process_tool_spec_index >= 0 && process_tool_spec_index < tool_spec_count ?
+                        &tool_specs[process_tool_spec_index] :
                 process_tool_kind != LLAMA_TOOL_KIND_NONE ?
                         find_tool_spec(tool_specs, tool_spec_count, process_tool_kind, nullptr) :
                         nullptr;
@@ -3317,17 +3533,31 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
         ++host_state.background_deferred_count;
     }
 
+    const std::string intent_text = event_text(vocab, mutable_event);
+    int32_t proposed_spec_index = -1;
+    const bool prefer_memory_tool =
+            normalized_word_overlap(intent_text, "memory remember previous earlier prior history search") > 0.0f;
+    const bool prefer_side_effects = trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT;
+    const llama_cognitive_tool_spec * proposed_spec =
+            (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT || mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL) ?
+                    select_best_tool_spec(
+                            ctx,
+                            tool_specs,
+                            tool_spec_count,
+                            LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                            intent_text,
+                            prefer_memory_tool,
+                            prefer_side_effects,
+                            &proposed_spec_index) :
+                    nullptr;
+    const int32_t proposed_tool_kind = proposed_spec ? proposed_spec->tool_kind : LLAMA_TOOL_KIND_NONE;
+    if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT && !proposed_spec) {
+        trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_ASK;
+        trace.reason_mask |= LLAMA_COG_REASON_HIGH_UNCERTAINTY;
+    }
     const bool waiting_on_tool =
             trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT ||
             (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_WAIT && tool_state.running_jobs > 0);
-    int32_t proposed_tool_kind = LLAMA_TOOL_KIND_NONE;
-    if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT ||
-            mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
-        proposed_tool_kind = LLAMA_TOOL_KIND_BASH_CLI;
-    }
-    int32_t proposed_spec_index = -1;
-    const llama_cognitive_tool_spec * proposed_spec =
-            find_tool_spec(tool_specs, tool_spec_count, proposed_tool_kind, &proposed_spec_index);
     const int32_t plan_id = resuming_active_tool && active_plan.valid ? active_plan.plan_id : next_plan_id++;
     const int32_t plan_revision_count =
             resuming_active_tool && active_plan.valid ? active_plan.revision_count + 1 : 0;
@@ -3362,7 +3592,9 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 trace.reason_mask,
                 trace.winner_score,
                 1,
-                true);
+                true,
+                proposed_spec,
+                proposed_spec_index);
     }
 
     if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ANSWER) {
@@ -3397,7 +3629,9 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 trace.reason_mask,
                 trace.winner_score,
                 proposed_spec ? std::max(1, proposed_spec->max_steps_reserved) : 1,
-                false);
+                false,
+                proposed_spec,
+                proposed_spec_index);
         (void) append_plan_step(
                 trace.plan,
                 LLAMA_COG_PLAN_STEP_OBSERVE_TOOL,
@@ -3407,7 +3641,9 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 trace.reason_mask,
                 trace.winner_score,
                 1,
-                true);
+                true,
+                proposed_spec,
+                proposed_spec_index);
     } else {
         const int32_t wait_status = waiting_on_tool ?
                 LLAMA_COG_PLAN_STEP_STATUS_PENDING :
@@ -3421,7 +3657,9 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 trace.reason_mask,
                 trace.winner_score,
                 1,
-                waiting_on_tool);
+                waiting_on_tool,
+                proposed_spec,
+                proposed_spec_index);
     }
     trace.plan.current_step_index = first_ready_plan_step(trace.plan);
     if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
@@ -3522,19 +3760,21 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 LLAMA_COG_COMMAND_INVOKE_TOOL,
                 trace.episode_id,
                 proposed_tool_kind,
+                proposed_spec_index,
                 tool_job_id,
                 trace.reason_mask,
                 trace.winner_score,
                 -1,
-                trace.loop_state.phase);
+                trace.loop_state.phase,
+                proposed_spec);
+        active_runner.pending_tool_spec_index = proposed_spec_index;
         active_runner.last_command_id = active_runner.pending_command_id > 0 ? active_runner.pending_command_id : active_runner.last_command_id;
         llama_bash_tool_config bash_config = {};
         if (active_runner.pending_command_id > 0) {
-            const std::string intent = event_text(vocab, mutable_event);
             if (proposed_tool_kind == LLAMA_TOOL_KIND_BASH_CLI &&
                     ctx.bash_tool_get_config(&bash_config)) {
                 activate_microphase(LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, tool_affinity);
-                const std::string command_text = infer_bash_command(intent);
+                const std::string command_text = infer_bash_command(intent_text);
                 llama_bash_tool_request request = {};
                 init_bash_request(
                         request,
@@ -3542,7 +3782,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                         active_runner.pending_command_id,
                         LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
                         tool_job_id,
-                        intent,
+                        intent_text,
                         command_text);
                 (void) ctx.bash_tool_set_request(request);
             } else if (proposed_tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
@@ -3553,7 +3793,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                         active_runner.pending_command_id,
                         LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
                         tool_job_id,
-                        intent,
+                        intent_text,
                         LLAMA_SERVING_LORA_LAYER_ACTIVE);
                 (void) ctx.hard_memory_set_request(request);
             }
@@ -3604,15 +3844,19 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                     trace.episode_id,
                     LLAMA_TOOL_KIND_NONE,
                     -1,
+                    -1,
                     trace.reason_mask,
                     trace.winner_score,
                     -1,
-                    trace.loop_state.phase);
+                    trace.loop_state.phase,
+                    nullptr);
+            active_runner.pending_tool_spec_index = -1;
             active_runner.last_command_id = active_runner.pending_command_id > 0 ? active_runner.pending_command_id : active_runner.last_command_id;
             active_runner.completed = false;
             active_runner.active = active_runner.pending_command_id > 0;
             active_runner.plan_status = LLAMA_COG_PLAN_STATUS_EXECUTING;
         } else {
+            active_runner.pending_tool_spec_index = waiting_on_tool ? active_runner.pending_tool_spec_index : -1;
             active_runner.completed = !waiting_on_tool;
             active_runner.active = waiting_on_tool;
             active_runner.plan_status = waiting_on_tool ? LLAMA_COG_PLAN_STATUS_WAITING_TOOL : LLAMA_COG_PLAN_STATUS_COMPLETED;
@@ -3633,14 +3877,21 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
         } else if ((mutable_event.flags & LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED) != 0) {
             observation_status = LLAMA_SELF_TOOL_JOB_COMPLETED;
         }
+        const llama_cognitive_tool_spec * observation_spec =
+                active_runner.pending_tool_spec_index >= 0 &&
+                        active_runner.pending_tool_spec_index < tool_spec_count ?
+                        &tool_specs[active_runner.pending_tool_spec_index] :
+                        nullptr;
         set_observation(
                 trace.observation,
                 true,
                 have_archive_bash_result ? LLAMA_TOOL_KIND_BASH_CLI : LLAMA_TOOL_KIND_GENERIC,
+                active_runner.pending_tool_spec_index,
                 have_archive_bash_result ? archive_bash_result.tool_job_id : -1,
                 observation_status,
                 0.55f * trace.winner_score + 0.45f * answerability,
-                0.50f * lex.followup + 0.30f * goal_relevance + 0.20f * recovery_urgency);
+                0.50f * lex.followup + 0.30f * goal_relevance + 0.20f * recovery_urgency,
+                observation_spec);
     }
 
     const llama_favorable_state_profile post_active_profile =
@@ -4031,7 +4282,7 @@ bool llama_cognitive_loop::dmn_defer(uint64_t now_us, llama_dmn_tick_trace * out
 }
 
 bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_trace) {
-    auto enqueue_command = [&](int32_t kind, int32_t tick_id, int32_t tool_kind, int32_t tool_job_id, uint32_t reason_mask, float priority, int32_t source_family, int32_t loop_phase) -> int32_t {
+    auto enqueue_command = [&](int32_t kind, int32_t tick_id, int32_t tool_kind, int32_t tool_spec_index, int32_t tool_job_id, uint32_t reason_mask, float priority, int32_t source_family, int32_t loop_phase, const llama_cognitive_tool_spec * spec) -> int32_t {
         compact_command_queue(command_queue, &command_count);
         if (command_count >= LLAMA_COGNITIVE_MAX_PENDING_COMMANDS) {
             return -1;
@@ -4046,11 +4297,13 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 0,
                 tick_id,
                 tool_kind,
+                tool_spec_index,
                 tool_job_id,
                 reason_mask,
                 priority,
                 source_family,
-                loop_phase);
+                loop_phase,
+                spec);
         return command_id;
     };
 
@@ -4068,6 +4321,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     trace.runner_up_action = LLAMA_DMN_ACTION_SILENT;
     trace.tool_job_id = -1;
     trace.tool_kind = LLAMA_TOOL_KIND_NONE;
+    trace.tool_spec_index = -1;
     last_favorable_profile = runtime.compute_favorable_profile();
     trace.favorable_divergence = last_favorable_profile.aggregate_divergence;
     last_counterfactual_trace = {};
@@ -4082,6 +4336,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     dmn_runner = {};
     dmn_runner.max_steps = 3;
     dmn_runner.pending_command_id = -1;
+    dmn_runner.pending_tool_spec_index = -1;
     dmn_runner.last_command_id = -1;
     dmn_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
     dmn_runner.plan_id = -1;
@@ -4147,15 +4402,20 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
             process_plan = &dmn_plan;
         }
         int32_t process_tool_kind = LLAMA_TOOL_KIND_NONE;
+        int32_t process_tool_spec_index = -1;
         if (process_plan &&
                 process_plan->valid &&
                 process_plan->current_step_index >= 0 &&
                 process_plan->current_step_index < process_plan->step_count) {
             process_tool_kind = process_plan->steps[process_plan->current_step_index].tool_kind;
+            process_tool_spec_index = process_plan->steps[process_plan->current_step_index].tool_spec_index;
         } else if (trace.tool_kind != LLAMA_TOOL_KIND_NONE) {
             process_tool_kind = trace.tool_kind;
+            process_tool_spec_index = trace.tool_spec_index;
         }
         const llama_cognitive_tool_spec * process_tool_spec =
+                process_tool_spec_index >= 0 && process_tool_spec_index < tool_spec_count ?
+                        &tool_specs[process_tool_spec_index] :
                 process_tool_kind != LLAMA_TOOL_KIND_NONE ?
                         find_tool_spec(tool_specs, tool_spec_count, process_tool_kind, nullptr) :
                         nullptr;
@@ -4305,6 +4565,33 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     }
 
     const int32_t working_memory_count = ctx.self_state_working_memory_count();
+    auto select_dmn_spec = [&](const std::string & hint, int32_t * out_index) -> const llama_cognitive_tool_spec * {
+        const bool prefer_memory =
+                last_remediation_plan.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY ||
+                normalized_word_overlap(hint, "memory remember previous prior history search") > 0.0f;
+        return select_best_tool_spec(
+                ctx,
+                tool_specs,
+                tool_spec_count,
+                LLAMA_COG_COMMAND_ORIGIN_DMN,
+                hint,
+                prefer_memory,
+                !prefer_memory,
+                out_index);
+    };
+    int32_t selected_dmn_spec_index = -1;
+    const llama_cognitive_tool_spec * selected_dmn_spec =
+            trace.winner_action == LLAMA_DMN_ACTION_INVOKE_TOOL ?
+                    select_dmn_spec(
+                            last_remediation_plan.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY ?
+                                    "memory retrieval prior state history search" :
+                                    "inspect runtime repository state and execution context",
+                            &selected_dmn_spec_index) :
+                    nullptr;
+    if (trace.winner_action == LLAMA_DMN_ACTION_INVOKE_TOOL && !selected_dmn_spec) {
+        trace.winner_action = LLAMA_DMN_ACTION_SILENT;
+        selected_reason_mask |= LLAMA_COG_REASON_HIGH_UNCERTAINTY;
+    }
     if (working_memory_count >= 4) {
         trace.maintenance_mask |= LLAMA_DMN_MAINTENANCE_COMPRESS_WORKING_MEMORY;
     }
@@ -4357,22 +4644,26 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 trace.plan,
                 LLAMA_COG_PLAN_STEP_INVOKE_TOOL,
                 LLAMA_COG_PLAN_STEP_STATUS_READY,
-                last_remediation_plan.tool_kind,
+                selected_dmn_spec ? selected_dmn_spec->tool_kind : last_remediation_plan.tool_kind,
                 last_remediation_plan.source_family,
                 selected_reason_mask,
                 trace.winner_score,
                 1,
-                false);
+                false,
+                selected_dmn_spec,
+                selected_dmn_spec_index);
         (void) append_plan_step(
                 trace.plan,
                 LLAMA_COG_PLAN_STEP_OBSERVE_TOOL,
                 LLAMA_COG_PLAN_STEP_STATUS_PENDING,
-                last_remediation_plan.tool_kind,
+                selected_dmn_spec ? selected_dmn_spec->tool_kind : last_remediation_plan.tool_kind,
                 last_remediation_plan.source_family,
                 selected_reason_mask,
                 trace.winner_score,
                 1,
-                true);
+                true,
+                selected_dmn_spec,
+                selected_dmn_spec_index);
     } else if (trace.winner_action == LLAMA_DMN_ACTION_EMIT) {
         (void) append_plan_step(
                 trace.plan,
@@ -4522,6 +4813,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 true,
                 LLAMA_TOOL_KIND_NONE,
                 -1,
+                -1,
                 LLAMA_SELF_TOOL_JOB_COMPLETED,
                 0.55f * trace.pressure.counterfactual + 0.45f * trace.favorable_divergence,
                 trace.pressure.continuation);
@@ -4542,12 +4834,16 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         if (should_gather_followup && dmn_runner.steps_taken < dmn_runner.max_steps) {
             trace.winner_action = LLAMA_DMN_ACTION_INVOKE_TOOL;
             trace.tool_job_id = next_tool_job_id++;
-            trace.tool_kind = last_remediation_plan.tool_kind;
+            int32_t spec_index = -1;
+            const llama_cognitive_tool_spec * spec = select_dmn_spec(
+                    last_remediation_plan.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY ?
+                            "memory retrieval prior state history search" :
+                            "inspect runtime repository state and execution context",
+                    &spec_index);
+            trace.tool_kind = spec ? spec->tool_kind : last_remediation_plan.tool_kind;
+            trace.tool_spec_index = spec_index;
             (void) ctx.self_state_upsert_tool_job(trace.tool_job_id, LLAMA_SELF_TOOL_JOB_PENDING, clamp_unit(trace.winner_score));
             last_remediation_plan.tool_job_id = trace.tool_job_id;
-            int32_t spec_index = -1;
-            const llama_cognitive_tool_spec * spec =
-                    find_tool_spec(tool_specs, tool_spec_count, trace.tool_kind, &spec_index);
             set_loop_state(
                     trace.loop_state,
                     LLAMA_COG_LOOP_PHASE_PREPARE_TOOL,
@@ -4577,7 +4873,9 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                     selected_reason_mask,
                     trace.winner_score,
                     spec ? std::max(1, spec->max_steps_reserved) : 1,
-                    false);
+                    false,
+                    spec,
+                    spec_index);
             (void) append_plan_step(
                     trace.plan,
                     LLAMA_COG_PLAN_STEP_OBSERVE_TOOL,
@@ -4587,7 +4885,9 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                     selected_reason_mask,
                     trace.winner_score,
                     1,
-                    true);
+                    true,
+                    spec,
+                    spec_index);
             trace.plan.current_step_index = trace.plan.step_count - 1;
             trace.plan.status = LLAMA_COG_PLAN_STATUS_WAITING_TOOL;
             trace.plan.terminal_reason = LLAMA_COG_TERMINAL_TOOL_REQUIRED;
@@ -4597,11 +4897,14 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 LLAMA_COG_COMMAND_INVOKE_TOOL,
                 trace.tick_id,
                     trace.tool_kind,
+                    spec_index,
                     trace.tool_job_id,
                     selected_reason_mask,
                     trace.winner_score,
                     last_remediation_plan.source_family,
-                    trace.loop_state.phase);
+                    trace.loop_state.phase,
+                    spec);
+            dmn_runner.pending_tool_spec_index = spec_index;
             dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
             llama_bash_tool_config bash_config = {};
             if (dmn_runner.pending_command_id > 0) {
@@ -4666,10 +4969,13 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                     trace.tick_id,
                     LLAMA_TOOL_KIND_NONE,
                     -1,
+                    -1,
                     selected_reason_mask,
                     trace.winner_score,
                     last_remediation_plan.source_family,
-                    trace.loop_state.phase);
+                    trace.loop_state.phase,
+                    nullptr);
+            dmn_runner.pending_tool_spec_index = -1;
             dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
         } else {
             dmn_runner.completed = true;
@@ -4682,14 +4988,14 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 tool_affinity,
                 clamp_unit((float) working_memory_count / 8.0f));
         trace.tool_job_id = next_tool_job_id++;
-        trace.tool_kind = last_remediation_plan.tool_kind;
+        trace.tool_kind = selected_dmn_spec ? selected_dmn_spec->tool_kind : last_remediation_plan.tool_kind;
+        trace.tool_spec_index = selected_dmn_spec_index;
         (void) ctx.self_state_upsert_tool_job(trace.tool_job_id, LLAMA_SELF_TOOL_JOB_PENDING, clamp_unit(trace.winner_score));
         if (last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO) {
             last_remediation_plan.tool_job_id = trace.tool_job_id;
         }
-        int32_t spec_index = -1;
-        const llama_cognitive_tool_spec * spec =
-                find_tool_spec(tool_specs, tool_spec_count, trace.tool_kind, &spec_index);
+        int32_t spec_index = selected_dmn_spec_index;
+        const llama_cognitive_tool_spec * spec = selected_dmn_spec;
         set_loop_state(
                 trace.loop_state,
                 LLAMA_COG_LOOP_PHASE_PREPARE_TOOL,
@@ -4722,11 +5028,14 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 LLAMA_COG_COMMAND_INVOKE_TOOL,
                 trace.tick_id,
                 trace.tool_kind,
+                spec_index,
                 trace.tool_job_id,
                 selected_reason_mask,
                 trace.winner_score,
                 last_remediation_plan.source_family,
-                trace.loop_state.phase);
+                trace.loop_state.phase,
+                spec);
+        dmn_runner.pending_tool_spec_index = spec_index;
         dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
         llama_bash_tool_config bash_config = {};
         if (dmn_runner.pending_command_id > 0) {
@@ -4795,10 +5104,13 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 trace.tick_id,
                 LLAMA_TOOL_KIND_NONE,
                 -1,
+                -1,
                 selected_reason_mask,
                 trace.winner_score,
                 last_remediation_plan.source_family,
-                trace.loop_state.phase);
+                trace.loop_state.phase,
+                nullptr);
+        dmn_runner.pending_tool_spec_index = -1;
         dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
     } else {
         const int32_t terminal_reason =

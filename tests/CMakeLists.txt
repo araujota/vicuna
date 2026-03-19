@@ -211,6 +211,9 @@ llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURC
 llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
+llama_build(test-openclaw-tool-fabric.cpp ../tools/server/server-openclaw-fabric.cpp)
+target_include_directories(test-openclaw-tool-fabric PRIVATE ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/tools/server)
+llama_test(test-openclaw-tool-fabric)
 llama_build_and_test(
     test-peg-parser.cpp
     peg-parser/simple-tokenize.cpp

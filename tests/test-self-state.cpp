@@ -1517,6 +1517,81 @@ int main(int argc, char ** argv) {
         mock_server.stop();
     }
 
+    {
+        const int32_t base_trace_count = llama_self_state_trace_count(ctx);
+        const int32_t base_working_memory = llama_self_state_working_memory_count(ctx);
+        const std::vector<llama_token> user_tokens = tokenize_or_die(vocab, "While you were away I asked for a status update.");
+        const std::vector<llama_token> system_tokens = tokenize_or_die(vocab, "I reviewed the build logs and queued the next repair step.");
+        const std::vector<llama_token> tool_tokens = tokenize_or_die(vocab, "bash tool completed: git status showed one modified runtime file.");
+
+        auto admit_event = [ctx](const llama_self_state_event & event) {
+            llama_self_state_feature_vector pre = {};
+            llama_self_state_feature_vector post = {};
+            return llama_self_state_build_prewrite_features(ctx, &event, &pre) == 0 &&
+                    llama_self_state_apply_prewrite(ctx, &event, &pre) == 0 &&
+                    llama_self_state_build_postwrite_features(ctx, &event, &post) == 0 &&
+                    llama_self_state_apply_postwrite(ctx, &event, &post) == 0;
+        };
+
+        const llama_self_state_event user_event = {
+            /*.tokens =*/ user_tokens.data(),
+            /*.n_tokens =*/ user_tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
+            /*.decoder_entropy =*/ 0.0f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+        const llama_self_state_event system_event = {
+            /*.tokens =*/ system_tokens.data(),
+            /*.n_tokens =*/ system_tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED | LLAMA_SELF_STATE_EVENT_EMIT_FOLLOWUP,
+            /*.decoder_entropy =*/ 0.0f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+        const llama_self_state_event tool_event = {
+            /*.tokens =*/ tool_tokens.data(),
+            /*.n_tokens =*/ tool_tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_TOOL,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED | LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED,
+            /*.decoder_entropy =*/ 0.0f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+
+        if (!admit_event(user_event) ||
+            !admit_event(system_event) ||
+            !admit_event(tool_event)) {
+            std::fprintf(stderr, "failed to admit shared conversation/tool/system events\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        if (llama_self_state_trace_count(ctx) < base_trace_count + 3 ||
+            llama_self_state_working_memory_count(ctx) < base_working_memory + 3) {
+            std::fprintf(stderr, "shared context events did not enter the unified trace and working memory\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_self_trace_item_info trace_item = {};
+        if (llama_self_state_trace_get_item(ctx, llama_self_state_trace_count(ctx) - 3, &trace_item) != 0 ||
+            trace_item.role != LLAMA_SELF_STATE_EVENT_USER ||
+            llama_self_state_trace_get_item(ctx, llama_self_state_trace_count(ctx) - 2, &trace_item) != 0 ||
+            trace_item.role != LLAMA_SELF_STATE_EVENT_SYSTEM ||
+            llama_self_state_trace_get_item(ctx, llama_self_state_trace_count(ctx) - 1, &trace_item) != 0 ||
+            trace_item.role != LLAMA_SELF_STATE_EVENT_TOOL) {
+            std::fprintf(stderr, "shared context events were not preserved in one ordered trace\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+    }
+
     if (llama_self_state_clear_trace(ctx) != 0 ||
         llama_self_state_trace_count(ctx) != 0) {
         std::fprintf(stderr, "trace clear failed\n");

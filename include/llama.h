@@ -1786,11 +1786,15 @@ extern "C" {
         LLAMA_SELF_STATE_MAX_DELTA_DIMS = 8,
         LLAMA_COGNITIVE_MAX_TOOL_SPECS = 8,
         LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS = 48,
+        LLAMA_COGNITIVE_TOOL_DESCRIPTION_MAX_CHARS = 160,
         LLAMA_COGNITIVE_MAX_PENDING_COMMANDS = 16,
         LLAMA_COGNITIVE_MAX_PLAN_STEPS = 5,
         LLAMA_SELF_MODEL_EXTENSION_MAX_ITEMS = 32,
         LLAMA_PROCESS_FUNCTIONAL_MAX_ENTRIES = 16,
-        LLAMA_PROCESS_FUNCTIONAL_KEY_MAX_CHARS = 96,
+        LLAMA_PROCESS_FUNCTIONAL_KEY_MAX_CHARS = 160,
+        LLAMA_OPENCLAW_CAPABILITY_ID_MAX_CHARS = 96,
+        LLAMA_OPENCLAW_PLUGIN_ID_MAX_CHARS = 64,
+        LLAMA_OPENCLAW_NAMESPACE_MAX_CHARS = 128,
     };
 
     enum llama_process_functional_scope_kind {
@@ -1837,6 +1841,8 @@ extern "C" {
         int32_t transient_step_index;
         int32_t transient_source_id;
         char tool_name[LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS];
+        char capability_id[LLAMA_OPENCLAW_CAPABILITY_ID_MAX_CHARS];
+        char provenance_namespace[LLAMA_OPENCLAW_NAMESPACE_MAX_CHARS];
         char semantic_key[LLAMA_PROCESS_FUNCTIONAL_KEY_MAX_CHARS];
     };
 
@@ -2230,6 +2236,10 @@ extern "C" {
         int32_t latency_class;
         int32_t max_steps_reserved;
         char name[LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS];
+        char description[LLAMA_COGNITIVE_TOOL_DESCRIPTION_MAX_CHARS];
+        char capability_id[LLAMA_OPENCLAW_CAPABILITY_ID_MAX_CHARS];
+        char owner_plugin_id[LLAMA_OPENCLAW_PLUGIN_ID_MAX_CHARS];
+        char provenance_namespace[LLAMA_OPENCLAW_NAMESPACE_MAX_CHARS];
     };
 
     struct llama_cognitive_tool_proposal {
@@ -2242,15 +2252,20 @@ extern "C" {
         int32_t expected_steps;
         float expected_observation_gain;
         int32_t job_id;
+        char capability_id[LLAMA_OPENCLAW_CAPABILITY_ID_MAX_CHARS];
+        char provenance_namespace[LLAMA_OPENCLAW_NAMESPACE_MAX_CHARS];
     };
 
     struct llama_cognitive_observation {
         bool valid;
         int32_t tool_kind;
+        int32_t spec_index;
         int32_t job_id;
         int32_t status;
         float signal;
         float followup_affinity;
+        char capability_id[LLAMA_OPENCLAW_CAPABILITY_ID_MAX_CHARS];
+        char provenance_namespace[LLAMA_OPENCLAW_NAMESPACE_MAX_CHARS];
     };
 
     struct llama_cognitive_loop_state {
@@ -2271,22 +2286,27 @@ extern "C" {
         int32_t episode_id;
         int32_t tick_id;
         int32_t tool_kind;
+        int32_t tool_spec_index;
         int32_t tool_job_id;
         uint32_t reason_mask;
         float priority;
         int32_t source_family;
         int32_t loop_phase;
+        char capability_id[LLAMA_OPENCLAW_CAPABILITY_ID_MAX_CHARS];
     };
 
     struct llama_cognitive_plan_step {
         int32_t kind;
         int32_t status;
         int32_t tool_kind;
+        int32_t tool_spec_index;
         int32_t source_family;
         uint32_t reason_mask;
         float priority;
         int32_t expected_steps;
         bool requires_tool_result;
+        char capability_id[LLAMA_OPENCLAW_CAPABILITY_ID_MAX_CHARS];
+        char provenance_namespace[LLAMA_OPENCLAW_NAMESPACE_MAX_CHARS];
     };
 
     struct llama_cognitive_plan_trace {
@@ -2315,6 +2335,7 @@ extern "C" {
         int32_t steps_taken;
         int32_t max_steps;
         int32_t pending_command_id;
+        int32_t pending_tool_spec_index;
         int32_t last_command_id;
         int32_t functional_microphase;
         int32_t plan_id;
@@ -2333,6 +2354,7 @@ extern "C" {
         int32_t steps_taken;
         int32_t max_steps;
         int32_t pending_command_id;
+        int32_t pending_tool_spec_index;
         int32_t last_command_id;
         int32_t functional_microphase;
         int32_t plan_id;
@@ -2431,6 +2453,7 @@ extern "C" {
         int32_t burst_count;
         uint32_t maintenance_mask;
         int32_t tool_kind;
+        int32_t tool_spec_index;
         int32_t tool_job_id;
         float favorable_divergence;
         struct llama_cognitive_plan_trace plan;

@@ -487,6 +487,8 @@ int main(int argc, char ** argv) {
     process_signature.transient_step_index = 1;
     process_signature.transient_source_id = 11;
     std::snprintf(process_signature.tool_name, sizeof(process_signature.tool_name), "%s", "bash-cli");
+    std::snprintf(process_signature.capability_id, sizeof(process_signature.capability_id), "%s", "openclaw/local/exec");
+    std::snprintf(process_signature.provenance_namespace, sizeof(process_signature.provenance_namespace), "%s", "openclaw/local/exec");
     std::snprintf(process_signature.semantic_key, sizeof(process_signature.semantic_key), "%s", "dmn/counterfactual_compare/step_kind:4/tool:bash-cli");
     if (!ctx->process_functional_set_execution(process_signature)) {
         fprintf(stderr, "failed to seed process-functional execution signature\n");
