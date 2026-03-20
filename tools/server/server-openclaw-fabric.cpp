@@ -59,6 +59,24 @@ bool env_list_contains(const char * name, const char * needle, bool default_valu
     return false;
 }
 
+bool builtin_tool_enabled_for_env(const char * tool_id) {
+    if (!tool_id) {
+        return false;
+    }
+    if (env_list_contains("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS", tool_id, true)) {
+        return true;
+    }
+    // Compatibility: older host-local env files often pin the builtin allowlist
+    // to exec + hard_memory_query. Treat that legacy hard-memory entry as the
+    // whole hard-memory tool layer so explicit durable writes are not silently
+    // removed from the live OpenClaw surface.
+    if (std::strcmp(tool_id, "hard_memory_write") == 0 &&
+            env_list_contains("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS", "hard_memory_query", false)) {
+        return true;
+    }
+    return false;
+}
+
 void set_bounded(char * dst, size_t dst_size, const std::string & src) {
     if (!dst || dst_size == 0) {
         return;
@@ -1223,7 +1241,7 @@ bool server_openclaw_fabric::rebuild_catalog(
             builtin_capability_registrations(&registration_count);
     for (size_t i = 0; i < registration_count; ++i) {
         const auto & registration = registrations[i];
-        if (!env_list_contains("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS", registration.tool_id, true)) {
+        if (!builtin_tool_enabled_for_env(registration.tool_id)) {
             continue;
         }
         if (!registration.is_available(bash_enabled, hard_memory_enabled, codex_enabled)) {

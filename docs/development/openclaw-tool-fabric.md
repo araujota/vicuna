@@ -76,13 +76,18 @@ and mirrored in
 
 - `VICUNA_OPENCLAW_TOOL_FABRIC_ENABLED=1`
   Enables catalog installation and strict dispatch resolution.
-- `VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS=exec,hard_memory_query`
+- `VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS=exec,hard_memory_query,hard_memory_write`
   Optional comma-separated allowlist of registered built-ins.
 - `VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH=/path/to/openclaw-catalog.json`
   Optional external catalog file merged with the built-ins.
 
 If the fabric is enabled but no routable capabilities survive policy and local
 tool availability checks, startup refuses to install the catalog.
+
+If a host still carries the older builtin allowlist
+`exec,hard_memory_query`, the runtime now compatibility-upgrades that setting
+so `hard_memory_write` remains available as part of the hard-memory tool layer
+instead of being silently dropped.
 
 At runtime, `llama-server` now logs the effective prerequisite state and the
 installed capability set, for example:

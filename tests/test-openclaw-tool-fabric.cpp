@@ -113,6 +113,28 @@ int main() {
         return 1;
     }
 
+    setenv("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS", "exec,hard_memory_query", 1);
+    server_openclaw_fabric legacy_filtered_fabric;
+    if (!expect(legacy_filtered_fabric.configure(true, true, true, &error), error.c_str())) {
+        return 1;
+    }
+    std::vector<llama_cognitive_tool_spec> legacy_specs;
+    if (!expect(legacy_filtered_fabric.build_cognitive_specs(&legacy_specs), "failed to build legacy-filtered cognitive specs")) {
+        return 1;
+    }
+    if (!expect(legacy_specs.size() == 3, "expected legacy allowlist to preserve exec plus the full hard-memory tool layer")) {
+        return 1;
+    }
+    if (!expect(legacy_filtered_fabric.capability_by_tool_name("hard_memory_write") != nullptr,
+                "expected legacy allowlist compatibility to retain hard-memory write")) {
+        return 1;
+    }
+    if (!expect(legacy_filtered_fabric.capability_by_tool_name("codex") == nullptr,
+                "expected codex to remain filtered when omitted from explicit allowlist")) {
+        return 1;
+    }
+    unsetenv("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS");
+
     std::vector<int32_t> exec_only = { 0 };
     std::vector<server_openclaw_xml_tool_contract> contracts;
     if (!expect(fabric.build_xml_tool_contracts(&contracts, &exec_only, &error), error.c_str())) {
