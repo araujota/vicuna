@@ -591,7 +591,7 @@ openclaw_tool_capability_descriptor build_exec_descriptor() {
     exec.capability_kind = "tool";
     exec.owner_plugin_id = "openclaw-core";
     exec.tool_name = "exec";
-    exec.description = "Run a command through the bounded execution policy";
+    exec.description = "Run one bounded command invocation through the execution policy; do not use shell chaining or redirection";
     exec.input_schema_json = R"({"type":"object","required":["command"],"properties":{"command":{"type":"string"},"workdir":{"type":"string"}}})";
     exec.output_contract = "pending_then_result";
     exec.side_effect_class = "system_exec";
@@ -935,12 +935,15 @@ bool server_openclaw_fabric::render_tool_call_xml_guidance(
         }
         out << "\n";
         for (const auto & arg : contract.args) {
-            out << "  - " << arg.name << ": " << xml_type_label(arg.allowed_types);
-            if (arg.required) {
-                out << " (required)";
-            }
-            out << "\n";
+        out << "  - " << arg.name << ": " << xml_type_label(arg.allowed_types);
+        if (arg.required) {
+            out << " (required)";
         }
+        if (contract.tool_name == "exec" && arg.name == "command") {
+            out << " [single command only; no pipes, redirects, chaining, or substitution]";
+        }
+        out << "\n";
+    }
     }
 
     const auto & example = contracts.front();

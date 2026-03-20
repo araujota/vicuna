@@ -136,7 +136,7 @@ static bool validate_bash_request(
 
     if (request.reject_shell_metacharacters && command_contains_forbidden_meta(command_text)) {
         if (out_error) {
-            *out_error = "bash command contains disallowed shell metacharacters";
+            *out_error = "bash command contains disallowed shell metacharacters such as &&, ||, ;, |, >, <, `, or $(";
         }
         return false;
     }

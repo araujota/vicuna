@@ -1646,6 +1646,18 @@ static std::string percent_encode_query(const std::string & text) {
     return encoded;
 }
 
+static bool exec_command_contains_forbidden_meta(const std::string & command_text) {
+    static const char * const blocked_tokens[] = {
+        "&&", "||", ";", "|", ">", "<", "`", "$("
+    };
+    for (const char * token : blocked_tokens) {
+        if (command_text.find(token) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static std::string format_react_bash_observation(const llama_bash_tool_result & result) {
     std::ostringstream oss;
     oss << "status=";
@@ -2824,7 +2836,16 @@ private:
 
             std::string command_text = request.command_text;
             if (capability->descriptor.capability_id == "openclaw.exec.command") {
-                command_text = trim_ascii_copy(json_value(arguments, "command", std::string()));
+                const std::string xml_command = trim_ascii_copy(json_value(arguments, "command", std::string()));
+                if (!xml_command.empty()) {
+                    if (request.reject_shell_metacharacters &&
+                            exec_command_contains_forbidden_meta(xml_command)) {
+                        SRV_WRN("planner emitted unsafe exec override for command %d; preserving preflight command\n",
+                                runner.pending_command_id);
+                    } else {
+                        command_text = xml_command;
+                    }
+                }
                 const std::string workdir = trim_ascii_copy(json_value(arguments, "workdir", std::string()));
                 if (!workdir.empty()) {
                     const std::filesystem::path base_workdir(trim_ascii_copy(request.working_directory));
@@ -5731,11 +5752,31 @@ private:
             if (!openclaw_fabric.configure(bash_tool_enabled, hard_memory_enabled, codex_tool_enabled, &fabric_error)) {
                 SRV_WRN("failed to configure OpenClaw tool fabric: %s\n", fabric_error.c_str());
             } else if (openclaw_fabric.enabled()) {
+                const char * catalog_path = getenv("VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH");
+                const bool catalog_exists =
+                        catalog_path && catalog_path[0] != '\0' &&
+                        std::filesystem::exists(catalog_path);
+                SRV_INF("OpenClaw prerequisites: bash=%d hard_memory=%d codex=%d catalog_path=%s catalog_exists=%d\n",
+                        bash_tool_enabled ? 1 : 0,
+                        hard_memory_enabled ? 1 : 0,
+                        codex_tool_enabled ? 1 : 0,
+                        catalog_path && catalog_path[0] != '\0' ? catalog_path : "<unset>",
+                        catalog_exists ? 1 : 0);
                 std::vector<llama_cognitive_tool_spec> specs;
                 if (openclaw_fabric.build_cognitive_specs(&specs) &&
                         !specs.empty() &&
                         llama_cognitive_tool_spec_set(ctx, specs.data(), (int32_t) specs.size()) == 0) {
+                    std::ostringstream capability_summary;
+                    const auto & capabilities = openclaw_fabric.capabilities();
+                    for (size_t i = 0; i < capabilities.size(); ++i) {
+                        if (i > 0) {
+                            capability_summary << ", ";
+                        }
+                        capability_summary << capabilities[i].descriptor.tool_name
+                                           << "=" << capabilities[i].descriptor.capability_id;
+                    }
                     SRV_INF("OpenClaw tool fabric enabled with %zu capabilities\n", specs.size());
+                    SRV_INF("OpenClaw capability set: %s\n", capability_summary.str().c_str());
                 } else {
                     SRV_WRN("%s\n", "failed to install OpenClaw tool catalog into cognitive runtime");
                 }

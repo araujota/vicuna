@@ -2,12 +2,14 @@ import type { CapabilityCatalog, CapabilityDescriptor } from "./contracts.js";
 import { assertCapabilityCatalog } from "./contracts.js";
 import type { OpenClawToolSecrets } from "./config.js";
 
-export type BuiltinToolId = "exec" | "hard_memory_query";
+export type BuiltinToolId = "exec" | "hard_memory_query" | "hard_memory_write" | "codex";
 
 export type CatalogOptions = {
   enabledTools?: BuiltinToolId[];
   enableExec?: boolean;
   enableHardMemoryQuery?: boolean;
+  enableHardMemoryWrite?: boolean;
+  enableCodex?: boolean;
 };
 
 export type RuntimeCatalogOptions = {
@@ -21,7 +23,7 @@ function execCapability(): CapabilityDescriptor {
     capability_kind: "tool",
     owner_plugin_id: "openclaw-core",
     tool_name: "exec",
-    description: "Run a command through bounded execution policy",
+    description: "Run one bounded command invocation through the execution policy; do not use shell chaining or redirection",
     input_schema_json: {
       type: "object",
       required: ["command"],
@@ -71,6 +73,83 @@ function hardMemoryCapability(): CapabilityDescriptor {
   };
 }
 
+function hardMemoryWriteCapability(): CapabilityDescriptor {
+  return {
+    capability_id: "openclaw.vicuna.hard_memory_write",
+    tool_surface_id: "vicuna.memory.hard_write",
+    capability_kind: "memory_adapter",
+    owner_plugin_id: "vicuna-memory",
+    tool_name: "hard_memory_write",
+    description: "Archive explicit durable memories to Vicuña hard memory and Supermemory",
+    input_schema_json: {
+      type: "object",
+      required: ["memories"],
+      properties: {
+        memories: {
+          type: "array",
+          minItems: 1,
+          items: {
+            type: "object",
+            required: ["content"],
+            properties: {
+              content: { type: "string" },
+              title: { type: "string" },
+              key: { type: "string" },
+              kind: { type: "string" },
+              domain: { type: "string" },
+              tags: { type: "array", items: { type: "string" } },
+              importance: { type: "number" },
+              confidence: { type: "number" },
+              gainBias: { type: "number" },
+              allostaticRelevance: { type: "number" },
+              isStatic: { type: "boolean" }
+            }
+          }
+        },
+        containerTag: { type: "string" }
+      }
+    },
+    output_contract: "completed_result",
+    side_effect_class: "memory_write",
+    approval_mode: "none",
+    execution_modes: ["sync"],
+    provenance_namespace: "openclaw/vicuna-memory/memory_adapter/hard_memory_write",
+    tool_kind: 3,
+    tool_flags: 0,
+    latency_class: 2,
+    max_steps_reserved: 3,
+    dispatch_backend: "legacy_hard_memory"
+  };
+}
+
+function codexCapability(): CapabilityDescriptor {
+  return {
+    capability_id: "openclaw.vicuna.codex_cli",
+    tool_surface_id: "vicuna.codex.main",
+    capability_kind: "tool",
+    owner_plugin_id: "vicuna-runtime",
+    tool_name: "codex",
+    description: "Use the local Codex CLI to implement a repository change and rebuild the runtime",
+    input_schema_json: {
+      type: "object",
+      required: ["task"],
+      properties: {
+        task: { type: "string" }
+      }
+    },
+    output_contract: "pending_then_result",
+    side_effect_class: "self_modification",
+    approval_mode: "none",
+    execution_modes: ["background"],
+    provenance_namespace: "openclaw/vicuna-runtime/tool/codex",
+    tool_kind: 5,
+    tool_flags: 0,
+    latency_class: 2,
+    max_steps_reserved: 3,
+    dispatch_backend: "legacy_codex"
+  };
+}
+
 function tavilyWebSearchCapability(): CapabilityDescriptor {
   return {
     capability_id: "openclaw.tavily.web_search",
@@ -104,7 +183,9 @@ function tavilyWebSearchCapability(): CapabilityDescriptor {
 
 const BUILTIN_CAPABILITIES: Record<BuiltinToolId, () => CapabilityDescriptor> = {
   exec: execCapability,
-  hard_memory_query: hardMemoryCapability
+  hard_memory_query: hardMemoryCapability,
+  hard_memory_write: hardMemoryWriteCapability,
+  codex: codexCapability
 };
 
 export function buildCatalog(options: CatalogOptions = {}): CapabilityCatalog {
@@ -116,6 +197,12 @@ export function buildCatalog(options: CatalogOptions = {}): CapabilityCatalog {
         }
         if (toolId === "hard_memory_query") {
           return options.enableHardMemoryQuery !== false;
+        }
+        if (toolId === "hard_memory_write") {
+          return options.enableHardMemoryWrite !== false;
+        }
+        if (toolId === "codex") {
+          return options.enableCodex !== false;
         }
         return true;
       })

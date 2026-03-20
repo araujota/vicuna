@@ -5,13 +5,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { buildCatalog, buildRuntimeCatalog } from "../src/catalog.js";
-import { loadToolSecrets, saveToolSecrets, upsertTavilyApiKey } from "../src/config.js";
+import { defaultPaths, loadToolSecrets, saveToolSecrets, upsertTavilyApiKey } from "../src/config.js";
 import { resolveInvocation } from "../src/invoke.js";
 import { writeRuntimeCatalog } from "../src/runtime-catalog.js";
 
 test("default catalog includes exec and hard-memory", () => {
   const catalog = buildCatalog();
-  assert.equal(catalog.capabilities.length, 2);
+  assert.equal(catalog.capabilities.length, 4);
   assert.deepEqual(
     catalog.capabilities.map((capability) => ({
       tool_surface_id: capability.tool_surface_id,
@@ -25,6 +25,14 @@ test("default catalog includes exec and hard-memory", () => {
       {
         tool_surface_id: "vicuna.memory.hard_query",
         capability_id: "openclaw.vicuna.hard_memory_query"
+      },
+      {
+        tool_surface_id: "vicuna.memory.hard_write",
+        capability_id: "openclaw.vicuna.hard_memory_write"
+      },
+      {
+        tool_surface_id: "vicuna.codex.main",
+        capability_id: "openclaw.vicuna.codex_cli"
       }
     ]
   );
@@ -98,4 +106,21 @@ test("OpenClaw secrets persist Tavily config and emit a runtime catalog", () => 
     runtimeCatalog.capabilities.map((capability: { capability_id: string }) => capability.capability_id),
     ["openclaw.tavily.web_search"]
   );
+});
+
+test("runtime catalog path honors the configured fabric catalog path", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vicuna-openclaw-harness-env-"));
+  const secretsPath = path.join(tempDir, "openclaw-tool-secrets.json");
+  const configuredCatalogPath = path.join(tempDir, "configured", "runtime-catalog.json");
+
+  saveToolSecrets(secretsPath, upsertTavilyApiKey({}, "test-key"));
+
+  process.env.VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH = configuredCatalogPath;
+  const paths = defaultPaths(tempDir);
+  assert.equal(paths.runtimeCatalogPath, configuredCatalogPath);
+
+  writeRuntimeCatalog(configuredCatalogPath, secretsPath);
+  assert.equal(fs.existsSync(configuredCatalogPath), true);
+
+  delete process.env.VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH;
 });

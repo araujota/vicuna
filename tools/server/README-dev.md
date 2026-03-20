@@ -204,6 +204,13 @@ admitting the emitted text back into self-state, and then submitting a typed
 `llama_telegram_relay_result` so the DMN loop can continue without being
 treated as a foreground assistant reply.
 
+Active and DMN continuation are no longer governed by the old tiny hardcoded
+runner ceilings. The runner status surfaces still expose `steps_taken` and
+`max_steps`, but `max_steps` now acts as an effectively unbounded observability
+budget rather than as the stop condition. Real termination comes from explicit
+completion, tool waits, governance blocking, pressure admission, or foreground
+preemption.
+
 ### ReAct Tool-Call XML Contract
 
 For active-loop ReAct tool steps, host code now enforces one canonical tool
@@ -217,6 +224,12 @@ surface for model output:
   or `json`
 - reject undeclared arguments, duplicate arguments, missing required arguments,
   malformed XML, and schema/type mismatches
+
+For `tool="exec"`, the planner-visible contract is now stricter: `command`
+means one bounded invocation only, not shell scripting. `server_context`
+preserves the preflight-safe command if planner XML tries to replace it with a
+metacharacter-heavy shell pipeline, and `server-bash-tool` still rejects
+chaining, redirection, and command substitution at execution time.
 
 `server-openclaw-fabric.cpp` derives these contracts from the registered tool
 schema, injects the contract into the tool-step system prompt, parses only the

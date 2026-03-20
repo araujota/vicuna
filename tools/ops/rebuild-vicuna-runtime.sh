@@ -64,6 +64,52 @@ run_cmd() {
     "$@"
 }
 
+resolve_runtime_node_bin() {
+    if [[ -n "${TELEGRAM_BRIDGE_NODE_BIN:-}" && -x "${TELEGRAM_BRIDGE_NODE_BIN:-}" ]]; then
+        printf '%s\n' "$TELEGRAM_BRIDGE_NODE_BIN"
+        return 0
+    fi
+    if command -v node >/dev/null 2>&1; then
+        printf '%s\n' "$(command -v node)"
+        return 0
+    fi
+    return 1
+}
+
+sync_runtime_catalog() {
+    local catalog_path="${VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH:-}"
+    [[ -n "$catalog_path" ]] || return 0
+
+    local node_bin
+    node_bin="$(resolve_runtime_node_bin)" || die "failed to resolve node for OpenClaw runtime catalog sync"
+
+    local -a sync_env=(
+        env
+        "REPO_ROOT=$REPO_ROOT"
+        "VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH=$catalog_path"
+    )
+    if [[ -n "${VICUNA_CODEX_TOOL_PATH:-}" ]]; then
+        sync_env+=("VICUNA_CODEX_TOOL_PATH=$VICUNA_CODEX_TOOL_PATH")
+    fi
+
+    if (( DRY_RUN )); then
+        run_cmd "${sync_env[@]}" "$node_bin" "$REPO_ROOT/tools/openclaw-harness/dist/index.js" sync-runtime-catalog
+        return 0
+    fi
+
+    if [[ -w "$(dirname "$catalog_path")" || ( -e "$catalog_path" && -w "$catalog_path" ) ]]; then
+        "${sync_env[@]}" "$node_bin" "$REPO_ROOT/tools/openclaw-harness/dist/index.js" sync-runtime-catalog >/dev/null
+        return 0
+    fi
+
+    local service_user="${VICUNA_SERVICE_USER:-vicuna}"
+    if (( EUID == 0 )); then
+        runuser -u "$service_user" -- "${sync_env[@]}" "$node_bin" "$REPO_ROOT/tools/openclaw-harness/dist/index.js" sync-runtime-catalog >/dev/null
+    else
+        sudo -u "$service_user" "${sync_env[@]}" "$node_bin" "$REPO_ROOT/tools/openclaw-harness/dist/index.js" sync-runtime-catalog >/dev/null
+    fi
+}
+
 systemctl_cmd() {
     if [[ "$SYSTEMD_SCOPE" == "system" ]]; then
         if (( EUID == 0 )); then
@@ -199,10 +245,13 @@ done
 
 log "repo=$REPO_ROOT service=$RUNTIME_SERVICE build_dir=$BUILD_DIR"
 log "runtime_state_path=$VICUNA_RUNTIME_STATE_PATH"
+log "openclaw_catalog_path=${VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH:-<unset>}"
 
 if [[ -z "${VICUNA_RUNTIME_STATE_PATH:-}" ]] && (( ! ALLOW_STATE_RESET )); then
     die "VICUNA_RUNTIME_STATE_PATH must be configured unless --allow-state-reset is used"
 fi
+
+sync_runtime_catalog
 
 had_snapshot=0
 if [[ -n "${VICUNA_RUNTIME_STATE_PATH:-}" && -f "$VICUNA_RUNTIME_STATE_PATH" ]]; then

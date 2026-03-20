@@ -116,6 +116,42 @@ resolve_node_bin() {
     die "could not resolve Node.js >= 20.16; set TELEGRAM_BRIDGE_NODE_BIN"
 }
 
+resolve_codex_bin() {
+    if [[ -n "${VICUNA_CODEX_TOOL_PATH:-}" && -x "${VICUNA_CODEX_TOOL_PATH:-}" ]]; then
+        printf '%s\n' "$VICUNA_CODEX_TOOL_PATH"
+        return 0
+    fi
+
+    if command -v codex >/dev/null 2>&1; then
+        printf '%s\n' "$(command -v codex)"
+        return 0
+    fi
+
+    local owner_home
+    owner_home="$(getent passwd "$INTERACTIVE_OWNER" | cut -d: -f6)"
+    if [[ -n "$owner_home" ]]; then
+        local candidate=""
+        candidate="$(runuser -u "$INTERACTIVE_OWNER" -- bash -lc 'command -v codex' 2>/dev/null || true)"
+        if [[ -n "$candidate" && -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+
+        for candidate in \
+            "$owner_home/.local/bin/codex" \
+            "$owner_home/.npm-global/bin/codex" \
+            "/usr/local/bin/codex"
+        do
+            if [[ -x "$candidate" ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done
+    fi
+
+    printf '\n'
+}
+
 ensure_group() {
     getent group "$SERVICE_GROUP" >/dev/null 2>&1 || run_cmd groupadd --system "$SERVICE_GROUP"
 }
@@ -154,11 +190,14 @@ grant_repo_access() {
 
 write_env_file() {
     local node_bin="$1"
+    local codex_bin="$2"
     run_cmd install -d -m 0755 "$ETC_DIR"
     if (( DRY_RUN )); then
         cat <<EOF
 VICUNA_SYSTEMD_SCOPE=system
 VICUNA_SYSTEM_ENV_FILE=$ENV_FILE
+VICUNA_SERVICE_USER=$SERVICE_USER
+VICUNA_SERVICE_GROUP=$SERVICE_GROUP
 VICUNA_RUNTIME_SERVICE_NAME=vicuna-runtime.service
 VICUNA_REPO_ROOT=$REPO_ROOT
 REPO_ROOT=$REPO_ROOT
@@ -166,6 +205,7 @@ VICUNA_RUNTIME_STATE_PATH=$RUNTIME_STATE_PATH
 VICUNA_RUNTIME_STATE_BACKUP_DIR=$RUNTIME_BACKUP_DIR
 VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH=$OPENCLAW_CATALOG_PATH
 VICUNA_BASH_TOOL_WORKDIR=$REPO_ROOT
+VICUNA_CODEX_TOOL_PATH=$codex_bin
 VICUNA_CODEX_TOOL_WORKDIR=$REPO_ROOT
 TELEGRAM_BRIDGE_STATE_PATH=$TELEGRAM_STATE_PATH
 TELEGRAM_BRIDGE_NODE_BIN=$node_bin
@@ -175,6 +215,8 @@ EOF
     cat >"$ENV_FILE" <<EOF
 VICUNA_SYSTEMD_SCOPE=system
 VICUNA_SYSTEM_ENV_FILE=$ENV_FILE
+VICUNA_SERVICE_USER=$SERVICE_USER
+VICUNA_SERVICE_GROUP=$SERVICE_GROUP
 VICUNA_RUNTIME_SERVICE_NAME=vicuna-runtime.service
 VICUNA_REPO_ROOT=$REPO_ROOT
 REPO_ROOT=$REPO_ROOT
@@ -182,6 +224,7 @@ VICUNA_RUNTIME_STATE_PATH=$RUNTIME_STATE_PATH
 VICUNA_RUNTIME_STATE_BACKUP_DIR=$RUNTIME_BACKUP_DIR
 VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH=$OPENCLAW_CATALOG_PATH
 VICUNA_BASH_TOOL_WORKDIR=$REPO_ROOT
+VICUNA_CODEX_TOOL_PATH=$codex_bin
 VICUNA_CODEX_TOOL_WORKDIR=$REPO_ROOT
 TELEGRAM_BRIDGE_STATE_PATH=$TELEGRAM_STATE_PATH
 TELEGRAM_BRIDGE_NODE_BIN=$node_bin
@@ -227,6 +270,27 @@ disable_user_service_if_possible() {
         systemctl --user disable --now "$service_name" >/dev/null 2>&1 || true
 }
 
+sync_runtime_catalog() {
+    local node_bin="$1"
+    local codex_bin="$2"
+
+    run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$(dirname "$OPENCLAW_CATALOG_PATH")"
+
+    local -a sync_env=(
+        env
+        "REPO_ROOT=$REPO_ROOT"
+        "VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH=$OPENCLAW_CATALOG_PATH"
+    )
+    if [[ -n "$codex_bin" ]]; then
+        sync_env+=("VICUNA_CODEX_TOOL_PATH=$codex_bin")
+    fi
+
+    run_cmd "${sync_env[@]}" "$node_bin" "$REPO_ROOT/tools/openclaw-harness/dist/index.js" sync-runtime-catalog
+    if [[ -f "$OPENCLAW_CATALOG_PATH" ]]; then
+        run_cmd chown "$SERVICE_USER:$SERVICE_GROUP" "$OPENCLAW_CATALOG_PATH"
+    fi
+}
+
 while (($# > 0)); do
     case "$1" in
         --dry-run)
@@ -246,16 +310,18 @@ done
 require_root
 
 NODE_BIN="$(resolve_node_bin)"
+CODEX_BIN="$(resolve_codex_bin)"
 
 log "repo=$REPO_ROOT service_user=$SERVICE_USER interactive_owner=$INTERACTIVE_OWNER"
-log "state_root=$STATE_ROOT cache_root=$CACHE_ROOT log_root=$LOG_ROOT node_bin=$NODE_BIN"
+log "state_root=$STATE_ROOT cache_root=$CACHE_ROOT log_root=$LOG_ROOT node_bin=$NODE_BIN codex_bin=${CODEX_BIN:-<missing>}"
 
 ensure_group
 ensure_user
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_ROOT" "$CACHE_ROOT" "$LOG_ROOT"
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$(dirname "$RUNTIME_STATE_PATH")" "$RUNTIME_BACKUP_DIR" "$(dirname "$TELEGRAM_STATE_PATH")"
 grant_repo_access
-write_env_file "$NODE_BIN"
+write_env_file "$NODE_BIN" "$CODEX_BIN"
+sync_runtime_catalog "$NODE_BIN" "$CODEX_BIN"
 install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-runtime.system.service" "$SYSTEMD_DIR/vicuna-runtime.service"
 install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-telegram-bridge.system.service" "$SYSTEMD_DIR/vicuna-telegram-bridge.service"
 

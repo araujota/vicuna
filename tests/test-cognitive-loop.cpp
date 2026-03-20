@@ -895,7 +895,18 @@ int main(int argc, char ** argv) {
             trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ||
             trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP ||
             trace.tool_proposal.expected_steps <= 0) {
-            std::fprintf(stderr, "active act trace did not expose tool preparation scaffolding\n");
+            std::fprintf(stderr,
+                         "active act trace did not expose tool preparation scaffolding"
+                         " phase=%d terminal=%d continue=%d wait=%d proposal=%d tool_kind=%d family=%d microphase=%d expected_steps=%d\n",
+                         trace.loop_state.phase,
+                         trace.loop_state.terminal_reason,
+                         trace.loop_state.continuation_allowed ? 1 : 0,
+                         trace.loop_state.waiting_on_tool ? 1 : 0,
+                         trace.tool_proposal.valid ? 1 : 0,
+                         trace.tool_proposal.tool_kind,
+                         trace.functional_activation.top_family,
+                         trace.functional_activation.microphase,
+                         trace.tool_proposal.expected_steps);
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -1203,9 +1214,10 @@ int main(int argc, char ** argv) {
             !runner.active ||
             !runner.waiting_on_tool ||
             runner.pending_command_id != command.command_id ||
+            runner.max_steps <= 3 ||
             !expect_functional_family_state("active-act-dispatch-functional", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, true, LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, 0.10f) ||
             !expect_functional_family_state("active-act-dispatch-planner-functional", ctx, LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION, true, LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, 0.10f)) {
-            std::fprintf(stderr, "active tool-dispatch ablation setup was not active before command completion\n");
+            std::fprintf(stderr, "active tool-dispatch ablation setup did not preserve an unbounded continuation budget\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -1395,6 +1407,69 @@ int main(int argc, char ** argv) {
         if (!expect_bash_request("active-tavily-current-info-request", ctx, command, "tavily-web-search --query-url=", &request) ||
             std::strstr(request.command_text, "president%20of%20Albania%20today") == nullptr) {
             std::fprintf(stderr, "Tavily current-info request was not synthesized correctly: %s\n", request.command_text);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(ctx);
+    }
+
+    {
+        g_contradiction_score = 0.05f;
+        g_uncertainty_score = 0.05f;
+        g_broadcast_score = 0.05f;
+
+        llama_context * ctx = create_context(model);
+        if (!ctx) {
+            std::fprintf(stderr, "failed to create explicit Tavily request context\n");
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_tool_spec tavily_spec = {};
+        tavily_spec.tool_kind = LLAMA_TOOL_KIND_BASH_CLI;
+        tavily_spec.flags = LLAMA_COG_TOOL_ACTIVE_ELIGIBLE | LLAMA_COG_TOOL_DMN_ELIGIBLE;
+        tavily_spec.latency_class = LLAMA_COG_TOOL_LATENCY_MEDIUM;
+        tavily_spec.max_steps_reserved = 2;
+        std::snprintf(tavily_spec.name, sizeof(tavily_spec.name), "%s", "web_search");
+        std::snprintf(tavily_spec.description, sizeof(tavily_spec.description), "%s", "Search the live web through Tavily");
+        std::snprintf(tavily_spec.capability_id, sizeof(tavily_spec.capability_id), "%s", "openclaw.tavily.web_search");
+        std::snprintf(tavily_spec.owner_plugin_id, sizeof(tavily_spec.owner_plugin_id), "%s", "openclaw-tavily");
+        std::snprintf(tavily_spec.provenance_namespace, sizeof(tavily_spec.provenance_namespace), "%s", "openclaw/openclaw-tavily/tool/web_search");
+        if (llama_cognitive_tool_spec_set(ctx, &tavily_spec, 1) != 0) {
+            std::fprintf(stderr, "failed to install explicit Tavily tool spec\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> tokens = tokenize_or_die(vocab, "Use the Tavily search tool to find current Disney history details.");
+        const llama_self_state_event event = {
+            /*.tokens =*/ tokens.data(),
+            /*.n_tokens =*/ tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.05f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+
+        llama_active_loop_trace trace = {};
+        if (!expect_active_action("active-explicit-tavily", ctx, event, LLAMA_ACTIVE_LOOP_ACTION_ACT, &trace)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_command command = {};
+        llama_bash_tool_request request = {};
+        if (!trace.tool_proposal.valid ||
+            std::string(trace.tool_proposal.capability_id) != "openclaw.tavily.web_search" ||
+            !expect_single_command("active-explicit-tavily-command", ctx, LLAMA_COG_COMMAND_ORIGIN_ACTIVE, LLAMA_COG_COMMAND_INVOKE_TOOL, &command) ||
+            !expect_bash_request("active-explicit-tavily-request", ctx, command, "tavily-web-search --query-url=", &request) ||
+            std::strstr(request.command_text, "Tavily%20search%20tool") == nullptr) {
+            std::fprintf(stderr, "explicit Tavily wording did not resolve to a Tavily command\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -2279,9 +2354,10 @@ int main(int argc, char ** argv) {
             !runner.active ||
             !runner.waiting_on_tool ||
             runner.pending_command_id != command.command_id ||
+            runner.max_steps <= 3 ||
             runner.functional_microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP ||
             !expect_functional_family_state("dmn-invoke-tool-functional", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, true, LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, 0.10f)) {
-            std::fprintf(stderr, "tool-focused DMN runner did not retain pending tool command\n");
+            std::fprintf(stderr, "tool-focused DMN runner did not retain pending tool command with unbounded continuation budget\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;

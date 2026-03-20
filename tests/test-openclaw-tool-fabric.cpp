@@ -136,6 +136,10 @@ int main() {
                 "expected canonical XML guidance example")) {
         return 1;
     }
+    if (!expect(guidance.find("single command only; no pipes, redirects, chaining, or substitution") != std::string::npos,
+                "expected exec guidance to document bounded single-command policy")) {
+        return 1;
+    }
 
     server_openclaw_parsed_tool_call parsed = {};
     const std::string valid_tool_xml =
@@ -321,9 +325,9 @@ int main() {
 
     llama_cognitive_command external_command = {};
     external_command.kind = LLAMA_COG_COMMAND_INVOKE_TOOL;
-    external_command.tool_kind = specs[3].tool_kind;
-    external_command.tool_spec_index = 3;
-    std::snprintf(external_command.capability_id, sizeof(external_command.capability_id), "%s", specs[3].capability_id);
+    external_command.tool_kind = specs.back().tool_kind;
+    external_command.tool_spec_index = (int32_t) specs.size() - 1;
+    std::snprintf(external_command.capability_id, sizeof(external_command.capability_id), "%s", specs.back().capability_id);
     if (!expect(reloadable_fabric.resolve_command(external_command, &error) != nullptr, error.c_str())) {
         return 1;
     }

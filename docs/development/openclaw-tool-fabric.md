@@ -65,6 +65,12 @@ and mirrored in
 - `hard_memory_query`
   `tool_surface_id=vicuna.memory.hard_query`
   `capability_id=openclaw.vicuna.hard_memory_query`
+- `hard_memory_write`
+  `tool_surface_id=vicuna.memory.hard_write`
+  `capability_id=openclaw.vicuna.hard_memory_write`
+- `codex`
+  `tool_surface_id=vicuna.codex.main`
+  `capability_id=openclaw.vicuna.codex_cli`
 
 ## Runtime Flags
 
@@ -77,6 +83,13 @@ and mirrored in
 
 If the fabric is enabled but no routable capabilities survive policy and local
 tool availability checks, startup refuses to install the catalog.
+
+At runtime, `llama-server` now logs the effective prerequisite state and the
+installed capability set, for example:
+
+- `bash=1 hard_memory=1 codex=1`
+- `catalog_path=/var/cache/vicuna/openclaw-catalog.json catalog_exists=1`
+- `OpenClaw capability set: exec=..., hard_memory_query=..., ...`
 
 ## Live Catalog Reload
 
@@ -105,7 +118,8 @@ not in `VICUNA_*` runtime env vars.
 The harness now uses:
 
 - runtime external catalog:
-  `REPO_ROOT/.cache/vicuna/openclaw-catalog.json`
+  `REPO_ROOT/.cache/vicuna/openclaw-catalog.json` by default, or
+  `VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH` when explicitly configured
 - OpenClaw tool secrets:
   `REPO_ROOT/.cache/vicuna/openclaw-tool-secrets.json`
 
@@ -147,6 +161,13 @@ lets the running runtime pick up the new capability on the next idle reload
 cycle. When selected, the runtime dispatches the bounded wrapper command
 `tools/openclaw-harness/bin/tavily-web-search`.
 
+For system-service deployments, `tools/ops/install-vicuna-system-service.sh`
+and `tools/ops/rebuild-vicuna-runtime.sh` now sync the runtime catalog to the
+configured `VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH` before service startup or
+restart. This closes the drift where the harness had generated a Tavily catalog
+under `REPO_ROOT/.cache/vicuna/` but the live runtime was loading
+`/var/cache/vicuna/openclaw-catalog.json`.
+
 For active engagement, the runtime now defaults into a ReAct-style foreground
 loop when a live tool surface is available and the turn implies open-ended
 investigation or fresh current information. The foreground transcript becomes:
@@ -186,3 +207,11 @@ commits to the final user-facing answer.
 
 The invariant is simple: if a tool is not present in both registries, it is not
 selectable and it is not dispatchable.
+
+## Exec Policy
+
+`exec` remains intentionally narrower than a shell script surface. Planner XML
+for `exec.command` must describe a single bounded invocation only. The server
+still rejects shell metacharacters such as pipes, redirects, chaining, and
+substitution, and it now preserves the preflight-safe command if planner XML
+tries to override that request with unsafe shell syntax.
