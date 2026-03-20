@@ -319,6 +319,20 @@ function normalizeTranscriptMessage(raw) {
   return { role, content };
 }
 
+export function retainCoherentTranscriptWindow(messages, options = {}) {
+  const maxHistoryMessages = Math.max(1, parseInteger(options.maxHistoryMessages, DEFAULT_MAX_HISTORY_MESSAGES));
+  const bounded = (messages ?? []).slice(-maxHistoryMessages);
+  if (bounded.length <= 1) {
+    return bounded;
+  }
+
+  let startIndex = 0;
+  while (startIndex < bounded.length - 1 && bounded[startIndex].role === 'assistant') {
+    startIndex += 1;
+  }
+  return bounded.slice(startIndex);
+}
+
 function normalizeChatSessions(raw, maxHistoryMessages) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return {};
@@ -326,7 +340,10 @@ function normalizeChatSessions(raw, maxHistoryMessages) {
   const chatSessions = {};
   for (const [chatId, session] of Object.entries(raw)) {
     const messages = Array.isArray(session?.messages)
-      ? session.messages.map(normalizeTranscriptMessage).filter(Boolean).slice(-maxHistoryMessages)
+      ? retainCoherentTranscriptWindow(
+        session.messages.map(normalizeTranscriptMessage).filter(Boolean),
+        { maxHistoryMessages },
+      )
       : [];
     if (messages.length > 0) {
       chatSessions[String(chatId)] = { messages };
@@ -405,10 +422,10 @@ export function appendChatTranscriptMessage(state, chatId, role, content, option
   }
   const chatKey = String(chatId);
   const maxHistoryMessages = Math.max(1, parseInteger(options.maxHistoryMessages, DEFAULT_MAX_HISTORY_MESSAGES));
-  const nextMessages = [
+  const nextMessages = retainCoherentTranscriptWindow([
     ...getChatTranscript(state, chatKey),
     normalized,
-  ].slice(-maxHistoryMessages);
+  ], { maxHistoryMessages });
 
   return {
     ...registerChat(state, chatKey),

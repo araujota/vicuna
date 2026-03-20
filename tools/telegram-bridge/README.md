@@ -119,6 +119,9 @@ even simple allowed commands from forking on a busy workstation.
   a raw file record and an extracted-text record linked by shared metadata
 - each Telegram chat keeps its own bounded persisted transcript keyed by
   Telegram `chat_id`, so follow-up turns reuse recent context after restarts
+- bounded transcript trimming drops any leading assistant-only orphan created by
+  raw history clipping so the runtime keeps seeing a coherent conversation that
+  still includes the latest user turn
 - each forwarded Telegram turn now logs transcript length and role sequence to
   the bridge journal for continuity debugging
 - proactive runtime self-emits are consumed from `/v1/responses/stream` and
@@ -132,6 +135,10 @@ even simple allowed commands from forking on a busy workstation.
   errors mean another bot poller is still running with the same token, either
   on this host or somewhere else; clear the extra poller before expecting
   stable message ingress
+- if the bridge appears to answer an older Telegram topic, inspect the bridge
+  state file and journal together: if `telegramOffset` is still increasing and
+  new `appended Telegram user turn` entries appear, the defect is in transcript
+  shaping rather than Telegram update replay
 
 ## Test
 

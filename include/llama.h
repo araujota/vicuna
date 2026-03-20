@@ -951,6 +951,7 @@ extern "C" {
         LLAMA_TOOL_KIND_HARD_MEMORY_WRITE = 3,
         LLAMA_TOOL_KIND_BASH_CLI          = 4,
         LLAMA_TOOL_KIND_CODEX_CLI         = 5,
+        LLAMA_TOOL_KIND_TELEGRAM_RELAY    = 6,
     };
 
     enum llama_self_model_extension_kind {
@@ -1795,6 +1796,12 @@ extern "C" {
         LLAMA_CODEX_TOOL_STDOUT_MAX_CHARS = 8192,
         LLAMA_CODEX_TOOL_STDERR_MAX_CHARS = 8192,
         LLAMA_CODEX_TOOL_ERROR_MAX_CHARS = 512,
+        LLAMA_DMN_MAX_REPORTABLE_CONCEPTS = 4,
+        LLAMA_DMN_PROMPT_MAX_CHARS = 512,
+        LLAMA_DMN_PROMPT_OUTLINE_MAX_CHARS = 256,
+        LLAMA_TELEGRAM_RELAY_TEXT_MAX_CHARS = 1024,
+        LLAMA_TELEGRAM_RELAY_DEDUPE_MAX_CHARS = 128,
+        LLAMA_TELEGRAM_RELAY_ERROR_MAX_CHARS = 256,
         LLAMA_SELF_STATE_MAX_DELTA_DIMS = 8,
         LLAMA_COGNITIVE_MAX_TOOL_SPECS = 8,
         LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS = 48,
@@ -2205,6 +2212,52 @@ extern "C" {
         LLAMA_COG_HARD_MEMORY_OPERATION_WRITE = 1,
     };
 
+    enum llama_dmn_reportable_concept_kind {
+        LLAMA_DMN_CONCEPT_NONE = 0,
+        LLAMA_DMN_CONCEPT_MOTIVE = 1,
+        LLAMA_DMN_CONCEPT_TENSION = 2,
+        LLAMA_DMN_CONCEPT_QUESTION = 3,
+        LLAMA_DMN_CONCEPT_NEXT_ACTION = 4,
+    };
+
+    enum llama_telegram_relay_intent_kind {
+        LLAMA_TELEGRAM_RELAY_QUESTION = 0,
+        LLAMA_TELEGRAM_RELAY_COMMENT = 1,
+        LLAMA_TELEGRAM_RELAY_CONCLUSION = 2,
+    };
+
+    struct llama_dmn_reportable_concept {
+        bool valid;
+        int32_t kind;
+        float salience;
+        float confidence;
+        float user_contact_affordance;
+        float tool_affordance;
+        char hint[LLAMA_DMN_PROMPT_OUTLINE_MAX_CHARS];
+    };
+
+    struct llama_dmn_self_model_revision {
+        bool valid;
+        int32_t revision_id;
+        uint64_t input_hash;
+        float materiality_score;
+        bool requires_prompt_regen;
+    };
+
+    struct llama_dmn_prompt_revision {
+        bool valid;
+        int32_t prompt_revision_id;
+        int32_t source_revision_id;
+        uint64_t prompt_hash;
+        bool regenerated;
+        int32_t concept_count;
+        float user_contact_affinity;
+        float tool_affinity;
+        char macro_outline[LLAMA_DMN_PROMPT_OUTLINE_MAX_CHARS];
+        char rendered_prompt[LLAMA_DMN_PROMPT_MAX_CHARS];
+        struct llama_dmn_reportable_concept concepts[LLAMA_DMN_MAX_REPORTABLE_CONCEPTS];
+    };
+
     struct llama_cognitive_hard_memory_request {
         int32_t command_id;
         int32_t origin;
@@ -2222,6 +2275,27 @@ extern "C" {
         int32_t operation;
         struct llama_hard_memory_result result;
         struct llama_hard_memory_archive_trace archive_trace;
+    };
+
+    struct llama_telegram_relay_request {
+        int32_t command_id;
+        int32_t origin;
+        int32_t tool_job_id;
+        int32_t intent_kind;
+        float urgency;
+        bool command_ready;
+        char dedupe_key[LLAMA_TELEGRAM_RELAY_DEDUPE_MAX_CHARS];
+        char text[LLAMA_TELEGRAM_RELAY_TEXT_MAX_CHARS];
+    };
+
+    struct llama_telegram_relay_result {
+        int32_t command_id;
+        int32_t tool_job_id;
+        int32_t intent_kind;
+        bool delivered;
+        int64_t delivered_at_ms;
+        char dedupe_key[LLAMA_TELEGRAM_RELAY_DEDUPE_MAX_CHARS];
+        char error_text[LLAMA_TELEGRAM_RELAY_ERROR_MAX_CHARS];
     };
 
     struct llama_favorable_dimension_target {
@@ -2445,6 +2519,8 @@ extern "C" {
         int32_t plan_status;
         int32_t plan_revision_count;
         int32_t current_plan_step;
+        int32_t self_model_revision_id;
+        int32_t prompt_revision_id;
     };
 
     struct llama_active_loop_candidate {
@@ -2523,6 +2599,8 @@ extern "C" {
         bool admitted;
         bool deferred_for_foreground;
         struct llama_dmn_pressure_vector pressure;
+        struct llama_dmn_self_model_revision self_model_revision;
+        struct llama_dmn_prompt_revision prompt_revision;
         int32_t reactivation_count;
         struct llama_self_reactivation_info reactivation_targets[LLAMA_DMN_MAX_REACTIVATION_TARGETS];
         uint32_t seed_source_mask;
@@ -3297,6 +3375,17 @@ extern "C" {
     LLAMA_API int32_t llama_cognitive_hard_memory_submit_result(
             struct llama_context * ctx,
             const struct llama_cognitive_hard_memory_result * result,
+            struct llama_active_loop_trace * out_active_trace);
+    LLAMA_API int32_t llama_cognitive_telegram_relay_get_request(
+            const struct llama_context * ctx,
+            int32_t command_id,
+            struct llama_telegram_relay_request * out_request);
+    LLAMA_API int32_t llama_cognitive_telegram_relay_set_request(
+            struct llama_context * ctx,
+            const struct llama_telegram_relay_request * request);
+    LLAMA_API int32_t llama_cognitive_telegram_relay_submit_result(
+            struct llama_context * ctx,
+            const struct llama_telegram_relay_result * result,
             struct llama_active_loop_trace * out_active_trace);
     LLAMA_API int32_t llama_cognitive_active_runner_get(
             const struct llama_context * ctx,

@@ -183,6 +183,24 @@ def test_unified_provenance_repository_records_self_improvement_events(tmp_path)
     assert active_event["payload"]["self_model"]["extension_summary"]["active_count"] >= 0
     assert "functional" in active_event["payload"]
     assert "process_functional" in active_event["payload"]
+    assert "plan" in active_event["payload"]["active_loop"]
+    assert isinstance(active_event["payload"]["active_loop"]["plan"]["steps"], list)
+    assert "candidates" in active_event["payload"]["active_loop"]
+
+    active_final_events = [
+        event for event in events
+        if event["event_kind"] == "active_loop" and event.get("source") == "active_final"
+    ]
+    if active_final_events:
+        narration = active_final_events[-1]["payload"]["extra"]["narration"]
+        assert narration["resolved_text"]
+
+    tool_call_events = [event for event in events if event["event_kind"] == "tool_call"]
+    if tool_call_events:
+        tool_call_event = tool_call_events[-1]
+        assert "command" in tool_call_event["payload"]
+        assert "tool_call" in tool_call_event["payload"]
+        assert tool_call_event["payload"]["command"]["command_id"] >= 1
 
     health = server.make_request("GET", "/health")
     assert health.status_code == 200

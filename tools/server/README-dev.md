@@ -180,6 +180,30 @@ accessible in the rebuilt registry, and publishes the final user-visible
 message. The message should include any required manual follow-up such as API
 keys or secrets copied from Codex's `Manual requirements:` line.
 
+### DMN Self-Model Translation and Telegram Relay
+
+The DMN no longer seeds itself from the old fixed-width candidate/seed path.
+Instead, each admitted tick compiles the current hidden self-model state into a
+bounded `llama_dmn_prompt_revision` and uses that translated natural-language
+workspace as the prompt substrate for the same planner/tool loop used by active
+engagement.
+
+That translation is explicit and inspectable:
+
+- `llama_dmn_self_model_revision` tracks the hashed hidden-state inputs that
+  produced the current reportable view
+- `llama_dmn_prompt_revision` stores the rendered natural-language prompt,
+  macro outline, concept list, and user-contact/tool affinities
+- every material self-model update forces a new prompt revision before the next
+  DMN phase begins
+
+DMN user contact now routes through the typed `LLAMA_TOOL_KIND_TELEGRAM_RELAY`
+tool instead of `LLAMA_COG_COMMAND_EMIT_BACKGROUND`. `server_context` handles
+that tool locally by publishing the requested text to the proactive mailbox,
+admitting the emitted text back into self-state, and then submitting a typed
+`llama_telegram_relay_result` so the DMN loop can continue without being
+treated as a foreground assistant reply.
+
 ### ReAct Tool-Call XML Contract
 
 For active-loop ReAct tool steps, host code now enforces one canonical tool
@@ -291,15 +315,31 @@ The repository is intentionally local and low-overhead:
   decode step
 - each line is one JSON object with explicit `schema_version`, `session_id`,
   `sequence`, `timestamp_ms`, `event_kind`, `source`, and `payload`
-- payloads summarize typed runtime surfaces rather than copying human logs
+- payloads keep typed runtime surfaces, full active/DMN narration where
+  available, and exact structured tool requests/results
 
 Current event kinds are:
 
-- `active_loop` for admitted active-loop episodes
+- `active_loop` for admitted active-loop episodes and final active narration
 - `tool_result` for bash and hard-memory result integration, including
   immediate host-side failures
+- `tool_call` for exact structured bash, hard-memory, Codex, and Telegram relay
+  requests before host-side execution begins
 - `dmn_tick` for admitted DMN work, including counterfactual, governance, and
-  remediation summaries
+  remediation summaries plus the rendered DMN prompt narration
+
+Narration and exact tool-call capture now follow this policy:
+
+- active-loop provenance records plan detail, candidate detail, and planner
+  narration when available; if the model did not emit planner reasoning, the
+  server records a deterministic plan-based fallback narration instead
+- DMN provenance records the translated prompt revision, concept frames, plan
+  detail, candidate detail, and a resolved DMN narration text
+- tool requests are captured at dispatch time in `tool_call` events with exact
+  structured payloads, then later paired with `tool_result` events via
+  `command_id` and `tool_job_id`
+- concise `journalctl` lines remain breadcrumbs; the JSONL provenance stream is
+  the canonical inspection surface for complete narration and payload bodies
 
 This repository is meant to answer direction-of-progress questions with one
 source of truth:

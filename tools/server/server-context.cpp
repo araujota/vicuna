@@ -987,6 +987,124 @@ static json process_trace_summary_to_json(const llama_process_functional_trace &
     };
 }
 
+static json cognitive_loop_state_to_json(const llama_cognitive_loop_state & state) {
+    return {
+        {"phase", state.phase},
+        {"terminal_reason", state.terminal_reason},
+        {"max_steps", state.max_steps},
+        {"steps_taken", state.steps_taken},
+        {"continuation_allowed", state.continuation_allowed},
+        {"waiting_on_tool", state.waiting_on_tool},
+        {"tool_registry_count", state.tool_registry_count},
+    };
+}
+
+static json cognitive_plan_step_to_json(const llama_cognitive_plan_step & step, int32_t index) {
+    return {
+        {"index", index},
+        {"kind", step.kind},
+        {"status", step.status},
+        {"tool_kind", step.tool_kind},
+        {"tool_spec_index", step.tool_spec_index},
+        {"source_family", step.source_family},
+        {"reason_mask", step.reason_mask},
+        {"priority", step.priority},
+        {"expected_steps", step.expected_steps},
+        {"requires_tool_result", step.requires_tool_result},
+        {"capability_id", bounded_cstr_to_string(step.capability_id)},
+        {"provenance_namespace", bounded_cstr_to_string(step.provenance_namespace)},
+    };
+}
+
+static json cognitive_plan_trace_to_json(const llama_cognitive_plan_trace & trace) {
+    json steps = json::array();
+    for (int32_t i = 0; i < trace.step_count && i < LLAMA_COGNITIVE_MAX_PLAN_STEPS; ++i) {
+        steps.push_back(cognitive_plan_step_to_json(trace.steps[i], i));
+    }
+    return {
+        {"valid", trace.valid},
+        {"plan_id", trace.plan_id},
+        {"origin", trace.origin},
+        {"mode", trace.mode},
+        {"status", trace.status},
+        {"revision_count", trace.revision_count},
+        {"current_step_index", trace.current_step_index},
+        {"step_count", trace.step_count},
+        {"selected_family", trace.selected_family},
+        {"terminal_reason", trace.terminal_reason},
+        {"reason_mask", trace.reason_mask},
+        {"plan_score", trace.plan_score},
+        {"ambiguity", trace.ambiguity},
+        {"steps", std::move(steps)},
+    };
+}
+
+static json active_candidates_to_json(const llama_active_loop_trace & trace) {
+    json candidates = json::array();
+    for (int32_t i = 0; i < trace.candidate_count && i < LLAMA_ACTIVE_LOOP_MAX_CANDIDATES; ++i) {
+        const auto & candidate = trace.candidates[i];
+        candidates.push_back({
+            {"action", candidate.action},
+            {"score", candidate.score},
+            {"user_relevance", candidate.user_relevance},
+            {"latency_pressure", candidate.latency_pressure},
+            {"tool_affinity", candidate.tool_affinity},
+            {"inhibition", candidate.inhibition},
+            {"reason_mask", candidate.reason_mask},
+        });
+    }
+    return candidates;
+}
+
+static json dmn_candidates_to_json(const llama_dmn_tick_trace & trace) {
+    json candidates = json::array();
+    for (int32_t i = 0; i < trace.candidate_count && i < LLAMA_DMN_MAX_CANDIDATES; ++i) {
+        const auto & candidate = trace.candidates[i];
+        candidates.push_back({
+            {"action", candidate.action},
+            {"score", candidate.score},
+            {"inhibition", candidate.inhibition},
+            {"social_relevance", candidate.social_relevance},
+            {"continuation", candidate.continuation},
+            {"tool_affinity", candidate.tool_affinity},
+            {"reason_mask", candidate.reason_mask},
+        });
+    }
+    return candidates;
+}
+
+static json dmn_reactivation_targets_to_json(const llama_dmn_tick_trace & trace) {
+    json targets = json::array();
+    for (int32_t i = 0; i < trace.reactivation_count && i < LLAMA_DMN_MAX_REACTIVATION_TARGETS; ++i) {
+        const auto & target = trace.reactivation_targets[i];
+        targets.push_back({
+            {"handle_id", target.handle_id},
+            {"kind", target.kind},
+            {"priority", target.priority},
+            {"top_similarity", target.top_similarity},
+            {"last_update_monotonic_ms", target.last_update_monotonic_ms},
+        });
+    }
+    return targets;
+}
+
+static json dmn_prompt_concepts_to_json(const llama_dmn_prompt_revision & prompt_revision) {
+    json concepts = json::array();
+    for (int32_t i = 0; i < prompt_revision.concept_count && i < LLAMA_DMN_MAX_REPORTABLE_CONCEPTS; ++i) {
+        const auto & concept = prompt_revision.concepts[i];
+        concepts.push_back({
+            {"valid", concept.valid},
+            {"kind", concept.kind},
+            {"salience", concept.salience},
+            {"confidence", concept.confidence},
+            {"user_contact_affordance", concept.user_contact_affordance},
+            {"tool_affordance", concept.tool_affordance},
+            {"hint", bounded_cstr_to_string(concept.hint)},
+        });
+    }
+    return concepts;
+}
+
 static json active_trace_summary_to_json(const llama_active_loop_trace & trace) {
     return {
         {"episode_id", trace.episode_id},
@@ -1005,6 +1123,10 @@ static json active_trace_summary_to_json(const llama_active_loop_trace & trace) 
         {"runner_up_action", trace.runner_up_action},
         {"runner_up_score", trace.runner_up_score},
         {"reason_mask", trace.reason_mask},
+        {"loop_state", cognitive_loop_state_to_json(trace.loop_state)},
+        {"candidate_count", trace.candidate_count},
+        {"candidates", active_candidates_to_json(trace)},
+        {"plan", cognitive_plan_trace_to_json(trace.plan)},
         {"functional_activation", functional_activation_to_json(trace.functional_activation)},
         {"tool_proposal", {
             {"valid", trace.tool_proposal.valid},
@@ -1049,6 +1171,7 @@ static json dmn_trace_summary_to_json(const llama_dmn_tick_trace & trace) {
             {"total", trace.pressure.total},
         }},
         {"candidate_count", trace.candidate_count},
+        {"candidates", dmn_candidates_to_json(trace)},
         {"winner_action", trace.winner_action},
         {"winner_score", trace.winner_score},
         {"runner_up_action", trace.runner_up_action},
@@ -1058,8 +1181,56 @@ static json dmn_trace_summary_to_json(const llama_dmn_tick_trace & trace) {
         {"tool_kind", trace.tool_kind},
         {"tool_spec_index", trace.tool_spec_index},
         {"tool_job_id", trace.tool_job_id},
+        {"loop_state", cognitive_loop_state_to_json(trace.loop_state)},
+        {"reactivation_count", trace.reactivation_count},
+        {"reactivation_targets", dmn_reactivation_targets_to_json(trace)},
+        {"seed_source_mask", trace.seed_source_mask},
+        {"self_model_revision", {
+            {"valid", trace.self_model_revision.valid},
+            {"revision_id", trace.self_model_revision.revision_id},
+            {"input_hash", trace.self_model_revision.input_hash},
+            {"materiality_score", trace.self_model_revision.materiality_score},
+            {"requires_prompt_regen", trace.self_model_revision.requires_prompt_regen},
+        }},
+        {"prompt_revision", {
+            {"valid", trace.prompt_revision.valid},
+            {"prompt_revision_id", trace.prompt_revision.prompt_revision_id},
+            {"source_revision_id", trace.prompt_revision.source_revision_id},
+            {"prompt_hash", trace.prompt_revision.prompt_hash},
+            {"regenerated", trace.prompt_revision.regenerated},
+            {"concept_count", trace.prompt_revision.concept_count},
+            {"user_contact_affinity", trace.prompt_revision.user_contact_affinity},
+            {"tool_affinity", trace.prompt_revision.tool_affinity},
+            {"macro_outline", bounded_cstr_to_string(trace.prompt_revision.macro_outline)},
+            {"rendered_prompt", bounded_cstr_to_string(trace.prompt_revision.rendered_prompt)},
+            {"concepts", dmn_prompt_concepts_to_json(trace.prompt_revision)},
+        }},
         {"favorable_divergence", trace.favorable_divergence},
+        {"plan", cognitive_plan_trace_to_json(trace.plan)},
         {"functional_activation", functional_activation_to_json(trace.functional_activation)},
+        {"tool_proposal", {
+            {"valid", trace.tool_proposal.valid},
+            {"tool_kind", trace.tool_proposal.tool_kind},
+            {"spec_index", trace.tool_proposal.spec_index},
+            {"reason_mask", trace.tool_proposal.reason_mask},
+            {"source_family", trace.tool_proposal.source_family},
+            {"expected_steps", trace.tool_proposal.expected_steps},
+            {"expected_observation_gain", trace.tool_proposal.expected_observation_gain},
+            {"job_id", trace.tool_proposal.job_id},
+            {"capability_id", bounded_cstr_to_string(trace.tool_proposal.capability_id)},
+            {"provenance_namespace", bounded_cstr_to_string(trace.tool_proposal.provenance_namespace)},
+        }},
+        {"observation", {
+            {"valid", trace.observation.valid},
+            {"tool_kind", trace.observation.tool_kind},
+            {"spec_index", trace.observation.spec_index},
+            {"job_id", trace.observation.job_id},
+            {"status", trace.observation.status},
+            {"signal", trace.observation.signal},
+            {"followup_affinity", trace.observation.followup_affinity},
+            {"capability_id", bounded_cstr_to_string(trace.observation.capability_id)},
+            {"provenance_namespace", bounded_cstr_to_string(trace.observation.provenance_namespace)},
+        }},
     };
 }
 
@@ -1126,6 +1297,120 @@ static json remediation_plan_to_json(const llama_remediation_plan & plan) {
     };
 }
 
+static json bash_request_to_json(const llama_bash_tool_request & request) {
+    return {
+        {"command_id", request.command_id},
+        {"origin", request.origin},
+        {"tool_job_id", request.tool_job_id},
+        {"timeout_ms", request.timeout_ms},
+        {"cpu_time_limit_secs", request.cpu_time_limit_secs},
+        {"max_child_processes", request.max_child_processes},
+        {"max_open_files", request.max_open_files},
+        {"max_file_size_bytes", request.max_file_size_bytes},
+        {"max_stdout_bytes", request.max_stdout_bytes},
+        {"max_stderr_bytes", request.max_stderr_bytes},
+        {"inherit_env", request.inherit_env},
+        {"login_shell", request.login_shell},
+        {"reject_shell_metacharacters", request.reject_shell_metacharacters},
+        {"command_ready", request.command_ready},
+        {"bash_path", bounded_cstr_to_string(request.bash_path)},
+        {"working_directory", bounded_cstr_to_string(request.working_directory)},
+        {"allowed_commands", bounded_cstr_to_string(request.allowed_commands)},
+        {"blocked_patterns", bounded_cstr_to_string(request.blocked_patterns)},
+        {"allowed_env", bounded_cstr_to_string(request.allowed_env)},
+        {"intent_text", bounded_cstr_to_string(request.intent_text)},
+        {"command_text", bounded_cstr_to_string(request.command_text)},
+    };
+}
+
+static json hard_memory_request_to_json(const llama_cognitive_hard_memory_request & request) {
+    json out = {
+        {"command_id", request.command_id},
+        {"origin", request.origin},
+        {"tool_job_id", request.tool_job_id},
+        {"operation", request.operation},
+        {"container_tag", bounded_cstr_to_string(request.container_tag)},
+        {"write_count", request.write_count},
+        {"query", {
+            {"limit", request.query.limit},
+            {"threshold", request.query.threshold},
+            {"include_profile", request.query.include_profile},
+            {"use_temporal_self_hint", request.query.use_temporal_self_hint},
+            {"temporal_adapter_role", request.query.temporal_adapter_role},
+            {"query", bounded_cstr_to_string(request.query.query)},
+            {"container_tag", bounded_cstr_to_string(request.query.container_tag)},
+        }},
+    };
+    json write_items = json::array();
+    for (int32_t i = 0; i < request.write_count && i < LLAMA_HARD_MEMORY_MAX_PRIMITIVES; ++i) {
+        const auto & item = request.write_items[i];
+        json tags = json::array();
+        for (int32_t j = 0; j < LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS; ++j) {
+            const std::string tag = bounded_cstr_to_string(item.primitive.tags[j]);
+            if (!tag.empty()) {
+                tags.push_back(tag);
+            }
+        }
+        write_items.push_back({
+            {"is_static", item.is_static},
+            {"primitive", {
+                {"kind", item.primitive.kind},
+                {"domain", item.primitive.domain},
+                {"source_role", item.primitive.source_role},
+                {"source_channel", item.primitive.source_channel},
+                {"source_tool_kind", item.primitive.source_tool_kind},
+                {"transaction_id", item.primitive.transaction_id},
+                {"flags", item.primitive.flags},
+                {"importance", item.primitive.importance},
+                {"confidence", item.primitive.confidence},
+                {"gain_bias", item.primitive.gain_bias},
+                {"allostatic_relevance", item.primitive.allostatic_relevance},
+                {"key", bounded_cstr_to_string(item.primitive.key)},
+                {"title", bounded_cstr_to_string(item.primitive.title)},
+                {"content", bounded_cstr_to_string(item.primitive.content)},
+                {"tags", std::move(tags)},
+            }},
+        });
+    }
+    out["write_items"] = std::move(write_items);
+    return out;
+}
+
+static json codex_request_to_json(const llama_codex_tool_request & request) {
+    return {
+        {"command_id", request.command_id},
+        {"origin", request.origin},
+        {"tool_job_id", request.tool_job_id},
+        {"timeout_ms", request.timeout_ms},
+        {"max_stdout_bytes", request.max_stdout_bytes},
+        {"max_stderr_bytes", request.max_stderr_bytes},
+        {"dangerous_no_approval", request.dangerous_no_approval},
+        {"rebuild_after_changes", request.rebuild_after_changes},
+        {"verify_tool_access_after_rebuild", request.verify_tool_access_after_rebuild},
+        {"command_ready", request.command_ready},
+        {"codex_path", bounded_cstr_to_string(request.codex_path)},
+        {"working_directory", bounded_cstr_to_string(request.working_directory)},
+        {"rebuild_script_path", bounded_cstr_to_string(request.rebuild_script_path)},
+        {"rebuild_helper_path", bounded_cstr_to_string(request.rebuild_helper_path)},
+        {"completion_message_path", bounded_cstr_to_string(request.completion_message_path)},
+        {"intent_text", bounded_cstr_to_string(request.intent_text)},
+        {"task_prompt", bounded_cstr_to_string(request.task_prompt)},
+    };
+}
+
+static json telegram_relay_request_to_json(const llama_telegram_relay_request & request) {
+    return {
+        {"command_id", request.command_id},
+        {"origin", request.origin},
+        {"tool_job_id", request.tool_job_id},
+        {"intent_kind", request.intent_kind},
+        {"urgency", request.urgency},
+        {"command_ready", request.command_ready},
+        {"dedupe_key", bounded_cstr_to_string(request.dedupe_key)},
+        {"text", bounded_cstr_to_string(request.text)},
+    };
+}
+
 static json bash_result_to_json(const llama_bash_tool_result & result) {
     return {
         {"command_id", result.command_id},
@@ -1182,6 +1467,18 @@ static json codex_result_to_json(const llama_codex_tool_result & result) {
     };
 }
 
+static json telegram_relay_result_to_json(const llama_telegram_relay_result & result) {
+    return {
+        {"command_id", result.command_id},
+        {"tool_job_id", result.tool_job_id},
+        {"intent_kind", result.intent_kind},
+        {"delivered", result.delivered},
+        {"delivered_at_ms", result.delivered_at_ms},
+        {"dedupe_key", bounded_cstr_to_string(result.dedupe_key)},
+        {"error_text", bounded_cstr_to_string(result.error_text)},
+    };
+}
+
 static std::string trim_ascii_copy(const std::string & value) {
     size_t begin = 0;
     while (begin < value.size() && std::isspace((unsigned char) value[begin])) {
@@ -1192,6 +1489,69 @@ static std::string trim_ascii_copy(const std::string & value) {
         --end;
     }
     return value.substr(begin, end - begin);
+}
+
+static std::string active_narration_fallback_text(const llama_active_loop_trace & trace) {
+    std::ostringstream oss;
+    oss.setf(std::ios::fixed);
+    oss.precision(3);
+    oss << "Active loop winner action " << trace.winner_action
+        << " with score " << trace.winner_score;
+    if (trace.plan.valid) {
+        oss << ". Plan " << trace.plan.plan_id
+            << " has " << trace.plan.step_count
+            << " steps and current step " << trace.plan.current_step_index;
+    }
+    if (trace.tool_proposal.valid) {
+        oss << ". Proposed tool kind " << trace.tool_proposal.tool_kind;
+    }
+    if (trace.observation.valid) {
+        oss << ". Observation status " << trace.observation.status;
+    }
+    return oss.str();
+}
+
+static json build_active_narration_json(
+        const llama_active_loop_trace & trace,
+        const std::string & planner_reasoning,
+        const std::string & assistant_output,
+        const std::string & raw_tool_call_xml) {
+    const std::string trimmed_reasoning = trim_ascii_copy(planner_reasoning);
+    const std::string trimmed_output = trim_ascii_copy(assistant_output);
+    const std::string trimmed_tool_xml = trim_ascii_copy(raw_tool_call_xml);
+    const bool have_reasoning = !trimmed_reasoning.empty();
+    return {
+        {"source", have_reasoning ? "planner_reasoning" : "plan_fallback"},
+        {"resolved_text", have_reasoning ? trimmed_reasoning : active_narration_fallback_text(trace)},
+        {"planner_reasoning_text", trimmed_reasoning},
+        {"assistant_output_text", trimmed_output},
+        {"raw_tool_call_xml", trimmed_tool_xml},
+    };
+}
+
+static std::string dmn_narration_fallback_text(const llama_dmn_tick_trace & trace) {
+    std::ostringstream oss;
+    oss.setf(std::ios::fixed);
+    oss.precision(3);
+    oss << "DMN tick " << trace.tick_id
+        << " winner action " << trace.winner_action
+        << " with score " << trace.winner_score
+        << ", contradiction " << trace.pressure.contradiction
+        << ", uncertainty " << trace.pressure.uncertainty
+        << ", continuation " << trace.pressure.continuation;
+    return oss.str();
+}
+
+static json build_dmn_narration_json(const llama_dmn_tick_trace & trace) {
+    const std::string rendered_prompt = trim_ascii_copy(bounded_cstr_to_string(trace.prompt_revision.rendered_prompt));
+    const std::string macro_outline = trim_ascii_copy(bounded_cstr_to_string(trace.prompt_revision.macro_outline));
+    const bool have_prompt = !rendered_prompt.empty();
+    return {
+        {"source", have_prompt ? "prompt_revision" : "dmn_fallback"},
+        {"resolved_text", have_prompt ? rendered_prompt : dmn_narration_fallback_text(trace)},
+        {"macro_outline", macro_outline},
+        {"rendered_prompt", rendered_prompt},
+    };
 }
 
 static int32_t parse_hard_memory_kind_json(const json & value) {
@@ -3024,6 +3384,127 @@ private:
         (void) append_provenance_event("active_loop", source ? source : "active", payload, progress);
     }
 
+    json active_waiting_task_provenance_extra(int32_t command_id, const llama_active_loop_trace * active_trace = nullptr) {
+        std::string planner_reasoning;
+        std::string raw_tool_xml;
+        std::string assistant_role;
+        std::string assistant_content;
+        json assistant_tool_calls = json::array();
+        llama_active_loop_trace stored_trace = {};
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(runtime_state_mutex);
+            auto it = waiting_active_tasks.find(command_id);
+            if (it != waiting_active_tasks.end()) {
+                planner_reasoning = it->second.react_last_planner_reasoning;
+                raw_tool_xml = it->second.react_last_tool_xml_payload;
+                stored_trace = it->second.active_trace;
+                if (!it->second.react_messages.empty()) {
+                    const auto & final_msg = it->second.react_messages.back();
+                    assistant_role = final_msg.role;
+                    assistant_content = final_msg.content;
+                    for (const auto & tool_call : final_msg.tool_calls) {
+                        assistant_tool_calls.push_back({
+                            {"name", tool_call.name},
+                            {"arguments", tool_call.arguments},
+                            {"id", tool_call.id},
+                        });
+                    }
+                }
+                found = true;
+            }
+        }
+        if (!found) {
+            return json::object();
+        }
+
+        const llama_active_loop_trace & trace_for_narration =
+                active_trace ? *active_trace : stored_trace;
+        json extra = {
+            {"narration", build_active_narration_json(
+                    trace_for_narration,
+                    planner_reasoning,
+                    assistant_content,
+                    raw_tool_xml)},
+        };
+        if (!assistant_role.empty() || !assistant_content.empty() || !assistant_tool_calls.empty()) {
+            extra["assistant_message"] = {
+                {"role", assistant_role},
+                {"content", assistant_content},
+            };
+            if (!assistant_tool_calls.empty()) {
+                extra["assistant_message"]["tool_calls"] = std::move(assistant_tool_calls);
+            }
+        }
+        return extra;
+    }
+
+    void capture_tool_call_provenance(
+            const char * source,
+            const llama_cognitive_command & command,
+            const json & tool_call,
+            const json * extra = nullptr) {
+        vicuna_progress_snapshot progress = {};
+        llama_self_model_state_info model_state = {};
+        llama_functional_lora_trace functional_trace = {};
+        llama_process_functional_trace process_trace = {};
+        if (!collect_progress_snapshot(&progress, &model_state, &functional_trace, &process_trace)) {
+            return;
+        }
+
+        json payload = {
+            {"command", {
+                {"command_id", command.command_id},
+                {"origin", command.origin},
+                {"kind", command.kind},
+                {"status", command.status},
+                {"episode_id", command.episode_id},
+                {"tick_id", command.tick_id},
+                {"tool_kind", command.tool_kind},
+                {"tool_spec_index", command.tool_spec_index},
+                {"tool_job_id", command.tool_job_id},
+                {"reason_mask", command.reason_mask},
+                {"priority", command.priority},
+                {"source_family", command.source_family},
+                {"loop_phase", command.loop_phase},
+                {"capability_id", bounded_cstr_to_string(command.capability_id)},
+            }},
+            {"tool_call", tool_call},
+            {"self_model", self_model_summary_to_json(model_state)},
+            {"functional", functional_trace_summary_to_json(functional_trace)},
+            {"process_functional", process_trace_summary_to_json(process_trace)},
+        };
+
+        if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+            llama_active_loop_trace active_trace = {};
+            const json waiting_extra = active_waiting_task_provenance_extra(command.command_id);
+            if (llama_active_loop_get_last_trace(ctx, &active_trace) == 0) {
+                payload["active_loop"] = active_trace_summary_to_json(active_trace);
+            }
+            if (!waiting_extra.empty()) {
+                payload["extra"] = waiting_extra;
+            }
+        } else if (command.origin == LLAMA_COG_COMMAND_ORIGIN_DMN) {
+            llama_dmn_tick_trace dmn_trace = {};
+            if (llama_dmn_get_last_trace(ctx, &dmn_trace) == 0) {
+                payload["dmn"] = dmn_trace_summary_to_json(dmn_trace);
+                payload["narration"] = build_dmn_narration_json(dmn_trace);
+            }
+        }
+
+        if (extra && !extra->empty()) {
+            if (payload.contains("extra") && payload["extra"].is_object()) {
+                for (auto it = extra->begin(); it != extra->end(); ++it) {
+                    payload["extra"][it.key()] = it.value();
+                }
+            } else {
+                payload["extra"] = *extra;
+            }
+        }
+
+        (void) append_provenance_event("tool_call", source ? source : "tool", payload, progress);
+    }
+
     void capture_tool_result_provenance(
             const char * source,
             const json & tool_result,
@@ -3068,6 +3549,7 @@ private:
 
         json payload = {
             {"dmn", dmn_trace_summary_to_json(dmn_trace)},
+            {"narration", build_dmn_narration_json(dmn_trace)},
             {"counterfactual", counterfactual_trace_summary_to_json(counterfactual)},
             {"governance", governance_trace_summary_to_json(governance)},
             {"remediation", remediation_plan_to_json(remediation)},
@@ -4362,6 +4844,28 @@ private:
             }
         };
 
+        auto submit_telegram_relay_result = [&](const llama_cognitive_command & command,
+                                                const llama_telegram_relay_request * request,
+                                                bool delivered,
+                                                const char * error_text) {
+            llama_telegram_relay_result result = {};
+            result.command_id = command.command_id;
+            result.tool_job_id = command.tool_job_id;
+            result.intent_kind = request ? request->intent_kind : LLAMA_TELEGRAM_RELAY_COMMENT;
+            result.delivered = delivered;
+            result.delivered_at_ms = delivered ? ggml_time_ms() : 0;
+            if (request) {
+                std::snprintf(result.dedupe_key, sizeof(result.dedupe_key), "%s", request->dedupe_key);
+            }
+            if (error_text && error_text[0] != '\0') {
+                std::snprintf(result.error_text, sizeof(result.error_text), "%s", error_text);
+            }
+            if (llama_cognitive_telegram_relay_submit_result(ctx, &result, nullptr) == 0) {
+                mark_runtime_state_dirty("telegram-relay-immediate-result");
+                capture_tool_result_provenance("telegram_relay_immediate", telegram_relay_result_to_json(result), nullptr);
+            }
+        };
+
         bool dispatched = false;
         const int32_t command_count = llama_cognitive_command_count(ctx);
         for (int32_t i = 0; i < command_count; ++i) {
@@ -4378,6 +4882,60 @@ private:
             }
             if (llama_cognitive_command_ack(ctx, command.command_id) != 0) {
                 SRV_WRN("failed to ack tool command %d\n", command.command_id);
+                continue;
+            }
+
+            if (command.tool_kind == LLAMA_TOOL_KIND_TELEGRAM_RELAY) {
+                llama_telegram_relay_request request = {};
+                if (llama_cognitive_telegram_relay_get_request(ctx, command.command_id, &request) != 0) {
+                    SRV_WRN("telegram relay command %d did not have a pending request\n", command.command_id);
+                    submit_telegram_relay_result(command, nullptr, false, "telegram relay request was missing");
+                    continue;
+                }
+
+                const std::string relay_text = trim_ascii_copy(request.text);
+                if (!request.command_ready || relay_text.empty()) {
+                    submit_telegram_relay_result(command, &request, false, "telegram relay request did not include any text");
+                    continue;
+                }
+
+                capture_tool_call_provenance(
+                        "telegram_relay",
+                        command,
+                        telegram_relay_request_to_json(request));
+
+                std::string response_id;
+                const char * source_tag = request.dedupe_key[0] != '\0' ? request.dedupe_key : "telegram-relay";
+                const bool published = proactive_mailbox_publish(relay_text, source_tag, &response_id);
+                if (!published) {
+                    {
+                        std::lock_guard<std::mutex> lock(proactive_mailbox.mutex);
+                        proactive_mailbox.fail_total++;
+                    }
+                    submit_telegram_relay_result(command, &request, false, "telegram relay publish failed");
+                    continue;
+                }
+
+                if (!admit_runtime_emit_text(
+                            ctx,
+                            relay_text,
+                            command.origin,
+                            LLAMA_FUNCTIONAL_MICROPHASE_NONE,
+                            command.command_id,
+                            -1,
+                            LLAMA_SELF_STATE_EVENT_EMIT_FOLLOWUP)) {
+                    SRV_WRN("failed to admit telegram relay command %d into self-state\n", command.command_id);
+                }
+
+                submit_telegram_relay_result(command, &request, true, "");
+                mark_runtime_state_dirty("telegram-relay-publish");
+                dispatched = true;
+                SRV_INF("delivered telegram relay command %d origin=%d job=%d response=%s dedupe=\"%s\"\n",
+                        command.command_id,
+                        command.origin,
+                        request.tool_job_id,
+                        response_id.c_str(),
+                        request.dedupe_key);
                 continue;
             }
 
@@ -4429,6 +4987,11 @@ private:
                     continue;
                 }
 
+                capture_tool_call_provenance(
+                        "bash_tool",
+                        command,
+                        bash_request_to_json(request));
+
                 vicuna_external_work_item work = {};
                 work.command_id = command.command_id;
                 work.origin = command.origin;
@@ -4479,6 +5042,11 @@ private:
                     continue;
                 }
 
+                capture_tool_call_provenance(
+                        "hard_memory",
+                        command,
+                        hard_memory_request_to_json(request));
+
                 vicuna_external_work_item work = {};
                 work.command_id = command.command_id;
                 work.origin = command.origin;
@@ -4516,6 +5084,11 @@ private:
                     submit_codex_error(command, !config.enabled ? "codex tool is disabled" : "codex tool request did not include a task");
                     continue;
                 }
+
+                capture_tool_call_provenance(
+                        "codex_tool",
+                        command,
+                        codex_request_to_json(request));
 
                 vicuna_external_work_item work = {};
                 work.command_id = command.command_id;
@@ -6095,6 +6668,33 @@ private:
                 }
             }
 
+            {
+                json assistant_message = {
+                    {"role", final_msg.role},
+                    {"content", final_msg.content},
+                };
+                if (!final_msg.tool_calls.empty()) {
+                    json tool_calls = json::array();
+                    for (const auto & tool_call : final_msg.tool_calls) {
+                        tool_calls.push_back({
+                            {"name", tool_call.name},
+                            {"arguments", tool_call.arguments},
+                            {"id", tool_call.id},
+                        });
+                    }
+                    assistant_message["tool_calls"] = std::move(tool_calls);
+                }
+                const json extra = {
+                    {"narration", build_active_narration_json(
+                            resumed_task.active_trace,
+                            resumed_task.react_last_planner_reasoning,
+                            final_msg.content,
+                            tool_xml_payload)},
+                    {"assistant_message", std::move(assistant_message)},
+                };
+                capture_active_loop_provenance("active_final", resumed_task.active_trace, &extra);
+            }
+
             if (have_pending_command) {
                 resumed_task.react_last_tool_xml_payload = tool_xml_payload;
                 {
@@ -6120,6 +6720,30 @@ private:
                 slot.task->has_active_trace &&
                 parsed_final_msg) {
             const std::string visible_reasoning = trim_ascii_copy(planner_reasoning);
+            json assistant_message = {
+                {"role", final_msg.role},
+                {"content", final_msg.content},
+            };
+            if (!final_msg.tool_calls.empty()) {
+                json tool_calls = json::array();
+                for (const auto & tool_call : final_msg.tool_calls) {
+                    tool_calls.push_back({
+                        {"name", tool_call.name},
+                        {"arguments", tool_call.arguments},
+                        {"id", tool_call.id},
+                    });
+                }
+                assistant_message["tool_calls"] = std::move(tool_calls);
+            }
+            const json extra = {
+                {"narration", build_active_narration_json(
+                        slot.task->active_trace,
+                        visible_reasoning,
+                        final_msg.content,
+                        tool_xml_payload)},
+                {"assistant_message", std::move(assistant_message)},
+            };
+            capture_active_loop_provenance("active_final", slot.task->active_trace, &extra);
             if (!visible_reasoning.empty()) {
                 const std::vector<llama_token> reasoning_tokens =
                         common_tokenize(vocab, visible_reasoning, true, true);

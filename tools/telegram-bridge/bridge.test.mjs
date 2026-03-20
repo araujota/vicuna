@@ -19,10 +19,12 @@ import {
   normalizeDocumentPlainText,
   normalizeState,
   parseSseChunk,
+  retainCoherentTranscriptWindow,
   saveState,
   sanitizeAssistantRelayText,
   splitSseBuffer,
   summarizeChatCompletion,
+  updateTelegramOffset,
 } from './lib.mjs';
 
 test('extractResponseText returns assistant output text', () => {
@@ -439,7 +441,7 @@ test('appendProactiveId maintains bounded dedupe ids', () => {
   assert.deepEqual(state.proactiveResponseIds, ['resp_1', 'resp_2']);
 });
 
-test('appendChatTranscriptMessage isolates chats and trims bounded history', () => {
+test('appendChatTranscriptMessage isolates chats and trims bounded history coherently', () => {
   let state = normalizeState({});
   state = appendChatTranscriptMessage(state, 1, 'user', 'hello', { maxHistoryMessages: 3 });
   state = appendChatTranscriptMessage(state, 1, 'assistant', 'hi', { maxHistoryMessages: 3 });
@@ -448,12 +450,70 @@ test('appendChatTranscriptMessage isolates chats and trims bounded history', () 
   state = appendChatTranscriptMessage(state, 1, 'assistant', 'answer', { maxHistoryMessages: 3 });
 
   assert.deepEqual(getChatTranscript(state, 1), [
-    { role: 'assistant', content: 'hi' },
     { role: 'user', content: 'follow-up' },
     { role: 'assistant', content: 'answer' },
   ]);
   assert.deepEqual(getChatTranscript(state, 2), [
     { role: 'user', content: 'other chat' },
+  ]);
+});
+
+test('retainCoherentTranscriptWindow drops leading assistant orphan after bounded trim', () => {
+  const retained = retainCoherentTranscriptWindow([
+    { role: 'user', content: 'u1' },
+    { role: 'assistant', content: 'a1' },
+    { role: 'user', content: 'u2' },
+    { role: 'assistant', content: 'a2' },
+    { role: 'user', content: 'u3' },
+  ], { maxHistoryMessages: 4 });
+
+  assert.deepEqual(retained, [
+    { role: 'user', content: 'u2' },
+    { role: 'assistant', content: 'a2' },
+    { role: 'user', content: 'u3' },
+  ]);
+});
+
+test('appendChatTranscriptMessage preserves newest user turn without leading assistant orphan', () => {
+  let state = normalizeState({});
+  for (let index = 1; index <= 6; index += 1) {
+    state = appendChatTranscriptMessage(state, 1, 'user', `u${index}`, { maxHistoryMessages: 12 });
+    state = appendChatTranscriptMessage(state, 1, 'assistant', `a${index}`, { maxHistoryMessages: 12 });
+  }
+
+  state = appendChatTranscriptMessage(state, 1, 'user', 'u7', { maxHistoryMessages: 12 });
+
+  assert.deepEqual(getChatTranscript(state, 1), [
+    { role: 'user', content: 'u2' },
+    { role: 'assistant', content: 'a2' },
+    { role: 'user', content: 'u3' },
+    { role: 'assistant', content: 'a3' },
+    { role: 'user', content: 'u4' },
+    { role: 'assistant', content: 'a4' },
+    { role: 'user', content: 'u5' },
+    { role: 'assistant', content: 'a5' },
+    { role: 'user', content: 'u6' },
+    { role: 'assistant', content: 'a6' },
+    { role: 'user', content: 'u7' },
+  ]);
+});
+
+test('normalizeState repairs persisted chat sessions that start with assistant-only orphan', () => {
+  const state = normalizeState({
+    chatSessions: {
+      1: {
+        messages: [
+          { role: 'assistant', content: 'a1' },
+          { role: 'user', content: 'u2' },
+          { role: 'assistant', content: 'a2' },
+        ],
+      },
+    },
+  }, { maxHistoryMessages: 3 });
+
+  assert.deepEqual(getChatTranscript(state, 1), [
+    { role: 'user', content: 'u2' },
+    { role: 'assistant', content: 'a2' },
   ]);
 });
 
@@ -476,5 +536,17 @@ test('saveState persists chatSessions transcript history', async () => {
   assert.deepEqual(getChatTranscript(reloaded, 7502424413), [
     { role: 'user', content: 'first' },
     { role: 'assistant', content: 'second' },
+  ]);
+});
+
+test('updateTelegramOffset remains monotonic alongside transcript updates', () => {
+  let state = normalizeState({});
+  state = updateTelegramOffset(state, 40);
+  state = appendChatTranscriptMessage(state, 1, 'user', 'hello', { maxHistoryMessages: 4 });
+  state = updateTelegramOffset(state, 39);
+
+  assert.equal(state.telegramOffset, 41);
+  assert.deepEqual(getChatTranscript(state, 1), [
+    { role: 'user', content: 'hello' },
   ]);
 });

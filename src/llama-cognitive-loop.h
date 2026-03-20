@@ -31,6 +31,9 @@ public:
     bool cognitive_bash_tool_submit_result(const llama_bash_tool_result & result, llama_active_loop_trace * out_active_trace);
     bool cognitive_codex_tool_submit_result(const llama_codex_tool_result & result, llama_active_loop_trace * out_active_trace);
     bool cognitive_hard_memory_submit_result(const llama_cognitive_hard_memory_result & result, llama_active_loop_trace * out_active_trace);
+    bool cognitive_telegram_relay_get_request(int32_t command_id, llama_telegram_relay_request * out_request) const;
+    bool cognitive_telegram_relay_set_request(const llama_telegram_relay_request & request);
+    bool cognitive_telegram_relay_submit_result(const llama_telegram_relay_result & result, llama_active_loop_trace * out_active_trace);
     bool cognitive_active_runner_get(llama_cognitive_active_runner_status * out_status) const;
     bool cognitive_dmn_runner_get(llama_cognitive_dmn_runner_status * out_status) const;
 
@@ -78,12 +81,21 @@ private:
     llama_codex_tool_config codex_config = {};
     llama_codex_tool_request codex_requests[LLAMA_COGNITIVE_MAX_PENDING_COMMANDS] = {};
     int32_t codex_request_count = 0;
+    llama_telegram_relay_request telegram_requests[LLAMA_COGNITIVE_MAX_PENDING_COMMANDS] = {};
+    int32_t telegram_request_count = 0;
     llama_codex_tool_result last_codex_result = {};
     bool has_last_codex_result = false;
+    llama_telegram_relay_result last_telegram_result = {};
+    bool has_last_telegram_result = false;
+    llama_dmn_self_model_revision current_self_model_revision = {};
+    llama_dmn_prompt_revision current_prompt_revision = {};
+    uint64_t current_dmn_prompt_input_hash = 0;
     uint64_t temporal_self_next_trigger_us = 0;
     int32_t next_episode_id = 1;
     int32_t next_tick_id = 1;
     int32_t next_tool_job_id = 1;
     int32_t next_command_id = 1;
     int32_t next_plan_id = 1;
+    int32_t next_dmn_self_model_revision_id = 1;
+    int32_t next_dmn_prompt_revision_id = 1;
 };

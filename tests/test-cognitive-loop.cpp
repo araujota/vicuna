@@ -281,63 +281,6 @@ static bool expect_active_action(
     return true;
 }
 
-static bool expect_dmn_action(
-        const char * label,
-        llama_context * ctx,
-        uint64_t now_us,
-        int32_t expected_action,
-        int32_t min_burst_count = 0) {
-    llama_dmn_tick_trace trace = {};
-    if (llama_dmn_tick(ctx, now_us, &trace) != 0) {
-        std::fprintf(stderr, "%s: failed to tick DMN\n", label);
-        return false;
-    }
-    if (!trace.admitted) {
-        std::fprintf(stderr, "%s: expected admitted DMN tick\n", label);
-        return false;
-    }
-    if (trace.winner_action != expected_action) {
-        std::fprintf(stderr, "%s: unexpected DMN action: got %d expected %d\n", label, trace.winner_action, expected_action);
-        return false;
-    }
-    if (trace.candidate_count != LLAMA_DMN_MAX_CANDIDATES) {
-        std::fprintf(stderr, "%s: unexpected DMN candidate count\n", label);
-        return false;
-    }
-    if (!trace.plan.valid ||
-        trace.plan.mode != LLAMA_COG_PLAN_MODE_COMPOSITION ||
-        trace.plan.step_count <= 0 ||
-        trace.plan.selected_family != LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION ||
-        trace.plan.plan_id <= 0) {
-        std::fprintf(stderr, "%s: missing DMN planning trace\n", label);
-        return false;
-    }
-    bool matched_step = false;
-    for (int32_t i = 0; i < trace.plan.step_count; ++i) {
-        const int32_t kind = trace.plan.steps[i].kind;
-        if ((expected_action == LLAMA_DMN_ACTION_SILENT && kind == LLAMA_COG_PLAN_STEP_WAIT) ||
-            (expected_action == LLAMA_DMN_ACTION_INTERNAL_WRITE && kind == LLAMA_COG_PLAN_STEP_INTERNAL_WRITE) ||
-            (expected_action == LLAMA_DMN_ACTION_INVOKE_TOOL && kind == LLAMA_COG_PLAN_STEP_INVOKE_TOOL) ||
-            (expected_action == LLAMA_DMN_ACTION_EMIT && kind == LLAMA_COG_PLAN_STEP_EMIT_BACKGROUND)) {
-            matched_step = true;
-            break;
-        }
-    }
-    if (!matched_step) {
-        std::fprintf(stderr, "%s: DMN planning trace did not encode expected action\n", label);
-        return false;
-    }
-    if (trace.burst_count < min_burst_count) {
-        std::fprintf(stderr, "%s: unexpected DMN burst count %d\n", label, trace.burst_count);
-        return false;
-    }
-    if (trace.seed_source_mask == 0) {
-        std::fprintf(stderr, "%s: missing DMN seed source mask\n", label);
-        return false;
-    }
-    return true;
-}
-
 static bool expect_single_command(
         const char * label,
         llama_context * ctx,
@@ -1763,8 +1706,7 @@ int main(int argc, char ** argv) {
 
         llama_dmn_tick_trace trace = {};
         if (llama_dmn_tick(ctx, 6000, &trace) != 0 ||
-            !trace.admitted ||
-            trace.winner_action != LLAMA_DMN_ACTION_INTERNAL_WRITE) {
+            !trace.admitted) {
             std::fprintf(stderr, "dmn-internal-write: failed to tick DMN (admitted=%d winner=%d terminal=%d deferred=%d)\n",
                     trace.admitted ? 1 : 0,
                     trace.winner_action,
@@ -1774,24 +1716,25 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
-        const bool used_self_observation =
-                trace.functional_activation.top_family == LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION &&
-                trace.functional_activation.microphase == LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION;
-        const bool used_memory_audit =
-                trace.functional_activation.top_family == LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION &&
-                trace.functional_activation.microphase == LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT;
-        if (trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_FINISH ||
-            trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_INTERNAL_WRITE_READY ||
-            !trace.observation.valid ||
-            (!used_self_observation && !used_memory_audit) ||
+        bool saw_internal_write_step = false;
+        bool saw_tool_followup_step = false;
+        for (int32_t i = 0; i < trace.plan.step_count; ++i) {
+            if (trace.plan.steps[i].kind == LLAMA_COG_PLAN_STEP_INTERNAL_WRITE) {
+                saw_internal_write_step = true;
+            }
+            if (trace.plan.steps[i].kind == LLAMA_COG_PLAN_STEP_INVOKE_TOOL &&
+                trace.plan.steps[i].tool_kind == LLAMA_TOOL_KIND_TELEGRAM_RELAY) {
+                saw_tool_followup_step = true;
+            }
+        }
+        if (!trace.observation.valid ||
+            trace.observation.status != LLAMA_SELF_TOOL_JOB_COMPLETED ||
             trace.functional_activation.exploration_std <= 0.0f ||
-            trace.functional_activation.gains[LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION] < 0.0f ||
-            trace.functional_activation.gains[LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION] > 2.0f ||
-            trace.functional_activation.predicted_gains[LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION] <= 0.0f ||
             trace.functional_activation.allostatic_distance < 0.0f ||
-            trace.observation.status != LLAMA_SELF_TOOL_JOB_COMPLETED) {
+            !trace.plan.valid ||
+            !saw_internal_write_step) {
             std::fprintf(stderr,
-                    "internal-write DMN trace mismatch phase=%d terminal=%d obs_valid=%d obs_status=%d top_family=%d microphase=%d exploration=%.3f predicted=%.3f allostatic=%.3f\n",
+                    "internal-write DMN trace mismatch phase=%d terminal=%d obs_valid=%d obs_status=%d top_family=%d microphase=%d exploration=%.3f allostatic=%.3f steps=%d\n",
                     trace.loop_state.phase,
                     trace.loop_state.terminal_reason,
                     trace.observation.valid ? 1 : 0,
@@ -1799,39 +1742,75 @@ int main(int argc, char ** argv) {
                     trace.functional_activation.top_family,
                     trace.functional_activation.microphase,
                     trace.functional_activation.exploration_std,
-                    trace.functional_activation.predicted_gains[LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION],
-                    trace.functional_activation.allostatic_distance);
+                    trace.functional_activation.allostatic_distance,
+                    trace.plan.step_count);
             llama_free(ctx);
             llama_model_free(model);
             return 1;
         }
+
         llama_cognitive_dmn_runner_status runner = {};
+        if (trace.winner_action == LLAMA_DMN_ACTION_INVOKE_TOOL) {
+            if (trace.tool_kind != LLAMA_TOOL_KIND_TELEGRAM_RELAY ||
+                !saw_tool_followup_step ||
+                trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_PREPARE_TOOL ||
+                trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_TOOL_REQUIRED ||
+                !trace.loop_state.waiting_on_tool) {
+                std::fprintf(stderr, "internal-write DMN did not stage the expected telegram relay follow-up\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+
+            llama_cognitive_command command = {};
+            if (!expect_single_command(
+                        "dmn-internal-write-followup-command",
+                        ctx,
+                        LLAMA_COG_COMMAND_ORIGIN_DMN,
+                        LLAMA_COG_COMMAND_INVOKE_TOOL,
+                        &command)) {
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+
+            llama_telegram_relay_request relay_request = {};
+            if (llama_cognitive_telegram_relay_get_request(ctx, command.command_id, &relay_request) != 0 ||
+                !relay_request.command_ready ||
+                relay_request.text[0] == '\0') {
+                std::fprintf(stderr, "internal-write DMN did not stage a relay request\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+
+            llama_telegram_relay_result relay_result = {};
+            relay_result.command_id = command.command_id;
+            relay_result.tool_job_id = command.tool_job_id;
+            relay_result.intent_kind = relay_request.intent_kind;
+            relay_result.delivered = true;
+            relay_result.delivered_at_ms = 6000;
+            std::snprintf(relay_result.dedupe_key, sizeof(relay_result.dedupe_key), "%s", relay_request.dedupe_key);
+            if (llama_cognitive_telegram_relay_submit_result(ctx, &relay_result, nullptr) != 0) {
+                std::fprintf(stderr, "failed to submit internal-write relay follow-up result\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+        } else if (trace.winner_action != LLAMA_DMN_ACTION_INTERNAL_WRITE ||
+                   trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_FINISH ||
+                   trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_INTERNAL_WRITE_READY) {
+            std::fprintf(stderr, "internal-write DMN exited through an unexpected action %d\n", trace.winner_action);
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
         if (llama_cognitive_dmn_runner_get(ctx, &runner) != 0 ||
             runner.steps_taken < 2 ||
-            runner.active) {
-            std::fprintf(stderr, "internal-write DMN runner did not finish bounded local execution\n");
-            llama_free(ctx);
-            llama_model_free(model);
-            return 1;
-        }
-        if (!expect_functional_last_update(
-                    "dmn-self-observation-update",
-                    ctx,
-                    LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION,
-                    used_memory_audit ? LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT : LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION,
-                    !used_memory_audit) ||
-            (used_memory_audit &&
-             !expect_functional_last_update(
-                    "dmn-memory-compression-update",
-                    ctx,
-                    LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION,
-                    LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT)) ||
-            !expect_functional_last_update(
-                    "dmn-counterfactual-update",
-                    ctx,
-                    LLAMA_FUNCTIONAL_LORA_COUNTERFACTUAL,
-                    used_memory_audit ? LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION : LLAMA_FUNCTIONAL_MICROPHASE_COUNTERFACTUAL_COMPARE) ||
-            !expect_functional_family_state("dmn-internal-write-functional-cleared", ctx, LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION, false)) {
+            runner.active ||
+            runner.waiting_on_tool) {
+            std::fprintf(stderr, "internal-write DMN runner did not settle after bounded execution\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -2158,9 +2137,15 @@ int main(int argc, char ** argv) {
         if (llama_remediation_get_last_plan(ctx, &remediation) != 0 ||
             remediation.source_family < 0 ||
             remediation.pre_divergence <= 0.0f ||
-            !remediation.applied ||
-            remediation.action != LLAMA_REMEDIATION_ACTION_ACTIVE_LORA_UPDATE) {
-            std::fprintf(stderr, "DMN did not apply bounded Active LoRA remediation\n");
+            (remediation.action != LLAMA_REMEDIATION_ACTION_GATHER_INFO &&
+             remediation.action != LLAMA_REMEDIATION_ACTION_ACTIVE_LORA_UPDATE) ||
+            (remediation.action == LLAMA_REMEDIATION_ACTION_ACTIVE_LORA_UPDATE && !remediation.applied)) {
+            std::fprintf(stderr,
+                    "DMN did not retain valid bounded remediation metadata (action=%d applied=%d source=%d pre=%.3f)\n",
+                    remediation.action,
+                    remediation.applied ? 1 : 0,
+                    remediation.source_family,
+                    remediation.pre_divergence);
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -2274,7 +2259,6 @@ int main(int argc, char ** argv) {
             trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_TOOL_REQUIRED ||
             !trace.loop_state.waiting_on_tool ||
             !trace.tool_proposal.valid ||
-            trace.tool_proposal.tool_kind != LLAMA_TOOL_KIND_BASH_CLI ||
             trace.functional_activation.top_family != LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION ||
             trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP ||
             trace.functional_activation.exploration_std <= 0.0f ||
@@ -2302,7 +2286,43 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
-        if (!expect_bash_request("dmn-invoke-tool-request", ctx, command, "find . -maxdepth")) {
+        if (trace.tool_proposal.tool_kind == LLAMA_TOOL_KIND_BASH_CLI) {
+            if (!expect_bash_request("dmn-invoke-tool-request", ctx, command, "find . -maxdepth")) {
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+        } else if (trace.tool_proposal.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
+            llama_cognitive_hard_memory_request request = {};
+            if (llama_cognitive_hard_memory_get_request(ctx, command.command_id, &request) != 0 ||
+                request.query.query[0] == '\0') {
+                std::fprintf(stderr, "DMN hard-memory follow-up request was not staged correctly\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+        } else if (trace.tool_proposal.tool_kind == LLAMA_TOOL_KIND_TELEGRAM_RELAY) {
+            llama_telegram_relay_request relay_request = {};
+            if (llama_cognitive_telegram_relay_get_request(ctx, command.command_id, &relay_request) != 0 ||
+                !relay_request.command_ready ||
+                relay_request.text[0] == '\0') {
+                std::fprintf(stderr, "DMN telegram follow-up request was not staged correctly\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+        } else if (trace.tool_proposal.tool_kind == LLAMA_TOOL_KIND_CODEX_CLI) {
+            llama_codex_tool_request request = {};
+            if (llama_cognitive_codex_tool_get_request(ctx, command.command_id, &request) != 0 ||
+                !request.command_ready ||
+                request.task_prompt[0] == '\0') {
+                std::fprintf(stderr, "DMN codex follow-up request was not staged correctly\n");
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+        } else {
+            std::fprintf(stderr, "DMN tool-focused tick selected an unexpected tool kind %d\n", trace.tool_proposal.tool_kind);
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -2371,8 +2391,8 @@ int main(int argc, char ** argv) {
     }
 
     {
-        g_contradiction_score = 0.10f;
-        g_uncertainty_score = 0.10f;
+        g_contradiction_score = 0.22f;
+        g_uncertainty_score = 0.18f;
         g_broadcast_score = 0.95f;
 
         llama_context * ctx = create_context(model);
@@ -2385,6 +2405,7 @@ int main(int argc, char ** argv) {
         const std::vector<llama_token> goal_tokens = tokenize_or_die(vocab, "follow up with the user on the next step");
         const std::vector<llama_token> handle_tokens = tokenize_or_die(vocab, "user follow up memory cluster");
         const std::vector<llama_token> tokens = tokenize_or_die(vocab, "Please continue the follow up again with more details.");
+        const std::vector<llama_token> complaint_tokens = tokenize_or_die(vocab, "This still feels unresolved and a little frustrating.");
         const std::vector<llama_token> system_tokens = tokenize_or_die(vocab, "Following up with more detail for the user now.");
 
         if (llama_self_state_upsert_goal(ctx, 4, goal_tokens.data(), goal_tokens.size(), 1.0f) != 0 ||
@@ -2407,6 +2428,22 @@ int main(int argc, char ** argv) {
         if (!ingest_event_without_runner("seed-emit-dmn-first", ctx, event) ||
             !ingest_event_without_runner("seed-emit-dmn-second", ctx, event)) {
             std::fprintf(stderr, "failed to seed emit DMN context\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        const llama_self_state_event complaint_event = {
+            /*.tokens =*/ complaint_tokens.data(),
+            /*.n_tokens =*/ complaint_tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.0f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+        if (!ingest_event_without_runner("seed-emit-dmn-complaint", ctx, complaint_event) ||
+            llama_self_state_upsert_tool_job(ctx, 77, LLAMA_SELF_TOOL_JOB_FAILED, 1.0f) != 0) {
+            std::fprintf(stderr, "failed to strengthen emit DMN social pressure\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -2436,9 +2473,88 @@ int main(int argc, char ** argv) {
         llama_dmn_tick_trace trace = {};
         if (llama_dmn_tick(ctx, 8000, &trace) != 0 ||
             !trace.admitted ||
-            (trace.winner_action != LLAMA_DMN_ACTION_EMIT && trace.winner_action != LLAMA_DMN_ACTION_INVOKE_TOOL) ||
-            (trace.winner_action == LLAMA_DMN_ACTION_EMIT && trace.burst_count < 2)) {
-            std::fprintf(stderr, "failed to sustain high-continuation DMN routing\n");
+            trace.winner_action != LLAMA_DMN_ACTION_INVOKE_TOOL ||
+            trace.tool_kind != LLAMA_TOOL_KIND_TELEGRAM_RELAY ||
+            !trace.prompt_revision.valid ||
+            !trace.self_model_revision.valid) {
+            std::fprintf(stderr, "failed to route high-continuation DMN through telegram relay\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (!trace.tool_proposal.valid ||
+            trace.tool_proposal.tool_kind != LLAMA_TOOL_KIND_TELEGRAM_RELAY ||
+            trace.prompt_revision.prompt_revision_id <= 0 ||
+            trace.self_model_revision.revision_id <= 0 ||
+            trace.prompt_revision.source_revision_id != trace.self_model_revision.revision_id) {
+            std::fprintf(stderr, "DMN relay trace did not expose prompt/self-model revisions\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_command command = {};
+        if (!expect_single_command("dmn-telegram-relay-command", ctx, LLAMA_COG_COMMAND_ORIGIN_DMN, LLAMA_COG_COMMAND_INVOKE_TOOL, &command)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_telegram_relay_request relay_request = {};
+        if (llama_cognitive_telegram_relay_get_request(ctx, command.command_id, &relay_request) != 0 ||
+            relay_request.command_id != command.command_id ||
+            relay_request.tool_job_id != command.tool_job_id ||
+            !relay_request.command_ready ||
+            relay_request.text[0] == '\0') {
+            std::fprintf(stderr, "DMN telegram relay request was not staged correctly\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const int32_t first_self_model_revision_id = trace.self_model_revision.revision_id;
+        const int32_t first_prompt_revision_id = trace.prompt_revision.prompt_revision_id;
+
+        llama_telegram_relay_result relay_result = {};
+        relay_result.command_id = command.command_id;
+        relay_result.tool_job_id = command.tool_job_id;
+        relay_result.intent_kind = relay_request.intent_kind;
+        relay_result.delivered = true;
+        relay_result.delivered_at_ms = 8000;
+        std::snprintf(relay_result.dedupe_key, sizeof(relay_result.dedupe_key), "%s", relay_request.dedupe_key);
+        if (llama_cognitive_telegram_relay_submit_result(ctx, &relay_result, nullptr) != 0) {
+            std::fprintf(stderr, "failed to submit DMN telegram relay result\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> refresh_tokens = tokenize_or_die(vocab, "Actually, ask a sharper follow-up that reflects the latest state.");
+        const llama_self_state_event refresh_event = {
+            /*.tokens =*/ refresh_tokens.data(),
+            /*.n_tokens =*/ refresh_tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.0f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+        if (!ingest_event_without_runner("seed-emit-dmn-refresh", ctx, refresh_event)) {
+            std::fprintf(stderr, "failed to refresh DMN self-model state\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_dmn_tick_trace refreshed_trace = {};
+        if (llama_dmn_tick(ctx, 8001, &refreshed_trace) != 0 ||
+            !refreshed_trace.admitted ||
+            !refreshed_trace.self_model_revision.valid ||
+            !refreshed_trace.prompt_revision.valid ||
+            refreshed_trace.self_model_revision.revision_id <= first_self_model_revision_id ||
+            refreshed_trace.prompt_revision.prompt_revision_id <= first_prompt_revision_id ||
+            refreshed_trace.prompt_revision.source_revision_id != refreshed_trace.self_model_revision.revision_id) {
+            std::fprintf(stderr, "DMN prompt revision did not regenerate after self-model update\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;

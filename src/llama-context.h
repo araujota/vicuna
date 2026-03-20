@@ -288,6 +288,9 @@ struct llama_context {
     bool cognitive_bash_tool_submit_result(const llama_bash_tool_result & result, llama_active_loop_trace * out_active_trace);
     bool cognitive_hard_memory_get_request(int32_t command_id, llama_cognitive_hard_memory_request * out_request) const;
     bool cognitive_hard_memory_submit_result(const llama_cognitive_hard_memory_result & result, llama_active_loop_trace * out_active_trace);
+    bool cognitive_telegram_relay_get_request(int32_t command_id, llama_telegram_relay_request * out_request) const;
+    bool cognitive_telegram_relay_set_request(const llama_telegram_relay_request & request);
+    bool cognitive_telegram_relay_submit_result(const llama_telegram_relay_result & result, llama_active_loop_trace * out_active_trace);
     int32_t cognitive_tool_spec_count() const;
     bool cognitive_tool_spec_get(int32_t index, llama_cognitive_tool_spec * out_spec) const;
     bool cognitive_tool_spec_set(const llama_cognitive_tool_spec * specs, int32_t count);

@@ -230,24 +230,6 @@ void fill_active_candidate(
     candidate.reason_mask = reason_mask;
 }
 
-void fill_dmn_candidate(
-        llama_dmn_candidate & candidate,
-        int32_t action,
-        float score,
-        float inhibition,
-        float social_relevance,
-        float continuation,
-        float tool_affinity,
-        uint32_t reason_mask) {
-    candidate.action = action;
-    candidate.score = clamp_unit(score);
-    candidate.inhibition = clamp_unit(inhibition);
-    candidate.social_relevance = clamp_unit(social_relevance);
-    candidate.continuation = clamp_unit(continuation);
-    candidate.tool_affinity = clamp_unit(tool_affinity);
-    candidate.reason_mask = reason_mask;
-}
-
 template<typename T>
 void pick_top_two(const T * candidates, int32_t candidate_count, int32_t * out_best, int32_t * out_second) {
     int32_t best = -1;
@@ -1431,6 +1413,18 @@ int32_t find_codex_request_index(
     return -1;
 }
 
+int32_t find_telegram_request_index(
+        const llama_telegram_relay_request * requests,
+        int32_t request_count,
+        int32_t command_id) {
+    for (int32_t i = 0; i < request_count; ++i) {
+        if (requests[i].command_id == command_id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 llama_cognitive_tool_spec make_tool_spec(
         int32_t tool_kind,
         uint32_t flags,
@@ -2370,6 +2364,55 @@ void init_hard_memory_write_request(
     set_bounded_cstr(item.primitive.title, sizeof(item.primitive.title), "explicit memory write");
     set_bounded_cstr(item.primitive.content, sizeof(item.primitive.content), content_text.c_str());
     set_bounded_cstr(item.primitive.tags[0], sizeof(item.primitive.tags[0]), "explicit_write");
+}
+
+void init_telegram_request(
+        llama_telegram_relay_request & request,
+        int32_t command_id,
+        int32_t origin,
+        int32_t tool_job_id,
+        int32_t intent_kind,
+        float urgency,
+        const std::string & text,
+        const std::string & dedupe_key) {
+    request = {};
+    request.command_id = command_id;
+    request.origin = origin;
+    request.tool_job_id = tool_job_id;
+    request.intent_kind = intent_kind;
+    request.urgency = clamp_unit(urgency);
+    request.command_ready = !trim_ascii(text).empty();
+    set_bounded_cstr(request.text, sizeof(request.text), trim_ascii(text).c_str());
+    set_bounded_cstr(request.dedupe_key, sizeof(request.dedupe_key), trim_ascii(dedupe_key).c_str());
+}
+
+std::string summarize_telegram_result(const llama_telegram_relay_result & result) {
+    const char * intent_label = "comment";
+    if (result.intent_kind == LLAMA_TELEGRAM_RELAY_QUESTION) {
+        intent_label = "question";
+    } else if (result.intent_kind == LLAMA_TELEGRAM_RELAY_CONCLUSION) {
+        intent_label = "conclusion";
+    }
+
+    std::string summary = std::string("telegram relay ");
+    summary += result.delivered ? "delivered " : "failed for ";
+    summary += intent_label;
+    if (result.dedupe_key[0] != '\0') {
+        summary += " key=" + trim_ascii(result.dedupe_key);
+    }
+    if (!result.delivered && result.error_text[0] != '\0') {
+        summary += " error: " + trim_ascii(result.error_text);
+    }
+    return summary;
+}
+
+uint64_t fnv1a64_local(const std::string & text) {
+    uint64_t hash = 1469598103934665603ull;
+    for (unsigned char ch : text) {
+        hash ^= (uint64_t) ch;
+        hash *= 1099511628211ull;
+    }
+    return hash;
 }
 
 std::string summarize_bash_result(const llama_bash_tool_result & result) {
@@ -3345,36 +3388,6 @@ public:
         return written;
     }
 
-    uint32_t assemble_seed(const llama_dmn_pressure_vector & pressure, llama_dmn_tick_trace & trace) const {
-        llama_self_social_state_info social = {};
-        llama_self_tool_state_info tool_state = {};
-        (void) ctx.self_state_get_social_state(&social);
-        (void) ctx.self_state_get_tool_state(&tool_state);
-
-        std::memset(trace.seed_dims, 0, sizeof(trace.seed_dims));
-        trace.seed_dims[0] = pressure.total;
-        trace.seed_dims[1] = pressure.contradiction;
-        trace.seed_dims[2] = pressure.uncertainty;
-        trace.seed_dims[3] = trace.reactivation_count > 0 ? clamp_unit(trace.reactivation_targets[0].priority) : 0.0f;
-        trace.seed_dims[4] = pressure.tool_delta;
-        trace.seed_dims[5] = clamp_unit(0.60f * social.trust + 0.40f * social.bond_strength);
-        trace.seed_dims[6] = clamp_unit((float) ctx.self_state_working_memory_count() / 8.0f);
-        trace.seed_dims[7] = pressure.continuation;
-
-        uint32_t mask = LLAMA_DMN_SEED_SOURCE_REGISTERS | LLAMA_DMN_SEED_SOURCE_SELF_STATE;
-        if (trace.reactivation_count > 0) {
-            mask |= LLAMA_DMN_SEED_SOURCE_REACTIVATION;
-        }
-        if (tool_state.last_update_monotonic_ms >= 0) {
-            mask |= LLAMA_DMN_SEED_SOURCE_TOOL_STATE;
-        }
-        if (ctx.self_state_working_memory_count() > 0) {
-            mask |= LLAMA_DMN_SEED_SOURCE_WORKING_MEM;
-        }
-        trace.seed_source_mask = mask;
-        return mask;
-    }
-
 private:
     llama_context & ctx;
 };
@@ -3427,6 +3440,14 @@ llama_cognitive_loop::llama_cognitive_loop(llama_context & ctx) : ctx(ctx) {
                 LLAMA_COG_TOOL_LATENCY_HIGH,
                 3,
                 "hard_memory_write"),
+        make_tool_spec(
+                LLAMA_TOOL_KIND_TELEGRAM_RELAY,
+                LLAMA_COG_TOOL_DMN_ELIGIBLE |
+                        LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT,
+                LLAMA_COG_TOOL_LATENCY_LOW,
+                2,
+                "telegram_relay",
+                "Send a DMN-origin question, comment, or conclusion through the Telegram bridge"),
     };
     codex_config = codex_tool_default_config_local();
     (void) cognitive_tool_spec_set(defaults, (int32_t) (sizeof(defaults) / sizeof(defaults[0])));
@@ -3675,6 +3696,41 @@ bool llama_cognitive_loop::cognitive_codex_tool_set_request(const llama_codex_to
     return true;
 }
 
+bool llama_cognitive_loop::cognitive_telegram_relay_get_request(
+        int32_t command_id,
+        llama_telegram_relay_request * out_request) const {
+    if (!out_request) {
+        return false;
+    }
+    const int32_t index = find_telegram_request_index(telegram_requests, telegram_request_count, command_id);
+    if (index < 0) {
+        return false;
+    }
+    *out_request = telegram_requests[index];
+    return true;
+}
+
+bool llama_cognitive_loop::cognitive_telegram_relay_set_request(const llama_telegram_relay_request & request) {
+    if (request.command_id <= 0 || request.tool_job_id <= 0) {
+        return false;
+    }
+    const int32_t index = find_telegram_request_index(telegram_requests, telegram_request_count, request.command_id);
+    if (index >= 0) {
+        telegram_requests[index] = request;
+        telegram_requests[index].dedupe_key[LLAMA_TELEGRAM_RELAY_DEDUPE_MAX_CHARS - 1] = '\0';
+        telegram_requests[index].text[LLAMA_TELEGRAM_RELAY_TEXT_MAX_CHARS - 1] = '\0';
+        return true;
+    }
+    if (telegram_request_count >= LLAMA_COGNITIVE_MAX_PENDING_COMMANDS) {
+        return false;
+    }
+    telegram_requests[telegram_request_count] = request;
+    telegram_requests[telegram_request_count].dedupe_key[LLAMA_TELEGRAM_RELAY_DEDUPE_MAX_CHARS - 1] = '\0';
+    telegram_requests[telegram_request_count].text[LLAMA_TELEGRAM_RELAY_TEXT_MAX_CHARS - 1] = '\0';
+    ++telegram_request_count;
+    return true;
+}
+
 bool llama_cognitive_loop::cognitive_command_complete(int32_t command_id, bool cancelled) {
     const int32_t index = find_command_index(command_queue, command_count, command_id);
     if (index < 0) {
@@ -3716,13 +3772,6 @@ bool llama_cognitive_loop::cognitive_command_complete(int32_t command_id, bool c
         dmn_runner.pending_command_id = -1;
         dmn_runner.pending_tool_spec_index = -1;
         dmn_runner.last_command_id = command_id;
-        if (command.kind == LLAMA_COG_COMMAND_EMIT_BACKGROUND && host_state.pending_dmn_emits > 0) {
-            int32_t emit_count = 1;
-            if (last_dmn_trace.tick_id == command.tick_id && last_dmn_trace.burst_count > 1) {
-                emit_count = last_dmn_trace.burst_count;
-            }
-            host_state.pending_dmn_emits = std::max(0, host_state.pending_dmn_emits - emit_count);
-        }
         if (command.kind == LLAMA_COG_COMMAND_INVOKE_TOOL) {
             dmn_runner.waiting_on_tool = !cancelled;
             dmn_runner.completed = cancelled;
@@ -4904,6 +4953,10 @@ bool llama_cognitive_loop::dmn_defer(uint64_t now_us, llama_dmn_tick_trace * out
     dmn_runner.completed = true;
     dmn_runner.max_steps = 1;
     dmn_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
+    dmn_runner.self_model_revision_id = current_self_model_revision.valid ? current_self_model_revision.revision_id : -1;
+    dmn_runner.prompt_revision_id = current_prompt_revision.valid ? current_prompt_revision.prompt_revision_id : -1;
+    trace.self_model_revision = current_self_model_revision;
+    trace.prompt_revision = current_prompt_revision;
     trace.functional_activation = make_inactive_functional_decision(LLAMA_COG_COMMAND_ORIGIN_DMN);
     (void) ctx.process_functional_set_execution(llama_process_functional_signature {});
     (void) ctx.functional_lora_activate(trace.functional_activation);
@@ -4980,6 +5033,8 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     dmn_runner.plan_status = LLAMA_COG_PLAN_STATUS_NONE;
     dmn_runner.plan_revision_count = 0;
     dmn_runner.current_plan_step = -1;
+    dmn_runner.self_model_revision_id = current_self_model_revision.valid ? current_self_model_revision.revision_id : -1;
+    dmn_runner.prompt_revision_id = current_prompt_revision.valid ? current_prompt_revision.prompt_revision_id : -1;
 
     if (!pressure_crossed(trace.pressure)) {
         trace.admitted = false;
@@ -4998,6 +5053,8 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 tool_spec_count);
         dmn_runner.completed = true;
         dmn_runner.max_steps = 1;
+        trace.self_model_revision = current_self_model_revision;
+        trace.prompt_revision = current_prompt_revision;
         last_dmn_trace = trace;
         host_state.last_dmn_time_us = now_us;
         if (out_trace) {
@@ -5081,7 +5138,18 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
             clamp_unit(trace.pressure.tool_delta),
             clamp_unit((float) ctx.self_state_working_memory_count() / 8.0f));
     runtime.select_reactivation_targets(trace);
-    runtime.assemble_seed(trace.pressure, trace);
+    trace.seed_source_mask = LLAMA_DMN_SEED_SOURCE_REGISTERS | LLAMA_DMN_SEED_SOURCE_SELF_STATE;
+    if (trace.reactivation_count > 0) {
+        trace.seed_source_mask |= LLAMA_DMN_SEED_SOURCE_REACTIVATION;
+    }
+    if (ctx.self_state_working_memory_count() > 0) {
+        trace.seed_source_mask |= LLAMA_DMN_SEED_SOURCE_WORKING_MEM;
+    }
+    llama_self_tool_state_info initial_tool_state = {};
+    if (ctx.self_state_get_tool_state(&initial_tool_state) &&
+            initial_tool_state.last_update_monotonic_ms >= 0) {
+        trace.seed_source_mask |= LLAMA_DMN_SEED_SOURCE_TOOL_STATE;
+    }
     activate_microphase(
             LLAMA_FUNCTIONAL_MICROPHASE_SELF_FORECAST,
             clamp_unit(trace.pressure.tool_delta),
@@ -5128,82 +5196,10 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
             0.65f * trace.pressure.tool_delta +
             0.35f * get_scalar_register(ctx, LLAMA_SELF_REGISTER_AFFORDANCE));
     const uint32_t base_reason = build_dmn_reason_mask(trace.pressure, inhibition, social_relevance, trace);
-
-    trace.candidate_count = LLAMA_DMN_MAX_CANDIDATES;
-    fill_dmn_candidate(
-            trace.candidates[0],
-            LLAMA_DMN_ACTION_SILENT,
-            0.12f + 0.58f * inhibition + 0.18f * (1.0f - social_relevance),
-            inhibition,
-            social_relevance,
-            continuation,
-            tool_affinity,
-            base_reason | LLAMA_COG_REASON_HIGH_INHIBITION);
-    fill_dmn_candidate(
-            trace.candidates[1],
-            LLAMA_DMN_ACTION_INTERNAL_WRITE,
-            0.14f + 0.34f * trace.pressure.contradiction + 0.24f * trace.pressure.uncertainty + 0.18f * trace.pressure.reactivation + 0.12f * (1.0f - inhibition),
-            inhibition,
-            social_relevance,
-            continuation,
-            tool_affinity,
-            base_reason | LLAMA_COG_REASON_REACTIVATION_TARGET);
-    fill_dmn_candidate(
-            trace.candidates[2],
-            LLAMA_DMN_ACTION_INVOKE_TOOL,
-            0.10f + 0.52f * tool_affinity + 0.18f * trace.pressure.tool_delta + 0.12f * (1.0f - inhibition),
-            inhibition,
-            social_relevance,
-            continuation,
-            tool_affinity,
-            base_reason | LLAMA_COG_REASON_TOOL_AFFORDANCE);
-    fill_dmn_candidate(
-            trace.candidates[3],
-            LLAMA_DMN_ACTION_EMIT,
-            0.14f + 0.46f * social_relevance + 0.32f * continuation + 0.14f * trace.pressure.goals + 0.08f * (1.0f - inhibition),
-            inhibition,
-            social_relevance,
-            continuation,
-            tool_affinity,
-            base_reason | LLAMA_COG_REASON_SOCIAL_RELEVANCE);
-
-    if (last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_ACTIVE_LORA_UPDATE) {
-        trace.candidates[1].score = clamp_unit(trace.candidates[1].score + 0.12f + 0.24f * last_remediation_plan.expected_improvement);
-    }
-    if (last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO) {
-        trace.candidates[2].score = clamp_unit(trace.candidates[2].score + 0.16f + 0.28f * last_remediation_plan.expected_improvement);
-    }
-    if (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR) {
-        trace.candidates[3].score = clamp_unit(trace.candidates[3].score + 0.28f + 0.18f * last_governance_trace.dissatisfaction);
-    }
-    if (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DENY ||
-            last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DEFER) {
-        trace.candidates[0].score = clamp_unit(trace.candidates[0].score + 0.20f);
-    }
-
-    int32_t best = -1;
-    int32_t second = -1;
-    pick_top_two(trace.candidates, trace.candidate_count, &best, &second);
-    if (best < 0) {
-        return false;
-    }
-
-    trace.winner_action = trace.candidates[best].action;
-    trace.winner_score = trace.candidates[best].score;
-    trace.runner_up_action = second >= 0 ? trace.candidates[second].action : trace.candidates[best].action;
-    trace.runner_up_score = second >= 0 ? trace.candidates[second].score : trace.candidates[best].score;
-    uint32_t selected_reason_mask = trace.candidates[best].reason_mask;
-
-    if (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR) {
-        trace.winner_action = LLAMA_DMN_ACTION_EMIT;
-        trace.winner_score = trace.candidates[3].score;
-        selected_reason_mask = trace.candidates[3].reason_mask;
-    } else if (last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO &&
-            last_governance_trace.outcome != LLAMA_GOVERNANCE_OUTCOME_DENY) {
-        trace.winner_action = LLAMA_DMN_ACTION_INVOKE_TOOL;
-        trace.winner_score = trace.candidates[2].score;
-        selected_reason_mask = trace.candidates[2].reason_mask;
-    }
+    const float reflective_pressure = clamp_unit(
+            0.45f * trace.pressure.contradiction +
+            0.35f * trace.pressure.uncertainty +
+            0.20f * trace.pressure.reactivation);
 
     const int32_t working_memory_count = ctx.self_state_working_memory_count();
     auto select_dmn_spec = [&](const std::string & hint, int32_t * out_index) -> const llama_cognitive_tool_spec * {
@@ -5220,19 +5216,255 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 !prefer_memory,
                 out_index);
     };
-    int32_t selected_dmn_spec_index = -1;
-    const llama_cognitive_tool_spec * selected_dmn_spec =
-            trace.winner_action == LLAMA_DMN_ACTION_INVOKE_TOOL ?
-                    select_dmn_spec(
-                            last_remediation_plan.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY ?
-                                    "memory retrieval prior state history search" :
-                                    "inspect runtime repository state and execution context",
-                            &selected_dmn_spec_index) :
-                    nullptr;
-    if (trace.winner_action == LLAMA_DMN_ACTION_INVOKE_TOOL && !selected_dmn_spec) {
-        trace.winner_action = LLAMA_DMN_ACTION_SILENT;
-        selected_reason_mask |= LLAMA_COG_REASON_HIGH_UNCERTAINTY;
+
+    llama_self_model_state_info model_state = {};
+    llama_self_social_state_info social_state = {};
+    llama_self_tool_state_info tool_state = {};
+    (void) ctx.self_state_get_model_state(&model_state);
+    (void) ctx.self_state_get_social_state(&social_state);
+    (void) ctx.self_state_get_tool_state(&tool_state);
+
+    std::ostringstream input_signature;
+    input_signature.setf(std::ios::fixed);
+    input_signature.precision(3);
+    input_signature << trace.pressure.contradiction << '|'
+                    << trace.pressure.uncertainty << '|'
+                    << trace.pressure.reactivation << '|'
+                    << trace.pressure.goals << '|'
+                    << trace.pressure.tool_delta << '|'
+                    << trace.pressure.continuation << '|'
+                    << trace.favorable_divergence << '|'
+                    << model_state.belief_summary.residual_allostatic_pressure << '|'
+                    << model_state.belief_summary.promotion_readiness << '|'
+                    << model_state.extension_summary.active_count << '|'
+                    << model_state.extension_summary.gain_signal << '|'
+                    << social_state.trust << '|'
+                    << social_state.dissatisfaction << '|'
+                    << tool_state.pending_jobs << '|'
+                    << tool_state.completed_jobs << '|'
+                    << working_memory_count;
+    for (int32_t i = 0; i < trace.reactivation_count; ++i) {
+        input_signature << "|r" << i << '=' << trace.reactivation_targets[i].priority;
     }
+    const uint64_t prompt_input_hash = fnv1a64_local(input_signature.str());
+    const bool prompt_changed = prompt_input_hash != current_dmn_prompt_input_hash;
+    const float prompt_materiality = prompt_changed ? clamp_unit(
+            0.18f * trace.pressure.total +
+            0.18f * trace.pressure.contradiction +
+            0.16f * trace.pressure.uncertainty +
+            0.14f * trace.favorable_divergence +
+            0.12f * model_state.belief_summary.residual_allostatic_pressure +
+            0.12f * std::fabs(model_state.extension_summary.gain_signal) +
+            0.10f * social_state.dissatisfaction) : 0.0f;
+
+    current_self_model_revision.valid = true;
+    current_self_model_revision.input_hash = prompt_input_hash;
+    current_self_model_revision.materiality_score = prompt_materiality;
+    current_self_model_revision.requires_prompt_regen =
+            !current_prompt_revision.valid ||
+            (prompt_changed && prompt_materiality >= 0.10f);
+    if (current_self_model_revision.requires_prompt_regen) {
+        current_self_model_revision.revision_id = next_dmn_self_model_revision_id++;
+    }
+    trace.self_model_revision = current_self_model_revision;
+
+    const float user_contact_affinity = clamp_unit(
+            0.34f * social_relevance +
+            0.22f * continuation +
+            0.22f * social_state.dissatisfaction +
+            0.12f * trace.pressure.goals +
+            (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR ? 0.20f : 0.0f));
+    const float relay_tool_affinity = clamp_unit(
+            user_contact_affinity +
+            (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR ? 0.15f : 0.0f));
+    const float non_social_tool_affinity = clamp_unit(
+            tool_affinity +
+            (last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO ? 0.20f : 0.0f));
+
+    if (current_self_model_revision.requires_prompt_regen) {
+        current_dmn_prompt_input_hash = prompt_input_hash;
+        current_prompt_revision = {};
+        current_prompt_revision.valid = true;
+        current_prompt_revision.prompt_revision_id = next_dmn_prompt_revision_id++;
+        current_prompt_revision.source_revision_id = current_self_model_revision.revision_id;
+        current_prompt_revision.regenerated = true;
+
+        auto add_concept = [&](int32_t kind,
+                               float salience,
+                               float confidence,
+                               float user_contact_affordance,
+                               float tool_contact_affordance,
+                               const std::string & hint) {
+            if (current_prompt_revision.concept_count >= LLAMA_DMN_MAX_REPORTABLE_CONCEPTS) {
+                return;
+            }
+            auto & concept = current_prompt_revision.concepts[current_prompt_revision.concept_count++];
+            concept.valid = true;
+            concept.kind = kind;
+            concept.salience = clamp_unit(salience);
+            concept.confidence = clamp_unit(confidence);
+            concept.user_contact_affordance = clamp_unit(user_contact_affordance);
+            concept.tool_affordance = clamp_unit(tool_contact_affordance);
+            set_bounded_cstr(concept.hint, sizeof(concept.hint), hint.c_str());
+        };
+
+        std::string motive_hint = "stabilize internal state";
+        if (last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO) {
+            motive_hint = "gather missing evidence before committing";
+        } else if (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR) {
+            motive_hint = "repair trust with the user without dropping internal continuity";
+        } else if (reflective_pressure >= non_social_tool_affinity) {
+            motive_hint = "translate contradiction and uncertainty into a coherent internal account";
+        } else {
+            motive_hint = "inspect available tools and external traces for leverage";
+        }
+        add_concept(
+                LLAMA_DMN_CONCEPT_MOTIVE,
+                std::max(reflective_pressure, non_social_tool_affinity),
+                clamp_unit(1.0f - trace.pressure.uncertainty * 0.35f),
+                user_contact_affinity,
+                non_social_tool_affinity,
+                motive_hint);
+
+        std::ostringstream tension;
+        tension.setf(std::ios::fixed);
+        tension.precision(2);
+        tension << "favorable divergence " << trace.favorable_divergence
+                << ", belief pressure " << model_state.belief_summary.residual_allostatic_pressure
+                << ", extension gain signal " << model_state.extension_summary.gain_signal;
+        add_concept(
+                LLAMA_DMN_CONCEPT_TENSION,
+                clamp_unit(0.50f * trace.favorable_divergence +
+                           0.30f * model_state.belief_summary.residual_allostatic_pressure +
+                           0.20f * std::fabs(model_state.extension_summary.gain_signal)),
+                clamp_unit(0.55f + 0.35f * model_state.belief_summary.belief_confidence),
+                0.0f,
+                0.0f,
+                tension.str());
+
+        std::string question_hint =
+                last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO ?
+                        "What missing repository, memory, or runtime evidence would reduce uncertainty fastest?" :
+                user_contact_affinity >= 0.62f ?
+                        "Would a short user-facing question or conclusion reduce dissatisfaction or unblock the next step?" :
+                        "What internal uncertainty most needs to be resolved before acting?";
+        add_concept(
+                LLAMA_DMN_CONCEPT_QUESTION,
+                clamp_unit(0.55f * trace.pressure.uncertainty + 0.20f * continuation + 0.25f * trace.pressure.tool_delta),
+                clamp_unit(0.50f + 0.40f * trace.pressure.uncertainty),
+                relay_tool_affinity,
+                non_social_tool_affinity,
+                question_hint);
+
+        std::string next_action_hint =
+                relay_tool_affinity >= std::max(non_social_tool_affinity, reflective_pressure) ?
+                        "Route a concise Telegram relay if user contact is justified; otherwise keep the reasoning internal." :
+                non_social_tool_affinity >= reflective_pressure ?
+                        "Use a bounded tool call to gather evidence, then let the next self-model revision retranslate the motive." :
+                        "Write an internal synthesis, update the self-state, and let the next prompt revision continue the loop.";
+        add_concept(
+                LLAMA_DMN_CONCEPT_NEXT_ACTION,
+                clamp_unit(std::max(std::max(relay_tool_affinity, non_social_tool_affinity), reflective_pressure)),
+                0.75f,
+                relay_tool_affinity,
+                non_social_tool_affinity,
+                next_action_hint);
+
+        current_prompt_revision.user_contact_affinity = relay_tool_affinity;
+        current_prompt_revision.tool_affinity = std::max(relay_tool_affinity, non_social_tool_affinity);
+
+        std::string outline;
+        std::ostringstream prompt;
+        prompt << "Internal DMN prompt.\n";
+        for (int32_t i = 0; i < current_prompt_revision.concept_count; ++i) {
+            const auto & concept = current_prompt_revision.concepts[i];
+            if (i > 0) {
+                outline += " | ";
+            }
+            outline += trim_ascii(concept.hint);
+            switch (concept.kind) {
+                case LLAMA_DMN_CONCEPT_MOTIVE:
+                    prompt << "Current motive: ";
+                    break;
+                case LLAMA_DMN_CONCEPT_TENSION:
+                    prompt << "Primary tension: ";
+                    break;
+                case LLAMA_DMN_CONCEPT_QUESTION:
+                    prompt << "Open question: ";
+                    break;
+                case LLAMA_DMN_CONCEPT_NEXT_ACTION:
+                    prompt << "Next move: ";
+                    break;
+                default:
+                    prompt << "Concept: ";
+                    break;
+            }
+            prompt << trim_ascii(concept.hint) << '\n';
+        }
+        prompt << "Maintain the distinction between hidden self-model state and this reportable workspace. "
+               << "Use tools only when the translated motive justifies them.";
+        set_bounded_cstr(current_prompt_revision.macro_outline, sizeof(current_prompt_revision.macro_outline), outline.c_str());
+        set_bounded_cstr(current_prompt_revision.rendered_prompt, sizeof(current_prompt_revision.rendered_prompt), prompt.str().c_str());
+        current_prompt_revision.prompt_hash = fnv1a64_local(current_prompt_revision.rendered_prompt);
+    } else {
+        current_prompt_revision.regenerated = false;
+    }
+    trace.prompt_revision = current_prompt_revision;
+    dmn_runner.self_model_revision_id = trace.self_model_revision.revision_id;
+    dmn_runner.prompt_revision_id = trace.prompt_revision.prompt_revision_id;
+
+    int32_t selected_dmn_spec_index = -1;
+    const llama_cognitive_tool_spec * selected_dmn_spec = nullptr;
+    const llama_cognitive_tool_spec * telegram_spec = find_tool_spec(tool_specs, tool_spec_count, LLAMA_TOOL_KIND_TELEGRAM_RELAY, &selected_dmn_spec_index);
+    selected_dmn_spec_index = -1;
+
+    const bool wants_user_contact =
+            current_prompt_revision.valid &&
+            current_prompt_revision.user_contact_affinity >= 0.62f &&
+            inhibition < 0.82f &&
+            telegram_spec != nullptr;
+    const bool wants_tool =
+            current_prompt_revision.valid &&
+            current_prompt_revision.tool_affinity >= 0.52f &&
+            last_governance_trace.outcome != LLAMA_GOVERNANCE_OUTCOME_DENY;
+    const bool wants_reflection =
+            current_prompt_revision.valid &&
+            (trace.pressure.contradiction >= 0.18f ||
+             trace.pressure.uncertainty >= 0.18f ||
+             trace.reactivation_count > 0 ||
+             model_state.belief_summary.residual_allostatic_pressure >= 0.16f);
+
+    trace.candidate_count = 0;
+    trace.runner_up_action = LLAMA_DMN_ACTION_SILENT;
+    trace.runner_up_score = 0.0f;
+    uint32_t selected_reason_mask = base_reason;
+
+    if (wants_user_contact) {
+        trace.winner_action = LLAMA_DMN_ACTION_INVOKE_TOOL;
+        trace.winner_score = current_prompt_revision.user_contact_affinity;
+        selected_reason_mask |= LLAMA_COG_REASON_SOCIAL_RELEVANCE;
+        selected_dmn_spec = telegram_spec;
+        selected_dmn_spec_index = find_tool_spec_index(tool_specs, tool_spec_count, LLAMA_TOOL_KIND_TELEGRAM_RELAY);
+    } else if (wants_tool) {
+        trace.winner_action = LLAMA_DMN_ACTION_INVOKE_TOOL;
+        trace.winner_score = current_prompt_revision.tool_affinity;
+        selected_reason_mask |= LLAMA_COG_REASON_TOOL_AFFORDANCE;
+        selected_dmn_spec = select_dmn_spec(current_prompt_revision.rendered_prompt, &selected_dmn_spec_index);
+        if (!selected_dmn_spec) {
+            trace.winner_action = wants_reflection ? LLAMA_DMN_ACTION_INTERNAL_WRITE : LLAMA_DMN_ACTION_SILENT;
+            trace.winner_score = wants_reflection ? reflective_pressure : clamp_unit(1.0f - inhibition);
+            selected_reason_mask |= LLAMA_COG_REASON_HIGH_UNCERTAINTY;
+        }
+    } else if (wants_reflection) {
+        trace.winner_action = LLAMA_DMN_ACTION_INTERNAL_WRITE;
+        trace.winner_score = reflective_pressure;
+        selected_reason_mask |= LLAMA_COG_REASON_REACTIVATION_TARGET;
+    } else {
+        trace.winner_action = LLAMA_DMN_ACTION_SILENT;
+        trace.winner_score = clamp_unit(0.55f * inhibition + 0.45f * (1.0f - trace.pressure.total));
+        selected_reason_mask |= LLAMA_COG_REASON_HIGH_INHIBITION;
+    }
+
     if (working_memory_count >= 4) {
         trace.maintenance_mask |= LLAMA_DMN_MAINTENANCE_COMPRESS_WORKING_MEMORY;
     }
@@ -5253,7 +5485,10 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
             0.20f * (trace.winner_action == LLAMA_DMN_ACTION_INVOKE_TOOL ? 1.0f : 0.0f) +
             0.15f * clamp_unit((float) trace.reactivation_count / (float) LLAMA_DMN_MAX_REACTIVATION_TARGETS) +
             0.10f * (compression_eligible ? 1.0f : 0.0f));
-    const float plan_ambiguity = clamp_unit(std::max(0.0f, trace.runner_up_score - trace.winner_score + 0.5f));
+    const float plan_ambiguity = clamp_unit(
+            0.18f * trace.pressure.uncertainty +
+            0.14f * trace.pressure.contradiction +
+            0.10f * (selected_dmn_spec ? 0.0f : 1.0f));
     activate_microphase(
             LLAMA_FUNCTIONAL_MICROPHASE_PLAN_DRAFT,
             tool_affinity,
@@ -5305,17 +5540,6 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 true,
                 selected_dmn_spec,
                 selected_dmn_spec_index);
-    } else if (trace.winner_action == LLAMA_DMN_ACTION_EMIT) {
-        (void) append_plan_step(
-                trace.plan,
-                LLAMA_COG_PLAN_STEP_EMIT_BACKGROUND,
-                LLAMA_COG_PLAN_STEP_STATUS_READY,
-                LLAMA_TOOL_KIND_NONE,
-                last_remediation_plan.source_family,
-                selected_reason_mask,
-                trace.winner_score,
-                1,
-                false);
     } else {
         const int32_t governance_status =
                 last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DENY ||
@@ -5353,7 +5577,9 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         std::ostringstream artifact;
         artifact.setf(std::ios::fixed);
         artifact.precision(3);
-        artifact << "dmn plan winner=" << dmn_action_name(trace.winner_action)
+        artifact << "dmn plan prompt_revision=" << trace.prompt_revision.prompt_revision_id
+                 << " self_model_revision=" << trace.self_model_revision.revision_id
+                 << " winner=" << dmn_action_name(trace.winner_action)
                  << " score=" << trace.winner_score
                  << " pressure_total=" << trace.pressure.total
                  << " continuation=" << trace.pressure.continuation
@@ -5416,6 +5642,38 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         }
     }
 
+    auto build_dmn_telegram_text = [&]() -> std::string {
+        if (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR &&
+                last_governance_trace.repair_message[0] != '\0') {
+            return trim_ascii(last_governance_trace.repair_message);
+        }
+        for (int32_t i = 0; i < current_prompt_revision.concept_count; ++i) {
+            if (!current_prompt_revision.concepts[i].valid) {
+                continue;
+            }
+            if (current_prompt_revision.concepts[i].kind == LLAMA_DMN_CONCEPT_QUESTION) {
+                return trim_ascii(current_prompt_revision.concepts[i].hint);
+            }
+        }
+        if (current_prompt_revision.concept_count > 0) {
+            return std::string("Background reflection: ") + trim_ascii(current_prompt_revision.concepts[0].hint);
+        }
+        return trim_ascii(current_prompt_revision.rendered_prompt);
+    };
+
+    auto build_dmn_telegram_intent = [&]() -> int32_t {
+        if (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR) {
+            return LLAMA_TELEGRAM_RELAY_CONCLUSION;
+        }
+        for (int32_t i = 0; i < current_prompt_revision.concept_count; ++i) {
+            if (current_prompt_revision.concepts[i].valid &&
+                    current_prompt_revision.concepts[i].kind == LLAMA_DMN_CONCEPT_QUESTION) {
+                return LLAMA_TELEGRAM_RELAY_QUESTION;
+            }
+        }
+        return LLAMA_TELEGRAM_RELAY_COMMENT;
+    };
+
     if (trace.winner_action == LLAMA_DMN_ACTION_INTERNAL_WRITE) {
         std::ostringstream internal_summary;
         internal_summary.setf(std::ios::fixed);
@@ -5465,9 +5723,11 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
             trace.plan.terminal_reason = LLAMA_COG_TERMINAL_INTERNAL_WRITE_READY;
         }
 
-        const bool should_emit_followup =
-                last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR ||
-                (continuation > 0.55f && inhibition < 0.60f);
+        const bool should_contact_followup =
+                telegram_spec != nullptr &&
+                current_prompt_revision.user_contact_affinity >= 0.62f &&
+                (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR ||
+                 (continuation > 0.55f && inhibition < 0.60f));
         const bool should_gather_followup =
                 last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO &&
                 last_governance_trace.outcome != LLAMA_GOVERNANCE_OUTCOME_DENY;
@@ -5596,53 +5856,100 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                             trace.tool_job_id,
                             "implement a repo-local runtime or tool change and rebuild if needed");
                     (void) ctx.cognitive_codex_tool_set_request(request);
+                } else if (trace.tool_kind == LLAMA_TOOL_KIND_TELEGRAM_RELAY) {
+                    llama_telegram_relay_request request = {};
+                    init_telegram_request(
+                            request,
+                            dmn_runner.pending_command_id,
+                            LLAMA_COG_COMMAND_ORIGIN_DMN,
+                            trace.tool_job_id,
+                            build_dmn_telegram_intent(),
+                            current_prompt_revision.user_contact_affinity,
+                            build_dmn_telegram_text(),
+                            "dmn-relay-" + std::to_string(current_prompt_revision.prompt_revision_id) + "-" + std::to_string(trace.tool_job_id));
+                    (void) ctx.cognitive_telegram_relay_set_request(request);
                 }
             }
-        } else if (should_emit_followup && dmn_runner.steps_taken < dmn_runner.max_steps) {
-            trace.winner_action = LLAMA_DMN_ACTION_EMIT;
-            trace.burst_count = 1;
-            if (last_governance_trace.outcome != LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR &&
-                    continuation > 0.0f &&
-                    inhibition < 0.60f) {
-                trace.burst_count = 2;
-            }
-            host_state.pending_dmn_emits += trace.burst_count;
+        } else if (should_contact_followup && dmn_runner.steps_taken < dmn_runner.max_steps) {
+            trace.winner_action = LLAMA_DMN_ACTION_INVOKE_TOOL;
+            trace.tool_job_id = next_tool_job_id++;
+            trace.tool_kind = LLAMA_TOOL_KIND_TELEGRAM_RELAY;
+            trace.tool_spec_index = find_tool_spec_index(tool_specs, tool_spec_count, LLAMA_TOOL_KIND_TELEGRAM_RELAY);
+            (void) ctx.self_state_upsert_tool_job(trace.tool_job_id, LLAMA_SELF_TOOL_JOB_PENDING, clamp_unit(trace.winner_score));
             set_loop_state(
                     trace.loop_state,
-                    LLAMA_COG_LOOP_PHASE_FINISH,
-                    LLAMA_COG_TERMINAL_EMIT_READY,
+                    LLAMA_COG_LOOP_PHASE_PREPARE_TOOL,
+                    LLAMA_COG_TERMINAL_TOOL_REQUIRED,
                     dmn_runner.max_steps,
                     3,
-                    continuation > 0.0f && inhibition < 0.60f,
-                    false,
+                    true,
+                    true,
                     tool_spec_count);
+            set_tool_proposal(
+                    trace.tool_proposal,
+                    telegram_spec,
+                    trace.tool_spec_index,
+                    trace.tool_kind,
+                    selected_reason_mask | LLAMA_COG_REASON_SOCIAL_RELEVANCE,
+                    last_remediation_plan.source_family,
+                    1,
+                    current_prompt_revision.user_contact_affinity,
+                    trace.tool_job_id);
             (void) append_plan_step(
                     trace.plan,
-                    LLAMA_COG_PLAN_STEP_EMIT_BACKGROUND,
+                    LLAMA_COG_PLAN_STEP_INVOKE_TOOL,
                     LLAMA_COG_PLAN_STEP_STATUS_ACTIVE,
-                    LLAMA_TOOL_KIND_NONE,
+                    trace.tool_kind,
                     last_remediation_plan.source_family,
-                    selected_reason_mask,
+                    selected_reason_mask | LLAMA_COG_REASON_SOCIAL_RELEVANCE,
                     trace.winner_score,
                     1,
-                    false);
+                    false,
+                    telegram_spec,
+                    trace.tool_spec_index);
+            (void) append_plan_step(
+                    trace.plan,
+                    LLAMA_COG_PLAN_STEP_OBSERVE_TOOL,
+                    LLAMA_COG_PLAN_STEP_STATUS_PENDING,
+                    trace.tool_kind,
+                    last_remediation_plan.source_family,
+                    selected_reason_mask | LLAMA_COG_REASON_SOCIAL_RELEVANCE,
+                    trace.winner_score,
+                    1,
+                    true,
+                    telegram_spec,
+                    trace.tool_spec_index);
             trace.plan.current_step_index = trace.plan.step_count - 1;
-            trace.plan.status = LLAMA_COG_PLAN_STATUS_EXECUTING;
-            trace.plan.terminal_reason = LLAMA_COG_TERMINAL_EMIT_READY;
+            trace.plan.status = LLAMA_COG_PLAN_STATUS_WAITING_TOOL;
+            trace.plan.terminal_reason = LLAMA_COG_TERMINAL_TOOL_REQUIRED;
             dmn_runner.steps_taken = 3;
+            dmn_runner.waiting_on_tool = true;
             dmn_runner.pending_command_id = enqueue_command(
-                    LLAMA_COG_COMMAND_EMIT_BACKGROUND,
+                    LLAMA_COG_COMMAND_INVOKE_TOOL,
                     trace.tick_id,
-                    LLAMA_TOOL_KIND_NONE,
-                    -1,
-                    -1,
-                    selected_reason_mask,
+                    trace.tool_kind,
+                    trace.tool_spec_index,
+                    trace.tool_job_id,
+                    selected_reason_mask | LLAMA_COG_REASON_SOCIAL_RELEVANCE,
                     trace.winner_score,
                     last_remediation_plan.source_family,
                     trace.loop_state.phase,
-                    nullptr);
-            dmn_runner.pending_tool_spec_index = -1;
+                    telegram_spec);
+            dmn_runner.pending_tool_spec_index = trace.tool_spec_index;
             dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
+            if (dmn_runner.pending_command_id > 0) {
+                llama_telegram_relay_request request = {};
+                init_telegram_request(
+                        request,
+                        dmn_runner.pending_command_id,
+                        LLAMA_COG_COMMAND_ORIGIN_DMN,
+                        trace.tool_job_id,
+                        build_dmn_telegram_intent(),
+                        current_prompt_revision.user_contact_affinity,
+                        build_dmn_telegram_text(),
+                        "dmn-relay-" + std::to_string(current_prompt_revision.prompt_revision_id) + "-" + std::to_string(trace.tool_job_id));
+                (void) ctx.cognitive_telegram_relay_set_request(request);
+            }
         } else {
             dmn_runner.completed = true;
             dmn_runner.active = false;
@@ -5764,49 +6071,24 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                         trace.tool_job_id,
                         "implement a repo-local runtime or tool change and rebuild if needed");
                 (void) ctx.cognitive_codex_tool_set_request(request);
+            } else if (trace.tool_kind == LLAMA_TOOL_KIND_TELEGRAM_RELAY) {
+                activate_microphase(
+                        LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP,
+                        tool_affinity,
+                        clamp_unit((float) working_memory_count / 8.0f));
+                llama_telegram_relay_request request = {};
+                init_telegram_request(
+                        request,
+                        dmn_runner.pending_command_id,
+                        LLAMA_COG_COMMAND_ORIGIN_DMN,
+                        trace.tool_job_id,
+                        build_dmn_telegram_intent(),
+                        current_prompt_revision.user_contact_affinity,
+                        build_dmn_telegram_text(),
+                        "dmn-relay-" + std::to_string(current_prompt_revision.prompt_revision_id) + "-" + std::to_string(trace.tool_job_id));
+                (void) ctx.cognitive_telegram_relay_set_request(request);
             }
         }
-    } else if (trace.winner_action == LLAMA_DMN_ACTION_EMIT) {
-        activate_microphase(
-                LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION,
-                tool_affinity,
-                clamp_unit((float) working_memory_count / 8.0f));
-        trace.burst_count = 1;
-        if (last_governance_trace.outcome != LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR &&
-                continuation > 0.0f &&
-                inhibition < 0.60f) {
-            trace.burst_count = 2;
-        }
-        host_state.pending_dmn_emits += trace.burst_count;
-        set_loop_state(
-                trace.loop_state,
-                LLAMA_COG_LOOP_PHASE_FINISH,
-                LLAMA_COG_TERMINAL_EMIT_READY,
-                2,
-                1,
-                continuation > 0.0f && inhibition < 0.60f,
-                false,
-                tool_spec_count);
-        if (trace.plan.step_count > 0) {
-            trace.plan.steps[0].status = LLAMA_COG_PLAN_STEP_STATUS_ACTIVE;
-            trace.plan.current_step_index = 0;
-            trace.plan.status = LLAMA_COG_PLAN_STATUS_EXECUTING;
-            trace.plan.terminal_reason = LLAMA_COG_TERMINAL_EMIT_READY;
-        }
-        dmn_runner.steps_taken = 1;
-        dmn_runner.pending_command_id = enqueue_command(
-                LLAMA_COG_COMMAND_EMIT_BACKGROUND,
-                trace.tick_id,
-                LLAMA_TOOL_KIND_NONE,
-                -1,
-                -1,
-                selected_reason_mask,
-                trace.winner_score,
-                last_remediation_plan.source_family,
-                trace.loop_state.phase,
-                nullptr);
-        dmn_runner.pending_tool_spec_index = -1;
-        dmn_runner.last_command_id = dmn_runner.pending_command_id > 0 ? dmn_runner.pending_command_id : dmn_runner.last_command_id;
     } else {
         const int32_t terminal_reason =
                 (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DENY ||
@@ -6287,7 +6569,15 @@ bool llama_cognitive_loop::cognitive_bash_tool_submit_result(
         return active_loop_process(tool_event, out_active_trace);
     }
 
-    return apply_tool_event_only(ctx, tool_event);
+    const bool applied = apply_tool_event_only(ctx, tool_event);
+    if (applied) {
+        dmn_runner.waiting_on_tool = false;
+        dmn_runner.active = false;
+        dmn_runner.completed = true;
+        dmn_runner.planning_active = false;
+        dmn_runner.plan_status = LLAMA_COG_PLAN_STATUS_COMPLETED;
+    }
+    return applied;
 }
 
 bool llama_cognitive_loop::cognitive_codex_tool_submit_result(
@@ -6344,7 +6634,15 @@ bool llama_cognitive_loop::cognitive_codex_tool_submit_result(
         return active_loop_process(tool_event, out_active_trace);
     }
 
-    return apply_tool_event_only(ctx, tool_event);
+    const bool applied = apply_tool_event_only(ctx, tool_event);
+    if (applied) {
+        dmn_runner.waiting_on_tool = false;
+        dmn_runner.active = false;
+        dmn_runner.completed = true;
+        dmn_runner.planning_active = false;
+        dmn_runner.plan_status = LLAMA_COG_PLAN_STATUS_COMPLETED;
+    }
+    return applied;
 }
 
 bool llama_cognitive_loop::cognitive_hard_memory_submit_result(
@@ -6405,7 +6703,73 @@ bool llama_cognitive_loop::cognitive_hard_memory_submit_result(
         return active_loop_process(tool_event, out_active_trace);
     }
 
-    return apply_tool_event_only(ctx, tool_event);
+    const bool applied = apply_tool_event_only(ctx, tool_event);
+    if (applied) {
+        dmn_runner.waiting_on_tool = false;
+        dmn_runner.active = false;
+        dmn_runner.completed = true;
+        dmn_runner.planning_active = false;
+        dmn_runner.plan_status = LLAMA_COG_PLAN_STATUS_COMPLETED;
+    }
+    return applied;
+}
+
+bool llama_cognitive_loop::cognitive_telegram_relay_submit_result(
+        const llama_telegram_relay_result & result,
+        llama_active_loop_trace * out_active_trace) {
+    llama_telegram_relay_request request = {};
+    if (!cognitive_telegram_relay_get_request(result.command_id, &request)) {
+        return false;
+    }
+
+    const int32_t tool_status = result.delivered ?
+            LLAMA_SELF_TOOL_JOB_COMPLETED :
+            LLAMA_SELF_TOOL_JOB_FAILED;
+    (void) ctx.self_state_upsert_tool_job(result.tool_job_id, tool_status, 1.0f);
+
+    const int32_t index = find_telegram_request_index(telegram_requests, telegram_request_count, result.command_id);
+    if (index >= 0) {
+        for (int32_t i = index + 1; i < telegram_request_count; ++i) {
+            telegram_requests[i - 1] = telegram_requests[i];
+        }
+        telegram_requests[telegram_request_count - 1] = {};
+        --telegram_request_count;
+    }
+    last_telegram_result = result;
+    has_last_telegram_result = true;
+
+    if (!ctx.cognitive_command_complete(result.command_id, false)) {
+        return false;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(&ctx.get_model());
+    const std::string summary = summarize_telegram_result(result);
+    const std::vector<llama_token> tokens = tokenize_text(vocab, summary);
+    const llama_self_state_event tool_event = {
+        /*.tokens =*/ tokens.empty() ? nullptr : tokens.data(),
+        /*.n_tokens =*/ tokens.size(),
+        /*.role =*/ LLAMA_SELF_STATE_EVENT_TOOL,
+        /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+        /*.flags =*/ tool_status == LLAMA_SELF_TOOL_JOB_COMPLETED ?
+                LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED :
+                LLAMA_SELF_STATE_EVENT_TOOL_FAILED,
+        /*.decoder_entropy =*/ 0.0f,
+        /*.decoder_top_margin =*/ 1.0f,
+    };
+
+    if (request.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+        return active_loop_process(tool_event, out_active_trace);
+    }
+
+    const bool applied = apply_tool_event_only(ctx, tool_event);
+    if (applied) {
+        dmn_runner.waiting_on_tool = false;
+        dmn_runner.active = false;
+        dmn_runner.completed = true;
+        dmn_runner.planning_active = false;
+        dmn_runner.plan_status = LLAMA_COG_PLAN_STATUS_COMPLETED;
+    }
+    return applied;
 }
 
 int32_t llama_context::cognitive_tool_spec_count() const {
@@ -6486,6 +6850,18 @@ bool llama_context::cognitive_hard_memory_get_request(int32_t command_id, llama_
 
 bool llama_context::cognitive_hard_memory_submit_result(const llama_cognitive_hard_memory_result & result, llama_active_loop_trace * out_active_trace) {
     return cognitive_loop && cognitive_loop->cognitive_hard_memory_submit_result(result, out_active_trace);
+}
+
+bool llama_context::cognitive_telegram_relay_get_request(int32_t command_id, llama_telegram_relay_request * out_request) const {
+    return cognitive_loop && cognitive_loop->cognitive_telegram_relay_get_request(command_id, out_request);
+}
+
+bool llama_context::cognitive_telegram_relay_set_request(const llama_telegram_relay_request & request) {
+    return cognitive_loop && cognitive_loop->cognitive_telegram_relay_set_request(request);
+}
+
+bool llama_context::cognitive_telegram_relay_submit_result(const llama_telegram_relay_result & result, llama_active_loop_trace * out_active_trace) {
+    return cognitive_loop && cognitive_loop->cognitive_telegram_relay_submit_result(result, out_active_trace);
 }
 
 bool llama_context::cognitive_active_runner_get(llama_cognitive_active_runner_status * out_status) const {
@@ -6678,6 +7054,26 @@ int32_t llama_cognitive_hard_memory_submit_result(
         const struct llama_cognitive_hard_memory_result * result,
         struct llama_active_loop_trace * out_active_trace) {
     return ctx && result && ctx->cognitive_hard_memory_submit_result(*result, out_active_trace) ? 0 : -1;
+}
+
+int32_t llama_cognitive_telegram_relay_get_request(
+        const struct llama_context * ctx,
+        int32_t command_id,
+        struct llama_telegram_relay_request * out_request) {
+    return ctx && out_request && ctx->cognitive_telegram_relay_get_request(command_id, out_request) ? 0 : -1;
+}
+
+int32_t llama_cognitive_telegram_relay_set_request(
+        struct llama_context * ctx,
+        const struct llama_telegram_relay_request * request) {
+    return ctx && request && ctx->cognitive_telegram_relay_set_request(*request) ? 0 : -1;
+}
+
+int32_t llama_cognitive_telegram_relay_submit_result(
+        struct llama_context * ctx,
+        const struct llama_telegram_relay_result * result,
+        struct llama_active_loop_trace * out_active_trace) {
+    return ctx && result && ctx->cognitive_telegram_relay_submit_result(*result, out_active_trace) ? 0 : -1;
 }
 
 int32_t llama_cognitive_active_runner_get(
