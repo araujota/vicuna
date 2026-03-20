@@ -2329,12 +2329,47 @@ void init_hard_memory_request(
     request.command_id = command_id;
     request.origin = origin;
     request.tool_job_id = tool_job_id;
+    request.operation = LLAMA_COG_HARD_MEMORY_OPERATION_QUERY;
     request.query.limit = 4;
     request.query.threshold = 0.0f;
     request.query.include_profile = true;
     request.query.use_temporal_self_hint = temporal_adapter_role >= 0;
     request.query.temporal_adapter_role = temporal_adapter_role;
     set_bounded_cstr(request.query.query, sizeof(request.query.query), query_text.c_str());
+}
+
+void init_hard_memory_write_request(
+        llama_cognitive_hard_memory_request & request,
+        int32_t command_id,
+        int32_t origin,
+        int32_t tool_job_id,
+        const std::string & content_text) {
+    request = {};
+    request.command_id = command_id;
+    request.origin = origin;
+    request.tool_job_id = tool_job_id;
+    request.operation = LLAMA_COG_HARD_MEMORY_OPERATION_WRITE;
+    request.write_count = content_text.empty() ? 0 : 1;
+    if (request.write_count <= 0) {
+        return;
+    }
+
+    llama_hard_memory_write_item & item = request.write_items[0];
+    item = {};
+    item.is_static = false;
+    item.primitive = llama_hard_memory_default_primitive();
+    item.primitive.kind = LLAMA_HARD_MEMORY_PRIMITIVE_OUTCOME;
+    item.primitive.domain = LLAMA_HARD_MEMORY_DOMAIN_EPISTEMIC;
+    item.primitive.source_role = LLAMA_SELF_STATE_EVENT_SYSTEM;
+    item.primitive.source_channel = LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY;
+    item.primitive.source_tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_WRITE;
+    item.primitive.flags =
+            LLAMA_HARD_MEMORY_PRIMITIVE_AFFECT_GAIN |
+            LLAMA_HARD_MEMORY_PRIMITIVE_TOOL_DERIVED;
+    set_bounded_cstr(item.primitive.key, sizeof(item.primitive.key), "explicit-memory-write");
+    set_bounded_cstr(item.primitive.title, sizeof(item.primitive.title), "explicit memory write");
+    set_bounded_cstr(item.primitive.content, sizeof(item.primitive.content), content_text.c_str());
+    set_bounded_cstr(item.primitive.tags[0], sizeof(item.primitive.tags[0]), "explicit_write");
 }
 
 std::string summarize_bash_result(const llama_bash_tool_result & result) {
@@ -2467,6 +2502,33 @@ std::string summarize_hard_memory_result(const llama_hard_memory_result & result
         }
     }
 
+    return summary;
+}
+
+std::string summarize_hard_memory_archive_result(const llama_hard_memory_archive_trace & trace) {
+    std::string summary;
+    if (!trace.attempted) {
+        summary = "hard-memory write was not attempted.";
+    } else if (trace.archived) {
+        summary = "hard-memory write completed successfully.";
+    } else {
+        summary = "hard-memory write failed.";
+    }
+    if (trace.status_code > 0) {
+        summary += " status=" + std::to_string(trace.status_code) + ".";
+    }
+    if (trace.primitive_count > 0) {
+        summary += " stored_items=" + std::to_string(trace.primitive_count) + ".";
+    }
+    if (trace.container_tag[0] != '\0') {
+        summary += " container=" + trim_ascii(trace.container_tag) + ".";
+    }
+    if (trace.content_excerpt[0] != '\0') {
+        summary += " excerpt=\"" + trim_ascii(trace.content_excerpt) + "\".";
+    }
+    if (trace.error[0] != '\0') {
+        summary += " error: " + trim_ascii(trace.error);
+    }
     return summary;
 }
 
@@ -3358,7 +3420,8 @@ llama_cognitive_loop::llama_cognitive_loop(llama_context & ctx) : ctx(ctx) {
                 "hard_memory_query"),
         make_tool_spec(
                 LLAMA_TOOL_KIND_HARD_MEMORY_WRITE,
-                LLAMA_COG_TOOL_DMN_ELIGIBLE |
+                LLAMA_COG_TOOL_ACTIVE_ELIGIBLE |
+                        LLAMA_COG_TOOL_DMN_ELIGIBLE |
                         LLAMA_COG_TOOL_REMEDIATION_SAFE |
                         LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT,
                 LLAMA_COG_TOOL_LATENCY_HIGH,
@@ -4334,6 +4397,16 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                         tool_job_id,
                         intent_text,
                         LLAMA_SERVING_LORA_LAYER_ACTIVE);
+                (void) ctx.hard_memory_set_request(request);
+            } else if (proposed_tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_WRITE) {
+                activate_microphase(LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, tool_affinity);
+                llama_cognitive_hard_memory_request request = {};
+                init_hard_memory_write_request(
+                        request,
+                        active_runner.pending_command_id,
+                        LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                        tool_job_id,
+                        intent_text);
                 (void) ctx.hard_memory_set_request(request);
             } else if (proposed_tool_kind == LLAMA_TOOL_KIND_CODEX_CLI &&
                     ctx.codex_tool_get_config(&codex_config)) {
@@ -5503,6 +5576,15 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                             "relevant hard memory for current runtime remediation and self-state",
                             LLAMA_SERVING_LORA_LAYER_ACTIVE);
                     (void) ctx.hard_memory_set_request(request);
+                } else if (trace.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_WRITE) {
+                    llama_cognitive_hard_memory_request request = {};
+                    init_hard_memory_write_request(
+                            request,
+                            dmn_runner.pending_command_id,
+                            LLAMA_COG_COMMAND_ORIGIN_DMN,
+                            trace.tool_job_id,
+                            "durable runtime residue worth explicitly archiving to hard memory");
+                    (void) ctx.hard_memory_set_request(request);
                 } else if (trace.tool_kind == LLAMA_TOOL_KIND_CODEX_CLI &&
                         ctx.codex_tool_get_config(&codex_config)) {
                     llama_codex_tool_request request = {};
@@ -5653,6 +5735,19 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                         trace.tool_job_id,
                         "relevant hard memory for runtime remediation and self-state",
                         LLAMA_SERVING_LORA_LAYER_ACTIVE);
+                (void) ctx.hard_memory_set_request(request);
+            } else if (trace.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_WRITE) {
+                activate_microphase(
+                        LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP,
+                        tool_affinity,
+                        clamp_unit((float) working_memory_count / 8.0f));
+                llama_cognitive_hard_memory_request request = {};
+                init_hard_memory_write_request(
+                        request,
+                        dmn_runner.pending_command_id,
+                        LLAMA_COG_COMMAND_ORIGIN_DMN,
+                        trace.tool_job_id,
+                        "durable runtime residue worth explicitly archiving to hard memory");
                 (void) ctx.hard_memory_set_request(request);
             } else if (trace.tool_kind == LLAMA_TOOL_KIND_CODEX_CLI &&
                     ctx.codex_tool_get_config(&codex_config)) {
@@ -6260,16 +6355,27 @@ bool llama_cognitive_loop::cognitive_hard_memory_submit_result(
         return false;
     }
 
+    const bool is_write = request.operation == LLAMA_COG_HARD_MEMORY_OPERATION_WRITE;
     const int32_t tool_status =
-            (result.result.ok && result.result.status_code < 500) ?
-                    LLAMA_SELF_TOOL_JOB_COMPLETED :
-                    LLAMA_SELF_TOOL_JOB_FAILED;
+            is_write ?
+                    ((result.archive_trace.archived && result.archive_trace.status_code < 500) ?
+                            LLAMA_SELF_TOOL_JOB_COMPLETED :
+                            LLAMA_SELF_TOOL_JOB_FAILED) :
+                    ((result.result.ok && result.result.status_code < 500) ?
+                            LLAMA_SELF_TOOL_JOB_COMPLETED :
+                            LLAMA_SELF_TOOL_JOB_FAILED);
     (void) ctx.self_state_upsert_tool_job(result.tool_job_id, tool_status, 1.0f);
 
-    if (!ctx.hard_memory_submit_result(result.result)) {
-        return false;
+    if (is_write) {
+        if (!ctx.hard_memory_submit_archive_trace(result.archive_trace)) {
+            return false;
+        }
+    } else {
+        if (!ctx.hard_memory_submit_result(result.result)) {
+            return false;
+        }
+        (void) ctx.self_state_promote_hard_memory_query(request.query, result.result);
     }
-    (void) ctx.self_state_promote_hard_memory_query(request.query, result.result);
     if (!ctx.hard_memory_clear_request(result.command_id)) {
         return false;
     }
@@ -6278,7 +6384,10 @@ bool llama_cognitive_loop::cognitive_hard_memory_submit_result(
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(&ctx.get_model());
-    const std::string summary = summarize_hard_memory_result(result.result);
+    const std::string summary =
+            is_write ?
+                    summarize_hard_memory_archive_result(result.archive_trace) :
+                    summarize_hard_memory_result(result.result);
     const std::vector<llama_token> tokens = tokenize_text(vocab, summary);
     const llama_self_state_event tool_event = {
         /*.tokens =*/ tokens.empty() ? nullptr : tokens.data(),

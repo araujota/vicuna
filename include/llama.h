@@ -1980,6 +1980,11 @@ extern "C" {
         char title[LLAMA_HARD_MEMORY_MAX_TITLE_CHARS];
     };
 
+    struct llama_hard_memory_write_item {
+        bool is_static;
+        struct llama_hard_memory_primitive primitive;
+    };
+
     struct llama_hard_memory_retrieval_summary {
         int32_t event_count;
         int32_t trajectory_count;
@@ -2195,17 +2200,28 @@ extern "C" {
         char changed_files_excerpt[LLAMA_CODEX_TOOL_FILES_MAX_CHARS];
     };
 
+    enum llama_cognitive_hard_memory_operation {
+        LLAMA_COG_HARD_MEMORY_OPERATION_QUERY = 0,
+        LLAMA_COG_HARD_MEMORY_OPERATION_WRITE = 1,
+    };
+
     struct llama_cognitive_hard_memory_request {
         int32_t command_id;
         int32_t origin;
         int32_t tool_job_id;
+        int32_t operation;
         struct llama_hard_memory_query_request query;
+        int32_t write_count;
+        struct llama_hard_memory_write_item write_items[LLAMA_HARD_MEMORY_MAX_PRIMITIVES];
+        char container_tag[LLAMA_HARD_MEMORY_MAX_TAG_CHARS];
     };
 
     struct llama_cognitive_hard_memory_result {
         int32_t command_id;
         int32_t tool_job_id;
+        int32_t operation;
         struct llama_hard_memory_result result;
+        struct llama_hard_memory_archive_trace archive_trace;
     };
 
     struct llama_favorable_dimension_target {

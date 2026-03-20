@@ -1140,18 +1140,29 @@ static json bash_result_to_json(const llama_bash_tool_result & result) {
 }
 
 static json hard_memory_result_to_json(const llama_cognitive_hard_memory_result & result) {
-    return {
+    json out = {
         {"command_id", result.command_id},
         {"tool_job_id", result.tool_job_id},
-        {"ok", result.result.ok},
-        {"status_code", result.result.status_code},
-        {"result_count", result.result.result_count},
-        {"request_started_us", result.result.request_started_us},
-        {"request_completed_us", result.result.request_completed_us},
-        {"mean_similarity", result.result.retrieval_summary.mean_similarity},
-        {"gain_support", result.result.retrieval_summary.gain_support},
-        {"allostatic_support", result.result.retrieval_summary.allostatic_support},
+        {"operation", result.operation},
     };
+    if (result.operation == LLAMA_COG_HARD_MEMORY_OPERATION_WRITE) {
+        out["archived"] = result.archive_trace.archived;
+        out["attempted"] = result.archive_trace.attempted;
+        out["status_code"] = result.archive_trace.status_code;
+        out["primitive_count"] = result.archive_trace.primitive_count;
+        out["request_started_us"] = result.archive_trace.request_started_us;
+        out["request_completed_us"] = result.archive_trace.request_completed_us;
+    } else {
+        out["ok"] = result.result.ok;
+        out["status_code"] = result.result.status_code;
+        out["result_count"] = result.result.result_count;
+        out["request_started_us"] = result.result.request_started_us;
+        out["request_completed_us"] = result.result.request_completed_us;
+        out["mean_similarity"] = result.result.retrieval_summary.mean_similarity;
+        out["gain_support"] = result.result.retrieval_summary.gain_support;
+        out["allostatic_support"] = result.result.retrieval_summary.allostatic_support;
+    }
+    return out;
 }
 
 static json codex_result_to_json(const llama_codex_tool_result & result) {
@@ -1180,6 +1191,79 @@ static std::string trim_ascii_copy(const std::string & value) {
         --end;
     }
     return value.substr(begin, end - begin);
+}
+
+static int32_t parse_hard_memory_kind_json(const json & value) {
+    const std::string name = value.is_string() ? trim_ascii_copy(value.get<std::string>()) : std::string();
+    if (name == "trajectory") return LLAMA_HARD_MEMORY_PRIMITIVE_TRAJECTORY;
+    if (name == "outcome") return LLAMA_HARD_MEMORY_PRIMITIVE_OUTCOME;
+    if (name == "tool_observation") return LLAMA_HARD_MEMORY_PRIMITIVE_TOOL_OBSERVATION;
+    if (name == "user_model") return LLAMA_HARD_MEMORY_PRIMITIVE_USER_MODEL;
+    if (name == "self_model_fragment") return LLAMA_HARD_MEMORY_PRIMITIVE_SELF_MODEL_FRAGMENT;
+    if (name == "event_fragment") return LLAMA_HARD_MEMORY_PRIMITIVE_EVENT_FRAGMENT;
+    return value.is_number_integer() ? value.get<int32_t>() : LLAMA_HARD_MEMORY_PRIMITIVE_OUTCOME;
+}
+
+static int32_t parse_hard_memory_domain_json(const json & value) {
+    const std::string name = value.is_string() ? trim_ascii_copy(value.get<std::string>()) : std::string();
+    if (name == "goal_progress") return LLAMA_HARD_MEMORY_DOMAIN_GOAL_PROGRESS;
+    if (name == "user_outcome") return LLAMA_HARD_MEMORY_DOMAIN_USER_OUTCOME;
+    if (name == "epistemic") return LLAMA_HARD_MEMORY_DOMAIN_EPISTEMIC;
+    if (name == "efficiency") return LLAMA_HARD_MEMORY_DOMAIN_EFFICIENCY;
+    if (name == "recovery") return LLAMA_HARD_MEMORY_DOMAIN_RECOVERY;
+    if (name == "strategy") return LLAMA_HARD_MEMORY_DOMAIN_STRATEGY;
+    if (name == "self_improvement") return LLAMA_HARD_MEMORY_DOMAIN_SELF_IMPROVEMENT;
+    return value.is_number_integer() ? value.get<int32_t>() : LLAMA_HARD_MEMORY_DOMAIN_EPISTEMIC;
+}
+
+static bool populate_hard_memory_write_item_from_json(
+        const json & item_json,
+        llama_hard_memory_write_item * out_item) {
+    if (!out_item || !item_json.is_object()) {
+        return false;
+    }
+
+    const std::string content = trim_ascii_copy(json_value(item_json, "content", std::string()));
+    if (content.empty()) {
+        return false;
+    }
+
+    *out_item = {};
+    out_item->is_static = json_value(item_json, "isStatic", false);
+    out_item->primitive = llama_hard_memory_default_primitive();
+    out_item->primitive.kind = parse_hard_memory_kind_json(item_json.value("kind", json("outcome")));
+    out_item->primitive.domain = parse_hard_memory_domain_json(item_json.value("domain", json("epistemic")));
+    out_item->primitive.source_role = LLAMA_SELF_STATE_EVENT_SYSTEM;
+    out_item->primitive.source_channel = LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY;
+    out_item->primitive.source_tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_WRITE;
+    out_item->primitive.flags =
+            LLAMA_HARD_MEMORY_PRIMITIVE_AFFECT_GAIN |
+            LLAMA_HARD_MEMORY_PRIMITIVE_TOOL_DERIVED;
+    out_item->primitive.importance = json_value(item_json, "importance", out_item->primitive.importance);
+    out_item->primitive.confidence = json_value(item_json, "confidence", out_item->primitive.confidence);
+    out_item->primitive.gain_bias = json_value(item_json, "gainBias", out_item->primitive.gain_bias);
+    out_item->primitive.allostatic_relevance = json_value(item_json, "allostaticRelevance", out_item->primitive.allostatic_relevance);
+    std::snprintf(out_item->primitive.key, sizeof(out_item->primitive.key), "%s", json_value(item_json, "key", std::string()).c_str());
+    std::snprintf(out_item->primitive.title, sizeof(out_item->primitive.title), "%s", json_value(item_json, "title", std::string()).c_str());
+    std::snprintf(out_item->primitive.content, sizeof(out_item->primitive.content), "%s", content.c_str());
+
+    const json tags = item_json.value("tags", json::array());
+    if (tags.is_array()) {
+        int32_t written = 0;
+        for (const auto & tag : tags) {
+            if (written >= LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS || !tag.is_string()) {
+                break;
+            }
+            const std::string tag_text = trim_ascii_copy(tag.get<std::string>());
+            if (tag_text.empty()) {
+                continue;
+            }
+            std::snprintf(out_item->primitive.tags[written], sizeof(out_item->primitive.tags[written]), "%s", tag_text.c_str());
+            ++written;
+        }
+    }
+
+    return true;
 }
 
 static std::string percent_encode_query(const std::string & text) {
@@ -2420,14 +2504,49 @@ private:
                 request.command_id = runner.pending_command_id;
                 request.origin = LLAMA_COG_COMMAND_ORIGIN_ACTIVE;
             }
-            const std::string query = trim_ascii_copy(json_value(arguments, "query", std::string()));
-            if (query.empty()) {
-                if (out_error) {
-                    *out_error = "hard-memory tool call did not include a query";
+            if (capability->tool_spec.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_WRITE) {
+                const json memories = arguments.value("memories", json::array());
+                if (!memories.is_array() || memories.empty()) {
+                    if (out_error) {
+                        *out_error = "hard-memory write tool call did not include any memories";
+                    }
+                    return false;
                 }
-                return false;
+                request.operation = LLAMA_COG_HARD_MEMORY_OPERATION_WRITE;
+                request.write_count = 0;
+                std::memset(request.container_tag, 0, sizeof(request.container_tag));
+                const std::string container_tag = trim_ascii_copy(json_value(arguments, "containerTag", std::string()));
+                if (!container_tag.empty()) {
+                    std::snprintf(request.container_tag, sizeof(request.container_tag), "%s", container_tag.c_str());
+                }
+                for (const auto & item_json : memories) {
+                    if (request.write_count >= LLAMA_HARD_MEMORY_MAX_PRIMITIVES) {
+                        break;
+                    }
+                    if (!populate_hard_memory_write_item_from_json(
+                                item_json,
+                                &request.write_items[request.write_count])) {
+                        continue;
+                    }
+                    ++request.write_count;
+                }
+                if (request.write_count <= 0) {
+                    if (out_error) {
+                        *out_error = "hard-memory write tool call did not include any valid memory items";
+                    }
+                    return false;
+                }
+            } else {
+                request.operation = LLAMA_COG_HARD_MEMORY_OPERATION_QUERY;
+                const std::string query = trim_ascii_copy(json_value(arguments, "query", std::string()));
+                if (query.empty()) {
+                    if (out_error) {
+                        *out_error = "hard-memory tool call did not include a query";
+                    }
+                    return false;
+                }
+                std::snprintf(request.query.query, sizeof(request.query.query), "%s", query.c_str());
             }
-            std::snprintf(request.query.query, sizeof(request.query.query), "%s", query.c_str());
             if (llama_cognitive_hard_memory_set_request(ctx, &request) != 0) {
                 if (out_error) {
                     *out_error = "failed to install updated hard-memory request";
@@ -3387,7 +3506,17 @@ private:
                 (void) helper.configure(work.hard_memory_config);
                 result.hard_memory_result.command_id = work.command_id;
                 result.hard_memory_result.tool_job_id = work.hard_memory_request.tool_job_id;
-                (void) helper.query(work.hard_memory_request.query, &result.hard_memory_result.result);
+                result.hard_memory_result.operation = work.hard_memory_request.operation;
+                if (work.hard_memory_request.operation == LLAMA_COG_HARD_MEMORY_OPERATION_WRITE) {
+                    (void) helper.archive_write_items(
+                            work.hard_memory_request.write_items,
+                            work.hard_memory_request.write_count,
+                            work.hard_memory_request.container_tag[0] != '\0' ? work.hard_memory_request.container_tag : nullptr,
+                            nullptr);
+                    (void) helper.get_last_archive_trace(&result.hard_memory_result.archive_trace);
+                } else {
+                    (void) helper.query(work.hard_memory_request.query, &result.hard_memory_result.result);
+                }
             } else {
                 result.codex_request = work.codex_request;
                 (void) self->execute_codex_tool_request(work.codex_request, &result.codex_result);
@@ -4161,10 +4290,24 @@ private:
             llama_cognitive_hard_memory_result result = {};
             result.command_id = command.command_id;
             result.tool_job_id = command.tool_job_id;
-            result.result.ok = false;
-            result.result.tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_QUERY;
-            result.result.status_code = status_code;
-            std::snprintf(result.result.error, sizeof(result.result.error), "%s", error_text);
+            result.operation =
+                    command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_WRITE ?
+                            LLAMA_COG_HARD_MEMORY_OPERATION_WRITE :
+                            LLAMA_COG_HARD_MEMORY_OPERATION_QUERY;
+            if (result.operation == LLAMA_COG_HARD_MEMORY_OPERATION_WRITE) {
+                result.archive_trace.tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_WRITE;
+                result.archive_trace.status_code = status_code;
+                result.archive_trace.request_started_us = ggml_time_us();
+                result.archive_trace.request_completed_us = result.archive_trace.request_started_us;
+                std::snprintf(result.archive_trace.error, sizeof(result.archive_trace.error), "%s", error_text);
+            } else {
+                result.result.ok = false;
+                result.result.tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_QUERY;
+                result.result.status_code = status_code;
+                result.result.request_started_us = ggml_time_us();
+                result.result.request_completed_us = result.result.request_started_us;
+                std::snprintf(result.result.error, sizeof(result.result.error), "%s", error_text);
+            }
             if (llama_cognitive_hard_memory_submit_result(ctx, &result, nullptr) == 0) {
                 mark_runtime_state_dirty("hard-memory-immediate-result");
                 capture_tool_result_provenance("hard_memory_immediate", hard_memory_result_to_json(result), nullptr);
@@ -4215,7 +4358,8 @@ private:
                             resolve_error.c_str());
                     if (command.tool_kind == LLAMA_TOOL_KIND_BASH_CLI) {
                         submit_bash_error(command, resolve_error.c_str());
-                    } else if (command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
+                    } else if (command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY ||
+                               command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_WRITE) {
                         submit_hard_memory_error(command, 400, resolve_error.c_str());
                     } else if (command.tool_kind == LLAMA_TOOL_KIND_CODEX_CLI) {
                         submit_codex_error(command, resolve_error.c_str());
@@ -4227,7 +4371,8 @@ private:
                 backend = capability->backend;
             } else if (command.tool_kind == LLAMA_TOOL_KIND_BASH_CLI) {
                 backend = SERVER_OPENCLAW_DISPATCH_LEGACY_BASH;
-            } else if (command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
+            } else if (command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY ||
+                       command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_WRITE) {
                 backend = SERVER_OPENCLAW_DISPATCH_LEGACY_HARD_MEMORY;
             } else if (command.tool_kind == LLAMA_TOOL_KIND_CODEX_CLI) {
                 backend = SERVER_OPENCLAW_DISPATCH_LEGACY_CODEX;
@@ -4281,9 +4426,22 @@ private:
 
                 llama_hard_memory_config config = llama_hard_memory_default_config();
                 (void) llama_hard_memory_get_config(ctx, &config);
-                if (!config.enabled || request.query.query[0] == '\0') {
-                    submit_hard_memory_error(command, !config.enabled ? 503 : 400,
-                            !config.enabled ? "hard memory is disabled" : "hard memory request did not include a query");
+                const bool is_write = request.operation == LLAMA_COG_HARD_MEMORY_OPERATION_WRITE;
+                const bool valid_request =
+                        is_write ?
+                                (config.enabled && config.archive_enabled && request.write_count > 0) :
+                                (config.enabled && request.query.query[0] != '\0');
+                if (!valid_request) {
+                    submit_hard_memory_error(
+                            command,
+                            !config.enabled ? 503 : 400,
+                            !config.enabled ?
+                                    "hard memory is disabled" :
+                                    (is_write ?
+                                            (!config.archive_enabled ?
+                                                    "hard memory archival is disabled" :
+                                                    "hard memory write request did not include any memories") :
+                                            "hard memory request did not include a query"));
                     continue;
                 }
 
@@ -4302,11 +4460,13 @@ private:
                     std::lock_guard<std::mutex> lock(runtime_state_mutex);
                     external_observability.hard_memory_dispatch_total++;
                     dispatched = true;
-                    SRV_INF("queued hard-memory command %d origin=%d job=%d query=\"%s\"\n",
+                    SRV_INF("queued hard-memory command %d origin=%d job=%d mode=%d query=\"%s\" write_count=%d\n",
                             command.command_id,
                             command.origin,
                             request.tool_job_id,
-                            request.query.query);
+                            request.operation,
+                            request.query.query,
+                            request.write_count);
                 }
             } else if (backend == SERVER_OPENCLAW_DISPATCH_LEGACY_CODEX) {
                 llama_codex_tool_request request = {};
@@ -4345,7 +4505,8 @@ private:
             } else {
                 if (command.tool_kind == LLAMA_TOOL_KIND_BASH_CLI) {
                     submit_bash_error(command, "registered capability has no supported executor backend");
-                } else if (command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
+                } else if (command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY ||
+                           command.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_WRITE) {
                     submit_hard_memory_error(command, 501, "registered capability has no supported executor backend");
                 } else if (command.tool_kind == LLAMA_TOOL_KIND_CODEX_CLI) {
                     submit_codex_error(command, "registered capability has no supported executor backend");
@@ -4420,7 +4581,11 @@ private:
                             result.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE ? &active_trace : nullptr) == 0;
                     std::lock_guard<std::mutex> lock(runtime_state_mutex);
                     external_observability.hard_memory_complete_total++;
-                    if (!ok || !result.hard_memory_result.result.ok) {
+                    const bool hard_memory_failed =
+                            result.hard_memory_result.operation == LLAMA_COG_HARD_MEMORY_OPERATION_WRITE ?
+                                    !result.hard_memory_result.archive_trace.archived :
+                                    !result.hard_memory_result.result.ok;
+                    if (!ok || hard_memory_failed) {
                         external_observability.hard_memory_fail_total++;
                     }
                 } else {

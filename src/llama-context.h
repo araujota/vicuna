@@ -269,6 +269,7 @@ struct llama_context {
     bool hard_memory_get_request(int32_t command_id, llama_cognitive_hard_memory_request * out_request) const;
     bool hard_memory_clear_request(int32_t command_id);
     bool hard_memory_submit_result(const llama_hard_memory_result & result);
+    bool hard_memory_submit_archive_trace(const llama_hard_memory_archive_trace & trace);
     bool hard_memory_get_last_result(llama_hard_memory_result * out_result) const;
     bool hard_memory_get_last_archive_trace(llama_hard_memory_archive_trace * out_trace) const;
     bool bash_tool_configure(const llama_bash_tool_config & config);

@@ -1,13 +1,22 @@
 import http from 'node:http';
 import https from 'node:https';
+import os from 'node:os';
+import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
+import { PDFParse } from 'pdf-parse';
+import Supermemory, { toFile } from 'supermemory';
 import {
   appendProactiveId,
   appendChatTranscriptMessage,
+  buildTelegramFileUrl,
   extractChatCompletionText,
   extractResponseText,
   formatTelegramMessage,
   getChatTranscript,
+  ingestTelegramDocumentMessage,
   loadState,
   parseInteger,
   parseSseChunk,
@@ -17,6 +26,8 @@ import {
   updateTelegramOffset,
 } from './lib.mjs';
 
+const execFileAsync = promisify(execFile);
+
 const env = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
   vicunaBaseUrl: (process.env.TELEGRAM_BRIDGE_VICUNA_BASE_URL ?? 'http://127.0.0.1:8080').replace(/\/+$/, ''),
@@ -25,8 +36,10 @@ const env = {
   pollTimeoutSeconds: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS, 30)),
   maxHistoryMessages: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES, 12)),
   maxTokens: Math.max(32, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_TOKENS, 200)),
+  maxDocumentChars: Math.max(256, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_DOCUMENT_CHARS, 12000)),
   selfEmitAfter: Math.max(0, parseInteger(process.env.TELEGRAM_BRIDGE_SELF_EMIT_AFTER, 0)),
   vicunaApiKey: process.env.VICUNA_API_KEY ?? '',
+  supermemoryApiKey: process.env.SUPERMEMORY_API_KEY ?? '',
 };
 
 if (!env.telegramBotToken) {
@@ -42,6 +55,7 @@ let selfEmitGeneration = 0;
 const telegramBaseUrl = `https://api.telegram.org/bot${env.telegramBotToken}`;
 const vicunaUrl = new URL(env.vicunaBaseUrl);
 const sseHttpModule = vicunaUrl.protocol === 'https:' ? https : http;
+let supermemoryClient = null;
 
 function log(message, extra = undefined) {
   const prefix = '[telegram-bridge]';
@@ -85,6 +99,62 @@ async function telegramRequest(method, payload) {
     throw new Error(`telegram ${method} failed: ${response.status} ${JSON.stringify(body)}`);
   }
   return body.result;
+}
+
+function getSupermemoryClient() {
+  if (!env.supermemoryApiKey) {
+    return null;
+  }
+  if (!supermemoryClient) {
+    supermemoryClient = new Supermemory({
+      apiKey: env.supermemoryApiKey,
+    });
+  }
+  return supermemoryClient;
+}
+
+async function downloadTelegramFile(filePath) {
+  const response = await fetch(buildTelegramFileUrl(env.telegramBotToken, filePath));
+  if (!response.ok) {
+    throw new Error(`telegram file download failed: ${response.status}`);
+  }
+  const buffer = Buffer.from(await response.arrayBuffer());
+  return buffer;
+}
+
+async function extractPdfText(fileBuffer) {
+  const parser = new PDFParse({ data: fileBuffer });
+  try {
+    const result = await parser.getText();
+    return typeof result?.text === 'string' ? result.text : '';
+  } finally {
+    await parser.destroy();
+  }
+}
+
+async function extractWordText(fileBuffer, descriptor) {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vicuna-telegram-doc-'));
+  const inputPath = path.join(tempDir, descriptor.fileName);
+  try {
+    await writeFile(inputPath, fileBuffer);
+    const { stdout } = await execFileAsync('/usr/bin/textutil', [
+      '-convert',
+      'txt',
+      '-stdout',
+      '-strip',
+      inputPath,
+    ], {
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return stdout;
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      throw new Error('DOC/DOCX extraction requires /usr/bin/textutil on the bridge host.');
+    }
+    throw error;
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 }
 
 async function sendTelegramMessage(chatId, text, extra = {}) {
@@ -161,19 +231,72 @@ async function handleTelegramMessage(message) {
   await persistState();
 
   const text = typeof message.text === 'string' ? message.text.trim() : '';
-  if (!text) {
-    await sendTelegramMessage(
-      message.chat.id,
-      'Only plain text messages are supported right now.',
-      { reply_to_message_id: message.message_id },
-    );
-    return;
-  }
+  const hasDocument = Boolean(message.document?.file_id);
 
   if (text === '/start') {
     await sendTelegramMessage(
       message.chat.id,
       'Telegram relay connected. Your messages will be forwarded to the local Vicuña runtime, and proactive system emissions will be relayed here.',
+      { reply_to_message_id: message.message_id },
+    );
+    return;
+  }
+
+  if (hasDocument) {
+    const ingestion = await ingestTelegramDocumentMessage({
+      message,
+      maxDocumentChars: env.maxDocumentChars,
+      resolveTelegramFile: (fileId) => telegramRequest('getFile', { file_id: fileId }),
+      downloadTelegramFile,
+      extractPdfText,
+      extractWordText,
+      supermemoryClient: getSupermemoryClient(),
+      toFileFactory: (buffer, fileName) => toFile(buffer, fileName),
+    });
+
+    if (!ingestion.ok) {
+      await sendTelegramMessage(
+        message.chat.id,
+        ingestion.userError,
+        { reply_to_message_id: message.message_id },
+      );
+      return;
+    }
+
+    state = appendChatTranscriptMessage(
+      state,
+      message.chat.id,
+      'user',
+      ingestion.transcriptText,
+      { maxHistoryMessages: env.maxHistoryMessages },
+    );
+    await persistState();
+    log('appended Telegram document user turn', transcriptSummary(message.chat.id));
+
+    const reply = await callVicunaForTelegramMessage(message.chat.id);
+    const finalReply = reply || 'The runtime returned an empty response.';
+    state = appendChatTranscriptMessage(
+      state,
+      message.chat.id,
+      'assistant',
+      finalReply,
+      { maxHistoryMessages: env.maxHistoryMessages },
+    );
+    await persistState();
+    log('appended Telegram assistant turn', transcriptSummary(message.chat.id));
+
+    await sendTelegramMessage(
+      message.chat.id,
+      finalReply,
+      { reply_to_message_id: message.message_id },
+    );
+    return;
+  }
+
+  if (!text) {
+    await sendTelegramMessage(
+      message.chat.id,
+      'Only plain text, PDF, DOC, and DOCX messages are supported right now.',
       { reply_to_message_id: message.message_id },
     );
     return;

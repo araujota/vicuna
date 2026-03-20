@@ -343,6 +343,18 @@ Vicuña now stores bounded typed primitives instead of relying on one generic
 archive string. Host code should use `llama_hard_memory_archive_primitives()`
 when a tool result should remain durable beyond the immediate turn.
 
+There is also an explicit core tool path for durable writes:
+
+- `hard_memory_query` retrieves bounded results from Supermemory-backed hard
+  memory
+- `hard_memory_write` sends an explicit `memories` batch plus optional
+  `containerTag` through the same hard-memory backend, serializing to
+  `POST /v4/memories` with the configured Supermemory auth token
+- `hard_memory_write` has its own builtin capability id
+  `openclaw.vicuna.hard_memory_write` and provenance namespace
+  `openclaw/vicuna-memory/memory_adapter/hard_memory_write`, which gives it a
+  distinct per-tool process-functional bias entry from `hard_memory_query`
+
 Choose the narrowest primitive kind that matches the residue:
 
 - `TRAJECTORY` for multi-step execution traces or plans
@@ -361,11 +373,12 @@ Authoring rules:
   internal regulation state
 - prefer archiving a small batch of typed primitives over one large prose blob
 
-For the bare-minimum shipped system, the only first-class tool path is the bash
-CLI wrapper. That path should remain conservative: write `TOOL_OBSERVATION` or
-`OUTCOME` when command results are durable, and use self-model extension writes
-only when the command changed the system's internal model rather than merely
-producing evidence.
+The first-class tool surface now includes:
+
+- the bash CLI wrapper for bounded host execution
+- `hard_memory_query` for retrieval
+- `hard_memory_write` for explicit durable Supermemory writes
+- the Codex CLI wrapper for bounded self-modification work
 
 ### Example trace of a request
 

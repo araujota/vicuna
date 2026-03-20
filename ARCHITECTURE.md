@@ -596,6 +596,9 @@ Current implementation slice:
 - primary-channel events that produce above-threshold self-state deltas can now
   be archived into hard memory with message context plus a bounded top-register
   delta summary, while counterfactual-channel events remain excluded by default,
+- the tool surface now also includes an explicit `hard_memory_write` core tool
+  that can intentionally send bounded memory batches to Supermemory using the
+  same typed hard-memory backend rather than relying only on implicit archival,
 - counterfactual search now follows a hypothesis-first low-risk ladder centered
   on runtime-memory LoRA ablation plus functional-bias replay candidates
   (local, historical, orthogonal), with tool- or retrieval-oriented discrete
@@ -606,9 +609,10 @@ Current implementation slice:
   `past_quarter`, `past_year`, `all_time`),
 - bounded remediation currently targets Active LoRA only, with tool-oriented
   counterfactuals yielding `gather_info` plans that can now be typed as
-  first-class bash CLI work or hard-memory query work, with bash requests and
-  results carried through explicit bounded structs and executed only in
-  `llama-server`, and high-risk updater-policy proposals denied or deferred,
+  first-class bash CLI work, hard-memory query work, or hard-memory write work,
+  with requests and results carried through explicit bounded structs and
+  executed only in `llama-server`, and high-risk updater-policy proposals
+  denied or deferred,
 - repair urgency now contributes to the same DMN admission gate through
   updater-program policy (`repair_admission_floor` and
   `repair_admission_weight`) instead of bypassing the scheduler,

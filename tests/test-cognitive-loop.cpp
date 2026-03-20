@@ -636,6 +636,23 @@ int main(int argc, char ** argv) {
             llama_model_free(model);
             return 1;
         }
+        if (llama_cognitive_tool_spec_get(ctx, 3, &spec) != 0 ||
+            spec.tool_kind != LLAMA_TOOL_KIND_HARD_MEMORY_QUERY ||
+            spec.name[0] == '\0') {
+            std::fprintf(stderr, "hard-memory query cognitive tool registry entry was not populated\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (llama_cognitive_tool_spec_get(ctx, 4, &spec) != 0 ||
+            spec.tool_kind != LLAMA_TOOL_KIND_HARD_MEMORY_WRITE ||
+            spec.name[0] == '\0' ||
+            (spec.flags & LLAMA_COG_TOOL_ACTIVE_ELIGIBLE) == 0) {
+            std::fprintf(stderr, "hard-memory write cognitive tool registry entry was not active-eligible\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
 
         llama_self_model_extension_update extension = llama_self_model_extension_default_update();
         extension.source = LLAMA_SELF_MODEL_EXTENSION_SOURCE_TOOL_BASH_CLI;

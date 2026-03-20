@@ -284,6 +284,29 @@ static bool validate_primitive(llama_hard_memory_primitive * primitive) {
     return true;
 }
 
+static void ensure_primitive_key(llama_hard_memory_primitive * primitive) {
+    if (!primitive || primitive->key[0] != '\0') {
+        return;
+    }
+    const std::string digest_input =
+            std::to_string(primitive->kind) + "|" +
+            std::to_string(primitive->domain) + "|" +
+            read_cstr(primitive->title) + "|" +
+            read_cstr(primitive->content);
+    char key[LLAMA_HARD_MEMORY_MAX_ID_CHARS] = {};
+    std::snprintf(key, sizeof(key), "vicuna-%016llx",
+            (unsigned long long) fnv1a64(digest_input));
+    copy_cstr(primitive->key, key);
+}
+
+static bool validate_write_item(llama_hard_memory_write_item * item) {
+    if (!item) {
+        return false;
+    }
+    ensure_primitive_key(&item->primitive);
+    return validate_primitive(&item->primitive);
+}
+
 static void copy_tags(
         char (&dst)[LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS][LLAMA_HARD_MEMORY_MAX_TAG_CHARS],
         const json & tags) {
@@ -370,6 +393,129 @@ static json primitive_metadata_json(
     return metadata;
 }
 
+static bool archive_write_items_impl(
+        const llama_hard_memory_config & config,
+        const llama_hard_memory_write_item * input_items,
+        int32_t item_count,
+        const char * container_override,
+        const llama_self_state_delta_summary * delta_summary,
+        llama_hard_memory_archive_trace * io_last_archive) {
+    if (!io_last_archive) {
+        return false;
+    }
+
+    llama_hard_memory_archive_trace trace = {};
+    init_archive(trace);
+    if (delta_summary) {
+        trace.delta = *delta_summary;
+    }
+
+    const std::string tag = effective_container_tag(config, container_override);
+    copy_cstr(trace.container_tag, tag);
+
+    if (!query_enabled(config) || !config.archive_enabled) {
+        copy_cstr(trace.error, "hard memory archival is disabled or missing endpoint/auth configuration");
+        trace.request_completed_us = ggml_time_us();
+        *io_last_archive = trace;
+        return true;
+    }
+
+    if (!input_items || item_count <= 0) {
+        copy_cstr(trace.error, "hard memory archival requires at least one memory item");
+        trace.request_completed_us = ggml_time_us();
+        *io_last_archive = trace;
+        return true;
+    }
+
+    if (tag.empty()) {
+        copy_cstr(trace.error, "hard memory container tag is empty");
+        trace.request_completed_us = ggml_time_us();
+        *io_last_archive = trace;
+        return true;
+    }
+
+    std::vector<llama_hard_memory_write_item> items;
+    items.reserve((size_t) std::min<int32_t>(item_count, LLAMA_HARD_MEMORY_MAX_PRIMITIVES));
+    for (int32_t i = 0; i < item_count; ++i) {
+        llama_hard_memory_write_item item = input_items[i];
+        if (!validate_write_item(&item)) {
+            continue;
+        }
+        items.push_back(item);
+    }
+    if (items.empty()) {
+        copy_cstr(trace.error, "hard memory archival rejected all memory items");
+        trace.request_completed_us = ggml_time_us();
+        *io_last_archive = trace;
+        return true;
+    }
+
+    std::sort(items.begin(), items.end(), [](const llama_hard_memory_write_item & lhs, const llama_hard_memory_write_item & rhs) {
+        if (lhs.primitive.importance == rhs.primitive.importance) {
+            return std::strcmp(lhs.primitive.key, rhs.primitive.key) < 0;
+        }
+        return lhs.primitive.importance > rhs.primitive.importance;
+    });
+    if ((int32_t) items.size() > LLAMA_HARD_MEMORY_MAX_PRIMITIVES) {
+        items.resize(LLAMA_HARD_MEMORY_MAX_PRIMITIVES);
+    }
+
+    trace.attempted = true;
+    trace.primitive_count = (int32_t) items.size();
+    const std::string identity = read_cstr(config.runtime_identity).empty() ? "vicuna" : read_cstr(config.runtime_identity);
+
+    std::string digest_input = identity + "|" + tag;
+    json memories = json::array();
+    for (size_t i = 0; i < items.size(); ++i) {
+        const auto & item = items[i];
+        const auto & primitive = item.primitive;
+        digest_input += "|" + read_cstr(primitive.key) + "|" + read_cstr(primitive.title) + "|" + read_cstr(primitive.content);
+        fill_primitive_summary(trace.primitives[i], primitive);
+        if (i == 0) {
+            copy_cstr(trace.content_excerpt, trim_text(read_cstr(primitive.content), LLAMA_HARD_MEMORY_MAX_TEXT_CHARS - 1));
+        }
+        memories.push_back({
+            {"content", trim_text(read_cstr(primitive.content), 1024)},
+            {"isStatic", item.is_static},
+            {"metadata", primitive_metadata_json(primitive, identity, delta_summary)},
+        });
+    }
+
+    char custom_id[LLAMA_HARD_MEMORY_MAX_ID_CHARS] = {};
+    std::snprintf(custom_id, sizeof(custom_id), "vicuna-%016llx",
+            (unsigned long long) fnv1a64(digest_input));
+    copy_cstr(trace.custom_id, custom_id);
+
+    json body = {
+        {"containerTag", tag},
+        {"memories", memories},
+    };
+
+    httplib::Client cli(read_cstr(config.base_url));
+    cli.set_connection_timeout(std::chrono::milliseconds(config.timeout_ms));
+    cli.set_read_timeout(std::chrono::milliseconds(config.timeout_ms));
+    cli.set_write_timeout(std::chrono::milliseconds(config.timeout_ms));
+
+    const auto response = cli.Post("/v4/memories", build_headers(config), body.dump(), "application/json");
+    trace.request_completed_us = ggml_time_us();
+    if (!response) {
+        copy_cstr(trace.error, "hard memory archival request failed");
+        *io_last_archive = trace;
+        return true;
+    }
+
+    trace.status_code = response->status;
+    if (response->status < 200 || response->status >= 300) {
+        copy_cstr(trace.error, trim_text(response->body, sizeof(trace.error) - 1));
+        *io_last_archive = trace;
+        return true;
+    }
+
+    trace.archived = true;
+    *io_last_archive = trace;
+    return true;
+}
+
 static void accumulate_retrieval_summary(
         llama_hard_memory_retrieval_summary & summary,
         const llama_hard_memory_hit & hit) {
@@ -446,11 +592,27 @@ bool llama_hard_memory::set_request(const llama_cognitive_hard_memory_request & 
         return false;
     }
 
+    llama_cognitive_hard_memory_request normalized = request;
+    normalized.operation =
+            request.operation == LLAMA_COG_HARD_MEMORY_OPERATION_WRITE ?
+                    LLAMA_COG_HARD_MEMORY_OPERATION_WRITE :
+                    LLAMA_COG_HARD_MEMORY_OPERATION_QUERY;
+    normalized.query.query[LLAMA_HARD_MEMORY_QUERY_MAX_CHARS - 1] = '\0';
+    normalized.query.container_tag[LLAMA_HARD_MEMORY_MAX_TAG_CHARS - 1] = '\0';
+    normalized.container_tag[LLAMA_HARD_MEMORY_MAX_TAG_CHARS - 1] = '\0';
+    normalized.write_count = std::max<int32_t>(0, std::min<int32_t>(request.write_count, LLAMA_HARD_MEMORY_MAX_PRIMITIVES));
+    for (int32_t i = 0; i < LLAMA_HARD_MEMORY_MAX_PRIMITIVES; ++i) {
+        normalized.write_items[i].primitive.key[LLAMA_HARD_MEMORY_MAX_ID_CHARS - 1] = '\0';
+        normalized.write_items[i].primitive.title[LLAMA_HARD_MEMORY_MAX_TITLE_CHARS - 1] = '\0';
+        normalized.write_items[i].primitive.content[LLAMA_HARD_MEMORY_MAX_TEXT_CHARS - 1] = '\0';
+        for (int32_t tag_idx = 0; tag_idx < LLAMA_HARD_MEMORY_MAX_PRIMITIVE_TAGS; ++tag_idx) {
+            normalized.write_items[i].primitive.tags[tag_idx][LLAMA_HARD_MEMORY_MAX_TAG_CHARS - 1] = '\0';
+        }
+    }
+
     const int32_t index = find_request_index(requests, request_count, request.command_id);
     if (index >= 0) {
-        requests[index] = request;
-        requests[index].query.query[LLAMA_HARD_MEMORY_QUERY_MAX_CHARS - 1] = '\0';
-        requests[index].query.container_tag[LLAMA_HARD_MEMORY_MAX_TAG_CHARS - 1] = '\0';
+        requests[index] = normalized;
         return true;
     }
 
@@ -458,9 +620,7 @@ bool llama_hard_memory::set_request(const llama_cognitive_hard_memory_request & 
         return false;
     }
 
-    requests[request_count] = request;
-    requests[request_count].query.query[LLAMA_HARD_MEMORY_QUERY_MAX_CHARS - 1] = '\0';
-    requests[request_count].query.container_tag[LLAMA_HARD_MEMORY_MAX_TAG_CHARS - 1] = '\0';
+    requests[request_count] = normalized;
     ++request_count;
     return true;
 }
@@ -630,6 +790,19 @@ bool llama_hard_memory::submit_result(const llama_hard_memory_result & result) {
     return true;
 }
 
+bool llama_hard_memory::submit_archive_trace(const llama_hard_memory_archive_trace & trace) {
+    last_archive = trace;
+    last_archive.custom_id[LLAMA_HARD_MEMORY_MAX_ID_CHARS - 1] = '\0';
+    last_archive.container_tag[LLAMA_HARD_MEMORY_MAX_TAG_CHARS - 1] = '\0';
+    last_archive.content_excerpt[LLAMA_HARD_MEMORY_MAX_TEXT_CHARS - 1] = '\0';
+    last_archive.error[LLAMA_HARD_MEMORY_MAX_ERROR_CHARS - 1] = '\0';
+    for (int32_t i = 0; i < LLAMA_HARD_MEMORY_MAX_PRIMITIVES; ++i) {
+        last_archive.primitives[i].key[LLAMA_HARD_MEMORY_MAX_ID_CHARS - 1] = '\0';
+        last_archive.primitives[i].title[LLAMA_HARD_MEMORY_MAX_TITLE_CHARS - 1] = '\0';
+    }
+    return true;
+}
+
 bool llama_hard_memory::get_last_result(llama_hard_memory_result * out_result) const {
     if (!out_result) {
         return false;
@@ -642,115 +815,24 @@ bool llama_hard_memory::archive_primitives(
         const llama_hard_memory_primitive * input_primitives,
         int32_t primitive_count,
         const llama_self_state_delta_summary * delta_summary) {
-    llama_hard_memory_archive_trace trace = {};
-    init_archive(trace);
-    if (delta_summary) {
-        trace.delta = *delta_summary;
-    }
-
-    const std::string tag = effective_container_tag(config, nullptr);
-    copy_cstr(trace.container_tag, tag);
-
-    if (!query_enabled(config) || !config.archive_enabled) {
-        copy_cstr(trace.error, "hard memory archival is disabled or missing endpoint/auth configuration");
-        trace.request_completed_us = ggml_time_us();
-        last_archive = trace;
-        return true;
-    }
-
     if (!input_primitives || primitive_count <= 0) {
-        copy_cstr(trace.error, "hard memory archival requires at least one primitive");
-        trace.request_completed_us = ggml_time_us();
-        last_archive = trace;
-        return true;
+        return archive_write_items(nullptr, 0, nullptr, delta_summary);
     }
 
-    if (tag.empty()) {
-        copy_cstr(trace.error, "hard memory container tag is empty");
-        trace.request_completed_us = ggml_time_us();
-        last_archive = trace;
-        return true;
+    std::vector<llama_hard_memory_write_item> items((size_t) std::min<int32_t>(primitive_count, LLAMA_HARD_MEMORY_MAX_PRIMITIVES));
+    for (int32_t i = 0; i < primitive_count && i < LLAMA_HARD_MEMORY_MAX_PRIMITIVES; ++i) {
+        items[(size_t) i].is_static = false;
+        items[(size_t) i].primitive = input_primitives[i];
     }
+    return archive_write_items(items.data(), std::min<int32_t>(primitive_count, LLAMA_HARD_MEMORY_MAX_PRIMITIVES), nullptr, delta_summary);
+}
 
-    std::vector<llama_hard_memory_primitive> primitives;
-    primitives.reserve((size_t) std::min<int32_t>(primitive_count, LLAMA_HARD_MEMORY_MAX_PRIMITIVES));
-    for (int32_t i = 0; i < primitive_count; ++i) {
-        llama_hard_memory_primitive primitive = input_primitives[i];
-        if (!validate_primitive(&primitive)) {
-            continue;
-        }
-        primitives.push_back(primitive);
-    }
-    if (primitives.empty()) {
-        copy_cstr(trace.error, "hard memory archival rejected all primitives");
-        trace.request_completed_us = ggml_time_us();
-        last_archive = trace;
-        return true;
-    }
-
-    std::sort(primitives.begin(), primitives.end(), [](const llama_hard_memory_primitive & lhs, const llama_hard_memory_primitive & rhs) {
-        if (lhs.importance == rhs.importance) {
-            return std::strcmp(lhs.key, rhs.key) < 0;
-        }
-        return lhs.importance > rhs.importance;
-    });
-    if ((int32_t) primitives.size() > LLAMA_HARD_MEMORY_MAX_PRIMITIVES) {
-        primitives.resize(LLAMA_HARD_MEMORY_MAX_PRIMITIVES);
-    }
-
-    trace.attempted = true;
-    trace.primitive_count = (int32_t) primitives.size();
-    const std::string identity = read_cstr(config.runtime_identity).empty() ? "vicuna" : read_cstr(config.runtime_identity);
-
-    std::string digest_input = identity + "|" + tag;
-    json memories = json::array();
-    for (size_t i = 0; i < primitives.size(); ++i) {
-        const auto & primitive = primitives[i];
-        digest_input += "|" + read_cstr(primitive.key) + "|" + read_cstr(primitive.title) + "|" + read_cstr(primitive.content);
-        fill_primitive_summary(trace.primitives[i], primitive);
-        if (i == 0) {
-            copy_cstr(trace.content_excerpt, trim_text(read_cstr(primitive.content), LLAMA_HARD_MEMORY_MAX_TEXT_CHARS - 1));
-        }
-        memories.push_back({
-            {"content", trim_text(read_cstr(primitive.content), 1024)},
-            {"isStatic", false},
-            {"metadata", primitive_metadata_json(primitive, identity, delta_summary)},
-        });
-    }
-
-    char custom_id[LLAMA_HARD_MEMORY_MAX_ID_CHARS] = {};
-    std::snprintf(custom_id, sizeof(custom_id), "vicuna-%016llx",
-            (unsigned long long) fnv1a64(digest_input));
-    copy_cstr(trace.custom_id, custom_id);
-
-    json body = {
-        {"containerTag", tag},
-        {"memories", memories},
-    };
-
-    httplib::Client cli(read_cstr(config.base_url));
-    cli.set_connection_timeout(std::chrono::milliseconds(config.timeout_ms));
-    cli.set_read_timeout(std::chrono::milliseconds(config.timeout_ms));
-    cli.set_write_timeout(std::chrono::milliseconds(config.timeout_ms));
-
-    const auto response = cli.Post("/v4/memories", build_headers(config), body.dump(), "application/json");
-    trace.request_completed_us = ggml_time_us();
-    if (!response) {
-        copy_cstr(trace.error, "hard memory archival request failed");
-        last_archive = trace;
-        return true;
-    }
-
-    trace.status_code = response->status;
-    if (response->status < 200 || response->status >= 300) {
-        copy_cstr(trace.error, trim_text(response->body, sizeof(trace.error) - 1));
-        last_archive = trace;
-        return true;
-    }
-
-    trace.archived = true;
-    last_archive = trace;
-    return true;
+bool llama_hard_memory::archive_write_items(
+        const llama_hard_memory_write_item * items,
+        int32_t item_count,
+        const char * container_override,
+        const llama_self_state_delta_summary * delta_summary) {
+    return archive_write_items_impl(config, items, item_count, container_override, delta_summary, &last_archive);
 }
 
 bool llama_hard_memory::archive_event(
