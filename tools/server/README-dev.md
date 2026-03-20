@@ -89,6 +89,15 @@ Execution remains intentionally bounded and host-visible:
 - `VICUNA_BASH_TOOL_MAX_STDERR_BYTES`: bounded stderr capture budget
 - `VICUNA_BASH_TOOL_LOGIN_SHELL`: use `bash -lc` instead of `bash -c`
 - `VICUNA_BASH_TOOL_INHERIT_ENV`: inherit the server environment or launch with an empty one
+- `VICUNA_BASH_TOOL_MAX_CHILD_PROCESSES`: per-user process budget applied through `RLIMIT_NPROC`
+
+The managed runtime launcher defaults `VICUNA_BASH_TOOL_LOGIN_SHELL` to `0` so
+bounded tool commands avoid host login-shell startup scripts unless an operator
+explicitly opts back into them.
+It also defaults `VICUNA_BASH_TOOL_MAX_CHILD_PROCESSES` to `4096`, because
+Linux counts `RLIMIT_NPROC` against the whole user account; values that are too
+small can make even simple tool commands fail to fork on an otherwise healthy
+host.
 
 `server_context` acks pending bash commands, executes them synchronously on the
 host, submits typed results back into the runtime, and only then lets the

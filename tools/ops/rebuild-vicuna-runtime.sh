@@ -5,7 +5,19 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck disable=SC1091
 source "$REPO_ROOT/tools/ops/runtime-env.sh"
 
-RUNTIME_SERVICE="vicuna-runtime.service"
+SYSTEM_ENV_FILE="${VICUNA_SYSTEM_ENV_FILE:-/etc/vicuna/vicuna.env}"
+if [[ -z "${VICUNA_SYSTEMD_SCOPE:-}" && -r "$SYSTEM_ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$SYSTEM_ENV_FILE"
+fi
+
+SYSTEMD_SCOPE="${VICUNA_SYSTEMD_SCOPE:-user}"
+if [[ "$SYSTEMD_SCOPE" == "system" && -r "$SYSTEM_ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$SYSTEM_ENV_FILE"
+fi
+
+RUNTIME_SERVICE="${VICUNA_RUNTIME_SERVICE_NAME:-vicuna-runtime.service}"
 BUILD_DIR="build-host-cuda-128"
 PORT="8080"
 ALLOW_STATE_RESET=0
@@ -52,6 +64,18 @@ run_cmd() {
     "$@"
 }
 
+systemctl_cmd() {
+    if [[ "$SYSTEMD_SCOPE" == "system" ]]; then
+        if (( EUID == 0 )); then
+            systemctl "$@"
+        else
+            sudo systemctl "$@"
+        fi
+        return
+    fi
+    systemctl --user "$@"
+}
+
 health_json() {
     curl --silent --show-error "http://127.0.0.1:${PORT}/health"
 }
@@ -89,8 +113,40 @@ wait_for_health() {
     return 1
 }
 
+wait_for_persistence_ready() {
+    local attempts=60
+    local delay=1
+    local health=""
+    for ((i = 0; i < attempts; ++i)); do
+        if health="$(health_json 2>/dev/null)" && [[ -n "$health" ]]; then
+            local runtime_enabled runtime_healthy restored_path restore_attempted restore_success
+            runtime_enabled="$(json_expr "$health" "runtime_persistence.enabled" || true)"
+            runtime_healthy="$(json_expr "$health" "runtime_persistence.healthy" || true)"
+            restored_path="$(json_expr "$health" "runtime_persistence.path" || true)"
+            restore_attempted="$(json_expr "$health" "runtime_persistence.restore_attempted" || true)"
+            restore_success="$(json_expr "$health" "runtime_persistence.restore_success" || true)"
+
+            if [[ "$runtime_enabled" == "true" &&
+                  "$runtime_healthy" == "true" &&
+                  "$restored_path" == "$VICUNA_RUNTIME_STATE_PATH" ]]; then
+                if (( had_snapshot )); then
+                    if [[ "$restore_attempted" == "true" && "$restore_success" == "true" ]]; then
+                        printf '%s' "$health"
+                        return 0
+                    fi
+                else
+                    printf '%s' "$health"
+                    return 0
+                fi
+            fi
+        fi
+        sleep "$delay"
+    done
+    return 1
+}
+
 service_active() {
-    systemctl --user is-active --quiet "$RUNTIME_SERVICE"
+    systemctl_cmd is-active --quiet "$RUNTIME_SERVICE"
 }
 
 wait_for_service_stop() {
@@ -175,7 +231,7 @@ if service_active; then
     fi
 fi
 
-run_cmd systemctl --user stop "$RUNTIME_SERVICE"
+run_cmd systemctl_cmd stop "$RUNTIME_SERVICE"
 if (( ! DRY_RUN )); then
     wait_for_service_stop || die "runtime service did not stop cleanly"
 fi
@@ -188,14 +244,18 @@ fi
 run_cmd cmake -S "$REPO_ROOT" -B "$REPO_ROOT/$BUILD_DIR" -G Ninja -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a
 run_cmd cmake --build "$REPO_ROOT/$BUILD_DIR" --target llama-server -j 12
 
-run_cmd systemctl --user reset-failed "$RUNTIME_SERVICE"
-run_cmd systemctl --user start "$RUNTIME_SERVICE"
+run_cmd systemctl_cmd reset-failed "$RUNTIME_SERVICE"
+run_cmd systemctl_cmd start "$RUNTIME_SERVICE"
 
 if (( DRY_RUN )); then
     exit 0
 fi
 
-health="$(wait_for_health)" || die "runtime health endpoint did not recover after restart"
+if (( ALLOW_STATE_RESET )); then
+    health="$(wait_for_health)" || die "runtime health endpoint did not recover after restart"
+else
+    health="$(wait_for_persistence_ready)" || die "runtime persistence did not become healthy after restart"
+fi
 
 runtime_enabled="$(json_expr "$health" "runtime_persistence.enabled" || true)"
 runtime_healthy="$(json_expr "$health" "runtime_persistence.healthy" || true)"

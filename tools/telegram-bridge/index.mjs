@@ -6,7 +6,6 @@ import { execFile } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
-import { PDFParse } from 'pdf-parse';
 import Supermemory, { toFile } from 'supermemory';
 import {
   appendProactiveId,
@@ -23,6 +22,7 @@ import {
   registerChat,
   saveState,
   splitSseBuffer,
+  summarizeChatCompletion,
   updateTelegramOffset,
 } from './lib.mjs';
 
@@ -56,6 +56,7 @@ const telegramBaseUrl = `https://api.telegram.org/bot${env.telegramBotToken}`;
 const vicunaUrl = new URL(env.vicunaBaseUrl);
 const sseHttpModule = vicunaUrl.protocol === 'https:' ? https : http;
 let supermemoryClient = null;
+let pdfParseModulePromise = null;
 
 function log(message, extra = undefined) {
   const prefix = '[telegram-bridge]';
@@ -123,6 +124,10 @@ async function downloadTelegramFile(filePath) {
 }
 
 async function extractPdfText(fileBuffer) {
+  if (!pdfParseModulePromise) {
+    pdfParseModulePromise = import('pdf-parse');
+  }
+  const { PDFParse } = await pdfParseModulePromise;
   const parser = new PDFParse({ data: fileBuffer });
   try {
     const result = await parser.getText();
@@ -189,34 +194,75 @@ async function broadcastToChats(text) {
 
 async function callVicunaForTelegramMessage(chatId) {
   const transcript = getChatTranscript(state, chatId);
+  const baseSystemPrompt = 'You are replying to a Telegram user through middleware. Keep responses clear and concise unless the user asks for depth. Maintain continuity across the provided transcript. When the user explicitly asks to search the web or needs fresh current information, prefer the web search tool if the runtime makes it available. Use direct command-execution tools only when appropriate instead of pretending a command ran.';
+
+  async function requestCompletion(extraSystemMessages = []) {
+    const messages = [
+      {
+        role: 'system',
+        content: baseSystemPrompt,
+      },
+      ...extraSystemMessages,
+      ...transcript,
+    ];
+    const response = await fetch(`${env.vicunaBaseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: vicunaHeaders(),
+      body: JSON.stringify({
+        model: env.model,
+        temperature: 0.2,
+        messages,
+        max_tokens: env.maxTokens,
+      }),
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      throw new Error(`vicuna chat failed: ${response.status} ${JSON.stringify(body)}`);
+    }
+    return body;
+  }
+
   log('forwarding Telegram transcript to Vicuna', {
     chatId: String(chatId),
     messageCount: transcript.length,
     roles: transcript.map((entry) => entry.role),
     maxTokens: env.maxTokens,
   });
-  const messages = [
+
+  const firstBody = await requestCompletion();
+  let reply = extractChatCompletionText(firstBody);
+  if (reply) {
+    return reply;
+  }
+
+  log('Vicuna returned no relayable assistant text for Telegram request', {
+    chatId: String(chatId),
+    attempt: 1,
+    completion: summarizeChatCompletion(firstBody),
+  });
+
+  const retryBody = await requestCompletion([
     {
       role: 'system',
-      content: 'You are replying to a Telegram user through middleware. Keep responses clear and concise unless the user asks for depth. Maintain continuity across the provided transcript. When the user explicitly asks to search the web or needs fresh current information, prefer the web search tool if the runtime makes it available. Use direct command-execution tools only when appropriate instead of pretending a command ran.',
+      content: 'Your previous reply for this Telegram turn contained no relayable assistant text. Reply with a short plain-text assistant message for the user and do not emit an empty response.',
     },
-    ...transcript,
-  ];
-  const response = await fetch(`${env.vicunaBaseUrl}/v1/chat/completions`, {
-    method: 'POST',
-    headers: vicunaHeaders(),
-    body: JSON.stringify({
-      model: env.model,
-      temperature: 0.2,
-      messages,
-      max_tokens: env.maxTokens,
-    }),
-  });
-  const body = await response.json();
-  if (!response.ok) {
-    throw new Error(`vicuna chat failed: ${response.status} ${JSON.stringify(body)}`);
+  ]);
+  reply = extractChatCompletionText(retryBody);
+  if (reply) {
+    log('Vicuna retry recovered Telegram assistant text', {
+      chatId: String(chatId),
+      attempt: 2,
+      completion: summarizeChatCompletion(retryBody),
+    });
+    return reply;
   }
-  return extractChatCompletionText(body);
+
+  log('Vicuna retry still returned no relayable assistant text', {
+    chatId: String(chatId),
+    attempt: 2,
+    completion: summarizeChatCompletion(retryBody),
+  });
+  return '';
 }
 
 async function persistState() {

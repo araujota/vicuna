@@ -22,6 +22,7 @@ import {
   saveState,
   sanitizeAssistantRelayText,
   splitSseBuffer,
+  summarizeChatCompletion,
 } from './lib.mjs';
 
 test('extractResponseText returns assistant output text', () => {
@@ -66,6 +67,61 @@ test('extractChatCompletionText strips vicuna tool-call xml', () => {
   });
 
   assert.equal(text, 'I should search.');
+});
+
+test('extractChatCompletionText returns empty string for tool-call-only completion', () => {
+  const text = extractChatCompletionText({
+    choices: [
+      {
+        finish_reason: 'tool_calls',
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: { name: 'exec', arguments: '{}' },
+            },
+          ],
+        },
+      },
+    ],
+  });
+
+  assert.equal(text, '');
+});
+
+test('summarizeChatCompletion reports non-text completion shape', () => {
+  const summary = summarizeChatCompletion({
+    choices: [
+      {
+        finish_reason: 'tool_calls',
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: { name: 'exec', arguments: '{}' },
+            },
+          ],
+          reasoning_content: 'internal',
+        },
+      },
+    ],
+  });
+
+  assert.deepEqual(summary, {
+    finishReason: 'tool_calls',
+    messageRole: 'assistant',
+    contentType: 'string',
+    textLength: 0,
+    contentPartCount: 0,
+    toolCallCount: 1,
+    reasoningLength: 8,
+  });
 });
 
 test('sanitizeAssistantRelayText strips known tool-call xml blocks', () => {

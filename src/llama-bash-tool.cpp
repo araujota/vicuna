@@ -49,7 +49,8 @@ llama_bash_tool_config llama_bash_tool_default_config(void) {
     config.max_stdout_bytes = LLAMA_BASH_TOOL_STDOUT_MAX_CHARS - 1;
     config.max_stderr_bytes = LLAMA_BASH_TOOL_STDERR_MAX_CHARS - 1;
     copy_bounded_cstr(config.bash_path, sizeof(config.bash_path), "/bin/bash");
-    copy_bounded_cstr(config.allowed_commands, sizeof(config.allowed_commands), "pwd,ls,find,rg,cat,head,tail,grep,git,tavily-web-search,tools/openclaw-harness/bin/tavily-web-search");
+    // Empty disables the allowlist and leaves destructive-pattern blocking in force.
+    copy_bounded_cstr(config.allowed_commands, sizeof(config.allowed_commands), "");
     copy_bounded_cstr(config.blocked_patterns, sizeof(config.blocked_patterns), "rm -rf,:(){:|:&};:,mkfs,dd if=,chmod -R,chown -R,shutdown,reboot");
     copy_bounded_cstr(config.allowed_env, sizeof(config.allowed_env), "PATH,HOME,LANG,LC_ALL,LC_CTYPE");
     return config;

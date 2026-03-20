@@ -481,6 +481,24 @@ export function extractChatCompletionText(body) {
   return '';
 }
 
+export function summarizeChatCompletion(body) {
+  const choice = body?.choices?.[0];
+  const message = choice?.message;
+  const content = message?.content;
+  return {
+    finishReason: choice?.finish_reason ?? null,
+    messageRole: typeof message?.role === 'string' ? message.role : '',
+    contentType: Array.isArray(content) ? 'array' : typeof content,
+    textLength: extractChatCompletionText(body).length,
+    contentPartCount: Array.isArray(content) ? content.length : 0,
+    toolCallCount: Array.isArray(message?.tool_calls) ? message.tool_calls.length : 0,
+    reasoningLength:
+      typeof message?.reasoning_content === 'string'
+        ? message.reasoning_content.length
+        : 0,
+  };
+}
+
 export function parseSseChunk(chunk) {
   const events = [];
   const normalized = chunk.replace(/\r\n/g, '\n');

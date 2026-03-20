@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 MODEL_PATH="/usr/share/ollama/.ollama/models/blobs/sha256-3603045b543e1c0dfb27f126a3642e7f805e480b84c4781e3d848ace971cba7a"
 
 cd "$REPO_ROOT"

@@ -105,6 +105,44 @@ def test_runtime_snapshot_survives_restart(tmp_path):
     assert events[-1][1]["response"]["output"][0]["content"][0]["text"] == "persisted proactive message"
 
 
+def test_runtime_snapshot_migrates_legacy_bash_allowlist(tmp_path):
+    global server
+    snapshot_path = tmp_path / "runtime-state.json"
+    server.extra_env = {
+        "VICUNA_RUNTIME_STATE_PATH": str(snapshot_path),
+    }
+    server.start()
+
+    for _ in range(20):
+        if snapshot_path.exists():
+            break
+        time.sleep(0.25)
+    assert snapshot_path.exists()
+    server.stop()
+
+    snapshot = json.loads(snapshot_path.read_text())
+    snapshot["bash_tool_config"]["allowed_commands"] = (
+        "pwd,ls,find,rg,cat,head,tail,grep,git,tavily-web-search,"
+        "tools/openclaw-harness/bin/tavily-web-search"
+    )
+    snapshot_path.write_text(json.dumps(snapshot))
+
+    server = ServerPreset.tinyllama2()
+    server.extra_env = {
+        "VICUNA_RUNTIME_STATE_PATH": str(snapshot_path),
+        "VICUNA_BASH_TOOL_ALLOWED_COMMANDS": "",
+    }
+    server.start()
+    health = server.make_request("GET", "/health")
+    assert health.status_code == 200
+    assert health.body["runtime_persistence"]["restore_attempted"] is True
+    assert health.body["runtime_persistence"]["healthy"] is True
+    server.stop()
+
+    migrated_snapshot = json.loads(snapshot_path.read_text())
+    assert migrated_snapshot["bash_tool_config"]["allowed_commands"] == ""
+
+
 def test_unified_provenance_repository_records_self_improvement_events(tmp_path):
     global server
     snapshot_path = tmp_path / "runtime-state.json"
@@ -159,6 +197,22 @@ def test_unified_provenance_repository_records_self_improvement_events(tmp_path)
     assert "llamacpp:provenance_active_loop_total" in metrics.body
     assert "llamacpp:provenance_enabled" in metrics.body
     assert "llamacpp:provenance_self_state_allostatic_divergence" in metrics.body
+
+
+def test_idle_startup_throttles_dmn_ticks(tmp_path):
+    global server
+    provenance_path = tmp_path / "runtime-provenance.jsonl"
+    server.extra_env = {
+        "VICUNA_PROVENANCE_ENABLED": "1",
+        "VICUNA_PROVENANCE_LOG_PATH": str(provenance_path),
+    }
+    server.start()
+    time.sleep(1.5)
+
+    health = server.make_request("GET", "/health")
+    assert health.status_code == 200
+    assert health.body["provenance_repository"]["enabled"] is True
+    assert health.body["provenance_repository"]["dmn_total"] <= 1
 
 
 def test_server_props():

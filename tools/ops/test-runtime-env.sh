@@ -6,6 +6,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 unset VICUNA_RUNTIME_STATE_PATH
 unset VICUNA_RUNTIME_STATE_BACKUP_DIR
 unset VICUNA_BASH_TOOL_ENABLED
+unset VICUNA_BASH_TOOL_LOGIN_SHELL
+unset VICUNA_BASH_TOOL_MAX_CHILD_PROCESSES
+unset VICUNA_BASH_TOOL_ALLOWED_COMMANDS
 unset VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH
 
 # shellcheck disable=SC1091
@@ -27,6 +30,21 @@ EXPECTED_CATALOG_PATH="$REPO_ROOT/.cache/vicuna/openclaw-catalog.json"
 
 [[ "$VICUNA_BASH_TOOL_ENABLED" == "1" ]] || {
     printf 'expected bash tool enabled by default, got %s\n' "$VICUNA_BASH_TOOL_ENABLED" >&2
+    exit 1
+}
+
+[[ "$VICUNA_BASH_TOOL_LOGIN_SHELL" == "0" ]] || {
+    printf 'expected bash tool login shell disabled by default, got %s\n' "$VICUNA_BASH_TOOL_LOGIN_SHELL" >&2
+    exit 1
+}
+
+[[ "$VICUNA_BASH_TOOL_MAX_CHILD_PROCESSES" == "4096" ]] || {
+    printf 'expected bash tool max child processes 4096 by default, got %s\n' "$VICUNA_BASH_TOOL_MAX_CHILD_PROCESSES" >&2
+    exit 1
+}
+
+[[ -z "$VICUNA_BASH_TOOL_ALLOWED_COMMANDS" ]] || {
+    printf 'expected empty bash tool allowlist by default, got %s\n' "$VICUNA_BASH_TOOL_ALLOWED_COMMANDS" >&2
     exit 1
 }
 

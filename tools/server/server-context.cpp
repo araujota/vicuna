@@ -63,6 +63,7 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+constexpr uint64_t VICUNA_DMN_IDLE_TICK_MIN_INTERVAL_US = 5ULL * 1000ULL * 1000ULL;
 
 struct self_state_token_view {
     llama_tokens owned_tokens;
@@ -1905,6 +1906,15 @@ static json bash_tool_config_to_json(const llama_bash_tool_config & config) {
     };
 }
 
+static std::string migrate_legacy_bash_allowed_commands(const std::string & allowed_commands) {
+    static const std::string legacy_default =
+            "pwd,ls,find,rg,cat,head,tail,grep,git,tavily-web-search,tools/openclaw-harness/bin/tavily-web-search";
+    if (allowed_commands == legacy_default) {
+        return {};
+    }
+    return allowed_commands;
+}
+
 static bool bash_tool_config_from_json(const json & data, llama_bash_tool_config * out_config) {
     if (!out_config || !data.is_object()) {
         return false;
@@ -1924,7 +1934,9 @@ static bool bash_tool_config_from_json(const json & data, llama_bash_tool_config
     out_config->max_stderr_bytes = json_value(data, "max_stderr_bytes", out_config->max_stderr_bytes);
     std::snprintf(out_config->bash_path, sizeof(out_config->bash_path), "%s", json_value(data, "bash_path", std::string(out_config->bash_path)).c_str());
     std::snprintf(out_config->working_directory, sizeof(out_config->working_directory), "%s", json_value(data, "working_directory", std::string(out_config->working_directory)).c_str());
-    std::snprintf(out_config->allowed_commands, sizeof(out_config->allowed_commands), "%s", json_value(data, "allowed_commands", std::string(out_config->allowed_commands)).c_str());
+    const std::string allowed_commands = migrate_legacy_bash_allowed_commands(
+            json_value(data, "allowed_commands", std::string(out_config->allowed_commands)));
+    std::snprintf(out_config->allowed_commands, sizeof(out_config->allowed_commands), "%s", allowed_commands.c_str());
     std::snprintf(out_config->blocked_patterns, sizeof(out_config->blocked_patterns), "%s", json_value(data, "blocked_patterns", std::string(out_config->blocked_patterns)).c_str());
     std::snprintf(out_config->allowed_env, sizeof(out_config->allowed_env), "%s", json_value(data, "allowed_env", std::string(out_config->allowed_env)).c_str());
     return true;
@@ -2455,8 +2467,30 @@ private:
                 command_text = trim_ascii_copy(json_value(arguments, "command", std::string()));
                 const std::string workdir = trim_ascii_copy(json_value(arguments, "workdir", std::string()));
                 if (!workdir.empty()) {
-                    std::snprintf(request.working_directory, sizeof(request.working_directory), "%s", workdir.c_str());
+                    const std::filesystem::path base_workdir(trim_ascii_copy(request.working_directory));
+                    std::filesystem::path candidate_path(workdir);
+                    if (candidate_path.is_relative()) {
+                        candidate_path = base_workdir / candidate_path;
+                    }
+
+                    std::error_code ec;
+                    const std::filesystem::path normalized_base = std::filesystem::weakly_canonical(base_workdir, ec);
+                    ec.clear();
+                    const std::filesystem::path normalized_candidate = std::filesystem::weakly_canonical(candidate_path, ec);
+                    const bool candidate_exists = !ec && std::filesystem::exists(normalized_candidate);
+                    const bool candidate_is_dir = candidate_exists && std::filesystem::is_directory(normalized_candidate);
+                    const bool in_base =
+                            !normalized_base.empty() &&
+                            normalized_candidate.native().rfind(normalized_base.native(), 0) == 0;
+                    if (candidate_is_dir && in_base) {
+                        std::snprintf(request.working_directory, sizeof(request.working_directory), "%s", normalized_candidate.string().c_str());
+                    } else {
+                        SRV_WRN("ignoring invalid bash workdir override '%s' (base=%s)\n",
+                                workdir.c_str(),
+                                request.working_directory);
+                    }
                 }
+                request.login_shell = false;
             } else if (capability->descriptor.capability_id == "openclaw.tavily.web_search") {
                 std::string query = trim_ascii_copy(json_value(arguments, "query", std::string()));
                 if (query.empty()) {
@@ -6746,8 +6780,17 @@ private:
             }
 
 	            if (all_idle) {
+                    const uint64_t now_us = ggml_time_us();
+                    bool dmn_due = true;
+                    llama_cognitive_host_state host_state = {};
+                    if (llama_cognitive_get_host_state(ctx, &host_state) == 0 &&
+                            host_state.last_dmn_time_us > 0 &&
+                            now_us > host_state.last_dmn_time_us &&
+                            now_us - host_state.last_dmn_time_us < VICUNA_DMN_IDLE_TICK_MIN_INTERVAL_US) {
+                        dmn_due = false;
+                    }
 	                llama_dmn_tick_trace dmn_trace = {};
-	                if (llama_dmn_tick(ctx, ggml_time_us(), &dmn_trace) == 0 && dmn_trace.admitted) {
+	                if (dmn_due && llama_dmn_tick(ctx, now_us, &dmn_trace) == 0 && dmn_trace.admitted) {
 	                    SRV_INF("dmn tick %d winner=%d score=%.3f burst=%d\n",
 	                            dmn_trace.tick_id,
 	                            dmn_trace.winner_action,

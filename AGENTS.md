@@ -44,26 +44,31 @@ For build and development guidance, start with:
 
 ## Workstation Access
 
-As of 2026-03-19, this workstation reports:
+As of 2026-03-20, this workstation reports:
 - hostname: `tyler-araujo-MS-7E12`
 - primary LAN IPv4: `10.0.0.20`
+- Tailscale IPv4: `100.83.122.99`
+- Tailscale DNS name: `tyler-araujo-ms-7e12.tail4f73bf.ts.net`
 - repo path: `/home/tyler-araujo/Projects/vicuna`
 - default user: `tyler-araujo`
 
-Remote SSH target, once SSH is enabled on the workstation:
-- `ssh tyler-araujo@10.0.0.20`
+Preferred remote admin path:
+- `tailscale ssh tyler-araujo@100.83.122.99`
+- `tailscale ssh tyler-araujo@tyler-araujo-ms-7e12.tail4f73bf.ts.net`
 
-Current caveat:
-- SSH is not currently reachable on this host. At the time this note was written, neither `ssh.service` nor `sshd.service` existed and no listener was present on TCP port `22`.
+Requirements:
+- the client device must also be enrolled in the same Tailscale tailnet
+- Tailscale policy must allow SSH access to this node for the connecting user
 
-Remote rebuild/deploy workflow after SSH is enabled:
-- `ssh tyler-araujo@10.0.0.20`
+Remote rebuild/deploy workflow:
+- `tailscale ssh tyler-araujo@100.83.122.99`
 - `cd /home/tyler-araujo/Projects/vicuna`
 - `bash tools/ops/rebuild-vicuna-runtime.sh`
 
 Runtime verification after rebuild:
 - `curl http://127.0.0.1:8080/health`
-- `journalctl --user -u vicuna-runtime.service --no-pager -n 120`
+- `journalctl -u vicuna-runtime.service --no-pager -n 120`
+- `journalctl -u vicuna-telegram-bridge.service --no-pager -n 120`
 
 ## Active Technologies
 - C++17 with the existing `llama.cpp`/Vicuña runtime and C API surfaces + Existing Active LoRA manager, cognitive loop runtime, self-state and server serialization surfaces (044-process-functional-lora)

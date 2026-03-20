@@ -1,4 +1,7 @@
 {
+  "engines": {
+    "node": ">=20.16.0"
+  },
   "scripts": {
     "telegram-bridge:start": "node tools/telegram-bridge/index.mjs",
     "test:telegram-bridge": "node --test tools/telegram-bridge/bridge.test.mjs"

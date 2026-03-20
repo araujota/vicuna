@@ -17,6 +17,13 @@ Load the repo env file first:
 source ./.envrc
 ```
 
+The bridge requires Node `>=20.16.0`. The managed launcher resolves a suitable
+Node binary automatically, preferring:
+
+- `TELEGRAM_BRIDGE_NODE_BIN` when explicitly set
+- the current `node` on `PATH` if it is new enough
+- the user's `nvm` Node 20 installation when available
+
 Required variables:
 
 - `TELEGRAM_BOT_TOKEN`
@@ -53,7 +60,8 @@ For each supported Telegram document, the bridge:
 
 Extraction policy:
 
-- PDF uses the local Node dependency `pdf-parse`
+- PDF uses the local Node dependency `pdf-parse` and loads it lazily only when
+  a PDF message arrives
 - DOC and DOCX use the host's `/usr/bin/textutil` converter
 
 If `SUPERMEMORY_API_KEY` is missing, supported document ingestion is rejected.
@@ -87,8 +95,19 @@ default for managed operation. Override these if needed:
 - `VICUNA_BASH_TOOL_TIMEOUT_MS` default: `15000`
 - `VICUNA_BASH_TOOL_MAX_STDOUT_BYTES` default: `16384`
 - `VICUNA_BASH_TOOL_MAX_STDERR_BYTES` default: `8192`
-- `VICUNA_BASH_TOOL_LOGIN_SHELL` default: `1`
+- `VICUNA_BASH_TOOL_LOGIN_SHELL` default: `0`
 - `VICUNA_BASH_TOOL_INHERIT_ENV` default: `1`
+- `VICUNA_BASH_TOOL_MAX_CHILD_PROCESSES` default: `4096`
+
+`VICUNA_BASH_TOOL_LOGIN_SHELL=0` keeps the runtime on `bash -c` by default so
+bounded tool commands do not depend on host login-shell startup hooks such as
+`/etc/profile.d/*`. Set it back to `1` only when a specific command truly
+requires login-shell initialization.
+
+The managed default for `VICUNA_BASH_TOOL_MAX_CHILD_PROCESSES` is intentionally
+much higher than the runtime's old low safety floor because Linux applies
+`RLIMIT_NPROC` per user, not per command. Values that are too small can prevent
+even simple allowed commands from forking on a busy workstation.
 
 ## Behavior
 
@@ -109,6 +128,10 @@ default for managed operation. Override these if needed:
   closes an idle stream; it always reconnects with `after=0` and deduplicates
   by retained `response_id`, so retained self-emits are replay-safe across
   reconnects
+- repeated Telegram `409 Conflict: terminated by other getUpdates request`
+  errors mean another bot poller is still running with the same token, either
+  on this host or somewhere else; clear the extra poller before expecting
+  stable message ingress
 
 ## Test
 
