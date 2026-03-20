@@ -97,10 +97,13 @@ int main() {
     if (!expect(fabric.build_cognitive_specs(&specs), "failed to build cognitive specs")) {
         return 1;
     }
-    if (!expect(specs.size() == 3, "expected exec, hard-memory, and codex capabilities")) {
+    if (!expect(specs.size() == 4, "expected exec, hard-memory query, hard-memory write, and codex capabilities")) {
         return 1;
     }
     if (!expect(fabric.capability_by_tool_name("exec") != nullptr, "expected exec tool lookup to succeed")) {
+        return 1;
+    }
+    if (!expect(fabric.capability_by_tool_name("hard_memory_write") != nullptr, "expected hard-memory write tool lookup to succeed")) {
         return 1;
     }
     if (!expect(fabric.capability_by_tool_name("codex") != nullptr, "expected codex tool lookup to succeed")) {
@@ -165,6 +168,27 @@ int main() {
         return 1;
     }
     if (!expect(parsed.captured_payload == valid_tool_xml, "expected captured payload to preserve thought plus XML")) {
+        return 1;
+    }
+
+    std::vector<int32_t> write_only = { 2 };
+    const std::string valid_memory_write_xml =
+            "This should be preserved durably.\n"
+            "<vicuna_tool_call tool=\"hard_memory_write\">\n"
+            "  <arg name=\"memories\" type=\"json\">[{\"content\":\"The user prefers concise answers.\",\"kind\":\"user_model\",\"domain\":\"user_outcome\",\"tags\":[\"preference\"],\"isStatic\":true}]</arg>\n"
+            "  <arg name=\"containerTag\" type=\"string\">vicuna-self-state</arg>\n"
+            "</vicuna_tool_call>";
+    if (!expect(fabric.parse_tool_call_xml(valid_memory_write_xml, &parsed, &write_only, &error), error.c_str())) {
+        return 1;
+    }
+    if (!expect(parsed.message.tool_calls.size() == 1 &&
+                parsed.message.tool_calls[0].name == "hard_memory_write",
+                "expected hard-memory write tool XML to parse")) {
+        return 1;
+    }
+    if (!expect(parsed.message.tool_calls[0].arguments.find("\"containerTag\":\"vicuna-self-state\"") != std::string::npos &&
+                parsed.message.tool_calls[0].arguments.find("\"isStatic\":true") != std::string::npos,
+                "expected hard-memory write JSON arguments to preserve Supermemory fields")) {
         return 1;
     }
 
@@ -291,7 +315,7 @@ int main() {
     if (!expect(reloadable_fabric.build_cognitive_specs(&specs), "failed to build reloaded cognitive specs")) {
         return 1;
     }
-    if (!expect(specs.size() == 4, "expected built-ins plus one externally loaded capability")) {
+    if (!expect(specs.size() == 5, "expected built-ins plus one externally loaded capability")) {
         return 1;
     }
 

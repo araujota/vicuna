@@ -5052,6 +5052,10 @@ bool llama_context::hard_memory_submit_result(const llama_hard_memory_result & r
     return hard_memory && hard_memory->submit_result(result);
 }
 
+bool llama_context::hard_memory_submit_archive_trace(const llama_hard_memory_archive_trace & trace) {
+    return hard_memory && hard_memory->submit_archive_trace(trace);
+}
+
 bool llama_context::hard_memory_archive_primitives(
         const llama_hard_memory_primitive * primitives,
         int32_t primitive_count,

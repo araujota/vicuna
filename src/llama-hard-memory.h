@@ -15,9 +15,15 @@ public:
     bool clear_request(int32_t command_id);
     bool query(const llama_hard_memory_query_request & query, llama_hard_memory_result * out_result);
     bool submit_result(const llama_hard_memory_result & result);
+    bool submit_archive_trace(const llama_hard_memory_archive_trace & trace);
     bool archive_primitives(
             const llama_hard_memory_primitive * primitives,
             int32_t primitive_count,
+            const llama_self_state_delta_summary * delta_summary = nullptr);
+    bool archive_write_items(
+            const llama_hard_memory_write_item * items,
+            int32_t item_count,
+            const char * container_override = nullptr,
             const llama_self_state_delta_summary * delta_summary = nullptr);
     bool get_last_result(llama_hard_memory_result * out_result) const;
     bool archive_event(

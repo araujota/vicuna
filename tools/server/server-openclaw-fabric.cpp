@@ -636,6 +636,59 @@ openclaw_tool_capability_descriptor build_hard_memory_descriptor() {
     return memory;
 }
 
+openclaw_tool_capability_descriptor build_hard_memory_write_descriptor() {
+    openclaw_tool_capability_descriptor memory = {};
+    memory.capability_id = "openclaw.vicuna.hard_memory_write";
+    memory.tool_surface_id = "vicuna.memory.hard_write";
+    memory.capability_kind = "memory_adapter";
+    memory.owner_plugin_id = "vicuna-memory";
+    memory.tool_name = "hard_memory_write";
+    memory.description = "Archive explicit durable memories to Vicuña hard memory and Supermemory";
+    memory.input_schema_json = R"({
+        "type":"object",
+        "required":["memories"],
+        "properties":{
+            "memories":{
+                "type":"array",
+                "minItems":1,
+                "items":{
+                    "type":"object",
+                    "required":["content"],
+                    "properties":{
+                        "content":{"type":"string"},
+                        "title":{"type":"string"},
+                        "key":{"type":"string"},
+                        "kind":{"type":"string"},
+                        "domain":{"type":"string"},
+                        "tags":{"type":"array","items":{"type":"string"}},
+                        "importance":{"type":"number"},
+                        "confidence":{"type":"number"},
+                        "gainBias":{"type":"number"},
+                        "allostaticRelevance":{"type":"number"},
+                        "isStatic":{"type":"boolean"}
+                    }
+                }
+            },
+            "containerTag":{"type":"string"}
+        }
+    })";
+    memory.output_contract = "completed_result";
+    memory.side_effect_class = "memory_write";
+    memory.approval_mode = "none";
+    memory.execution_modes = {"sync"};
+    memory.provenance_namespace = "openclaw/vicuna-memory/memory_adapter/hard_memory_write";
+    memory.tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_WRITE;
+    memory.tool_flags =
+            LLAMA_COG_TOOL_ACTIVE_ELIGIBLE |
+            LLAMA_COG_TOOL_DMN_ELIGIBLE |
+            LLAMA_COG_TOOL_REMEDIATION_SAFE |
+            LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT;
+    memory.latency_class = LLAMA_COG_TOOL_LATENCY_HIGH;
+    memory.max_steps_reserved = 3;
+    memory.dispatch_backend = "legacy_hard_memory";
+    return memory;
+}
+
 openclaw_tool_capability_descriptor build_codex_descriptor() {
     openclaw_tool_capability_descriptor codex = {};
     codex.capability_id = "openclaw.vicuna.codex_cli";
@@ -675,6 +728,12 @@ const builtin_capability_registration * builtin_capability_registrations(size_t 
             SERVER_OPENCLAW_DISPATCH_LEGACY_HARD_MEMORY,
             hard_memory_available,
             build_hard_memory_descriptor,
+        },
+        {
+            "hard_memory_write",
+            SERVER_OPENCLAW_DISPATCH_LEGACY_HARD_MEMORY,
+            hard_memory_available,
+            build_hard_memory_write_descriptor,
         },
         {
             "codex",

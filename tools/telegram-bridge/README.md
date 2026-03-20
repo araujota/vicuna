@@ -29,7 +29,36 @@ Optional variables:
 - `TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS` default: `30`
 - `TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES` default: `12`
 - `TELEGRAM_BRIDGE_MAX_TOKENS` default: `200`
+- `TELEGRAM_BRIDGE_MAX_DOCUMENT_CHARS` default: `12000`
+- `SUPERMEMORY_API_KEY` required for PDF/DOC/DOCX ingestion and linked
+  Supermemory persistence
 - `VICUNA_API_KEY` if the server runs with bearer auth enabled
+
+## Document Ingestion
+
+Supported inbound Telegram document formats:
+
+- PDF
+- DOC
+- DOCX
+
+For each supported Telegram document, the bridge:
+
+1. downloads the raw file through Telegram `getFile`
+2. extracts plain text only
+3. stores the raw file in Supermemory
+4. stores the extracted text in Supermemory as a second linked document
+5. appends the normalized extracted text to the Telegram chat transcript before
+   forwarding the turn to Vicuña
+
+Extraction policy:
+
+- PDF uses the local Node dependency `pdf-parse`
+- DOC and DOCX use the host's `/usr/bin/textutil` converter
+
+If `SUPERMEMORY_API_KEY` is missing, supported document ingestion is rejected.
+If `/usr/bin/textutil` is missing, DOC and DOCX ingestion fails with a direct
+host requirement error.
 
 ## Start
 
@@ -66,6 +95,9 @@ default for managed operation. Override these if needed:
 - `/start` registers the chat for proactive relay and returns a confirmation
 - plain text user messages are sent to the local Vicuña runtime and the
   assistant reply is sent back to the same Telegram chat
+- supported PDF, DOC, and DOCX messages are converted into plain text before
+  they enter the local transcript and are also persisted to Supermemory as both
+  a raw file record and an extracted-text record linked by shared metadata
 - each Telegram chat keeps its own bounded persisted transcript keyed by
   Telegram `chat_id`, so follow-up turns reuse recent context after restarts
 - each forwarded Telegram turn now logs transcript length and role sequence to

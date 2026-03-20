@@ -7,10 +7,16 @@ import path from 'node:path';
 import {
   appendProactiveId,
   appendChatTranscriptMessage,
+  buildTelegramDocumentDescriptor,
+  buildTelegramDocumentLinkage,
+  buildTelegramFileUrl,
+  detectTelegramDocumentLogicalType,
   extractChatCompletionText,
   extractResponseText,
   getChatTranscript,
+  ingestTelegramDocumentMessage,
   loadState,
+  normalizeDocumentPlainText,
   normalizeState,
   parseSseChunk,
   saveState,
@@ -68,6 +74,250 @@ test('sanitizeAssistantRelayText strips known tool-call xml blocks', () => {
   );
 
   assert.equal(text, 'prefix\n\nsuffix');
+});
+
+test('detectTelegramDocumentLogicalType supports pdf doc and docx', () => {
+  assert.equal(detectTelegramDocumentLogicalType({
+    mime_type: 'application/pdf',
+    file_name: 'report.bin',
+  }), 'pdf');
+  assert.equal(detectTelegramDocumentLogicalType({
+    mime_type: 'application/msword',
+    file_name: 'report.doc',
+  }), 'doc');
+  assert.equal(detectTelegramDocumentLogicalType({
+    mime_type: 'application/octet-stream',
+    file_name: 'report.docx',
+  }), 'docx');
+  assert.equal(detectTelegramDocumentLogicalType({
+    mime_type: 'application/zip',
+    file_name: 'report.zip',
+  }), 'unsupported');
+});
+
+test('buildTelegramDocumentDescriptor normalizes telegram document metadata', () => {
+  const descriptor = buildTelegramDocumentDescriptor({
+    chat: { id: 42 },
+    message_id: 9,
+    document: {
+      file_id: 'file_1',
+      file_unique_id: 'uniq_1',
+      file_name: 'Quarterly Report.PDF',
+      mime_type: 'application/pdf',
+      file_size: 1234,
+    },
+  });
+
+  assert.deepEqual(descriptor, {
+    chatId: '42',
+    messageId: '9',
+    fileId: 'file_1',
+    fileUniqueId: 'uniq_1',
+    fileName: 'Quarterly Report.PDF',
+    mimeType: 'application/pdf',
+    fileSize: 1234,
+    extension: 'pdf',
+    logicalType: 'pdf',
+  });
+});
+
+test('normalizeDocumentPlainText collapses whitespace and truncates', () => {
+  const normalized = normalizeDocumentPlainText(' first \r\n\r\n\r\nsecond \f third ', { maxChars: 12 });
+
+  assert.equal(normalized.text, 'first\n\nsecon');
+  assert.equal(normalized.truncated, true);
+});
+
+test('buildTelegramDocumentLinkage creates shared metadata for raw and text documents', () => {
+  const linkage = buildTelegramDocumentLinkage({
+    chatId: '1001',
+    messageId: '7',
+    fileId: 'file_1',
+    fileUniqueId: 'uniq_1',
+    fileName: 'memo.docx',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    logicalType: 'docx',
+  });
+
+  assert.match(linkage.linkKey, /^telegram-doc-/);
+  assert.equal(linkage.containerTag, 'telegram-chat-1001');
+  assert.equal(linkage.rawMetadata.linkKey, linkage.textMetadata.linkKey);
+  assert.equal(linkage.rawMetadata.contentKind, 'source_file');
+  assert.equal(linkage.textMetadata.contentKind, 'extracted_text');
+});
+
+test('buildTelegramFileUrl creates telegram file endpoint', () => {
+  assert.equal(
+    buildTelegramFileUrl('token123', '/documents/file.pdf'),
+    'https://api.telegram.org/file/bottoken123/documents/file.pdf',
+  );
+});
+
+test('ingestTelegramDocumentMessage persists raw and extracted documents with shared linkage', async () => {
+  const calls = {
+    upload: [],
+    update: [],
+    add: [],
+  };
+  const supermemoryClient = {
+    documents: {
+      async uploadFile(payload) {
+        calls.upload.push(payload);
+        return { id: 'raw_doc_1' };
+      },
+      async update(id, payload) {
+        calls.update.push({ id, payload });
+        return { id, status: 'done' };
+      },
+      async add(payload) {
+        calls.add.push(payload);
+        return { id: 'text_doc_1' };
+      },
+    },
+  };
+
+  const result = await ingestTelegramDocumentMessage({
+    message: {
+      chat: { id: 77 },
+      message_id: 10,
+      document: {
+        file_id: 'file_1',
+        file_unique_id: 'uniq_1',
+        file_name: 'report.pdf',
+        mime_type: 'application/pdf',
+      },
+    },
+    maxDocumentChars: 50,
+    resolveTelegramFile: async (fileId) => {
+      assert.equal(fileId, 'file_1');
+      return { file_path: 'docs/report.pdf' };
+    },
+    downloadTelegramFile: async (filePath) => {
+      assert.equal(filePath, 'docs/report.pdf');
+      return Buffer.from('pdf bytes');
+    },
+    extractPdfText: async () => 'Alpha\n\n\nBeta',
+    extractWordText: async () => {
+      throw new Error('should not be called');
+    },
+    supermemoryClient,
+    toFileFactory: async (buffer, fileName) => ({ buffer: Buffer.from(buffer), fileName }),
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.rawDocumentId, 'raw_doc_1');
+  assert.equal(result.textDocumentId, 'text_doc_1');
+  assert.match(result.transcriptText, /\[Document: report\.pdf\]/);
+  assert.match(result.transcriptText, /Alpha\n\nBeta/);
+  assert.equal(calls.upload.length, 1);
+  assert.equal(calls.update.length, 1);
+  assert.equal(calls.add.length, 1);
+
+  const rawMetadata = JSON.parse(calls.upload[0].metadata);
+  assert.equal(rawMetadata.contentKind, 'source_file');
+  assert.equal(calls.update[0].payload.metadata.linkKey, rawMetadata.linkKey);
+  assert.equal(calls.add[0].metadata.linkKey, rawMetadata.linkKey);
+  assert.equal(calls.add[0].containerTag, calls.update[0].payload.containerTag);
+});
+
+test('ingestTelegramDocumentMessage rejects unsupported documents cleanly', async () => {
+  const result = await ingestTelegramDocumentMessage({
+    message: {
+      chat: { id: 77 },
+      message_id: 10,
+      document: {
+        file_id: 'file_1',
+        file_name: 'archive.zip',
+        mime_type: 'application/zip',
+      },
+    },
+    supermemoryClient: {},
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.userError, 'Only plain text, PDF, DOC, and DOCX messages are supported right now.');
+});
+
+test('ingestTelegramDocumentMessage requires supermemory for document processing', async () => {
+  const result = await ingestTelegramDocumentMessage({
+    message: {
+      chat: { id: 77 },
+      message_id: 10,
+      document: {
+        file_id: 'file_1',
+        file_name: 'report.pdf',
+        mime_type: 'application/pdf',
+      },
+    },
+    supermemoryClient: null,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.userError, 'SUPERMEMORY_API_KEY is required for Telegram document ingestion.');
+});
+
+test('ingestTelegramDocumentMessage surfaces partial failure after raw upload', async () => {
+  const supermemoryClient = {
+    documents: {
+      async uploadFile() {
+        return { id: 'raw_doc_1' };
+      },
+      async update() {
+        return { id: 'raw_doc_1', status: 'done' };
+      },
+      async add() {
+        throw new Error('text add failed');
+      },
+    },
+  };
+
+  const result = await ingestTelegramDocumentMessage({
+    message: {
+      chat: { id: 77 },
+      message_id: 10,
+      document: {
+        file_id: 'file_1',
+        file_unique_id: 'uniq_1',
+        file_name: 'report.pdf',
+        mime_type: 'application/pdf',
+      },
+    },
+    resolveTelegramFile: async () => ({ file_path: 'docs/report.pdf' }),
+    downloadTelegramFile: async () => Buffer.from('pdf bytes'),
+    extractPdfText: async () => 'Alpha',
+    extractWordText: async () => 'unused',
+    supermemoryClient,
+    toFileFactory: async () => ({ name: 'report.pdf' }),
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.partialFailure, true);
+  assert.match(result.userError, /partially failed after raw file storage/);
+});
+
+test('ingestTelegramDocumentMessage surfaces extraction failures directly', async () => {
+  const result = await ingestTelegramDocumentMessage({
+    message: {
+      chat: { id: 77 },
+      message_id: 10,
+      document: {
+        file_id: 'file_1',
+        file_name: 'report.doc',
+        mime_type: 'application/msword',
+      },
+    },
+    resolveTelegramFile: async () => ({ file_path: 'docs/report.doc' }),
+    downloadTelegramFile: async () => Buffer.from('doc bytes'),
+    extractPdfText: async () => 'unused',
+    extractWordText: async () => {
+      throw new Error('DOC/DOCX extraction requires /usr/bin/textutil on the bridge host.');
+    },
+    supermemoryClient: { documents: {} },
+    toFileFactory: async () => ({ name: 'report.doc' }),
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.userError, /textutil/);
 });
 
 test('parseSseChunk parses response events', () => {

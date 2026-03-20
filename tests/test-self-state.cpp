@@ -1,5 +1,6 @@
 #include "get-model.h"
 #include "llama.h"
+#include "../src/llama-hard-memory.h"
 
 #include <cpp-httplib/httplib.h>
 #include <nlohmann/json.hpp>
@@ -110,6 +111,8 @@ struct mock_supermemory_server {
     std::atomic<int> archive_calls = 0;
     std::string last_profile_body;
     std::string last_archive_body;
+    std::string last_archive_auth_header;
+    std::string last_archive_api_key_header;
     int port = -1;
 
     bool start() {
@@ -175,6 +178,8 @@ struct mock_supermemory_server {
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 last_archive_body = req.body;
+                last_archive_auth_header = req.get_header_value("Authorization");
+                last_archive_api_key_header = req.get_header_value("x-supermemory-api-key");
             }
             res.status = 201;
             res.set_content(json({
@@ -1506,6 +1511,96 @@ int main(int argc, char ** argv) {
             llama_self_state_apply_postwrite(hard_memory_ctx, &mild_event, &delta_post) != 0 ||
             mock_server.archive_calls.load() != 1) {
             std::fprintf(stderr, "hard-memory archival threshold did not suppress low-perturbation writes\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_hard_memory helper;
+        if (!helper.configure(hard_memory)) {
+            std::fprintf(stderr, "failed to configure explicit hard-memory helper\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_hard_memory_write_item explicit_item = {};
+        explicit_item.is_static = true;
+        explicit_item.primitive = llama_hard_memory_default_primitive();
+        explicit_item.primitive.kind = LLAMA_HARD_MEMORY_PRIMITIVE_USER_MODEL;
+        explicit_item.primitive.domain = LLAMA_HARD_MEMORY_DOMAIN_USER_OUTCOME;
+        explicit_item.primitive.source_tool_kind = LLAMA_TOOL_KIND_HARD_MEMORY_WRITE;
+        explicit_item.primitive.flags =
+                LLAMA_HARD_MEMORY_PRIMITIVE_AFFECT_GAIN |
+                LLAMA_HARD_MEMORY_PRIMITIVE_TOOL_DERIVED;
+        explicit_item.primitive.importance = 0.82f;
+        explicit_item.primitive.confidence = 0.91f;
+        explicit_item.primitive.gain_bias = 0.77f;
+        explicit_item.primitive.allostatic_relevance = 0.18f;
+        std::snprintf(explicit_item.primitive.title, sizeof(explicit_item.primitive.title), "%s", "user-verbosity");
+        std::snprintf(explicit_item.primitive.content, sizeof(explicit_item.primitive.content), "%s", "The user prefers concise answers about runtime status.");
+        std::snprintf(explicit_item.primitive.tags[0], sizeof(explicit_item.primitive.tags[0]), "%s", "preference");
+        std::snprintf(explicit_item.primitive.tags[1], sizeof(explicit_item.primitive.tags[1]), "%s", "verbosity");
+
+        if (!helper.archive_write_items(&explicit_item, 1, "explicit-tool-write", nullptr) ||
+            mock_server.archive_calls.load() != 2) {
+            std::fprintf(stderr, "explicit hard-memory write helper did not dispatch a Supermemory write\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_hard_memory_archive_trace explicit_trace = {};
+        if (!helper.get_last_archive_trace(&explicit_trace) ||
+            !explicit_trace.archived ||
+            explicit_trace.primitive_count != 1 ||
+            std::string(explicit_trace.container_tag) != "explicit-tool-write") {
+            std::fprintf(stderr, "explicit hard-memory write helper did not preserve archive trace state\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::string explicit_archive_body = [&]() {
+            std::lock_guard<std::mutex> lock(mock_server.mutex);
+            return mock_server.last_archive_body;
+        }();
+        const json explicit_archive_payload = json::parse(explicit_archive_body);
+        if (explicit_archive_payload.value("containerTag", std::string()) != "explicit-tool-write" ||
+            !explicit_archive_payload.contains("memories") ||
+            !explicit_archive_payload["memories"].is_array() ||
+            explicit_archive_payload["memories"].size() != 1 ||
+            !explicit_archive_payload["memories"][0].value("isStatic", false) ||
+            explicit_archive_payload["memories"][0].value("content", std::string()).find("concise answers") == std::string::npos ||
+            explicit_archive_payload["memories"][0]["metadata"].value("sourceToolKind", 0) != LLAMA_TOOL_KIND_HARD_MEMORY_WRITE ||
+            explicit_archive_payload["memories"][0]["metadata"].value("kind", std::string()) != "user_model") {
+            std::fprintf(stderr, "explicit hard-memory write payload did not preserve Supermemory write shape\n");
+            llama_free(hard_memory_ctx);
+            mock_server.stop();
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::string explicit_auth_header = [&]() {
+            std::lock_guard<std::mutex> lock(mock_server.mutex);
+            return mock_server.last_archive_auth_header;
+        }();
+        const std::string explicit_api_key_header = [&]() {
+            std::lock_guard<std::mutex> lock(mock_server.mutex);
+            return mock_server.last_archive_api_key_header;
+        }();
+        if (explicit_auth_header != "Bearer sm_test_token" ||
+            explicit_api_key_header != "sm_test_token") {
+            std::fprintf(stderr, "explicit hard-memory write did not authenticate with the configured Supermemory API key\n");
             llama_free(hard_memory_ctx);
             mock_server.stop();
             llama_free(ctx);
