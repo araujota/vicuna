@@ -1799,6 +1799,7 @@ extern "C" {
         LLAMA_DMN_MAX_REPORTABLE_CONCEPTS = 4,
         LLAMA_DMN_PROMPT_MAX_CHARS = 512,
         LLAMA_DMN_PROMPT_OUTLINE_MAX_CHARS = 256,
+        LLAMA_DMN_REASONING_MAX_CHARS = 1024,
         LLAMA_TELEGRAM_RELAY_TEXT_MAX_CHARS = 1024,
         LLAMA_TELEGRAM_RELAY_DEDUPE_MAX_CHARS = 128,
         LLAMA_TELEGRAM_RELAY_ERROR_MAX_CHARS = 256,
@@ -2617,6 +2618,7 @@ extern "C" {
         int32_t tool_spec_index;
         int32_t tool_job_id;
         float favorable_divergence;
+        char reasoning_text[LLAMA_DMN_REASONING_MAX_CHARS];
         struct llama_cognitive_plan_trace plan;
         struct llama_functional_activation_decision functional_activation;
         struct llama_cognitive_loop_state loop_state;

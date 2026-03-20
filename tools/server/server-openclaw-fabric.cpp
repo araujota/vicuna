@@ -105,6 +105,76 @@ std::string trim_ascii_copy_local(const std::string & value) {
     return value.substr(begin, end - begin);
 }
 
+void extract_hidden_reasoning_and_visible_text(
+        const std::string & text,
+        std::string * out_reasoning,
+        std::string * out_visible) {
+    if (out_reasoning) {
+        out_reasoning->clear();
+    }
+    if (out_visible) {
+        out_visible->clear();
+    }
+
+    static const std::string think_open = "<think>";
+    static const std::string think_close = "</think>";
+
+    std::string visible;
+    std::string reasoning;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t think_start = text.find(think_open, pos);
+        if (think_start == std::string::npos) {
+            visible += text.substr(pos);
+            break;
+        }
+
+        visible += text.substr(pos, think_start - pos);
+        const size_t body_start = think_start + think_open.size();
+        const size_t think_end = text.find(think_close, body_start);
+        if (think_end == std::string::npos) {
+            visible += text.substr(think_start);
+            break;
+        }
+
+        const std::string chunk = trim_ascii_copy_local(text.substr(body_start, think_end - body_start));
+        if (!chunk.empty()) {
+            if (!reasoning.empty()) {
+                reasoning += "\n\n";
+            }
+            reasoning += chunk;
+        }
+        pos = think_end + think_close.size();
+    }
+
+    visible = trim_ascii_copy_local(visible);
+    reasoning = trim_ascii_copy_local(reasoning);
+    if (reasoning.empty() && !visible.empty()) {
+        reasoning = visible;
+        visible.clear();
+    }
+
+    if (out_reasoning) {
+        *out_reasoning = std::move(reasoning);
+    }
+    if (out_visible) {
+        *out_visible = std::move(visible);
+    }
+}
+
+std::string strip_hidden_reasoning_markup_preserve_text(const std::string & text) {
+    std::string reasoning;
+    std::string visible;
+    extract_hidden_reasoning_and_visible_text(text, &reasoning, &visible);
+    if (reasoning.empty()) {
+        return visible;
+    }
+    if (visible.empty()) {
+        return reasoning;
+    }
+    return reasoning + "\n" + visible;
+}
+
 bool skip_ws(const std::string & text, size_t * pos) {
     if (!pos) {
         return false;
@@ -1034,7 +1104,7 @@ bool server_openclaw_fabric::parse_tool_call_xml(
         return false;
     }
     const size_t root_close_end = root_end + std::strlen(SERVER_OPENCLAW_XML_ROOT) + 3;
-    const std::string visible_prefix = trim_ascii_copy_local(text.substr(0, root_start));
+    const std::string raw_prefix = trim_ascii_copy_local(text.substr(0, root_start));
     const std::string xml_block = text.substr(root_start, root_close_end - root_start);
     if (!trim_ascii_copy_local(text.substr(root_close_end)).empty()) {
         set_error(out_error, "tool-call XML must not have trailing content after the closing tag");
@@ -1168,13 +1238,17 @@ bool server_openclaw_fabric::parse_tool_call_xml(
 
     out_parsed->message = {};
     out_parsed->message.role = "assistant";
+    std::string planner_reasoning;
+    std::string visible_prefix;
+    extract_hidden_reasoning_and_visible_text(raw_prefix, &planner_reasoning, &visible_prefix);
     out_parsed->message.content = visible_prefix;
+    out_parsed->message.reasoning_content = planner_reasoning;
     out_parsed->message.tool_calls = { common_chat_tool_call { tool_name, arguments.dump(), "" } };
     out_parsed->visible_prefix = visible_prefix;
     out_parsed->xml_block = xml_block;
-    out_parsed->captured_planner_reasoning = visible_prefix;
+    out_parsed->captured_planner_reasoning = planner_reasoning;
     out_parsed->captured_tool_xml = xml_block;
-    out_parsed->captured_payload = join_payload(visible_prefix, xml_block);
+    out_parsed->captured_payload = join_payload(raw_prefix, xml_block);
     return true;
 }
 
@@ -1183,15 +1257,15 @@ std::string server_openclaw_fabric::strip_tool_call_xml_markup(const std::string
     const std::string root_close = std::string("</") + SERVER_OPENCLAW_XML_ROOT + ">";
     size_t start = text.find(root_open);
     if (start == std::string::npos) {
-        return trim_ascii_copy_local(text);
+        return strip_hidden_reasoning_markup_preserve_text(text);
     }
     size_t end = text.find(root_close, start);
     if (end == std::string::npos) {
-        return trim_ascii_copy_local(text.substr(0, start));
+        return strip_hidden_reasoning_markup_preserve_text(text.substr(0, start));
     }
     end += root_close.size();
-    const std::string prefix = trim_ascii_copy_local(text.substr(0, start));
-    const std::string suffix = trim_ascii_copy_local(text.substr(end));
+    const std::string prefix = strip_hidden_reasoning_markup_preserve_text(text.substr(0, start));
+    const std::string suffix = strip_hidden_reasoning_markup_preserve_text(text.substr(end));
     if (prefix.empty()) {
         return suffix;
     }

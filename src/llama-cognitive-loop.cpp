@@ -119,6 +119,7 @@ llama_process_functional_signature make_process_signature(
 int32_t primary_functional_family(const llama_functional_activation_decision & decision);
 void set_bounded_cstr(char * dst, size_t dst_size, const char * src);
 bool is_tavily_web_search_capability(const llama_cognitive_tool_spec * spec);
+std::string trim_ascii(const std::string & text);
 
 lexical_signals analyze_event_lexicon(const llama_vocab * vocab, const llama_self_state_event & event) {
     lexical_signals out = {};
@@ -826,6 +827,62 @@ std::string dmn_action_name(int32_t action) {
         case LLAMA_DMN_ACTION_EMIT:           return "emit";
         default: return "unknown";
     }
+}
+
+std::string dmn_concept_hint(
+        const llama_dmn_prompt_revision & prompt_revision,
+        int32_t kind) {
+    for (int32_t i = 0; i < prompt_revision.concept_count; ++i) {
+        const auto & concept = prompt_revision.concepts[i];
+        if (concept.valid && concept.kind == kind) {
+            return trim_ascii(concept.hint);
+        }
+    }
+    return std::string();
+}
+
+std::string compose_dmn_reasoning_trace(
+        const llama_dmn_tick_trace & trace,
+        const llama_cognitive_tool_spec * selected_spec) {
+    const std::string motive = dmn_concept_hint(trace.prompt_revision, LLAMA_DMN_CONCEPT_MOTIVE);
+    const std::string tension = dmn_concept_hint(trace.prompt_revision, LLAMA_DMN_CONCEPT_TENSION);
+    const std::string question = dmn_concept_hint(trace.prompt_revision, LLAMA_DMN_CONCEPT_QUESTION);
+    const std::string next_action = dmn_concept_hint(trace.prompt_revision, LLAMA_DMN_CONCEPT_NEXT_ACTION);
+
+    std::ostringstream oss;
+    if (!motive.empty()) {
+        oss << "Thought: " << motive << "\n";
+    }
+    if (!tension.empty()) {
+        oss << "State: " << tension << "\n";
+    }
+    if (!question.empty()) {
+        oss << "Question: " << question << "\n";
+    }
+
+    switch (trace.winner_action) {
+        case LLAMA_DMN_ACTION_INVOKE_TOOL:
+            oss << "Action: use "
+                << (selected_spec ? trim_ascii(selected_spec->name) : std::string("tool"))
+                << " because the prompt revision favors external progress.";
+            break;
+        case LLAMA_DMN_ACTION_INTERNAL_WRITE:
+            oss << "Action: write an internal reflection artifact because the current pressure profile still needs consolidation.";
+            break;
+        case LLAMA_DMN_ACTION_SILENT:
+            oss << "Action: remain silent because inhibition or governance is stronger than the current action affordance.";
+            break;
+        case LLAMA_DMN_ACTION_EMIT:
+            oss << "Action: emit a background-facing message.";
+            break;
+        default:
+            oss << "Action: hold the current state.";
+            break;
+    }
+    if (!next_action.empty()) {
+        oss << "\nNext: " << next_action;
+    }
+    return trim_ascii(oss.str());
 }
 
 int32_t command_kind_for_plan_step(int32_t step_kind) {
@@ -5604,6 +5661,9 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                      last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_DEFER) ?
                             LLAMA_COG_PLAN_STATUS_BLOCKED :
                             LLAMA_COG_PLAN_STATUS_EXECUTING;
+    trace.tool_kind = selected_dmn_spec ? selected_dmn_spec->tool_kind : LLAMA_TOOL_KIND_NONE;
+    trace.tool_spec_index = selected_dmn_spec_index;
+    copy_cstr_local(trace.reasoning_text, compose_dmn_reasoning_trace(trace, selected_dmn_spec));
     dmn_plan = trace.plan;
     dmn_runner.plan_id = trace.plan.plan_id;
     dmn_runner.plan_mode = trace.plan.mode;
@@ -5613,22 +5673,10 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     dmn_runner.planning_active = true;
 
     {
-        std::ostringstream artifact;
-        artifact.setf(std::ios::fixed);
-        artifact.precision(3);
-        artifact << "dmn plan prompt_revision=" << trace.prompt_revision.prompt_revision_id
-                 << " self_model_revision=" << trace.self_model_revision.revision_id
-                 << " winner=" << dmn_action_name(trace.winner_action)
-                 << " score=" << trace.winner_score
-                 << " pressure_total=" << trace.pressure.total
-                 << " continuation=" << trace.pressure.continuation
-                 << " remediation=" << last_remediation_plan.action
-                 << " governance=" << last_governance_trace.outcome
-                 << " steps=" << trace.plan.step_count;
         (void) emit_cognitive_artifact_text(
                 ctx,
                 llama_model_get_vocab(&ctx.get_model()),
-                artifact.str(),
+                trim_ascii(trace.reasoning_text),
                 LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
                 LLAMA_SELF_COG_ARTIFACT_DMN_PLAN,
                 LLAMA_COG_COMMAND_ORIGIN_DMN,
@@ -5715,9 +5763,13 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
 
     if (trace.winner_action == LLAMA_DMN_ACTION_INTERNAL_WRITE) {
         std::ostringstream internal_summary;
+        internal_summary << trim_ascii(trace.reasoning_text);
+        if (internal_summary.tellp() > 0) {
+            internal_summary << "\n";
+        }
         internal_summary.setf(std::ios::fixed);
         internal_summary.precision(3);
-        internal_summary << "dmn internal write contradiction=" << trace.pressure.contradiction
+        internal_summary << "Observation: contradiction=" << trace.pressure.contradiction
                          << " uncertainty=" << trace.pressure.uncertainty
                          << " continuation=" << trace.pressure.continuation
                          << " remediation=" << last_remediation_plan.action

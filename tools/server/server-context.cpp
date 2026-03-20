@@ -1511,6 +1511,63 @@ static std::string active_narration_fallback_text(const llama_active_loop_trace 
     return oss.str();
 }
 
+static void split_hidden_reasoning_text(
+        const std::string & text,
+        std::string * out_reasoning,
+        std::string * out_visible) {
+    if (out_reasoning) {
+        out_reasoning->clear();
+    }
+    if (out_visible) {
+        out_visible->clear();
+    }
+
+    static const std::string think_open = "<think>";
+    static const std::string think_close = "</think>";
+
+    std::string visible;
+    std::string reasoning;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t think_start = text.find(think_open, pos);
+        if (think_start == std::string::npos) {
+            visible += text.substr(pos);
+            break;
+        }
+
+        visible += text.substr(pos, think_start - pos);
+        const size_t body_start = think_start + think_open.size();
+        const size_t think_end = text.find(think_close, body_start);
+        if (think_end == std::string::npos) {
+            visible += text.substr(think_start);
+            break;
+        }
+
+        const std::string chunk = trim_ascii_copy(text.substr(body_start, think_end - body_start));
+        if (!chunk.empty()) {
+            if (!reasoning.empty()) {
+                reasoning += "\n\n";
+            }
+            reasoning += chunk;
+        }
+        pos = think_end + think_close.size();
+    }
+
+    visible = trim_ascii_copy(visible);
+    reasoning = trim_ascii_copy(reasoning);
+    if (reasoning.empty() && !visible.empty()) {
+        reasoning = visible;
+        visible.clear();
+    }
+
+    if (out_reasoning) {
+        *out_reasoning = std::move(reasoning);
+    }
+    if (out_visible) {
+        *out_visible = std::move(visible);
+    }
+}
+
 static json build_active_narration_json(
         const llama_active_loop_trace & trace,
         const std::string & planner_reasoning,
@@ -1543,12 +1600,15 @@ static std::string dmn_narration_fallback_text(const llama_dmn_tick_trace & trac
 }
 
 static json build_dmn_narration_json(const llama_dmn_tick_trace & trace) {
+    const std::string reasoning_text = trim_ascii_copy(bounded_cstr_to_string(trace.reasoning_text));
     const std::string rendered_prompt = trim_ascii_copy(bounded_cstr_to_string(trace.prompt_revision.rendered_prompt));
     const std::string macro_outline = trim_ascii_copy(bounded_cstr_to_string(trace.prompt_revision.macro_outline));
+    const bool have_reasoning = !reasoning_text.empty();
     const bool have_prompt = !rendered_prompt.empty();
     return {
-        {"source", have_prompt ? "prompt_revision" : "dmn_fallback"},
-        {"resolved_text", have_prompt ? rendered_prompt : dmn_narration_fallback_text(trace)},
+        {"source", have_reasoning ? "dmn_reasoning" : have_prompt ? "prompt_revision" : "dmn_fallback"},
+        {"resolved_text", have_reasoning ? reasoning_text : have_prompt ? rendered_prompt : dmn_narration_fallback_text(trace)},
+        {"planner_reasoning_text", reasoning_text},
         {"macro_outline", macro_outline},
         {"rendered_prompt", rendered_prompt},
     };
@@ -2562,8 +2622,11 @@ private:
 
         const std::string guidance =
                 "Active engagement runs as a stepwise ReAct loop. "
-                "When a tool is available for this step, begin with a short first-move sentence that says what you are trying to do and which tool you are using, then emit the tool call. "
+                "Keep planning in hidden reasoning content only. "
+                "Do not place planning text in visible assistant content. "
+                "When a tool is available for this step, put the short first-move reasoning in hidden thinking content, then emit the tool call. "
                 "After a tool result arrives, continue in the same conversation until you are satisfied with the answer. "
+                "On final answer turns, keep reasoning hidden and put only the user-facing answer in visible assistant content. "
                 "Keep planning concise and never claim a tool ran unless you emitted the tool call.";
 
         if (!task.react_messages.empty() && task.react_messages.front().role == "system") {
@@ -2646,8 +2709,8 @@ private:
         common_chat_msg phase_system;
         phase_system.role = "system";
         phase_system.content = tool_phase ?
-                "A tool is available for this step. Start with a short first-move sentence naming the tool you will use, then emit the tool-call XML exactly as specified below.\n\n" + xml_guidance :
-                "This is the answer phase. Use the tool observations already in the conversation and answer the user directly. Do not emit tool calls or tool-call markup.";
+                "A tool is available for this step. Put a short ReAct-style thought in hidden reasoning content or <think></think> tags, keep visible assistant content empty unless absolutely necessary, then emit the tool-call XML exactly as specified below.\n\n" + xml_guidance :
+                "This is the answer phase. Think in hidden reasoning content or <think></think> tags, then answer the user directly in visible assistant content. Do not emit tool calls or tool-call markup.";
         prompt_messages.push_back(std::move(phase_system));
 
         const common_chat_params chat_completion = build_chat_completion_params(
@@ -2691,13 +2754,17 @@ private:
 
             const std::string sanitized = openclaw_fabric.strip_tool_call_xml_markup(text);
             if (sanitized != trim_ascii_copy(text)) {
+                std::string reasoning_text;
+                std::string visible_text;
+                split_hidden_reasoning_text(sanitized, &reasoning_text, &visible_text);
                 out_msg->role = "assistant";
-                out_msg->content = sanitized;
+                out_msg->content = visible_text;
+                out_msg->reasoning_content = reasoning_text;
                 if (out_tool_xml) {
                     out_tool_xml->clear();
                 }
                 if (out_planner_reasoning) {
-                    *out_planner_reasoning = sanitized;
+                    *out_planner_reasoning = reasoning_text;
                 }
                 return !out_msg->empty();
             }
@@ -2723,7 +2790,8 @@ private:
                         continue;
                     }
                     out_msg->role = "assistant";
-                    out_msg->content = out_prefix ? trim_ascii_copy(*out_prefix) : std::string();
+                    out_msg->content.clear();
+                    out_msg->reasoning_content = out_prefix ? trim_ascii_copy(*out_prefix) : std::string();
                     out_msg->tool_calls = { common_chat_tool_call { tool.name, arguments, "" } };
                     return true;
                 }
@@ -2746,7 +2814,7 @@ private:
             out_tool_xml->clear();
         }
         if (out_planner_reasoning) {
-            *out_planner_reasoning = trim_ascii_copy(out_msg->content);
+            *out_planner_reasoning = trim_ascii_copy(out_msg->reasoning_content);
         }
         return !out_msg->empty();
     }
@@ -6681,7 +6749,6 @@ private:
                 parsed_final_msg) {
             server_task resumed_task = std::move(*slot.task);
             resumed_task.react_messages.push_back(final_msg);
-            append_react_visible_prefix(resumed_task, final_msg);
             resumed_task.react_last_planner_reasoning = trim_ascii_copy(planner_reasoning);
 
             int32_t pending_command_id = -1;
@@ -6797,13 +6864,11 @@ private:
                 }
             }
         }
-
         if (slot.task &&
                 react_task_ready(*slot.task) &&
                 parsed_final_msg &&
-                final_msg.tool_calls.empty() &&
-                !slot.task->react_visible_prefix.empty()) {
-            slot.generated_text = slot.task->react_visible_prefix + "\n\n" + slot.generated_text;
+                final_msg.tool_calls.empty()) {
+            slot.generated_text = final_msg.content;
         }
 
         auto res = std::make_unique<server_task_result_cmpl_final>();

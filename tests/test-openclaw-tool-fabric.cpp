@@ -165,7 +165,7 @@ int main() {
 
     server_openclaw_parsed_tool_call parsed = {};
     const std::string valid_tool_xml =
-            "I should inspect the filesystem first.\n"
+            "<think>I should inspect the filesystem first.</think>\n"
             "<vicuna_tool_call tool=\"exec\">\n"
             "  <arg name=\"command\" type=\"string\">pwd</arg>\n"
             "</vicuna_tool_call>";
@@ -182,8 +182,16 @@ int main() {
                 "expected typed JSON arguments from XML")) {
         return 1;
     }
+    if (!expect(parsed.message.content.empty(),
+                "expected hidden reasoning to be removed from visible assistant content")) {
+        return 1;
+    }
+    if (!expect(parsed.message.reasoning_content == "I should inspect the filesystem first.",
+                "expected hidden reasoning to populate assistant reasoning_content")) {
+        return 1;
+    }
     if (!expect(parsed.captured_planner_reasoning == "I should inspect the filesystem first.",
-                "expected planner reasoning capture to preserve only the visible prefix")) {
+                "expected planner reasoning capture to preserve hidden reasoning text")) {
         return 1;
     }
     if (!expect(parsed.captured_tool_xml ==
@@ -199,7 +207,7 @@ int main() {
 
     std::vector<int32_t> write_only = { 2 };
     const std::string valid_memory_write_xml =
-            "This should be preserved durably.\n"
+            "<think>This should be preserved durably.</think>\n"
             "<vicuna_tool_call tool=\"hard_memory_write\">\n"
             "  <arg name=\"memories\" type=\"json\">[{\"content\":\"The user prefers concise answers.\",\"kind\":\"user_model\",\"domain\":\"user_outcome\",\"tags\":[\"preference\"],\"isStatic\":true}]</arg>\n"
             "  <arg name=\"containerTag\" type=\"string\">vicuna-self-state</arg>\n"
@@ -210,6 +218,10 @@ int main() {
     if (!expect(parsed.message.tool_calls.size() == 1 &&
                 parsed.message.tool_calls[0].name == "hard_memory_write",
                 "expected hard-memory write tool XML to parse")) {
+        return 1;
+    }
+    if (!expect(parsed.message.reasoning_content == "This should be preserved durably.",
+                "expected hard-memory write XML to preserve hidden reasoning")) {
         return 1;
     }
     if (!expect(parsed.message.tool_calls[0].arguments.find("\"containerTag\":\"vicuna-self-state\"") != std::string::npos &&

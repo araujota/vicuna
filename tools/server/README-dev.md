@@ -343,11 +343,17 @@ Current event kinds are:
 
 Narration and exact tool-call capture now follow this policy:
 
-- active-loop provenance records plan detail, candidate detail, and planner
-  narration when available; if the model did not emit planner reasoning, the
-  server records a deterministic plan-based fallback narration instead
+- active-loop provenance records plan detail, candidate detail, and hidden
+  planner reasoning when available; that reasoning is retained internally in
+  the continuing ReAct transcript via `reasoning_content`, but the outward
+  assistant response is scrubbed to visible answer text only
+- if the active model did not emit hidden planner reasoning, the server records
+  a deterministic plan-based fallback narration instead
 - DMN provenance records the translated prompt revision, concept frames, plan
-  detail, candidate detail, and a resolved DMN narration text
+  detail, candidate detail, and a resolved hidden DMN reasoning trace
+- DMN hidden reasoning is also admitted as a cognitive artifact in the
+  counterfactual channel so later runtime context can reuse it without routing
+  it to user-visible outputs
 - tool requests are captured at dispatch time in `tool_call` events with exact
   structured payloads, then later paired with `tool_result` events via
   `command_id` and `tool_job_id`

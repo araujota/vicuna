@@ -1892,7 +1892,15 @@ int main(int argc, char ** argv) {
         }
 
         bool saw_active_plan_artifact = false;
+        bool saw_dmn_plan_artifact = false;
         bool saw_dmn_internal_artifact = false;
+        if (trace.reasoning_text[0] == '\0' ||
+            std::string(trace.reasoning_text).find("Action:") == std::string::npos) {
+            std::fprintf(stderr, "DMN trace did not expose hidden reasoning text\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
         const int32_t trace_count = llama_self_state_trace_count(ctx);
         if (trace_count <= 0 || llama_self_state_trace_token_count(ctx) <= 0) {
             std::fprintf(stderr, "missing shared cognitive trace after DMN internal write\n");
@@ -1911,6 +1919,9 @@ int main(int argc, char ** argv) {
             if (item.artifact_kind == LLAMA_SELF_COG_ARTIFACT_ACTIVE_PLAN) {
                 saw_active_plan_artifact = true;
             }
+            if (item.artifact_kind == LLAMA_SELF_COG_ARTIFACT_DMN_PLAN) {
+                saw_dmn_plan_artifact = true;
+            }
             if (item.artifact_kind == LLAMA_SELF_COG_ARTIFACT_DMN_INTERNAL_WRITE) {
                 if (item.loop_origin != LLAMA_COG_COMMAND_ORIGIN_DMN ||
                     item.channel != LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL ||
@@ -1923,8 +1934,8 @@ int main(int argc, char ** argv) {
                 saw_dmn_internal_artifact = true;
             }
         }
-        if (!saw_active_plan_artifact || !saw_dmn_internal_artifact) {
-            std::fprintf(stderr, "shared cognitive trace did not retain both active and DMN artifacts\n");
+        if (!saw_active_plan_artifact || !saw_dmn_plan_artifact || !saw_dmn_internal_artifact) {
+            std::fprintf(stderr, "shared cognitive trace did not retain active, DMN plan, and DMN internal artifacts\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
