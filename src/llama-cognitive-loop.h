@@ -21,6 +21,11 @@ public:
     bool cognitive_command_complete(int32_t command_id, bool cancelled);
     bool cognitive_command_begin_external_wait(int32_t command_id);
     bool cognitive_command_rebind_tool(int32_t command_id, int32_t tool_spec_index);
+    bool cognitive_authoritative_react_set_enabled(bool enabled);
+    bool cognitive_active_authoritative_begin_tool(int32_t episode_id, uint32_t reason_mask, float priority, int32_t * out_command_id, int32_t * out_tool_job_id);
+    bool cognitive_active_authoritative_finish(int32_t episode_id, int32_t terminal_reason);
+    bool cognitive_dmn_authoritative_begin_tool(int32_t tick_id, uint32_t reason_mask, float priority, int32_t * out_command_id, int32_t * out_tool_job_id);
+    bool cognitive_dmn_authoritative_finish(int32_t tick_id, int32_t terminal_reason);
     bool cognitive_active_tool_emission_note(int32_t command_id, const llama_token * tokens, size_t n_tokens);
     bool cognitive_active_planner_reasoning_note(int32_t episode_id, const llama_token * tokens, size_t n_tokens);
     bool codex_tool_configure(const llama_codex_tool_config & config);
@@ -69,6 +74,7 @@ private:
     llama_governance_trace last_governance_trace = {};
     llama_temporal_self_improvement_trace last_temporal_self_trace = {};
     llama_cognitive_host_state host_state = {};
+    bool authoritative_react_control_enabled = false;
     bool tool_selection_episode_open = false;
     llama_functional_outcome_snapshot tool_selection_before = {};
     int32_t tool_selection_tool_kind = LLAMA_TOOL_KIND_NONE;

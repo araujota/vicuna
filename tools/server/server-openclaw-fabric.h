@@ -17,6 +17,7 @@ enum server_openclaw_dispatch_backend {
     SERVER_OPENCLAW_DISPATCH_LEGACY_BASH = 1,
     SERVER_OPENCLAW_DISPATCH_LEGACY_HARD_MEMORY = 2,
     SERVER_OPENCLAW_DISPATCH_LEGACY_CODEX = 3,
+    SERVER_OPENCLAW_DISPATCH_LEGACY_TELEGRAM = 4,
 };
 
 struct server_openclaw_capability_runtime {

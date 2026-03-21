@@ -1039,6 +1039,73 @@ int main(int argc, char ** argv) {
     }
 
     {
+        g_contradiction_score = 0.05f;
+        g_uncertainty_score = 0.05f;
+        g_broadcast_score = 0.05f;
+
+        llama_context * ctx = create_context(model);
+        if (!ctx) {
+            std::fprintf(stderr, "failed to create authoritative active context\n");
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_tool_spec tavily_spec = {};
+        tavily_spec.tool_kind = LLAMA_TOOL_KIND_BASH_CLI;
+        tavily_spec.flags = LLAMA_COG_TOOL_ACTIVE_ELIGIBLE | LLAMA_COG_TOOL_DMN_ELIGIBLE;
+        tavily_spec.latency_class = LLAMA_COG_TOOL_LATENCY_MEDIUM;
+        tavily_spec.max_steps_reserved = 2;
+        std::snprintf(tavily_spec.name, sizeof(tavily_spec.name), "%s", "web_search");
+        std::snprintf(tavily_spec.description, sizeof(tavily_spec.description), "%s", "Search the live web through Tavily");
+        std::snprintf(tavily_spec.capability_id, sizeof(tavily_spec.capability_id), "%s", "openclaw.tavily.web_search");
+        std::snprintf(tavily_spec.owner_plugin_id, sizeof(tavily_spec.owner_plugin_id), "%s", "openclaw-tavily");
+        std::snprintf(tavily_spec.provenance_namespace, sizeof(tavily_spec.provenance_namespace), "%s", "openclaw/openclaw-tavily/tool/web_search");
+        if (llama_cognitive_tool_spec_set(ctx, &tavily_spec, 1) != 0 ||
+            llama_cognitive_authoritative_react_set_enabled(ctx, true) != 0) {
+            std::fprintf(stderr, "failed to configure authoritative active tool context\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> tokens = tokenize_or_die(vocab, "Please search the live web for the current CEO of IBM.");
+        const llama_self_state_event event = {
+            /*.tokens =*/ tokens.data(),
+            /*.n_tokens =*/ tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.05f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+
+        llama_active_loop_trace trace = {};
+        if (!expect_active_action("active-authoritative-react", ctx, event, LLAMA_ACTIVE_LOOP_ACTION_ACT, &trace)) {
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        llama_cognitive_active_runner_status runner = {};
+        if (llama_cognitive_command_count(ctx) != 0 ||
+            trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_PROPOSE ||
+            trace.loop_state.waiting_on_tool ||
+            trace.tool_proposal.valid ||
+            llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
+            !runner.active ||
+            runner.waiting_on_tool ||
+            runner.pending_command_id != -1 ||
+            runner.pending_tool_spec_index != -1 ||
+            runner.steps_taken <= 0) {
+            std::fprintf(stderr, "authoritative active mode did not stop at propose without enqueuing a CPU-selected tool command\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(ctx);
+    }
+
+    {
         g_contradiction_score = 0.10f;
         g_uncertainty_score = 0.10f;
         g_broadcast_score = 0.05f;
@@ -2642,6 +2709,85 @@ int main(int argc, char ** argv) {
             refreshed_trace.prompt_revision.prompt_revision_id <= first_prompt_revision_id ||
             refreshed_trace.prompt_revision.source_revision_id != refreshed_trace.self_model_revision.revision_id) {
             std::fprintf(stderr, "DMN prompt revision did not regenerate after self-model update\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(ctx);
+    }
+
+    {
+        g_contradiction_score = 0.22f;
+        g_uncertainty_score = 0.18f;
+        g_broadcast_score = 0.95f;
+
+        llama_context * ctx = create_context(model);
+        if (!ctx) {
+            std::fprintf(stderr, "failed to create authoritative DMN context\n");
+            llama_model_free(model);
+            return 1;
+        }
+
+        if (llama_cognitive_authoritative_react_set_enabled(ctx, true) != 0) {
+            std::fprintf(stderr, "failed to enable authoritative DMN control\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> goal_tokens = tokenize_or_die(vocab, "follow up with the user on the next step");
+        const std::vector<llama_token> handle_tokens = tokenize_or_die(vocab, "user follow up memory cluster");
+        const std::vector<llama_token> tokens = tokenize_or_die(vocab, "Please continue the follow up again with more details.");
+        if (llama_self_state_upsert_goal(ctx, 41, goal_tokens.data(), goal_tokens.size(), 1.0f) != 0 ||
+            llama_self_state_upsert_memory_handle(ctx, 42, LLAMA_SELF_MEMORY_HANDLE_WORKING_MEMORY_CLUSTER, handle_tokens.data(), handle_tokens.size(), 1.0f) != 0) {
+            std::fprintf(stderr, "failed to seed authoritative DMN context\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const llama_self_state_event event = {
+            /*.tokens =*/ tokens.data(),
+            /*.n_tokens =*/ tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.0f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+        if (!ingest_event_without_runner("seed-authoritative-dmn", ctx, event)) {
+            std::fprintf(stderr, "failed to ingest authoritative DMN seed event\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_dmn_tick_trace trace = {};
+        if (llama_dmn_tick(ctx, 8100, &trace) != 0 ||
+            !trace.admitted ||
+            trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_PROPOSE ||
+            trace.loop_state.waiting_on_tool ||
+            trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_NONE ||
+            trace.tool_proposal.valid ||
+            !trace.prompt_revision.valid ||
+            !trace.self_model_revision.valid ||
+            llama_cognitive_command_count(ctx) != 0) {
+            std::fprintf(stderr, "authoritative DMN mode did not stop at propose without enqueuing a CPU-selected tool command\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_dmn_runner_status runner = {};
+        if (llama_cognitive_dmn_runner_get(ctx, &runner) != 0 ||
+            !runner.active ||
+            runner.waiting_on_tool ||
+            runner.pending_command_id != -1 ||
+            runner.pending_tool_spec_index != -1 ||
+            runner.prompt_revision_id != trace.prompt_revision.prompt_revision_id ||
+            runner.self_model_revision_id != trace.self_model_revision.revision_id) {
+            std::fprintf(stderr, "authoritative DMN runner did not retain prompt/self-model state while awaiting model-authored control\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;

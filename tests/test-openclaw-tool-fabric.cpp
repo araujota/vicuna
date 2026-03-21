@@ -97,7 +97,7 @@ int main() {
     if (!expect(fabric.build_cognitive_specs(&specs), "failed to build cognitive specs")) {
         return 1;
     }
-    if (!expect(specs.size() == 4, "expected exec, hard-memory query, hard-memory write, and codex capabilities")) {
+    if (!expect(specs.size() == 5, "expected exec, hard-memory query, hard-memory write, codex, and telegram relay capabilities")) {
         return 1;
     }
     if (!expect(fabric.capability_by_tool_name("exec") != nullptr, "expected exec tool lookup to succeed")) {
@@ -107,6 +107,9 @@ int main() {
         return 1;
     }
     if (!expect(fabric.capability_by_tool_name("codex") != nullptr, "expected codex tool lookup to succeed")) {
+        return 1;
+    }
+    if (!expect(fabric.capability_by_tool_name("telegram_relay") != nullptr, "expected telegram relay tool lookup to succeed")) {
         return 1;
     }
     if (!expect(fabric.capability_by_tool_name("missing") == nullptr, "expected unknown tool lookup to fail")) {
@@ -122,11 +125,15 @@ int main() {
     if (!expect(legacy_filtered_fabric.build_cognitive_specs(&legacy_specs), "failed to build legacy-filtered cognitive specs")) {
         return 1;
     }
-    if (!expect(legacy_specs.size() == 3, "expected legacy allowlist to preserve exec plus the full hard-memory tool layer")) {
+    if (!expect(legacy_specs.size() == 4, "expected legacy allowlist to preserve exec, telegram relay, and the full hard-memory tool layer")) {
         return 1;
     }
     if (!expect(legacy_filtered_fabric.capability_by_tool_name("hard_memory_write") != nullptr,
                 "expected legacy allowlist compatibility to retain hard-memory write")) {
+        return 1;
+    }
+    if (!expect(legacy_filtered_fabric.capability_by_tool_name("telegram_relay") != nullptr,
+                "expected legacy allowlist compatibility to retain telegram relay")) {
         return 1;
     }
     if (!expect(legacy_filtered_fabric.capability_by_tool_name("codex") == nullptr,
@@ -227,6 +234,32 @@ int main() {
     if (!expect(parsed.message.tool_calls[0].arguments.find("\"containerTag\":\"vicuna-self-state\"") != std::string::npos &&
                 parsed.message.tool_calls[0].arguments.find("\"isStatic\":true") != std::string::npos,
                 "expected hard-memory write JSON arguments to preserve Supermemory fields")) {
+        return 1;
+    }
+
+    std::vector<int32_t> relay_only = { 4 };
+    const std::string relay_xml =
+            "<think>The latest self-model revision says I should ask the user for clarification.</think>\n"
+            "<vicuna_tool_call tool=\"telegram_relay\">\n"
+            "  <arg name=\"text\" type=\"string\">Can you clarify which IBM division you meant?</arg>\n"
+            "  <arg name=\"intent\" type=\"string\">question</arg>\n"
+            "  <arg name=\"dedupeKey\" type=\"string\">dmn-relay-42</arg>\n"
+            "</vicuna_tool_call>";
+    if (!expect(fabric.parse_tool_call_xml(relay_xml, &parsed, &relay_only, &error), error.c_str())) {
+        return 1;
+    }
+    if (!expect(parsed.message.tool_calls.size() == 1 &&
+                parsed.message.tool_calls[0].name == "telegram_relay",
+                "expected telegram relay tool XML to parse")) {
+        return 1;
+    }
+    if (!expect(parsed.message.reasoning_content.find("latest self-model revision") != std::string::npos,
+                "expected telegram relay XML to preserve hidden reasoning")) {
+        return 1;
+    }
+    if (!expect(parsed.message.tool_calls[0].arguments.find("\"intent\":\"question\"") != std::string::npos &&
+                parsed.message.tool_calls[0].arguments.find("\"dedupeKey\":\"dmn-relay-42\"") != std::string::npos,
+                "expected telegram relay JSON arguments to preserve intent and dedupe metadata")) {
         return 1;
     }
 
@@ -353,7 +386,7 @@ int main() {
     if (!expect(reloadable_fabric.build_cognitive_specs(&specs), "failed to build reloaded cognitive specs")) {
         return 1;
     }
-    if (!expect(specs.size() == 5, "expected built-ins plus one externally loaded capability")) {
+    if (!expect(specs.size() == 6, "expected built-ins plus one externally loaded capability")) {
         return 1;
     }
 

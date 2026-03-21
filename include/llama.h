@@ -2227,6 +2227,15 @@ extern "C" {
         LLAMA_TELEGRAM_RELAY_CONCLUSION = 2,
     };
 
+    enum llama_authoritative_react_action {
+        LLAMA_AUTHORITATIVE_REACT_ACTION_NONE = 0,
+        LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER = 1,
+        LLAMA_AUTHORITATIVE_REACT_ACTION_ASK = 2,
+        LLAMA_AUTHORITATIVE_REACT_ACTION_ACT = 3,
+        LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT = 4,
+        LLAMA_AUTHORITATIVE_REACT_ACTION_INTERNAL_WRITE = 5,
+    };
+
     struct llama_dmn_reportable_concept {
         bool valid;
         int32_t kind;
@@ -3335,6 +3344,31 @@ extern "C" {
             struct llama_context * ctx,
             int32_t command_id,
             int32_t tool_spec_index);
+    LLAMA_API int32_t llama_cognitive_authoritative_react_set_enabled(
+            struct llama_context * ctx,
+            bool enabled);
+    LLAMA_API int32_t llama_cognitive_active_authoritative_begin_tool(
+            struct llama_context * ctx,
+            int32_t episode_id,
+            uint32_t reason_mask,
+            float priority,
+            int32_t * out_command_id,
+            int32_t * out_tool_job_id);
+    LLAMA_API int32_t llama_cognitive_active_authoritative_finish(
+            struct llama_context * ctx,
+            int32_t episode_id,
+            int32_t terminal_reason);
+    LLAMA_API int32_t llama_cognitive_dmn_authoritative_begin_tool(
+            struct llama_context * ctx,
+            int32_t tick_id,
+            uint32_t reason_mask,
+            float priority,
+            int32_t * out_command_id,
+            int32_t * out_tool_job_id);
+    LLAMA_API int32_t llama_cognitive_dmn_authoritative_finish(
+            struct llama_context * ctx,
+            int32_t tick_id,
+            int32_t terminal_reason);
     LLAMA_API int32_t llama_cognitive_active_tool_emission_note(
             struct llama_context * ctx,
             int32_t command_id,

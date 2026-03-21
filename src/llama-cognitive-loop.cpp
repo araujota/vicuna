@@ -3624,6 +3624,163 @@ bool llama_cognitive_loop::cognitive_command_rebind_tool(int32_t command_id, int
     return true;
 }
 
+bool llama_cognitive_loop::cognitive_authoritative_react_set_enabled(bool enabled) {
+    authoritative_react_control_enabled = enabled;
+    return true;
+}
+
+bool llama_cognitive_loop::cognitive_active_authoritative_begin_tool(
+        int32_t episode_id,
+        uint32_t reason_mask,
+        float priority,
+        int32_t * out_command_id,
+        int32_t * out_tool_job_id) {
+    if (out_command_id) {
+        *out_command_id = -1;
+    }
+    if (out_tool_job_id) {
+        *out_tool_job_id = -1;
+    }
+    if (episode_id <= 0 || active_runner.episode_id != episode_id || !active_runner.active) {
+        return false;
+    }
+
+    compact_command_queue(command_queue, &command_count);
+    if (command_count >= LLAMA_COGNITIVE_MAX_PENDING_COMMANDS) {
+        return false;
+    }
+
+    const int32_t tool_job_id = next_tool_job_id++;
+    const int32_t command_id = next_command_id++;
+    init_command(
+            command_queue[command_count++],
+            command_id,
+            LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+            LLAMA_COG_COMMAND_INVOKE_TOOL,
+            episode_id,
+            0,
+            LLAMA_TOOL_KIND_NONE,
+            -1,
+            tool_job_id,
+            reason_mask,
+            priority,
+            -1,
+            LLAMA_COG_LOOP_PHASE_PREPARE_TOOL,
+            nullptr);
+    (void) ctx.self_state_upsert_tool_job(tool_job_id, LLAMA_SELF_TOOL_JOB_PENDING, clamp_unit(priority));
+    active_runner.pending_command_id = command_id;
+    active_runner.pending_tool_spec_index = -1;
+    active_runner.last_command_id = command_id;
+    active_runner.waiting_on_tool = true;
+    active_runner.completed = false;
+    active_runner.active = true;
+    active_runner.plan_status = LLAMA_COG_PLAN_STATUS_WAITING_TOOL;
+    if (out_command_id) {
+        *out_command_id = command_id;
+    }
+    if (out_tool_job_id) {
+        *out_tool_job_id = tool_job_id;
+    }
+    return true;
+}
+
+bool llama_cognitive_loop::cognitive_active_authoritative_finish(int32_t episode_id, int32_t terminal_reason) {
+    if (episode_id <= 0 || active_runner.episode_id != episode_id) {
+        return false;
+    }
+    active_runner.waiting_on_tool = false;
+    active_runner.pending_command_id = -1;
+    active_runner.pending_tool_spec_index = -1;
+    active_runner.completed = true;
+    active_runner.active = false;
+    active_runner.planning_active = false;
+    active_runner.plan_status = LLAMA_COG_PLAN_STATUS_COMPLETED;
+    if (active_plan.valid) {
+        active_plan.status = LLAMA_COG_PLAN_STATUS_COMPLETED;
+        active_plan.terminal_reason = terminal_reason;
+        if (active_plan.current_step_index >= 0 && active_plan.current_step_index < active_plan.step_count) {
+            active_plan.steps[active_plan.current_step_index].status = LLAMA_COG_PLAN_STEP_STATUS_COMPLETED;
+        }
+    }
+    return true;
+}
+
+bool llama_cognitive_loop::cognitive_dmn_authoritative_begin_tool(
+        int32_t tick_id,
+        uint32_t reason_mask,
+        float priority,
+        int32_t * out_command_id,
+        int32_t * out_tool_job_id) {
+    if (out_command_id) {
+        *out_command_id = -1;
+    }
+    if (out_tool_job_id) {
+        *out_tool_job_id = -1;
+    }
+    if (tick_id <= 0 || dmn_runner.tick_id != tick_id || !dmn_runner.active) {
+        return false;
+    }
+
+    compact_command_queue(command_queue, &command_count);
+    if (command_count >= LLAMA_COGNITIVE_MAX_PENDING_COMMANDS) {
+        return false;
+    }
+
+    const int32_t tool_job_id = next_tool_job_id++;
+    const int32_t command_id = next_command_id++;
+    init_command(
+            command_queue[command_count++],
+            command_id,
+            LLAMA_COG_COMMAND_ORIGIN_DMN,
+            LLAMA_COG_COMMAND_INVOKE_TOOL,
+            0,
+            tick_id,
+            LLAMA_TOOL_KIND_NONE,
+            -1,
+            tool_job_id,
+            reason_mask,
+            priority,
+            -1,
+            LLAMA_COG_LOOP_PHASE_PREPARE_TOOL,
+            nullptr);
+    (void) ctx.self_state_upsert_tool_job(tool_job_id, LLAMA_SELF_TOOL_JOB_PENDING, clamp_unit(priority));
+    dmn_runner.pending_command_id = command_id;
+    dmn_runner.pending_tool_spec_index = -1;
+    dmn_runner.last_command_id = command_id;
+    dmn_runner.waiting_on_tool = true;
+    dmn_runner.completed = false;
+    dmn_runner.active = true;
+    dmn_runner.plan_status = LLAMA_COG_PLAN_STATUS_WAITING_TOOL;
+    if (out_command_id) {
+        *out_command_id = command_id;
+    }
+    if (out_tool_job_id) {
+        *out_tool_job_id = tool_job_id;
+    }
+    return true;
+}
+
+bool llama_cognitive_loop::cognitive_dmn_authoritative_finish(int32_t tick_id, int32_t terminal_reason) {
+    if (tick_id <= 0 || dmn_runner.tick_id != tick_id) {
+        return false;
+    }
+    dmn_runner.waiting_on_tool = false;
+    dmn_runner.pending_command_id = -1;
+    dmn_runner.pending_tool_spec_index = -1;
+    dmn_runner.completed = true;
+    dmn_runner.active = false;
+    dmn_runner.planning_active = false;
+    dmn_runner.plan_status = LLAMA_COG_PLAN_STATUS_COMPLETED;
+    if (dmn_plan.valid) {
+        dmn_plan.status = LLAMA_COG_PLAN_STATUS_COMPLETED;
+        dmn_plan.terminal_reason = terminal_reason;
+        if (dmn_plan.current_step_index >= 0 && dmn_plan.current_step_index < dmn_plan.step_count) {
+            dmn_plan.steps[dmn_plan.current_step_index].status = LLAMA_COG_PLAN_STEP_STATUS_COMPLETED;
+        }
+    }
+    return true;
+}
+
 bool llama_cognitive_loop::cognitive_command_begin_external_wait(int32_t command_id) {
     const int32_t index = find_command_index(command_queue, command_count, command_id);
     if (index < 0) {
@@ -4456,7 +4613,37 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
             clamp_unit((float) plan_revision_count / 4.0f));
     activate_microphase(final_microphase, tool_affinity);
 
-    if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
+    if (authoritative_react_control_enabled) {
+        set_loop_state(
+                trace.loop_state,
+                LLAMA_COG_LOOP_PHASE_PROPOSE,
+                LLAMA_COG_TERMINAL_NONE,
+                active_runner.max_steps,
+                resuming_active_tool ? active_runner.steps_taken + 1 : 1,
+                true,
+                false,
+                tool_spec_count);
+        trace.tool_followup_expected = false;
+        if (trace.plan.step_count > 0) {
+            const int32_t ready_step = first_ready_plan_step(trace.plan);
+            if (ready_step >= 0) {
+                trace.plan.steps[ready_step].status = LLAMA_COG_PLAN_STEP_STATUS_ACTIVE;
+            }
+            trace.plan.current_step_index = ready_step >= 0 ? ready_step : 0;
+            trace.plan.terminal_reason = LLAMA_COG_TERMINAL_NONE;
+            trace.plan.status = LLAMA_COG_PLAN_STATUS_EXECUTING;
+        }
+        active_runner.steps_taken = trace.loop_state.steps_taken;
+        active_runner.waiting_on_tool = false;
+        active_runner.pending_command_id = -1;
+        active_runner.pending_tool_spec_index = -1;
+        active_runner.completed = false;
+        active_runner.active = true;
+        active_runner.plan_status = LLAMA_COG_PLAN_STATUS_EXECUTING;
+        active_runner.current_plan_step = trace.plan.current_step_index;
+        active_plan = trace.plan;
+        tool_selection_episode_open = false;
+    } else if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
         const int32_t tool_job_id = next_tool_job_id++;
         trace.tool_proposal.job_id = tool_job_id;
         (void) ctx.self_state_upsert_tool_job(tool_job_id, LLAMA_SELF_TOOL_JOB_PENDING, clamp_unit(trace.winner_score));
@@ -5513,6 +5700,67 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     const llama_cognitive_tool_spec * selected_dmn_spec = nullptr;
     const llama_cognitive_tool_spec * telegram_spec = find_tool_spec(tool_specs, tool_spec_count, LLAMA_TOOL_KIND_TELEGRAM_RELAY, &selected_dmn_spec_index);
     selected_dmn_spec_index = -1;
+
+    if (authoritative_react_control_enabled) {
+        const float control_score = clamp_unit(std::max(std::max(
+                current_prompt_revision.user_contact_affinity,
+                current_prompt_revision.tool_affinity),
+                reflective_pressure));
+        init_plan_trace(
+                trace.plan,
+                next_plan_id++,
+                LLAMA_COG_COMMAND_ORIGIN_DMN,
+                0,
+                control_score,
+                clamp_unit(0.20f * trace.pressure.uncertainty + 0.10f * trace.pressure.contradiction),
+                base_reason);
+        (void) append_plan_step(
+                trace.plan,
+                LLAMA_COG_PLAN_STEP_WAIT,
+                LLAMA_COG_PLAN_STEP_STATUS_READY,
+                LLAMA_TOOL_KIND_NONE,
+                last_remediation_plan.source_family,
+                base_reason,
+                control_score,
+                1,
+                false);
+        trace.plan.current_step_index = 0;
+        trace.plan.status = LLAMA_COG_PLAN_STATUS_EXECUTING;
+        trace.plan.terminal_reason = LLAMA_COG_TERMINAL_NONE;
+        set_loop_state(
+                trace.loop_state,
+                LLAMA_COG_LOOP_PHASE_PROPOSE,
+                LLAMA_COG_TERMINAL_NONE,
+                dmn_runner.max_steps,
+                1,
+                true,
+                false,
+                tool_spec_count);
+        trace.winner_action = LLAMA_DMN_ACTION_SILENT;
+        trace.winner_score = control_score;
+        trace.tool_kind = LLAMA_TOOL_KIND_NONE;
+        trace.tool_spec_index = -1;
+        trace.reasoning_text[0] = '\0';
+        dmn_plan = trace.plan;
+        dmn_runner.steps_taken = 1;
+        dmn_runner.waiting_on_tool = false;
+        dmn_runner.pending_command_id = -1;
+        dmn_runner.pending_tool_spec_index = -1;
+        dmn_runner.completed = false;
+        dmn_runner.active = true;
+        dmn_runner.plan_id = trace.plan.plan_id;
+        dmn_runner.plan_mode = trace.plan.mode;
+        dmn_runner.plan_status = trace.plan.status;
+        dmn_runner.plan_revision_count = trace.plan.revision_count;
+        dmn_runner.current_plan_step = trace.plan.current_step_index;
+        dmn_runner.planning_active = true;
+        last_dmn_trace = trace;
+        host_state.last_dmn_time_us = now_us;
+        if (out_trace) {
+            *out_trace = trace;
+        }
+        return true;
+    }
 
     const bool wants_user_contact =
             current_prompt_revision.valid &&
@@ -6911,6 +7159,46 @@ bool llama_context::cognitive_command_rebind_tool(int32_t command_id, int32_t to
     return cognitive_loop && cognitive_loop->cognitive_command_rebind_tool(command_id, tool_spec_index);
 }
 
+bool llama_context::cognitive_authoritative_react_set_enabled(bool enabled) {
+    return cognitive_loop && cognitive_loop->cognitive_authoritative_react_set_enabled(enabled);
+}
+
+bool llama_context::cognitive_active_authoritative_begin_tool(
+        int32_t episode_id,
+        uint32_t reason_mask,
+        float priority,
+        int32_t * out_command_id,
+        int32_t * out_tool_job_id) {
+    return cognitive_loop && cognitive_loop->cognitive_active_authoritative_begin_tool(
+            episode_id,
+            reason_mask,
+            priority,
+            out_command_id,
+            out_tool_job_id);
+}
+
+bool llama_context::cognitive_active_authoritative_finish(int32_t episode_id, int32_t terminal_reason) {
+    return cognitive_loop && cognitive_loop->cognitive_active_authoritative_finish(episode_id, terminal_reason);
+}
+
+bool llama_context::cognitive_dmn_authoritative_begin_tool(
+        int32_t tick_id,
+        uint32_t reason_mask,
+        float priority,
+        int32_t * out_command_id,
+        int32_t * out_tool_job_id) {
+    return cognitive_loop && cognitive_loop->cognitive_dmn_authoritative_begin_tool(
+            tick_id,
+            reason_mask,
+            priority,
+            out_command_id,
+            out_tool_job_id);
+}
+
+bool llama_context::cognitive_dmn_authoritative_finish(int32_t tick_id, int32_t terminal_reason) {
+    return cognitive_loop && cognitive_loop->cognitive_dmn_authoritative_finish(tick_id, terminal_reason);
+}
+
 bool llama_context::cognitive_active_tool_emission_note(int32_t command_id, const llama_token * tokens, size_t n_tokens) {
     return cognitive_loop && cognitive_loop->cognitive_active_tool_emission_note(command_id, tokens, n_tokens);
 }
@@ -7094,6 +7382,56 @@ int32_t llama_cognitive_command_rebind_tool(
         int32_t command_id,
         int32_t tool_spec_index) {
     return ctx && ctx->cognitive_command_rebind_tool(command_id, tool_spec_index) ? 0 : -1;
+}
+
+int32_t llama_cognitive_authoritative_react_set_enabled(
+        struct llama_context * ctx,
+        bool enabled) {
+    return ctx && ctx->cognitive_authoritative_react_set_enabled(enabled) ? 0 : -1;
+}
+
+int32_t llama_cognitive_active_authoritative_begin_tool(
+        struct llama_context * ctx,
+        int32_t episode_id,
+        uint32_t reason_mask,
+        float priority,
+        int32_t * out_command_id,
+        int32_t * out_tool_job_id) {
+    return ctx && ctx->cognitive_active_authoritative_begin_tool(
+            episode_id,
+            reason_mask,
+            priority,
+            out_command_id,
+            out_tool_job_id) ? 0 : -1;
+}
+
+int32_t llama_cognitive_active_authoritative_finish(
+        struct llama_context * ctx,
+        int32_t episode_id,
+        int32_t terminal_reason) {
+    return ctx && ctx->cognitive_active_authoritative_finish(episode_id, terminal_reason) ? 0 : -1;
+}
+
+int32_t llama_cognitive_dmn_authoritative_begin_tool(
+        struct llama_context * ctx,
+        int32_t tick_id,
+        uint32_t reason_mask,
+        float priority,
+        int32_t * out_command_id,
+        int32_t * out_tool_job_id) {
+    return ctx && ctx->cognitive_dmn_authoritative_begin_tool(
+            tick_id,
+            reason_mask,
+            priority,
+            out_command_id,
+            out_tool_job_id) ? 0 : -1;
+}
+
+int32_t llama_cognitive_dmn_authoritative_finish(
+        struct llama_context * ctx,
+        int32_t tick_id,
+        int32_t terminal_reason) {
+    return ctx && ctx->cognitive_dmn_authoritative_finish(tick_id, terminal_reason) ? 0 : -1;
 }
 
 int32_t llama_cognitive_active_tool_emission_note(

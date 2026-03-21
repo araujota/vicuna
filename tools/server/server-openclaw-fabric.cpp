@@ -74,6 +74,12 @@ bool builtin_tool_enabled_for_env(const char * tool_id) {
             env_list_contains("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS", "hard_memory_query", false)) {
         return true;
     }
+    // Compatibility: preserve the DMN user-contact relay when older host-local
+    // allowlists pin the builtin surface to exec + hard_memory_query.
+    if (std::strcmp(tool_id, "telegram_relay") == 0 &&
+            env_list_contains("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS", "hard_memory_query", false)) {
+        return true;
+    }
     return false;
 }
 
@@ -656,6 +662,12 @@ bool dispatch_backend_from_string(
         }
         return true;
     }
+    if (value == "legacy_telegram") {
+        if (out_backend) {
+            *out_backend = SERVER_OPENCLAW_DISPATCH_LEGACY_TELEGRAM;
+        }
+        return true;
+    }
     set_error(out_error, "unsupported dispatch_backend: " + value);
     return false;
 }
@@ -670,6 +682,10 @@ bool hard_memory_available(bool /*bash_enabled*/, bool hard_memory_enabled, bool
 
 bool codex_available(bool /*bash_enabled*/, bool /*hard_memory_enabled*/, bool codex_enabled) {
     return codex_enabled;
+}
+
+bool telegram_available(bool /*bash_enabled*/, bool /*hard_memory_enabled*/, bool /*codex_enabled*/) {
+    return true;
 }
 
 openclaw_tool_capability_descriptor build_exec_descriptor() {
@@ -803,6 +819,31 @@ openclaw_tool_capability_descriptor build_codex_descriptor() {
     return codex;
 }
 
+openclaw_tool_capability_descriptor build_telegram_relay_descriptor() {
+    openclaw_tool_capability_descriptor relay = {};
+    relay.capability_id = "openclaw.vicuna.telegram_relay";
+    relay.tool_surface_id = "vicuna.telegram.relay";
+    relay.capability_kind = "tool";
+    relay.owner_plugin_id = "vicuna-runtime";
+    relay.tool_name = "telegram_relay";
+    relay.description = "Send a DMN-origin question, comment, or conclusion through the Telegram bridge";
+    relay.input_schema_json =
+            R"({"type":"object","required":["text"],"properties":{"text":{"type":"string"},"intent":{"type":"string"},"dedupeKey":{"type":"string"},"urgency":{"type":"number"}}})";
+    relay.output_contract = "completed_result";
+    relay.side_effect_class = "user_contact";
+    relay.approval_mode = "none";
+    relay.execution_modes = {"sync"};
+    relay.provenance_namespace = "openclaw/vicuna-runtime/tool/telegram_relay";
+    relay.tool_kind = LLAMA_TOOL_KIND_TELEGRAM_RELAY;
+    relay.tool_flags =
+            LLAMA_COG_TOOL_DMN_ELIGIBLE |
+            LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT;
+    relay.latency_class = LLAMA_COG_TOOL_LATENCY_LOW;
+    relay.max_steps_reserved = 2;
+    relay.dispatch_backend = "legacy_telegram";
+    return relay;
+}
+
 const builtin_capability_registration * builtin_capability_registrations(size_t * out_count) {
     static const builtin_capability_registration registrations[] = {
         {
@@ -828,6 +869,12 @@ const builtin_capability_registration * builtin_capability_registrations(size_t 
             SERVER_OPENCLAW_DISPATCH_LEGACY_CODEX,
             codex_available,
             build_codex_descriptor,
+        },
+        {
+            "telegram_relay",
+            SERVER_OPENCLAW_DISPATCH_LEGACY_TELEGRAM,
+            telegram_available,
+            build_telegram_relay_descriptor,
         },
     };
     if (out_count) {

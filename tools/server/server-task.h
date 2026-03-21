@@ -125,6 +125,12 @@ struct task_result_state {
         bool filter_tool_calls = false);
 };
 
+enum server_react_origin {
+    SERVER_REACT_ORIGIN_NONE = 0,
+    SERVER_REACT_ORIGIN_ACTIVE = 1,
+    SERVER_REACT_ORIGIN_DMN = 2,
+};
+
 struct server_task {
     int id = -1; // to be filled by server_queue
 
@@ -154,12 +160,17 @@ struct server_task {
     bool react_transcript_seeded = false;
     bool react_waiting_for_final_answer = false;
     int32_t react_iteration = 0;
+    int32_t react_origin = SERVER_REACT_ORIGIN_NONE;
+    int32_t react_retry_count = 0;
+    int32_t react_retry_limit = 2;
     size_t react_initial_message_count = 0;
     std::string react_visible_prefix;
     std::string react_last_planner_reasoning;
     std::string react_last_tool_xml_payload;
     std::vector<common_chat_msg> react_messages;
     std::vector<common_chat_tool> react_tools;
+    llama_dmn_tick_trace dmn_trace = {};
+    bool has_dmn_trace = false;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -254,12 +265,17 @@ struct server_task {
         copy.react_transcript_seeded = react_transcript_seeded;
         copy.react_waiting_for_final_answer = react_waiting_for_final_answer;
         copy.react_iteration = react_iteration;
+        copy.react_origin = react_origin;
+        copy.react_retry_count = react_retry_count;
+        copy.react_retry_limit = react_retry_limit;
         copy.react_initial_message_count = react_initial_message_count;
         copy.react_visible_prefix = react_visible_prefix;
         copy.react_last_planner_reasoning = react_last_planner_reasoning;
         copy.react_last_tool_xml_payload = react_last_tool_xml_payload;
         copy.react_messages = react_messages;
         copy.react_tools = react_tools;
+        copy.dmn_trace = dmn_trace;
+        copy.has_dmn_trace = has_dmn_trace;
         copy.id_slot   = -1; // child tasks cannot specify slot
 
         // use different sampling seed for each child

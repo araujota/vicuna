@@ -300,6 +300,11 @@ struct llama_context {
     bool cognitive_command_complete(int32_t command_id, bool cancelled);
     bool cognitive_command_begin_external_wait(int32_t command_id);
     bool cognitive_command_rebind_tool(int32_t command_id, int32_t tool_spec_index);
+    bool cognitive_authoritative_react_set_enabled(bool enabled);
+    bool cognitive_active_authoritative_begin_tool(int32_t episode_id, uint32_t reason_mask, float priority, int32_t * out_command_id, int32_t * out_tool_job_id);
+    bool cognitive_active_authoritative_finish(int32_t episode_id, int32_t terminal_reason);
+    bool cognitive_dmn_authoritative_begin_tool(int32_t tick_id, uint32_t reason_mask, float priority, int32_t * out_command_id, int32_t * out_tool_job_id);
+    bool cognitive_dmn_authoritative_finish(int32_t tick_id, int32_t terminal_reason);
     bool cognitive_active_tool_emission_note(int32_t command_id, const llama_token * tokens, size_t n_tokens);
     bool cognitive_active_planner_reasoning_note(int32_t episode_id, const llama_token * tokens, size_t n_tokens);
     bool cognitive_active_runner_get(llama_cognitive_active_runner_status * out_status) const;

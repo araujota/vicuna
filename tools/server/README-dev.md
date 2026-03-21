@@ -211,6 +211,31 @@ budget rather than as the stop condition. Real termination comes from explicit
 completion, tool waits, governance blocking, pressure admission, or foreground
 preemption.
 
+### Authoritative ReAct Control
+
+When the OpenClaw tool fabric is enabled, `server_context` now turns on
+authoritative ReAct control in the cognitive runtime. That changes the
+division of responsibility between the CPU loop and model generation:
+
+- CPU-side active and DMN traces still compute typed telemetry, plan state,
+  tool availability, and safety constraints
+- CPU-side policy no longer gets to authoritatively enqueue the final
+  `answer` / `ask` / `act` / `wait` decision or choose the concrete tool
+- instead, the server requests one hidden ReAct control step with explicit
+  `Thought:` and `Action:` lines plus a canonical XML tool call when the
+  action is `act`
+- the hidden ReAct step is validated against the exposed tool registry and
+  safety policy; invalid control output is critiqued and regenerated instead
+  of being silently replaced by a fallback CPU tool choice
+- only after validation does host code bind the selected tool request and
+  dispatch it
+
+This is why active and DMN runners now stop in `LLAMA_COG_LOOP_PHASE_PROPOSE`
+with no pending command when authoritative mode is enabled: the cognitive loop
+is yielding to the planner/tool LoRA stream to write the authoritative control
+step, and the CPU side resumes responsibility only for validation, dispatch,
+and observation integration.
+
 ### ReAct Tool-Call XML Contract
 
 For active-loop ReAct tool steps, host code now enforces one canonical tool
