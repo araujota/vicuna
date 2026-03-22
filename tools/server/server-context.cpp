@@ -3357,6 +3357,9 @@ private:
                 }
             }
         }
+        if (out_command_id) {
+            *out_command_id = command_id;
+        }
         const std::string intent_hint = react_intent_hint(task);
 
         if (capability->backend == SERVER_OPENCLAW_DISPATCH_LEGACY_BASH) {
@@ -3608,9 +3611,6 @@ private:
             return false;
         }
 
-        if (out_command_id) {
-            *out_command_id = command_id;
-        }
         SRV_INF("react rebound command=%d tool=\"%s\" backend=%d capability=\"%s\"\n",
                 command_id,
                 emitted_tool_name.empty() ? capability->descriptor.tool_name.c_str() : emitted_tool_name.c_str(),
@@ -7728,6 +7728,18 @@ static bool telegram_dialogue_history_from_json(
                                     &request_error) &&
                             pending_command_id > 0;
                     if (!queued) {
+                        if (pending_command_id > 0) {
+                            (void) llama_cognitive_command_complete(ctx, pending_command_id, true);
+                        }
+                        if (resumed_task.react_retry_count < resumed_task.react_retry_limit) {
+                            resumed_task.react_retry_count += 1;
+                            resumed_task.react_retry_feedback =
+                                    "Tool dispatch rejected: " + request_error;
+                            if (prepare_react_prompt(resumed_task)) {
+                                queue_tasks.post(std::move(resumed_task), true);
+                                return;
+                            }
+                        }
                         send_error(resumed_task, "Failed to queue authoritative ReAct tool dispatch: " + request_error, ERROR_TYPE_SERVER);
                         return;
                     }
