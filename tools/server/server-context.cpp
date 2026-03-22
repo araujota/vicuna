@@ -2837,8 +2837,10 @@ private:
             return false;
         }
 
-        return item.episode_or_tick_id > 0 &&
-               item.episode_or_tick_id == task.active_trace.episode_id;
+        // During a resumed Telegram turn, the prompt must be able to see the just-admitted
+        // non-visible shared-context chain even if the active trace was rehydrated under a
+        // different episode id. Fresh user-facing turns still exclude these items entirely.
+        return true;
     }
 
     std::string shared_context_summary_text_for_task(const server_task & task, int32_t limit = 8) const {
