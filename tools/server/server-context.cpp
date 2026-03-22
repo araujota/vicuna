@@ -3093,7 +3093,7 @@ private:
             if (out_msg->reasoning_content.empty()) {
                 out_msg->reasoning_content = reasoning_text;
             }
-            if (out_msg->tool_calls.empty() && trim_ascii_copy(out_msg->content).empty() && !visible_text.empty()) {
+            if (out_msg->tool_calls.empty()) {
                 out_msg->content = std::move(visible_text);
             }
         }
