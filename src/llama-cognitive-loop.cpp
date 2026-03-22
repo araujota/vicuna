@@ -5603,7 +5603,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         llama_self_state_feature_vector update_features = {};
         const llama_self_state_feature_vector * feature_ptr =
                 ctx.self_state_build_postwrite_features(update_event, &update_features) ? &update_features : nullptr;
-        (void) ctx.functional_lora_apply_update(
+        if (!ctx.functional_lora_apply_update(
                 family,
                 LLAMA_COG_COMMAND_ORIGIN_DMN,
                 start_microphase,
@@ -5617,7 +5617,11 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 clamp_signed_unit(signed_outcome),
                 clamp_unit(magnitude),
                 update_event,
-                feature_ptr);
+                feature_ptr)) {
+            std::fprintf(stderr,
+                    "%s: functional LoRA update failed family=%d start_microphase=%d settle_microphase=%d signed_outcome=%.3f magnitude=%.3f\n",
+                    __func__, family, start_microphase, settle_microphase, signed_outcome, magnitude);
+        }
         (void) emit_cognitive_artifact_tokens(
                 ctx,
                 update_tokens,
@@ -5765,23 +5769,45 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 0.10f * std::max(0.0f, 1.0f - best_functional_candidate->fragility_penalty));
         if (best_functional_candidate->functional_target_kind == LLAMA_FUNCTIONAL_LORA_TARGET_PROCESS_ENTRY &&
                 best_functional_candidate->process_entry_slot >= 0) {
-            (void) ctx.process_functional_apply_differential_update(
+            if (!ctx.process_functional_apply_differential_update(
                     best_functional_candidate->process_entry_slot,
                     best_functional_candidate->proposal_family,
                     best_functional_candidate->replay_mode,
                     best_functional_candidate->snapshot_slot,
                     best_functional_candidate->signed_advantage_vs_current,
                     differential_magnitude,
-                    best_functional_candidate->robustness_score);
+                    best_functional_candidate->robustness_score)) {
+                std::fprintf(stderr,
+                        "%s: process-functional differential update failed entry_slot=%d proposal_family=%d replay_mode=%d snapshot_slot=%d signed_delta=%.3f magnitude=%.3f robustness=%.3f\n",
+                        __func__,
+                        best_functional_candidate->process_entry_slot,
+                        best_functional_candidate->proposal_family,
+                        best_functional_candidate->replay_mode,
+                        best_functional_candidate->snapshot_slot,
+                        best_functional_candidate->signed_advantage_vs_current,
+                        differential_magnitude,
+                        best_functional_candidate->robustness_score);
+            }
         } else {
-            (void) ctx.functional_lora_apply_differential_update(
+            if (!ctx.functional_lora_apply_differential_update(
                     best_functional_candidate->functional_family,
                     best_functional_candidate->proposal_family,
                     best_functional_candidate->replay_mode,
                     best_functional_candidate->snapshot_slot,
                     best_functional_candidate->signed_advantage_vs_current,
                     differential_magnitude,
-                    best_functional_candidate->robustness_score);
+                    best_functional_candidate->robustness_score)) {
+                std::fprintf(stderr,
+                        "%s: functional differential update failed family=%d proposal_family=%d replay_mode=%d snapshot_slot=%d signed_delta=%.3f magnitude=%.3f robustness=%.3f\n",
+                        __func__,
+                        best_functional_candidate->functional_family,
+                        best_functional_candidate->proposal_family,
+                        best_functional_candidate->replay_mode,
+                        best_functional_candidate->snapshot_slot,
+                        best_functional_candidate->signed_advantage_vs_current,
+                        differential_magnitude,
+                        best_functional_candidate->robustness_score);
+            }
         }
     }
 
