@@ -2939,17 +2939,23 @@ private:
                     "<think>\nThought: "
                     "Continue that Thought line in at most two short sentences and roughly 40 words total. "
                     "Do not narrate recall attempts, filler, or stream-of-consciousness. "
-                    "Then add a new line with exactly:\n"
-                    "Action: answer|ask|act|wait\n"
-                    "Then close the block with </think>.\n"
+                    "Then add the Action line required for this step and close the block with </think>.\n"
                     "If Action is act, emit exactly one tool-call XML block immediately after the hidden reasoning. "
                     "If Action is answer or ask, put only the user-visible reply in visible assistant content. "
                     "If Action is wait, leave visible assistant content empty. "
                     "If the latest user turn requests current, live, dated, or otherwise external facts and a relevant external tool is available, choose act and use that tool instead of disclaiming lack of access. ") +
                     (active_initial_tool_call_required ?
                             "This is the first active control step for a live user turn. "
-                            "You must choose Action: act and emit exactly one tool-call XML block. "
-                            "Do not answer, ask, or conclude anything yet. The final answer must wait for a tool observation.\n" :
+                            "Your Action line must be exactly:\n"
+                            "Action: act\n"
+                            "After that, close </think> and emit exactly one tool-call XML block. "
+                            "Do not emit visible assistant text. Do not answer, ask, wait, or conclude anything yet. "
+                            "The final answer must wait for a tool observation.\n" :
+                            "Your Action line must be exactly one of:\n"
+                            "Action: answer|ask|act|wait\n") +
+                    (!active_initial_tool_call_required && task.react_resuming_from_tool_result ?
+                            "Because a tool observation is already present, any answer or question must be grounded in that observation. "
+                            "If you still need more evidence, choose Action: act and emit exactly one further tool call.\n" :
                             "") +
                     (task.react_resuming_from_tool_result ?
                             "A completed tool observation was just admitted. Based only on that tool observation, choose act, answer, or ask. "
