@@ -256,6 +256,11 @@ window into runtime-owned dialogue history before preparing the next
 authoritative ReAct step. That keeps runtime-side Telegram dialogue continuity
 alive across active replies, DMN emits, and runtime snapshot restore.
 
+The Tavily-backed `web_search` tool is now also explicitly source-first. The
+wrapper no longer treats Tavily's generated `answer` field as authoritative by
+default; it retrieves bounded multi-source evidence instead and expects the
+authoritative ReAct loop to synthesize from returned URLs, scores, and excerpts.
+
 Runtime snapshot restore now accepts snapshot schema version `6`, which is the
 first version that persists the Telegram dialogue object. That keeps bounded
 Telegram continuity available after a service restart instead of forcing the

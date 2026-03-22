@@ -187,15 +187,19 @@ function tavilyWebSearchCapability(): CapabilityDescriptor {
     capability_kind: "tool",
     owner_plugin_id: "openclaw-tavily",
     tool_name: "web_search",
-    description: "Search the live web through Tavily and return ranked results with snippets",
+    description: "Search the live web through Tavily and return ranked source evidence with URLs and excerpts; synthesize from the returned sources rather than expecting a provider-generated answer",
     input_schema_json: {
       type: "object",
       required: ["query"],
       properties: {
         query: { type: "string" },
-        topic: { type: "string", enum: ["general", "news"] },
+        topic: { type: "string", enum: ["general", "news", "finance"] },
         search_depth: { type: "string", enum: ["basic", "advanced"] },
-        max_results: { type: "integer", minimum: 1, maximum: 10 }
+        max_results: { type: "integer", minimum: 3, maximum: 8, default: 5 },
+        time_range: { type: "string", enum: ["day", "week", "month", "year"] },
+        include_domains: { type: "array", items: { type: "string" } },
+        exclude_domains: { type: "array", items: { type: "string" } },
+        country: { type: "string" }
       }
     },
     output_contract: "completed_result",

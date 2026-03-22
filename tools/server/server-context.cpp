@@ -3898,6 +3898,10 @@ private:
                 const std::string topic = trim_ascii_copy(json_value(arguments, "topic", std::string()));
                 const std::string search_depth = trim_ascii_copy(json_value(arguments, "search_depth", std::string()));
                 const int32_t max_results = json_value(arguments, "max_results", 0);
+                const std::string time_range = trim_ascii_copy(json_value(arguments, "time_range", std::string()));
+                const std::string country = trim_ascii_copy(json_value(arguments, "country", std::string()));
+                const auto include_domains = json_value(arguments, "include_domains", json::array());
+                const auto exclude_domains = json_value(arguments, "exclude_domains", json::array());
                 if (!topic.empty()) {
                     command_text += " --topic=" + topic;
                 }
@@ -3906,6 +3910,50 @@ private:
                 }
                 if (max_results > 0) {
                     command_text += " --max-results=" + std::to_string(max_results);
+                }
+                if (!time_range.empty()) {
+                    command_text += " --time-range=" + time_range;
+                }
+                if (!country.empty()) {
+                    command_text += " --country=" + percent_encode_query(country);
+                }
+                if (include_domains.is_array() && !include_domains.empty()) {
+                    std::vector<std::string> domains;
+                    for (const auto & entry : include_domains) {
+                        const std::string domain = trim_ascii_copy(entry.get<std::string>());
+                        if (!domain.empty()) {
+                            domains.push_back(domain);
+                        }
+                    }
+                    if (!domains.empty()) {
+                        std::ostringstream joined;
+                        for (size_t i = 0; i < domains.size(); ++i) {
+                            if (i > 0) {
+                                joined << ',';
+                            }
+                            joined << domains[i];
+                        }
+                        command_text += " --include-domains=" + percent_encode_query(joined.str());
+                    }
+                }
+                if (exclude_domains.is_array() && !exclude_domains.empty()) {
+                    std::vector<std::string> domains;
+                    for (const auto & entry : exclude_domains) {
+                        const std::string domain = trim_ascii_copy(entry.get<std::string>());
+                        if (!domain.empty()) {
+                            domains.push_back(domain);
+                        }
+                    }
+                    if (!domains.empty()) {
+                        std::ostringstream joined;
+                        for (size_t i = 0; i < domains.size(); ++i) {
+                            if (i > 0) {
+                                joined << ',';
+                            }
+                            joined << domains[i];
+                        }
+                        command_text += " --exclude-domains=" + percent_encode_query(joined.str());
+                    }
                 }
             }
 

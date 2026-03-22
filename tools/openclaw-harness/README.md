@@ -35,3 +35,20 @@ both of:
 If an emitted external catalog entry omits both active and DMN eligibility, the
 runtime now rejects that catalog instead of silently loading an unreachable
 tool.
+
+## Tavily Search Policy
+
+The Tavily-backed `web_search` tool is intentionally source-first.
+
+- the wrapper does not request Tavily's provider-generated `answer` field by
+  default
+- the wrapper requests richer source evidence using raw-content-compatible
+  retrieval and bounded multi-chunk excerpts
+- the wrapper maintains a quality floor on `max_results` so a weak single hit
+  does not dominate the observation by default
+- the runtime-facing schema exposes `time_range`, `include_domains`,
+  `exclude_domains`, `country`, `search_depth`, `topic`, and `max_results` so
+  ReAct can tune retrieval explicitly when needed
+
+The intended use is: retrieve evidence here, then let the authoritative ReAct
+loop synthesize from the returned URLs and excerpts.

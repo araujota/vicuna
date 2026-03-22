@@ -138,6 +138,19 @@ test("runtime catalog includes Tavily only when the OpenClaw secret is present",
       COG_TOOL_FLAG_REMEDIATION_SAFE |
       COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
   );
+  assert.deepEqual(
+    Object.keys((catalog.capabilities[0]?.input_schema_json as { properties: Record<string, unknown> }).properties).sort(),
+    [
+      "country",
+      "exclude_domains",
+      "include_domains",
+      "max_results",
+      "query",
+      "search_depth",
+      "time_range",
+      "topic",
+    ]
+  );
 });
 
 test("OpenClaw secrets persist Tavily config and emit a runtime catalog", () => {
