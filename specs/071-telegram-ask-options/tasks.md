@@ -22,4 +22,4 @@
 
 - [x] T008 Add native regression coverage for the new tool descriptor, XML parsing, and request/result plumbing in `/Users/tyleraraujo/vicuna/tests/test-openclaw-tool-fabric.cpp` and `/Users/tyleraraujo/vicuna/tests/test-cognitive-loop.cpp`
 - [x] T009 Update operator and architecture docs in `/Users/tyleraraujo/vicuna/tools/server/README-dev.md`, `/Users/tyleraraujo/vicuna/tools/telegram-bridge/README.md`, and `/Users/tyleraraujo/vicuna/ARCHITECTURE.md`
-- [ ] T010 Run targeted local validation and rebuild the host runtime and bridge, then verify the new tool is present in the live capability set
+- [x] T010 Run targeted local validation and rebuild the host runtime and bridge, then verify the new tool is present in the live capability set
