@@ -869,6 +869,26 @@ struct vicuna_telegram_dialogue_snapshot {
     std::unordered_map<std::string, int64_t> latest_message_id_by_scope;
 };
 
+struct vicuna_telegram_outbox_item {
+    uint64_t sequence_number = 0;
+    std::string kind;
+    std::string chat_scope;
+    std::string dedupe_key;
+    std::string question;
+    std::vector<std::string> options;
+    int64_t created_at_ms = 0;
+};
+
+struct vicuna_telegram_outbox {
+    mutable std::mutex mutex;
+    size_t max_items = 64;
+    uint64_t next_sequence_number = 1;
+    std::deque<vicuna_telegram_outbox_item> items;
+    uint64_t publish_total = 0;
+    uint64_t dropped_total = 0;
+    int64_t last_publish_ms = 0;
+};
+
 static std::string bounded_cstr_to_string(const char * value) {
     return value ? std::string(value) : std::string();
 }
@@ -1411,6 +1431,26 @@ static json telegram_relay_request_to_json(const llama_telegram_relay_request & 
     };
 }
 
+static json telegram_ask_options_request_to_json(const llama_telegram_ask_options_request & request) {
+    json options = json::array();
+    const int32_t option_count = std::clamp(request.option_count, 0, LLAMA_TELEGRAM_ASK_MAX_OPTIONS);
+    for (int32_t i = 0; i < option_count; ++i) {
+        options.push_back(bounded_cstr_to_string(request.options[i].label));
+    }
+    return {
+        {"command_id", request.command_id},
+        {"origin", request.origin},
+        {"tool_job_id", request.tool_job_id},
+        {"urgency", request.urgency},
+        {"command_ready", request.command_ready},
+        {"option_count", option_count},
+        {"dedupe_key", bounded_cstr_to_string(request.dedupe_key)},
+        {"chat_scope", bounded_cstr_to_string(request.chat_scope)},
+        {"question", bounded_cstr_to_string(request.question)},
+        {"options", std::move(options)},
+    };
+}
+
 static json bash_result_to_json(const llama_bash_tool_result & result) {
     return {
         {"command_id", result.command_id},
@@ -1475,6 +1515,18 @@ static json telegram_relay_result_to_json(const llama_telegram_relay_result & re
         {"delivered", result.delivered},
         {"delivered_at_ms", result.delivered_at_ms},
         {"dedupe_key", bounded_cstr_to_string(result.dedupe_key)},
+        {"error_text", bounded_cstr_to_string(result.error_text)},
+    };
+}
+
+static json telegram_ask_options_result_to_json(const llama_telegram_ask_options_result & result) {
+    return {
+        {"command_id", result.command_id},
+        {"tool_job_id", result.tool_job_id},
+        {"delivered", result.delivered},
+        {"delivered_at_ms", result.delivered_at_ms},
+        {"dedupe_key", bounded_cstr_to_string(result.dedupe_key)},
+        {"chat_scope", bounded_cstr_to_string(result.chat_scope)},
         {"error_text", bounded_cstr_to_string(result.error_text)},
     };
 }
@@ -2605,6 +2657,7 @@ private:
     vicuna_provenance_repository_state provenance_repository;
     vicuna_external_observability external_observability;
     mutable vicuna_proactive_mailbox proactive_mailbox;
+    mutable vicuna_telegram_outbox telegram_outbox;
     mutable vicuna_telegram_dialogue_history telegram_dialogue_history;
     mutable bool runtime_state_dirty = false;
     bool bash_tool_enabled = false;
@@ -3707,44 +3760,114 @@ private:
                 return false;
             }
         } else if (capability->backend == SERVER_OPENCLAW_DISPATCH_LEGACY_TELEGRAM) {
-            llama_telegram_relay_request request = {};
-            if (llama_cognitive_telegram_relay_get_request(ctx, command_id, &request) != 0) {
-                request.command_id = command_id;
-                request.origin = origin;
-                request.tool_job_id = tool_job_id;
-            }
-            std::string relay_text = trim_ascii_copy(json_value(arguments, "text", std::string()));
-            if (relay_text.empty()) {
-                relay_text = trim_ascii_copy(intent_hint);
-            }
-            if (relay_text.empty()) {
-                if (out_error) {
-                    *out_error = "telegram relay tool call did not include any text";
+            if (capability->tool_spec.tool_kind == LLAMA_TOOL_KIND_TELEGRAM_ASK_OPTIONS) {
+                llama_telegram_ask_options_request request = {};
+                if (llama_cognitive_telegram_ask_options_get_request(ctx, command_id, &request) != 0) {
+                    request.command_id = command_id;
+                    request.origin = origin;
+                    request.tool_job_id = tool_job_id;
                 }
-                return false;
-            }
-            const std::string dedupe_key = trim_ascii_copy(json_value(arguments, "dedupeKey", std::string()));
-            const std::string intent = trim_ascii_copy(json_value(arguments, "intent", std::string()));
-            request.intent_kind = telegram_intent_kind_from_text(intent);
-            request.urgency = std::clamp(
-                    json_value(
-                            arguments,
-                            "urgency",
-                            task.has_dmn_trace ? task.dmn_trace.winner_score : 0.5f),
-                    0.0f,
-                    1.0f);
-            request.command_ready = true;
-            std::snprintf(
-                    request.dedupe_key,
-                    sizeof(request.dedupe_key),
-                    "%s",
-                    dedupe_key.empty() ? ("react-relay-" + std::to_string(command_id)).c_str() : dedupe_key.c_str());
-            std::snprintf(request.text, sizeof(request.text), "%s", relay_text.c_str());
-            if (llama_cognitive_telegram_relay_set_request(ctx, &request) != 0) {
-                if (out_error) {
-                    *out_error = "failed to install updated telegram relay request";
+                std::string question = trim_ascii_copy(json_value(arguments, "question", std::string()));
+                if (question.empty()) {
+                    question = trim_ascii_copy(intent_hint);
                 }
-                return false;
+                const json options_json = arguments.value("options", json::array());
+                std::vector<std::string> options;
+                if (options_json.is_array()) {
+                    for (const auto & item : options_json) {
+                        const std::string label = trim_ascii_copy(item.is_string() ? item.get<std::string>() : std::string());
+                        if (!label.empty()) {
+                            options.push_back(label);
+                        }
+                        if ((int32_t) options.size() >= LLAMA_TELEGRAM_ASK_MAX_OPTIONS) {
+                            break;
+                        }
+                    }
+                }
+                if (question.empty() || options.size() < 2) {
+                    if (out_error) {
+                        *out_error = "ask_with_options tool call requires a question and at least two options";
+                    }
+                    return false;
+                }
+
+                const std::string dedupe_key = trim_ascii_copy(json_value(arguments, "dedupeKey", std::string()));
+                const std::string chat_scope =
+                        !trim_ascii_copy(task.telegram_chat_scope).empty() ?
+                                trim_ascii_copy(task.telegram_chat_scope) :
+                                dmn_telegram_dialogue_scope_locked();
+                if (chat_scope.empty()) {
+                    if (out_error) {
+                        *out_error = "ask_with_options could not resolve a Telegram chat scope";
+                    }
+                    return false;
+                }
+
+                request.urgency = std::clamp(
+                        json_value(
+                                arguments,
+                                "urgency",
+                                task.has_dmn_trace ? task.dmn_trace.winner_score : 0.5f),
+                        0.0f,
+                        1.0f);
+                request.command_ready = true;
+                request.option_count = std::min<int32_t>((int32_t) options.size(), LLAMA_TELEGRAM_ASK_MAX_OPTIONS);
+                std::snprintf(request.question, sizeof(request.question), "%s", question.c_str());
+                std::snprintf(request.chat_scope, sizeof(request.chat_scope), "%s", chat_scope.c_str());
+                std::snprintf(
+                        request.dedupe_key,
+                        sizeof(request.dedupe_key),
+                        "%s",
+                        dedupe_key.empty() ? ("react-ask-" + std::to_string(command_id)).c_str() : dedupe_key.c_str());
+                for (int32_t i = 0; i < request.option_count; ++i) {
+                    std::snprintf(request.options[i].label, sizeof(request.options[i].label), "%s", options[(size_t) i].c_str());
+                }
+                if (llama_cognitive_telegram_ask_options_set_request(ctx, &request) != 0) {
+                    if (out_error) {
+                        *out_error = "failed to install updated ask_with_options request";
+                    }
+                    return false;
+                }
+            } else {
+                llama_telegram_relay_request request = {};
+                if (llama_cognitive_telegram_relay_get_request(ctx, command_id, &request) != 0) {
+                    request.command_id = command_id;
+                    request.origin = origin;
+                    request.tool_job_id = tool_job_id;
+                }
+                std::string relay_text = trim_ascii_copy(json_value(arguments, "text", std::string()));
+                if (relay_text.empty()) {
+                    relay_text = trim_ascii_copy(intent_hint);
+                }
+                if (relay_text.empty()) {
+                    if (out_error) {
+                        *out_error = "telegram relay tool call did not include any text";
+                    }
+                    return false;
+                }
+                const std::string dedupe_key = trim_ascii_copy(json_value(arguments, "dedupeKey", std::string()));
+                const std::string intent = trim_ascii_copy(json_value(arguments, "intent", std::string()));
+                request.intent_kind = telegram_intent_kind_from_text(intent);
+                request.urgency = std::clamp(
+                        json_value(
+                                arguments,
+                                "urgency",
+                                task.has_dmn_trace ? task.dmn_trace.winner_score : 0.5f),
+                        0.0f,
+                        1.0f);
+                request.command_ready = true;
+                std::snprintf(
+                        request.dedupe_key,
+                        sizeof(request.dedupe_key),
+                        "%s",
+                        dedupe_key.empty() ? ("react-relay-" + std::to_string(command_id)).c_str() : dedupe_key.c_str());
+                std::snprintf(request.text, sizeof(request.text), "%s", relay_text.c_str());
+                if (llama_cognitive_telegram_relay_set_request(ctx, &request) != 0) {
+                    if (out_error) {
+                        *out_error = "failed to install updated telegram relay request";
+                    }
+                    return false;
+                }
             }
         } else {
             if (out_error) {
@@ -4609,6 +4732,85 @@ static bool telegram_dialogue_history_from_json(
             {"fail_total", snapshot.fail_total},
             {"dropped_total", snapshot.dropped_total},
             {"last_publish_ms", snapshot.last_publish_ms},
+        };
+    }
+
+    bool telegram_outbox_publish_ask_options(
+            const std::string & chat_scope,
+            const std::string & dedupe_key,
+            const std::string & question,
+            const std::vector<std::string> & options) const {
+        const std::string normalized_scope = normalize_telegram_chat_scope(chat_scope);
+        const std::string trimmed_question = trim_ascii_copy(question);
+        if (normalized_scope.empty() || trimmed_question.empty() || options.size() < 2) {
+            return false;
+        }
+
+        vicuna_telegram_outbox_item item = {};
+        item.sequence_number = 0;
+        item.kind = "ask_with_options";
+        item.chat_scope = normalized_scope;
+        item.dedupe_key = trim_ascii_copy(dedupe_key);
+        item.question = trimmed_question;
+        item.options.reserve(options.size());
+        for (const auto & option : options) {
+            const std::string trimmed = trim_ascii_copy(option);
+            if (!trimmed.empty()) {
+                item.options.push_back(trimmed);
+            }
+        }
+        if (item.options.size() < 2) {
+            return false;
+        }
+        item.created_at_ms = ggml_time_ms();
+
+        {
+            std::lock_guard<std::mutex> lock(telegram_outbox.mutex);
+            item.sequence_number = telegram_outbox.next_sequence_number++;
+            telegram_outbox.items.push_back(std::move(item));
+            telegram_outbox.publish_total++;
+            telegram_outbox.last_publish_ms = ggml_time_ms();
+            while (telegram_outbox.items.size() > telegram_outbox.max_items) {
+                telegram_outbox.items.pop_front();
+                telegram_outbox.dropped_total++;
+            }
+        }
+
+        return true;
+    }
+
+    std::vector<json> telegram_outbox_collect_items(uint64_t after_sequence, uint64_t * out_last_sequence) const {
+        std::lock_guard<std::mutex> lock(telegram_outbox.mutex);
+        std::vector<json> items;
+        uint64_t last_sequence = after_sequence;
+        for (const auto & item : telegram_outbox.items) {
+            if (item.sequence_number <= after_sequence) {
+                continue;
+            }
+            items.push_back({
+                {"sequence_number", item.sequence_number},
+                {"kind", item.kind},
+                {"chat_scope", item.chat_scope},
+                {"dedupe_key", item.dedupe_key},
+                {"question", item.question},
+                {"options", item.options},
+                {"created_at_ms", item.created_at_ms},
+            });
+            last_sequence = item.sequence_number;
+        }
+        if (out_last_sequence) {
+            *out_last_sequence = last_sequence;
+        }
+        return items;
+    }
+
+    json build_telegram_outbox_health_json() const {
+        std::lock_guard<std::mutex> lock(telegram_outbox.mutex);
+        return {
+            {"stored_items", (int) telegram_outbox.items.size()},
+            {"publish_total", telegram_outbox.publish_total},
+            {"dropped_total", telegram_outbox.dropped_total},
+            {"last_publish_ms", telegram_outbox.last_publish_ms},
         };
     }
 
@@ -5920,6 +6122,28 @@ static bool telegram_dialogue_history_from_json(
             }
         };
 
+        auto submit_telegram_ask_result = [&](const llama_cognitive_command & command,
+                                              const llama_telegram_ask_options_request * request,
+                                              bool delivered,
+                                              const char * error_text) {
+            llama_telegram_ask_options_result result = {};
+            result.command_id = command.command_id;
+            result.tool_job_id = command.tool_job_id;
+            result.delivered = delivered;
+            result.delivered_at_ms = delivered ? ggml_time_ms() : 0;
+            if (request) {
+                std::snprintf(result.dedupe_key, sizeof(result.dedupe_key), "%s", request->dedupe_key);
+                std::snprintf(result.chat_scope, sizeof(result.chat_scope), "%s", request->chat_scope);
+            }
+            if (error_text && error_text[0] != '\0') {
+                std::snprintf(result.error_text, sizeof(result.error_text), "%s", error_text);
+            }
+            if (llama_cognitive_telegram_ask_options_submit_result(ctx, &result, nullptr) == 0) {
+                mark_runtime_state_dirty("telegram-ask-options-immediate-result");
+                capture_tool_result_provenance("telegram_ask_options_immediate", telegram_ask_options_result_to_json(result), nullptr);
+            }
+        };
+
         bool dispatched = false;
         const int32_t command_count = llama_cognitive_command_count(ctx);
         for (int32_t i = 0; i < command_count; ++i) {
@@ -5996,6 +6220,69 @@ static bool telegram_dialogue_history_from_json(
                         command.origin,
                         request.tool_job_id,
                         response_id.c_str(),
+                        request.dedupe_key);
+                continue;
+            }
+
+            if (command.tool_kind == LLAMA_TOOL_KIND_TELEGRAM_ASK_OPTIONS) {
+                llama_telegram_ask_options_request request = {};
+                if (llama_cognitive_telegram_ask_options_get_request(ctx, command.command_id, &request) != 0) {
+                    SRV_WRN("telegram ask command %d did not have a pending request\n", command.command_id);
+                    submit_telegram_ask_result(command, nullptr, false, "telegram ask request was missing");
+                    continue;
+                }
+
+                const std::string question = trim_ascii_copy(request.question);
+                const std::string chat_scope = trim_ascii_copy(request.chat_scope);
+                std::vector<std::string> options;
+                const int32_t option_count = std::clamp(request.option_count, 0, LLAMA_TELEGRAM_ASK_MAX_OPTIONS);
+                for (int32_t i = 0; i < option_count; ++i) {
+                    const std::string label = trim_ascii_copy(request.options[i].label);
+                    if (!label.empty()) {
+                        options.push_back(label);
+                    }
+                }
+                if (!request.command_ready || question.empty() || chat_scope.empty() || options.size() < 2) {
+                    submit_telegram_ask_result(command, &request, false, "ask_with_options request was incomplete");
+                    continue;
+                }
+
+                capture_tool_call_provenance(
+                        "ask_with_options",
+                        command,
+                        telegram_ask_options_request_to_json(request));
+
+                if (!telegram_outbox_publish_ask_options(chat_scope, request.dedupe_key, question, options)) {
+                    submit_telegram_ask_result(command, &request, false, "telegram ask prompt enqueue failed");
+                    continue;
+                }
+
+                append_telegram_dialogue_assistant_turn(
+                        chat_scope,
+                        question,
+                        command.origin == LLAMA_COG_COMMAND_ORIGIN_DMN ? "telegram_ask_options_dmn" : "telegram_ask_options_active",
+                        std::string(),
+                        request.dedupe_key);
+
+                if (!admit_runtime_emit_text(
+                            ctx,
+                            question,
+                            command.origin,
+                            LLAMA_FUNCTIONAL_MICROPHASE_NONE,
+                            command.command_id,
+                            -1,
+                            LLAMA_SELF_STATE_EVENT_EMIT_FOLLOWUP)) {
+                    SRV_WRN("failed to admit telegram ask command %d into self-state\n", command.command_id);
+                }
+
+                submit_telegram_ask_result(command, &request, true, "");
+                mark_runtime_state_dirty("telegram-ask-options-publish");
+                dispatched = true;
+                SRV_INF("enqueued telegram ask-with-options command %d origin=%d job=%d scope=%s dedupe=\"%s\"\n",
+                        command.command_id,
+                        command.origin,
+                        request.tool_job_id,
+                        request.chat_scope,
                         request.dedupe_key);
                 continue;
             }
@@ -7098,6 +7385,7 @@ static bool telegram_dialogue_history_from_json(
                 }},
             }},
             {"proactive_mailbox", build_proactive_mailbox_health_json()},
+            {"telegram_outbox", build_telegram_outbox_health_json()},
             {"telegram_dialogue", build_telegram_dialogue_health_json()},
             {"runtime_persistence", {
                 {"enabled", false},
@@ -10865,6 +11153,18 @@ void server_routes::init_routes() {
             ctx_this->proactive_mailbox_disconnect_live_stream();
             return false;
         };
+        return res;
+    };
+
+    this->get_telegram_outbox = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        const uint64_t after_sequence = parse_uint64_param(req.get_param("after"), 0);
+        uint64_t last_sequence = after_sequence;
+        const std::vector<json> items = ctx_server.telegram_outbox_collect_items(after_sequence, &last_sequence);
+        res->ok({
+            {"items", items},
+            {"last_sequence", last_sequence},
+        });
         return res;
     };
 

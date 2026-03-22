@@ -80,6 +80,11 @@ bool builtin_tool_enabled_for_env(const char * tool_id) {
             env_list_contains("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS", "hard_memory_query", false)) {
         return true;
     }
+    if (std::strcmp(tool_id, "ask_with_options") == 0 &&
+            (env_list_contains("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS", "telegram_relay", false) ||
+             env_list_contains("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS", "hard_memory_query", false))) {
+        return true;
+    }
     return false;
 }
 
@@ -1004,6 +1009,32 @@ openclaw_tool_capability_descriptor build_telegram_relay_descriptor() {
     return relay;
 }
 
+openclaw_tool_capability_descriptor build_telegram_ask_options_descriptor() {
+    openclaw_tool_capability_descriptor ask = {};
+    ask.capability_id = "openclaw.vicuna.ask_with_options";
+    ask.tool_surface_id = "vicuna.telegram.ask_with_options";
+    ask.capability_kind = "tool";
+    ask.owner_plugin_id = "vicuna-runtime";
+    ask.tool_name = "ask_with_options";
+    ask.description = "Ask the Telegram user a question with inline reply options and continue once they choose one";
+    ask.input_schema_json =
+            R"({"type":"object","required":["question","options"],"properties":{"question":{"type":"string"},"options":{"type":"array","minItems":2,"maxItems":6,"items":{"type":"string"}},"dedupeKey":{"type":"string"},"urgency":{"type":"number"}}})";
+    ask.output_contract = "completed_result";
+    ask.side_effect_class = "user_contact";
+    ask.approval_mode = "none";
+    ask.execution_modes = {"sync"};
+    ask.provenance_namespace = "openclaw/vicuna-runtime/tool/ask_with_options";
+    ask.tool_kind = LLAMA_TOOL_KIND_TELEGRAM_ASK_OPTIONS;
+    ask.tool_flags =
+            LLAMA_COG_TOOL_ACTIVE_ELIGIBLE |
+            LLAMA_COG_TOOL_DMN_ELIGIBLE |
+            LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT;
+    ask.latency_class = LLAMA_COG_TOOL_LATENCY_LOW;
+    ask.max_steps_reserved = 2;
+    ask.dispatch_backend = "legacy_telegram";
+    return ask;
+}
+
 const builtin_capability_registration * builtin_capability_registrations(size_t * out_count) {
     static const builtin_capability_registration registrations[] = {
         {
@@ -1035,6 +1066,12 @@ const builtin_capability_registration * builtin_capability_registrations(size_t 
             SERVER_OPENCLAW_DISPATCH_LEGACY_TELEGRAM,
             telegram_available,
             build_telegram_relay_descriptor,
+        },
+        {
+            "ask_with_options",
+            SERVER_OPENCLAW_DISPATCH_LEGACY_TELEGRAM,
+            telegram_available,
+            build_telegram_ask_options_descriptor,
         },
     };
     if (out_count) {

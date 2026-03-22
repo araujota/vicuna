@@ -162,7 +162,7 @@ int main() {
     if (!expect(fabric.build_cognitive_specs(&specs), "failed to build cognitive specs")) {
         return 1;
     }
-    if (!expect(specs.size() == 5, "expected exec, hard-memory query, hard-memory write, codex, and telegram relay capabilities")) {
+    if (!expect(specs.size() == 6, "expected exec, hard-memory query, hard-memory write, codex, telegram relay, and ask-with-options capabilities")) {
         return 1;
     }
     if (!expect(fabric.capability_by_tool_name("exec") != nullptr, "expected exec tool lookup to succeed")) {
@@ -175,6 +175,9 @@ int main() {
         return 1;
     }
     if (!expect(fabric.capability_by_tool_name("telegram_relay") != nullptr, "expected telegram relay tool lookup to succeed")) {
+        return 1;
+    }
+    if (!expect(fabric.capability_by_tool_name("ask_with_options") != nullptr, "expected ask_with_options tool lookup to succeed")) {
         return 1;
     }
     if (!expect(fabric.capability_by_tool_name("missing") == nullptr, "expected unknown tool lookup to fail")) {
@@ -190,7 +193,7 @@ int main() {
     if (!expect(legacy_filtered_fabric.build_cognitive_specs(&legacy_specs), "failed to build legacy-filtered cognitive specs")) {
         return 1;
     }
-    if (!expect(legacy_specs.size() == 4, "expected legacy allowlist to preserve exec, telegram relay, and the full hard-memory tool layer")) {
+    if (!expect(legacy_specs.size() == 5, "expected legacy allowlist to preserve exec, telegram relay, ask-with-options, and the full hard-memory tool layer")) {
         return 1;
     }
     if (!expect(legacy_filtered_fabric.capability_by_tool_name("hard_memory_write") != nullptr,
@@ -199,6 +202,10 @@ int main() {
     }
     if (!expect(legacy_filtered_fabric.capability_by_tool_name("telegram_relay") != nullptr,
                 "expected legacy allowlist compatibility to retain telegram relay")) {
+        return 1;
+    }
+    if (!expect(legacy_filtered_fabric.capability_by_tool_name("ask_with_options") != nullptr,
+                "expected legacy allowlist compatibility to retain ask_with_options")) {
         return 1;
     }
     if (!expect(legacy_filtered_fabric.capability_by_tool_name("codex") == nullptr,
@@ -330,6 +337,33 @@ int main() {
     if (!expect(parsed.message.tool_calls[0].arguments.find("\"intent\":\"question\"") != std::string::npos &&
                 parsed.message.tool_calls[0].arguments.find("\"dedupeKey\":\"dmn-relay-42\"") != std::string::npos,
                 "expected telegram relay JSON arguments to preserve intent and dedupe metadata")) {
+        return 1;
+    }
+
+    std::vector<int32_t> ask_only = { 5 };
+    const std::string ask_xml =
+            "<think>I need the user to choose one concrete option before continuing.</think>\n"
+            "<vicuna_tool_call tool=\"ask_with_options\">\n"
+            "  <arg name=\"question\" type=\"string\">Which deployment target should I use?</arg>\n"
+            "  <arg name=\"options\" type=\"json\">[\"staging\",\"production\"]</arg>\n"
+            "  <arg name=\"dedupeKey\" type=\"string\">active-ask-7</arg>\n"
+            "</vicuna_tool_call>";
+    if (!expect(fabric.parse_tool_call_xml(ask_xml, &parsed, &ask_only, &error), error.c_str())) {
+        return 1;
+    }
+    if (!expect(parsed.message.tool_calls.size() == 1 &&
+                parsed.message.tool_calls[0].name == "ask_with_options",
+                "expected ask_with_options tool XML to parse")) {
+        return 1;
+    }
+    if (!expect(parsed.message.reasoning_content.find("choose one concrete option") != std::string::npos,
+                "expected ask_with_options XML to preserve hidden reasoning")) {
+        return 1;
+    }
+    if (!expect(parsed.message.tool_calls[0].arguments.find("\"question\":\"Which deployment target should I use?\"") != std::string::npos &&
+                parsed.message.tool_calls[0].arguments.find("\"options\":[\"staging\",\"production\"]") != std::string::npos &&
+                parsed.message.tool_calls[0].arguments.find("\"dedupeKey\":\"active-ask-7\"") != std::string::npos,
+                "expected ask_with_options JSON arguments to preserve question, options, and dedupe metadata")) {
         return 1;
     }
 

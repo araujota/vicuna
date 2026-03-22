@@ -181,6 +181,7 @@ int main(int argc, char ** argv) {
     if (!is_router_server) {
         ctx_http.get ("/v1/responses/stream",      ex_wrapper(routes.get_self_emit_stream_oai));
         ctx_http.get ("/v1/responses/:response_id", ex_wrapper(routes.get_response_oai));
+        ctx_http.get ("/v1/telegram/outbox",       ex_wrapper(routes.get_telegram_outbox));
     }
 
     if (!openai_surface) {

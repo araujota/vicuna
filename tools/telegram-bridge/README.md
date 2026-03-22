@@ -8,6 +8,8 @@ It does two jobs in one process:
   `/v1/chat/completions`
 - subscribes to `/v1/responses/stream` and relays proactive self-emits to every
   registered Telegram chat
+- polls `/v1/telegram/outbox` for runtime-owned `ask_with_options` prompts and
+  delivers them with Telegram `reply_markup.inline_keyboard`
 
 ## Environment
 
@@ -129,6 +131,12 @@ even simple allowed commands from forking on a busy workstation.
 - `/start` registers the chat for proactive relay and returns a confirmation
 - plain text user messages are sent to the local Vicuña runtime and the
   assistant reply is sent back to the same Telegram chat
+- runtime-owned `ask_with_options` tool calls are delivered through a dedicated
+  Telegram outbox surface, not through fallback assistant text
+- inline option clicks arrive as Telegram `callback_query` updates; the bridge
+  acknowledges the click, removes the consumed keyboard, rewrites the selected
+  option into the bounded Telegram transcript, and resumes the Telegram-origin
+  turn against the runtime
 - forwarded chat requests now include Telegram chat metadata headers so the
   runtime can maintain its own bounded last-`N` turn dialogue object instead of
   depending only on bridge-local transcript state
@@ -137,6 +145,8 @@ even simple allowed commands from forking on a busy workstation.
   a raw file record and an extracted-text record linked by shared metadata
 - each Telegram chat keeps its own bounded persisted transcript keyed by
   Telegram `chat_id`, so follow-up turns reuse recent context after restarts
+- pending inline-option prompts are also kept in bounded persisted bridge state
+  so callback selections can be resolved safely after bridge restart
 - bounded transcript trimming drops any leading assistant-only orphan created by
   raw history clipping so the runtime keeps seeing a coherent conversation that
   still includes the latest user turn
@@ -161,6 +171,9 @@ even simple allowed commands from forking on a busy workstation.
   state file and journal together: if `telegramOffset` is still increasing and
   new `appended Telegram user turn` entries appear, the defect is in transcript
   shaping rather than Telegram update replay
+- intentionally empty completion text is now allowed on Telegram turns because
+  the user-visible payload may already have been delivered by a tool such as
+  `ask_with_options`
 
 ## Test
 

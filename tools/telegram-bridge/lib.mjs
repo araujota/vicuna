@@ -4,13 +4,16 @@ import path from 'node:path';
 
 export const DEFAULT_STATE = {
   telegramOffset: 0,
+  telegramOutboxOffset: 0,
   chatIds: [],
   proactiveResponseIds: [],
   chatSessions: {},
+  pendingOptionPrompts: {},
 };
 
 export const DEFAULT_MAX_HISTORY_MESSAGES = 12;
 export const DEFAULT_MAX_DOCUMENT_CHARS = 12000;
+export const DEFAULT_MAX_PENDING_OPTION_PROMPTS = 32;
 
 const PDF_MIME_TYPES = new Set([
   'application/pdf',
@@ -352,15 +355,50 @@ function normalizeChatSessions(raw, maxHistoryMessages) {
   return chatSessions;
 }
 
+function normalizePendingOptionPrompts(raw, maxPendingPrompts) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {};
+  }
+  const entries = [];
+  for (const [promptId, prompt] of Object.entries(raw)) {
+    const question = typeof prompt?.question === 'string' ? prompt.question.trim() : '';
+    const options = Array.isArray(prompt?.options)
+      ? prompt.options
+        .map((value) => String(value ?? '').trim())
+        .filter(Boolean)
+        .slice(0, 6)
+      : [];
+    const chatId = String(prompt?.chatId ?? '').trim();
+    if (!promptId || !question || options.length < 2 || !chatId) {
+      continue;
+    }
+    entries.push([
+      String(promptId),
+      {
+        chatId,
+        question,
+        options,
+        telegramMessageId: Math.max(0, Number(prompt?.telegramMessageId ?? 0) || 0),
+        createdAtMs: Math.max(0, Number(prompt?.createdAtMs ?? 0) || 0),
+      },
+    ]);
+  }
+  entries.sort((lhs, rhs) => lhs[1].createdAtMs - rhs[1].createdAtMs);
+  return Object.fromEntries(entries.slice(-maxPendingPrompts));
+}
+
 export function normalizeState(raw, options = {}) {
   const state = raw && typeof raw === 'object' ? raw : {};
   const maxHistoryMessages = Math.max(1, parseInteger(options.maxHistoryMessages, DEFAULT_MAX_HISTORY_MESSAGES));
+  const maxPendingPrompts = Math.max(1, parseInteger(options.maxPendingOptionPrompts, DEFAULT_MAX_PENDING_OPTION_PROMPTS));
   const chatSessions = normalizeChatSessions(state.chatSessions, maxHistoryMessages);
   return {
     telegramOffset: Math.max(0, parseInteger(state.telegramOffset, 0)),
+    telegramOutboxOffset: Math.max(0, parseInteger(state.telegramOutboxOffset, 0)),
     chatIds: uniqueStrings([...(state.chatIds ?? []), ...Object.keys(chatSessions)]),
     proactiveResponseIds: uniqueStrings(state.proactiveResponseIds).slice(-256),
     chatSessions,
+    pendingOptionPrompts: normalizePendingOptionPrompts(state.pendingOptionPrompts, maxPendingPrompts),
   };
 }
 
@@ -435,6 +473,39 @@ export function appendChatTranscriptMessage(state, chatId, role, content, option
         messages: nextMessages,
       },
     },
+  };
+}
+
+export function setPendingOptionPrompt(state, promptId, prompt, options = {}) {
+  const maxPendingPrompts = Math.max(1, parseInteger(options.maxPendingOptionPrompts, DEFAULT_MAX_PENDING_OPTION_PROMPTS));
+  const normalizedState = normalizeState(state, options);
+  const nextPrompts = {
+    ...(normalizedState.pendingOptionPrompts ?? {}),
+    [String(promptId)]: {
+      chatId: String(prompt?.chatId ?? '').trim(),
+      question: String(prompt?.question ?? '').trim(),
+      options: Array.isArray(prompt?.options) ? prompt.options.map((value) => String(value ?? '').trim()).filter(Boolean).slice(0, 6) : [],
+      telegramMessageId: Math.max(0, Number(prompt?.telegramMessageId ?? 0) || 0),
+      createdAtMs: Math.max(0, Number(prompt?.createdAtMs ?? Date.now()) || Date.now()),
+    },
+  };
+  return {
+    ...normalizedState,
+    pendingOptionPrompts: normalizePendingOptionPrompts(nextPrompts, maxPendingPrompts),
+  };
+}
+
+export function getPendingOptionPrompt(state, promptId) {
+  return state?.pendingOptionPrompts?.[String(promptId)] ?? null;
+}
+
+export function deletePendingOptionPrompt(state, promptId, options = {}) {
+  const normalizedState = normalizeState(state, options);
+  const nextPrompts = { ...(normalizedState.pendingOptionPrompts ?? {}) };
+  delete nextPrompts[String(promptId)];
+  return {
+    ...normalizedState,
+    pendingOptionPrompts: nextPrompts,
   };
 }
 

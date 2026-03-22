@@ -546,7 +546,7 @@ int main(int argc, char ** argv) {
         }
 
         llama_cognitive_tool_spec spec = {};
-        if (llama_cognitive_tool_spec_count(ctx) < 5 ||
+        if (llama_cognitive_tool_spec_count(ctx) < 7 ||
             llama_cognitive_tool_spec_get(ctx, 0, &spec) != 0 ||
             spec.tool_kind != LLAMA_TOOL_KIND_GENERIC ||
             spec.name[0] == '\0') {
@@ -584,6 +584,25 @@ int main(int argc, char ** argv) {
             spec.name[0] == '\0' ||
             (spec.flags & LLAMA_COG_TOOL_ACTIVE_ELIGIBLE) == 0) {
             std::fprintf(stderr, "hard-memory write cognitive tool registry entry was not active-eligible\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (llama_cognitive_tool_spec_get(ctx, 5, &spec) != 0 ||
+            spec.tool_kind != LLAMA_TOOL_KIND_TELEGRAM_RELAY ||
+            spec.name[0] == '\0' ||
+            (spec.flags & LLAMA_COG_TOOL_DMN_ELIGIBLE) == 0) {
+            std::fprintf(stderr, "telegram relay cognitive tool registry entry was not DMN-eligible\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        if (llama_cognitive_tool_spec_get(ctx, 6, &spec) != 0 ||
+            spec.tool_kind != LLAMA_TOOL_KIND_TELEGRAM_ASK_OPTIONS ||
+            spec.name[0] == '\0' ||
+            (spec.flags & LLAMA_COG_TOOL_ACTIVE_ELIGIBLE) == 0 ||
+            (spec.flags & LLAMA_COG_TOOL_DMN_ELIGIBLE) == 0) {
+            std::fprintf(stderr, "ask-with-options cognitive tool registry entry was not dual-eligible\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -2912,6 +2931,128 @@ int main(int argc, char ** argv) {
 
         llama_free(no_repair_ctx);
         llama_free(repair_ctx);
+    }
+
+    {
+        llama_context * ctx = create_context(model);
+        if (!ctx) {
+            std::fprintf(stderr, "failed to create ask-with-options authoritative context\n");
+            llama_model_free(model);
+            return 1;
+        }
+
+        if (llama_cognitive_authoritative_react_set_enabled(ctx, true) != 0) {
+            std::fprintf(stderr, "failed to enable authoritative react for ask-with-options test\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> tokens = tokenize_or_die(vocab, "Ask me which deployment target I want, then wait for my selection.");
+        const llama_self_state_event event = {
+            /*.tokens =*/ tokens.data(),
+            /*.n_tokens =*/ tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.0f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+
+        llama_active_loop_trace trace = {};
+        if (llama_cognitive_active_authoritative_prepare(ctx, &event, &trace) != 0 ||
+            !trace.authoritative_turn.valid ||
+            trace.episode_id <= 0) {
+            std::fprintf(stderr, "failed to prepare authoritative ask-with-options turn\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        int32_t command_id = -1;
+        int32_t tool_job_id = -1;
+        if (llama_cognitive_active_authoritative_begin_tool(
+                    ctx,
+                    trace.episode_id,
+                    0,
+                    0.85f,
+                    &command_id,
+                    &tool_job_id) != 0 ||
+            command_id <= 0 ||
+            tool_job_id <= 0 ||
+            llama_cognitive_command_rebind_tool(ctx, command_id, 6) != 0) {
+            std::fprintf(stderr, "failed to begin authoritative ask-with-options tool command\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_telegram_ask_options_request request = {};
+        request.command_id = command_id;
+        request.origin = LLAMA_COG_COMMAND_ORIGIN_ACTIVE;
+        request.tool_job_id = tool_job_id;
+        request.urgency = 0.65f;
+        request.command_ready = true;
+        request.option_count = 3;
+        std::snprintf(request.dedupe_key, sizeof(request.dedupe_key), "%s", "active-ask-1");
+        std::snprintf(request.chat_scope, sizeof(request.chat_scope), "%s", "7502424413");
+        std::snprintf(request.question, sizeof(request.question), "%s", "Which deployment target should I use?");
+        std::snprintf(request.options[0].label, sizeof(request.options[0].label), "%s", "staging");
+        std::snprintf(request.options[1].label, sizeof(request.options[1].label), "%s", "production");
+        std::snprintf(request.options[2].label, sizeof(request.options[2].label), "%s", "cancel");
+
+        if (llama_cognitive_telegram_ask_options_set_request(ctx, &request) != 0) {
+            std::fprintf(stderr, "failed to set ask-with-options request\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_telegram_ask_options_request staged_request = {};
+        if (llama_cognitive_telegram_ask_options_get_request(ctx, command_id, &staged_request) != 0 ||
+            staged_request.command_id != command_id ||
+            staged_request.tool_job_id != tool_job_id ||
+            !staged_request.command_ready ||
+            std::strcmp(staged_request.chat_scope, "7502424413") != 0 ||
+            std::strcmp(staged_request.question, "Which deployment target should I use?") != 0 ||
+            staged_request.option_count != 3 ||
+            std::strcmp(staged_request.options[1].label, "production") != 0) {
+            std::fprintf(stderr, "ask-with-options request was not staged correctly\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_telegram_ask_options_result result = {};
+        result.command_id = command_id;
+        result.tool_job_id = tool_job_id;
+        result.delivered = true;
+        result.delivered_at_ms = 9100;
+        std::snprintf(result.dedupe_key, sizeof(result.dedupe_key), "%s", staged_request.dedupe_key);
+        std::snprintf(result.chat_scope, sizeof(result.chat_scope), "%s", staged_request.chat_scope);
+        if (llama_cognitive_telegram_ask_options_submit_result(ctx, &result, nullptr) != 0) {
+            std::fprintf(stderr, "failed to submit ask-with-options result\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_active_runner_status runner = {};
+        llama_active_loop_trace latest = {};
+        if (llama_cognitive_telegram_ask_options_get_request(ctx, command_id, &staged_request) == 0 ||
+            llama_cognitive_command_count(ctx) != 0 ||
+            llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
+            runner.active ||
+            !runner.completed ||
+            llama_active_loop_get_last_trace(ctx, &latest) != 0 ||
+            latest.loop_state.terminal_reason != LLAMA_COG_TERMINAL_ASK_USER) {
+            std::fprintf(stderr, "ask-with-options result did not settle the authoritative turn as ask-user\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(ctx);
     }
 
     {

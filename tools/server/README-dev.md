@@ -205,6 +205,17 @@ mailbox transport cache and not a substitute for shared cognitive context. It
 exists so Telegram-origin replies and DMN-origin Telegram emits can reuse only
 the last `N` user-facing turns when continuity matters.
 
+The Telegram bridge now also has a dedicated runtime-owned ask-options transport
+surface. The builtin cognitive tool `ask_with_options` is available to active
+and DMN authoritative ReAct turns, but delivery is not faked through assistant
+text. `server_context` validates the typed request, resolves a Telegram chat
+scope, publishes the prompt plus option list into `/v1/telegram/outbox`, and
+completes the tool command immediately after enqueue. The bridge consumes that
+outbox, sends the question through Telegram `reply_markup.inline_keyboard`,
+acknowledges the eventual `callback_query`, and rewrites the selected option
+into bounded Telegram transcript state before resuming the next Telegram-origin
+turn.
+
 The emotive moment surface is also now lexicalized against VAD-style norms
 instead of a small hand-picked mood table. Internally the runtime keeps
 bounded `[0,1]` affective registers, projects them onto a Warriner-style

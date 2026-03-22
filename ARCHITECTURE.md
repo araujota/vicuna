@@ -155,6 +155,13 @@ Both loops share state, but they do not share identical triggers or output polic
   proactive mailbox transport store. When the runtime is answering a Telegram
   user or preparing a proactive Telegram message, it consumes only the last `N`
   Telegram turns from that object.
+- Telegram clarification and discrete-choice requests now live on that same
+  explicit tool substrate through `ask_with_options`. Active and DMN ReAct turns
+  can emit a first-class ask-options tool call, `server_context` publishes the
+  typed request into a dedicated Telegram outbox, and the bridge resumes the
+  dialogue when a `callback_query` selection arrives. The original cognitive
+  flow is resumed through bounded transcript continuity rather than by keeping a
+  hidden prompt-only wait state in the bridge.
 - Authoritative ReAct parsing treats emitted tool structure as first-class
   evidence. If the model emits a `<vicuna_tool_call ...>` block with trailing
   chatter or a partial close, the runtime salvages that emitted structure and

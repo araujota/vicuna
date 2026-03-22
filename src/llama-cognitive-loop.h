@@ -40,6 +40,9 @@ public:
     bool cognitive_telegram_relay_get_request(int32_t command_id, llama_telegram_relay_request * out_request) const;
     bool cognitive_telegram_relay_set_request(const llama_telegram_relay_request & request);
     bool cognitive_telegram_relay_submit_result(const llama_telegram_relay_result & result, llama_active_loop_trace * out_active_trace);
+    bool cognitive_telegram_ask_options_get_request(int32_t command_id, llama_telegram_ask_options_request * out_request) const;
+    bool cognitive_telegram_ask_options_set_request(const llama_telegram_ask_options_request & request);
+    bool cognitive_telegram_ask_options_submit_result(const llama_telegram_ask_options_result & result, llama_active_loop_trace * out_active_trace);
     bool cognitive_active_runner_get(llama_cognitive_active_runner_status * out_status) const;
     bool cognitive_dmn_runner_get(llama_cognitive_dmn_runner_status * out_status) const;
 
@@ -94,6 +97,10 @@ private:
     bool has_last_codex_result = false;
     llama_telegram_relay_result last_telegram_result = {};
     bool has_last_telegram_result = false;
+    llama_telegram_ask_options_request telegram_ask_requests[LLAMA_COGNITIVE_MAX_PENDING_COMMANDS] = {};
+    int32_t telegram_ask_request_count = 0;
+    llama_telegram_ask_options_result last_telegram_ask_result = {};
+    bool has_last_telegram_ask_result = false;
     llama_dmn_self_model_revision current_self_model_revision = {};
     llama_self_model_revision current_canonical_self_model_revision = {};
     llama_emotive_moment_revision current_emotive_moment_revision = {};

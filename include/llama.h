@@ -986,6 +986,7 @@ extern "C" {
         LLAMA_TOOL_KIND_BASH_CLI          = 4,
         LLAMA_TOOL_KIND_CODEX_CLI         = 5,
         LLAMA_TOOL_KIND_TELEGRAM_RELAY    = 6,
+        LLAMA_TOOL_KIND_TELEGRAM_ASK_OPTIONS = 7,
     };
 
     enum llama_self_model_extension_kind {
@@ -1869,6 +1870,10 @@ extern "C" {
         LLAMA_TELEGRAM_RELAY_TEXT_MAX_CHARS = 1024,
         LLAMA_TELEGRAM_RELAY_DEDUPE_MAX_CHARS = 128,
         LLAMA_TELEGRAM_RELAY_ERROR_MAX_CHARS = 256,
+        LLAMA_TELEGRAM_CHAT_SCOPE_MAX_CHARS = 64,
+        LLAMA_TELEGRAM_ASK_QUESTION_MAX_CHARS = 512,
+        LLAMA_TELEGRAM_ASK_OPTION_LABEL_MAX_CHARS = 96,
+        LLAMA_TELEGRAM_ASK_MAX_OPTIONS = 6,
         LLAMA_SELF_STATE_MAX_DELTA_DIMS = 8,
         LLAMA_COGNITIVE_MAX_TOOL_SPECS = 8,
         LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS = 48,
@@ -2448,6 +2453,33 @@ extern "C" {
         bool delivered;
         int64_t delivered_at_ms;
         char dedupe_key[LLAMA_TELEGRAM_RELAY_DEDUPE_MAX_CHARS];
+        char error_text[LLAMA_TELEGRAM_RELAY_ERROR_MAX_CHARS];
+    };
+
+    struct llama_telegram_ask_option_item {
+        char label[LLAMA_TELEGRAM_ASK_OPTION_LABEL_MAX_CHARS];
+    };
+
+    struct llama_telegram_ask_options_request {
+        int32_t command_id;
+        int32_t origin;
+        int32_t tool_job_id;
+        float urgency;
+        bool command_ready;
+        int32_t option_count;
+        char dedupe_key[LLAMA_TELEGRAM_RELAY_DEDUPE_MAX_CHARS];
+        char chat_scope[LLAMA_TELEGRAM_CHAT_SCOPE_MAX_CHARS];
+        char question[LLAMA_TELEGRAM_ASK_QUESTION_MAX_CHARS];
+        struct llama_telegram_ask_option_item options[LLAMA_TELEGRAM_ASK_MAX_OPTIONS];
+    };
+
+    struct llama_telegram_ask_options_result {
+        int32_t command_id;
+        int32_t tool_job_id;
+        bool delivered;
+        int64_t delivered_at_ms;
+        char dedupe_key[LLAMA_TELEGRAM_RELAY_DEDUPE_MAX_CHARS];
+        char chat_scope[LLAMA_TELEGRAM_CHAT_SCOPE_MAX_CHARS];
         char error_text[LLAMA_TELEGRAM_RELAY_ERROR_MAX_CHARS];
     };
 
@@ -3597,6 +3629,17 @@ extern "C" {
     LLAMA_API int32_t llama_cognitive_telegram_relay_submit_result(
             struct llama_context * ctx,
             const struct llama_telegram_relay_result * result,
+            struct llama_active_loop_trace * out_active_trace);
+    LLAMA_API int32_t llama_cognitive_telegram_ask_options_get_request(
+            const struct llama_context * ctx,
+            int32_t command_id,
+            struct llama_telegram_ask_options_request * out_request);
+    LLAMA_API int32_t llama_cognitive_telegram_ask_options_set_request(
+            struct llama_context * ctx,
+            const struct llama_telegram_ask_options_request * request);
+    LLAMA_API int32_t llama_cognitive_telegram_ask_options_submit_result(
+            struct llama_context * ctx,
+            const struct llama_telegram_ask_options_result * result,
             struct llama_active_loop_trace * out_active_trace);
     LLAMA_API int32_t llama_cognitive_active_runner_get(
             const struct llama_context * ctx,

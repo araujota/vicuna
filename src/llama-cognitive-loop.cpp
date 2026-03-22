@@ -1400,6 +1400,18 @@ int32_t find_telegram_request_index(
     return -1;
 }
 
+int32_t find_telegram_ask_request_index(
+        const llama_telegram_ask_options_request * requests,
+        int32_t request_count,
+        int32_t command_id) {
+    for (int32_t i = 0; i < request_count; ++i) {
+        if (requests[i].command_id == command_id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 llama_cognitive_tool_spec make_tool_spec(
         int32_t tool_kind,
         uint32_t flags,
@@ -2278,6 +2290,31 @@ void init_telegram_request(
     set_bounded_cstr(request.dedupe_key, sizeof(request.dedupe_key), trim_ascii(dedupe_key).c_str());
 }
 
+void init_telegram_ask_request(
+        llama_telegram_ask_options_request & request,
+        int32_t command_id,
+        int32_t origin,
+        int32_t tool_job_id,
+        float urgency,
+        const std::string & chat_scope,
+        const std::string & question,
+        const std::vector<std::string> & options,
+        const std::string & dedupe_key) {
+    request = {};
+    request.command_id = command_id;
+    request.origin = origin;
+    request.tool_job_id = tool_job_id;
+    request.urgency = clamp_unit(urgency);
+    request.command_ready = !trim_ascii(question).empty() && options.size() >= 2;
+    request.option_count = std::min<int32_t>((int32_t) options.size(), LLAMA_TELEGRAM_ASK_MAX_OPTIONS);
+    set_bounded_cstr(request.chat_scope, sizeof(request.chat_scope), trim_ascii(chat_scope).c_str());
+    set_bounded_cstr(request.question, sizeof(request.question), trim_ascii(question).c_str());
+    set_bounded_cstr(request.dedupe_key, sizeof(request.dedupe_key), trim_ascii(dedupe_key).c_str());
+    for (int32_t i = 0; i < request.option_count; ++i) {
+        set_bounded_cstr(request.options[i].label, sizeof(request.options[i].label), trim_ascii(options[(size_t) i]).c_str());
+    }
+}
+
 std::string summarize_telegram_result(const llama_telegram_relay_result & result) {
     const char * intent_label = "comment";
     if (result.intent_kind == LLAMA_TELEGRAM_RELAY_QUESTION) {
@@ -2289,6 +2326,21 @@ std::string summarize_telegram_result(const llama_telegram_relay_result & result
     std::string summary = std::string("telegram relay ");
     summary += result.delivered ? "delivered " : "failed for ";
     summary += intent_label;
+    if (result.dedupe_key[0] != '\0') {
+        summary += " key=" + trim_ascii(result.dedupe_key);
+    }
+    if (!result.delivered && result.error_text[0] != '\0') {
+        summary += " error: " + trim_ascii(result.error_text);
+    }
+    return summary;
+}
+
+std::string summarize_telegram_ask_result(const llama_telegram_ask_options_result & result) {
+    std::string summary = std::string("telegram ask-with-options ");
+    summary += result.delivered ? "delivered" : "failed";
+    if (result.chat_scope[0] != '\0') {
+        summary += " scope=" + trim_ascii(result.chat_scope);
+    }
     if (result.dedupe_key[0] != '\0') {
         summary += " key=" + trim_ascii(result.dedupe_key);
     }
@@ -3340,6 +3392,15 @@ llama_cognitive_loop::llama_cognitive_loop(llama_context & ctx) : ctx(ctx) {
                 2,
                 "telegram_relay",
                 "Send a DMN-origin question, comment, or conclusion through the Telegram bridge"),
+        make_tool_spec(
+                LLAMA_TOOL_KIND_TELEGRAM_ASK_OPTIONS,
+                LLAMA_COG_TOOL_ACTIVE_ELIGIBLE |
+                        LLAMA_COG_TOOL_DMN_ELIGIBLE |
+                        LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT,
+                LLAMA_COG_TOOL_LATENCY_LOW,
+                2,
+                "ask_with_options",
+                "Ask the Telegram user a question with inline reply options and continue after they choose"),
     };
     codex_config = codex_tool_default_config_local();
     (void) cognitive_tool_spec_set(defaults, (int32_t) (sizeof(defaults) / sizeof(defaults[0])));
@@ -4099,6 +4160,58 @@ bool llama_cognitive_loop::cognitive_telegram_relay_set_request(const llama_tele
     telegram_requests[telegram_request_count].dedupe_key[LLAMA_TELEGRAM_RELAY_DEDUPE_MAX_CHARS - 1] = '\0';
     telegram_requests[telegram_request_count].text[LLAMA_TELEGRAM_RELAY_TEXT_MAX_CHARS - 1] = '\0';
     ++telegram_request_count;
+    return true;
+}
+
+bool llama_cognitive_loop::cognitive_telegram_ask_options_get_request(
+        int32_t command_id,
+        llama_telegram_ask_options_request * out_request) const {
+    if (!out_request) {
+        return false;
+    }
+    const int32_t index = find_telegram_ask_request_index(telegram_ask_requests, telegram_ask_request_count, command_id);
+    if (index < 0) {
+        return false;
+    }
+    *out_request = telegram_ask_requests[index];
+    return true;
+}
+
+bool llama_cognitive_loop::cognitive_telegram_ask_options_set_request(const llama_telegram_ask_options_request & request) {
+    if (request.command_id <= 0 || request.tool_job_id <= 0) {
+        return false;
+    }
+    const int32_t index = find_telegram_ask_request_index(telegram_ask_requests, telegram_ask_request_count, request.command_id);
+    if (index >= 0) {
+        telegram_ask_requests[index] = request;
+        telegram_ask_requests[index].dedupe_key[LLAMA_TELEGRAM_RELAY_DEDUPE_MAX_CHARS - 1] = '\0';
+        telegram_ask_requests[index].chat_scope[LLAMA_TELEGRAM_CHAT_SCOPE_MAX_CHARS - 1] = '\0';
+        telegram_ask_requests[index].question[LLAMA_TELEGRAM_ASK_QUESTION_MAX_CHARS - 1] = '\0';
+        telegram_ask_requests[index].option_count = std::clamp(
+                telegram_ask_requests[index].option_count,
+                0,
+                (int32_t) LLAMA_TELEGRAM_ASK_MAX_OPTIONS);
+        for (int32_t i = 0; i < telegram_ask_requests[index].option_count; ++i) {
+            telegram_ask_requests[index].options[i].label[LLAMA_TELEGRAM_ASK_OPTION_LABEL_MAX_CHARS - 1] = '\0';
+        }
+        return true;
+    }
+    if (telegram_ask_request_count >= LLAMA_COGNITIVE_MAX_PENDING_COMMANDS) {
+        return false;
+    }
+    telegram_ask_requests[telegram_ask_request_count] = request;
+    telegram_ask_requests[telegram_ask_request_count].dedupe_key[LLAMA_TELEGRAM_RELAY_DEDUPE_MAX_CHARS - 1] = '\0';
+    telegram_ask_requests[telegram_ask_request_count].chat_scope[LLAMA_TELEGRAM_CHAT_SCOPE_MAX_CHARS - 1] = '\0';
+    telegram_ask_requests[telegram_ask_request_count].question[LLAMA_TELEGRAM_ASK_QUESTION_MAX_CHARS - 1] = '\0';
+    telegram_ask_requests[telegram_ask_request_count].option_count =
+            std::clamp(
+                    telegram_ask_requests[telegram_ask_request_count].option_count,
+                    0,
+                    (int32_t) LLAMA_TELEGRAM_ASK_MAX_OPTIONS);
+    for (int32_t i = 0; i < telegram_ask_requests[telegram_ask_request_count].option_count; ++i) {
+        telegram_ask_requests[telegram_ask_request_count].options[i].label[LLAMA_TELEGRAM_ASK_OPTION_LABEL_MAX_CHARS - 1] = '\0';
+    }
+    ++telegram_ask_request_count;
     return true;
 }
 
@@ -6464,6 +6577,69 @@ bool llama_cognitive_loop::cognitive_telegram_relay_submit_result(
     return applied;
 }
 
+bool llama_cognitive_loop::cognitive_telegram_ask_options_submit_result(
+        const llama_telegram_ask_options_result & result,
+        llama_active_loop_trace * out_active_trace) {
+    GGML_UNUSED(out_active_trace);
+
+    llama_telegram_ask_options_request request = {};
+    if (!cognitive_telegram_ask_options_get_request(result.command_id, &request)) {
+        return false;
+    }
+
+    const int32_t command_index = find_command_index(command_queue, command_count, result.command_id);
+    if (command_index < 0) {
+        return false;
+    }
+    const llama_cognitive_command command = command_queue[command_index];
+
+    const int32_t tool_status = result.delivered ?
+            LLAMA_SELF_TOOL_JOB_COMPLETED :
+            LLAMA_SELF_TOOL_JOB_FAILED;
+    (void) ctx.self_state_upsert_tool_job(result.tool_job_id, tool_status, 1.0f);
+
+    const int32_t request_index = find_telegram_ask_request_index(telegram_ask_requests, telegram_ask_request_count, result.command_id);
+    if (request_index >= 0) {
+        for (int32_t i = request_index + 1; i < telegram_ask_request_count; ++i) {
+            telegram_ask_requests[i - 1] = telegram_ask_requests[i];
+        }
+        telegram_ask_requests[telegram_ask_request_count - 1] = {};
+        --telegram_ask_request_count;
+    }
+    last_telegram_ask_result = result;
+    has_last_telegram_ask_result = true;
+
+    if (!ctx.cognitive_command_complete(result.command_id, false)) {
+        return false;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(&ctx.get_model());
+    const std::string summary = summarize_telegram_ask_result(result);
+    const std::vector<llama_token> tokens = tokenize_text(vocab, summary);
+    const llama_self_state_event tool_event = {
+        /*.tokens =*/ tokens.empty() ? nullptr : tokens.data(),
+        /*.n_tokens =*/ tokens.size(),
+        /*.role =*/ LLAMA_SELF_STATE_EVENT_TOOL,
+        /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+        /*.flags =*/ tool_status == LLAMA_SELF_TOOL_JOB_COMPLETED ?
+                LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED :
+                LLAMA_SELF_STATE_EVENT_TOOL_FAILED,
+        /*.decoder_entropy =*/ 0.0f,
+        /*.decoder_top_margin =*/ 1.0f,
+    };
+
+    const bool applied = apply_tool_event_only(ctx, tool_event);
+    if (!applied) {
+        return false;
+    }
+
+    if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+        return cognitive_active_authoritative_finish(command.episode_id, LLAMA_COG_TERMINAL_ASK_USER);
+    }
+
+    return cognitive_dmn_authoritative_finish(command.tick_id, LLAMA_COG_TERMINAL_ASK_USER);
+}
+
 int32_t llama_context::cognitive_tool_spec_count() const {
     return cognitive_loop ? cognitive_loop->cognitive_tool_spec_count() : 0;
 }
@@ -6600,6 +6776,18 @@ bool llama_context::cognitive_telegram_relay_set_request(const llama_telegram_re
 
 bool llama_context::cognitive_telegram_relay_submit_result(const llama_telegram_relay_result & result, llama_active_loop_trace * out_active_trace) {
     return cognitive_loop && cognitive_loop->cognitive_telegram_relay_submit_result(result, out_active_trace);
+}
+
+bool llama_context::cognitive_telegram_ask_options_get_request(int32_t command_id, llama_telegram_ask_options_request * out_request) const {
+    return cognitive_loop && cognitive_loop->cognitive_telegram_ask_options_get_request(command_id, out_request);
+}
+
+bool llama_context::cognitive_telegram_ask_options_set_request(const llama_telegram_ask_options_request & request) {
+    return cognitive_loop && cognitive_loop->cognitive_telegram_ask_options_set_request(request);
+}
+
+bool llama_context::cognitive_telegram_ask_options_submit_result(const llama_telegram_ask_options_result & result, llama_active_loop_trace * out_active_trace) {
+    return cognitive_loop && cognitive_loop->cognitive_telegram_ask_options_submit_result(result, out_active_trace);
 }
 
 bool llama_context::cognitive_active_runner_get(llama_cognitive_active_runner_status * out_status) const {
@@ -6869,6 +7057,26 @@ int32_t llama_cognitive_telegram_relay_submit_result(
         const struct llama_telegram_relay_result * result,
         struct llama_active_loop_trace * out_active_trace) {
     return ctx && result && ctx->cognitive_telegram_relay_submit_result(*result, out_active_trace) ? 0 : -1;
+}
+
+int32_t llama_cognitive_telegram_ask_options_get_request(
+        const struct llama_context * ctx,
+        int32_t command_id,
+        struct llama_telegram_ask_options_request * out_request) {
+    return ctx && out_request && ctx->cognitive_telegram_ask_options_get_request(command_id, out_request) ? 0 : -1;
+}
+
+int32_t llama_cognitive_telegram_ask_options_set_request(
+        struct llama_context * ctx,
+        const struct llama_telegram_ask_options_request * request) {
+    return ctx && request && ctx->cognitive_telegram_ask_options_set_request(*request) ? 0 : -1;
+}
+
+int32_t llama_cognitive_telegram_ask_options_submit_result(
+        struct llama_context * ctx,
+        const struct llama_telegram_ask_options_result * result,
+        struct llama_active_loop_trace * out_active_trace) {
+    return ctx && result && ctx->cognitive_telegram_ask_options_submit_result(*result, out_active_trace) ? 0 : -1;
 }
 
 int32_t llama_cognitive_active_runner_get(
