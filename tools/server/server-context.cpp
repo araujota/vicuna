@@ -2634,10 +2634,6 @@ private:
         return !waiting_dmn_tasks.empty();
     }
 
-    bool react_task_ready(const server_task & task) const {
-        return task.react_enabled;
-    }
-
     std::string shared_context_origin_label(int32_t origin) const {
         switch (origin) {
             case LLAMA_SHARED_CONTEXT_ORIGIN_ACTIVE: return "active";
@@ -2887,7 +2883,7 @@ private:
     }
 
     bool prepare_react_prompt(server_task & task) {
-        if (!react_task_ready(task)) {
+        if (!server_task_has_authoritative_react_surface(task)) {
             return false;
         }
 
@@ -2903,8 +2899,6 @@ private:
                 return false;
             }
         }
-        const bool active_tool_progress_required = server_task_active_trace_requires_tool_progress(task);
-
         std::vector<common_chat_msg> prompt_messages = canonical_react_messages(task);
         common_chat_msg phase_system;
         phase_system.role = "system";
@@ -2951,11 +2945,6 @@ private:
                     "If Action is answer or ask, put only the user-visible reply in visible assistant content. "
                     "If Action is wait, leave visible assistant content empty. "
                     "If the latest user turn requests current, live, dated, or otherwise external facts and a relevant external tool is available, choose act and use that tool instead of disclaiming lack of access. ") +
-                    (active_tool_progress_required ?
-                            "The current typed active plan still requires tool progress. "
-                            "For this step, choose Action: act and emit exactly one tool-call XML block. "
-                            "Do not answer, ask, or wait yet because the work is not complete.\n" :
-                            "") +
                     (task.react_resuming_from_tool_result ?
                             "A completed tool observation was just admitted. Based on that observation, choose act, answer, or ask. "
                             "Do not choose wait unless another already-issued external tool is still outstanding.\n" :
@@ -2979,7 +2968,6 @@ private:
         inputs.tools = task.react_tools;
         inputs.tool_choice =
                 task.react_tools.empty() ? COMMON_CHAT_TOOL_CHOICE_NONE :
-                active_tool_progress_required ? COMMON_CHAT_TOOL_CHOICE_REQUIRED :
                 COMMON_CHAT_TOOL_CHOICE_AUTO;
         inputs.use_jinja = chat_params.use_jinja;
         inputs.parallel_tool_calls = false;
@@ -3280,11 +3268,6 @@ private:
                 out_step->error = "active turns may not choose internal_write";
                 return false;
             }
-            if (server_task_active_trace_requires_tool_progress(task) &&
-                    out_step->action != LLAMA_AUTHORITATIVE_REACT_ACTION_ACT) {
-                out_step->error = "active turn still requires tool progress and must choose act";
-                return false;
-            }
             if ((out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER ||
                         out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ASK) &&
                     trim_ascii_copy(out_step->assistant_msg.content).empty()) {
@@ -3322,7 +3305,6 @@ private:
         task.params.sampling = params_base.sampling;
         task.params.speculative = params_base.speculative;
         task.skip_active_loop_preflight = true;
-        task.react_enabled = true;
         task.react_origin = SERVER_REACT_ORIGIN_DMN;
         task.has_dmn_trace = true;
         task.dmn_trace = trace;
@@ -6299,7 +6281,7 @@ static bool telegram_dialogue_history_from_json(
                         resumed_task.has_active_trace = true;
                         resumed_task.skip_active_loop_preflight = true;
                         resumed_task.react_resuming_from_tool_result = true;
-                        if (react_task_ready(resumed_task)) {
+                        if (server_task_has_authoritative_react_surface(resumed_task)) {
                             append_react_tool_result(resumed_task, result);
                             if (!prepare_react_prompt(resumed_task)) {
                                 SRV_WRN("failed to prepare resumed ReAct prompt for command %d\n", result.command_id);
@@ -6327,7 +6309,7 @@ static bool telegram_dialogue_history_from_json(
                         if (resumed_task.has_dmn_trace) {
                             resumed_task.dmn_trace.observation.valid = true;
                         }
-                        if (react_task_ready(resumed_task)) {
+                        if (server_task_has_authoritative_react_surface(resumed_task)) {
                             append_react_tool_result(resumed_task, result);
                             if (!prepare_react_prompt(resumed_task)) {
                                 SRV_WRN("failed to prepare resumed DMN ReAct prompt for command %d\n", result.command_id);
@@ -7728,10 +7710,10 @@ static bool telegram_dialogue_history_from_json(
         parsed_react_step react_step = {};
         const bool parsed_react =
                 slot.task &&
-                react_task_ready(*slot.task) &&
+                server_task_has_authoritative_react_surface(*slot.task) &&
                 parse_authoritative_react_step(*slot.task, slot.generated_text, &react_step);
 
-        if (slot.task && react_task_ready(*slot.task) && !parsed_react) {
+        if (slot.task && server_task_has_authoritative_react_surface(*slot.task) && !parsed_react) {
             server_task retry_task = std::move(*slot.task);
             const std::string react_parse_input =
                     retry_task.react_assistant_prefill.empty() ?
@@ -7755,7 +7737,7 @@ static bool telegram_dialogue_history_from_json(
             return;
         }
 
-        if (slot.task && react_task_ready(*slot.task) && parsed_react) {
+        if (slot.task && server_task_has_authoritative_react_surface(*slot.task) && parsed_react) {
             server_task resumed_task = std::move(*slot.task);
             resumed_task.react_retry_feedback.clear();
             const std::string planner_reasoning = trim_ascii_copy(react_step.planner_reasoning);
@@ -8313,11 +8295,10 @@ static bool telegram_dialogue_history_from_json(
                             (void) llama_active_loop_get_last_trace(ctx, &task.active_trace);
 
                             if (authoritative_react_control_enabled) {
-                                task.react_enabled = true;
                                 task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
                             }
 
-                            const bool use_react_step = task.react_enabled;
+                            const bool use_react_step = server_task_has_authoritative_react_surface(task);
                             if (use_react_step) {
                                 if (!prepare_react_prompt(task)) {
                                     send_error(task, "Failed to prepare authoritative ReAct prompt", ERROR_TYPE_SERVER);

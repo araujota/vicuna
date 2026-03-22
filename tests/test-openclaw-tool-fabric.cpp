@@ -58,61 +58,34 @@ int main() {
         return 1;
     }
 
-    server_task tool_required_task(SERVER_TASK_TYPE_COMPLETION);
-    tool_required_task.react_enabled = true;
-    tool_required_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
-    tool_required_task.has_active_trace = true;
-    tool_required_task.react_tools.push_back(common_chat_tool{ "exec", "Run one bounded command invocation", "{}" });
-    tool_required_task.active_trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_ACT;
-    if (!expect(server_task_active_trace_requires_tool_progress(tool_required_task),
-                "expected active ACT winner_action to require tool progress")) {
+    server_task active_react_task(SERVER_TASK_TYPE_COMPLETION);
+    active_react_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
+    active_react_task.has_active_trace = true;
+    if (!expect(server_task_has_authoritative_react_surface(active_react_task),
+                "expected active completion task with an active trace to be ReAct-ready")) {
         return 1;
     }
 
-    server_task answer_ready_task(SERVER_TASK_TYPE_COMPLETION);
-    answer_ready_task.react_enabled = true;
-    answer_ready_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
-    answer_ready_task.has_active_trace = true;
-    answer_ready_task.react_tools.push_back(common_chat_tool{ "exec", "Run one bounded command invocation", "{}" });
-    answer_ready_task.active_trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_ANSWER;
-    answer_ready_task.active_trace.plan.valid = true;
-    answer_ready_task.active_trace.plan.step_count = 1;
-    answer_ready_task.active_trace.plan.current_step_index = 0;
-    answer_ready_task.active_trace.plan.steps[0].kind = LLAMA_COG_PLAN_STEP_EMIT_ANSWER;
-    answer_ready_task.active_trace.plan.steps[0].status = LLAMA_COG_PLAN_STEP_STATUS_ACTIVE;
-    if (!expect(!server_task_active_trace_requires_tool_progress(answer_ready_task),
-                "expected active answer-ready trace to allow terminal response")) {
+    server_task inactive_active_task(SERVER_TASK_TYPE_COMPLETION);
+    inactive_active_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
+    if (!expect(!server_task_has_authoritative_react_surface(inactive_active_task),
+                "expected active-origin task without an active trace to be non-ReAct-ready")) {
         return 1;
     }
 
-    server_task pending_observation_task(SERVER_TASK_TYPE_COMPLETION);
-    pending_observation_task.react_enabled = true;
-    pending_observation_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
-    pending_observation_task.has_active_trace = true;
-    pending_observation_task.react_tools.push_back(common_chat_tool{ "exec", "Run one bounded command invocation", "{}" });
-    pending_observation_task.active_trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_WAIT;
-    pending_observation_task.active_trace.plan.valid = true;
-    pending_observation_task.active_trace.plan.step_count = 2;
-    pending_observation_task.active_trace.plan.current_step_index = 1;
-    pending_observation_task.active_trace.plan.terminal_reason = LLAMA_COG_TERMINAL_TOOL_REQUIRED;
-    pending_observation_task.active_trace.plan.steps[0].kind = LLAMA_COG_PLAN_STEP_INVOKE_TOOL;
-    pending_observation_task.active_trace.plan.steps[0].status = LLAMA_COG_PLAN_STEP_STATUS_COMPLETED;
-    pending_observation_task.active_trace.plan.steps[1].kind = LLAMA_COG_PLAN_STEP_OBSERVE_TOOL;
-    pending_observation_task.active_trace.plan.steps[1].status = LLAMA_COG_PLAN_STEP_STATUS_ACTIVE;
-    pending_observation_task.active_trace.plan.steps[1].requires_tool_result = true;
-    if (!expect(server_task_active_trace_requires_tool_progress(pending_observation_task),
-                "expected pending tool observation to require further tool progress")) {
+    server_task dmn_react_task(SERVER_TASK_TYPE_COMPLETION);
+    dmn_react_task.react_origin = SERVER_REACT_ORIGIN_DMN;
+    dmn_react_task.has_dmn_trace = true;
+    if (!expect(server_task_has_authoritative_react_surface(dmn_react_task),
+                "expected DMN completion task with a DMN trace to be ReAct-ready")) {
         return 1;
     }
 
-    server_task dmn_task(SERVER_TASK_TYPE_COMPLETION);
-    dmn_task.react_enabled = true;
-    dmn_task.react_origin = SERVER_REACT_ORIGIN_DMN;
-    dmn_task.has_active_trace = true;
-    dmn_task.react_tools.push_back(common_chat_tool{ "exec", "Run one bounded command invocation", "{}" });
-    dmn_task.active_trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_ACT;
-    if (!expect(!server_task_active_trace_requires_tool_progress(dmn_task),
-                "expected DMN traces to be ignored by active tool-progress predicate")) {
+    server_task wrong_type_task(SERVER_TASK_TYPE_EMBEDDING);
+    wrong_type_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
+    wrong_type_task.has_active_trace = true;
+    if (!expect(!server_task_has_authoritative_react_surface(wrong_type_task),
+                "expected non-completion task types to remain outside authoritative ReAct")) {
         return 1;
     }
 
