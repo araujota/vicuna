@@ -1698,8 +1698,6 @@ bool emit_cognitive_artifact_tokens(
             !ctx.self_state_apply_postwrite(event, post)) {
         return false;
     }
-
-    (void) ctx.active_lora_ingest(event, &post);
     if (out_postwrite) {
         *out_postwrite = post;
     }
@@ -4057,10 +4055,6 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     trace.emotive_moment_revision = current_emotive_moment_revision;
     trace.authoritative_turn.source_emotive_revision_id = current_emotive_moment_revision.revision_id;
     trace.authoritative_turn.source_context_revision = trace.context_window.head_revision;
-
-    if ((mutable_event.flags & LLAMA_SELF_STATE_EVENT_ADMITTED) && mutable_event.tokens && mutable_event.n_tokens > 0) {
-        (void) ctx.active_lora_ingest(mutable_event, &trace.postwrite_features);
-    }
 
     const lexical_signals lex = analyze_event_lexicon(vocab, mutable_event);
     const float uncertainty = clamp_unit(std::max(trace.postwrite_features.uncertainty_score, trace.prewrite_features.uncertainty_score));

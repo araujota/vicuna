@@ -212,6 +212,13 @@ bounded `[0,1]` affective registers, projects them onto a Warriner-style
 deterministic natural-language description that includes those norm-aligned
 scores together with social closeness, tension, and goal pressure.
 
+The `/health` payload now also exposes the current self-model revision, current
+emotive-moment revision, and current shared-context-window state so operators
+can verify what the ReAct loop is being seeded with on a live runtime.
+
+Temporal Active LoRA writes are not part of live self-state admission. They are
+only triggered when context spans are evicted into temporal memory.
+
 Authoritative ReAct parsing is also hardened around emitted structure. When the
 model emits a `<vicuna_tool_call ...>` block with trailing chatter or a partial
 closing tag, the server now salvages the emitted tool-call structure and

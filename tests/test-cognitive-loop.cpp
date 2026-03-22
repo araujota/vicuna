@@ -514,14 +514,6 @@ static bool ingest_event_without_runner(
         return false;
     }
 
-    if ((mutable_event.flags & LLAMA_SELF_STATE_EVENT_ADMITTED) &&
-        mutable_event.tokens &&
-        mutable_event.n_tokens > 0 &&
-        llama_active_lora_ingest(ctx, mutable_event.tokens, mutable_event.n_tokens) != 0) {
-        std::fprintf(stderr, "%s: failed to ingest active LoRA span\n", label);
-        return false;
-    }
-
     return true;
 }
 

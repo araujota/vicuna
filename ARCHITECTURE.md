@@ -418,7 +418,9 @@ of:
 This keeps the observability model unified:
 
 - one local source of truth for longitudinal analysis
-- one online metrics/health surface derived from the same data
+- one online metrics/health surface derived from the same data, including the
+  current self-model revision, emotive-moment revision, and shared-context
+  window state visible to ReAct prompt assembly
 - and one schema that can later be exported into broader tracing/evaluation
   infrastructure without redesigning the runtime
 

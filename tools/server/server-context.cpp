@@ -157,8 +157,7 @@ static bool admit_runtime_emit_tokens(
     if (!admitted) {
         return false;
     }
-
-    return llama_active_lora_ingest_event(ctx, &event, &post) == 0;
+    return true;
 }
 
 static bool admit_runtime_emit_text(
@@ -7038,6 +7037,15 @@ static bool telegram_dialogue_history_from_json(
     }
 
     json build_health_json() const {
+        llama_self_model_revision self_model_revision = {};
+        llama_emotive_moment_revision emotive_moment_revision = {};
+        llama_shared_cognitive_context_window shared_context_window = {};
+        const bool have_self_model_revision =
+                ctx && llama_self_state_get_self_model_revision(ctx, &self_model_revision) == 0 && self_model_revision.valid;
+        const bool have_emotive_moment_revision =
+                ctx && llama_self_state_get_emotive_moment_revision(ctx, &emotive_moment_revision) == 0 && emotive_moment_revision.valid;
+        const bool have_shared_context_window =
+                ctx && llama_shared_cognitive_context_get_window(ctx, &shared_context_window) == 0;
         json health = {
             {"status", "ok"},
             {"state", state == SERVER_STATE_READY ? "ready" : "loading"},
@@ -7045,6 +7053,27 @@ static bool telegram_dialogue_history_from_json(
             {"waiting_active_tasks", 0},
             {"external_bash_pending", count_pending_external_work(bash_work)},
             {"external_hard_memory_pending", count_pending_external_work(hard_memory_work)},
+            {"cognitive_state", {
+                {"self_model_revision", {
+                    {"valid", have_self_model_revision},
+                    {"revision_id", have_self_model_revision ? self_model_revision.revision_id : 0},
+                    {"allostatic_distance", have_self_model_revision ? self_model_revision.allostatic_distance : 0.0},
+                    {"materiality_score", have_self_model_revision ? self_model_revision.materiality_score : 0.0},
+                }},
+                {"emotive_moment", {
+                    {"valid", have_emotive_moment_revision},
+                    {"revision_id", have_emotive_moment_revision ? emotive_moment_revision.revision_id : 0},
+                    {"source_self_model_revision_id", have_emotive_moment_revision ? emotive_moment_revision.source_self_model_revision_id : 0},
+                    {"materiality_score", have_emotive_moment_revision ? emotive_moment_revision.materiality_score : 0.0},
+                    {"text", have_emotive_moment_revision ? bounded_cstr_to_string(emotive_moment_revision.text) : std::string()},
+                }},
+                {"shared_context_window", {
+                    {"valid", have_shared_context_window},
+                    {"head_revision", have_shared_context_window ? shared_context_window.head_revision : 0},
+                    {"item_count", have_shared_context_window ? shared_context_window.item_count : 0},
+                    {"token_count", have_shared_context_window ? shared_context_window.token_count : 0},
+                }},
+            }},
             {"proactive_mailbox", build_proactive_mailbox_health_json()},
             {"telegram_dialogue", build_telegram_dialogue_health_json()},
             {"runtime_persistence", {
