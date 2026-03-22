@@ -7707,6 +7707,19 @@ static bool telegram_dialogue_history_from_json(
     }
 
     void send_final_response(server_slot & slot) {
+        if (slot.task) {
+            SLT_INF(slot,
+                    "authoritative react finalize: type=%d prepare=%d ready=%d origin=%d active=%d dmn=%d prefill=%zu tools=%zu retry=%d\n",
+                    (int) slot.task->type,
+                    server_task_should_prepare_authoritative_react(*slot.task) ? 1 : 0,
+                    server_task_has_authoritative_react_surface(*slot.task) ? 1 : 0,
+                    (int) slot.task->react_origin,
+                    slot.task->has_active_trace ? 1 : 0,
+                    slot.task->has_dmn_trace ? 1 : 0,
+                    slot.task->react_assistant_prefill.size(),
+                    slot.task->react_tools.size(),
+                    slot.task->react_retry_count);
+        }
         parsed_react_step react_step = {};
         const bool parsed_react =
                 slot.task &&
