@@ -2675,6 +2675,59 @@ private:
         return trim_ascii_copy(emotive.text);
     }
 
+    std::string current_emotive_style_directive() const {
+        llama_emotive_moment_revision emotive = {};
+        if (!ctx || llama_self_state_get_emotive_moment_revision(ctx, &emotive) != 0 || !emotive.valid) {
+            return {};
+        }
+
+        const auto & affect = emotive.affective_vector;
+
+        const char * tone = "steady";
+        if (affect.arousal >= 0.72f || affect.cognitive_tension >= 0.62f) {
+            tone = affect.valence >= 0.55f ? "energized" : "strained";
+        } else if (affect.arousal <= 0.32f) {
+            tone = affect.valence >= 0.55f ? "calm" : "subdued";
+        } else if (affect.valence >= 0.68f) {
+            tone = "warm";
+        } else if (affect.valence <= 0.38f) {
+            tone = "somber";
+        }
+
+        const char * stance = "balanced";
+        if (affect.dominance >= 0.70f) {
+            stance = affect.cognitive_tension >= 0.55f ? "firm" : "confident";
+        } else if (affect.dominance <= 0.34f) {
+            stance = "tentative";
+        } else if (affect.cognitive_tension >= 0.58f) {
+            stance = "careful";
+        }
+
+        const char * social_posture = "neutral";
+        if (affect.social_closeness >= 0.68f) {
+            social_posture = "affiliative";
+        } else if (affect.social_closeness <= 0.30f) {
+            social_posture = "reserved";
+        } else if (affect.valence >= 0.62f) {
+            social_posture = "receptive";
+        }
+
+        const char * verbosity = "moderately concise";
+        if (affect.goal_pressure >= 0.70f || affect.cognitive_tension >= 0.64f) {
+            verbosity = "brief and efficient";
+        } else if (affect.arousal <= 0.30f && affect.goal_pressure <= 0.36f) {
+            verbosity = "measured and slightly fuller";
+        }
+
+        std::ostringstream style;
+        style << "Emotive style directive: let the current emotive state shape wording and pacing. "
+              << "Use a " << tone << ", " << stance << ", " << social_posture
+              << " tone; keep visible language " << verbosity << ". "
+              << "Let this influence hidden reasoning and natural-language replies, "
+              << "but do not let it alter tool XML, tool arguments, JSON, identifiers, or other structured output.";
+        return style.str();
+    }
+
     std::string shared_context_summary_text(int32_t limit = 8) const {
         if (!ctx) {
             return {};
@@ -2902,6 +2955,7 @@ private:
         common_chat_msg phase_system;
         phase_system.role = "system";
         const std::string emotive = current_emotive_moment_text();
+        const std::string emotive_style = current_emotive_style_directive();
         const std::string context_summary = shared_context_summary_text();
         if (task.react_origin == SERVER_REACT_ORIGIN_DMN) {
             phase_system.content =
@@ -2924,6 +2978,7 @@ private:
                             "") +
                     "Do not invent any parallel transcript or selector policy.\n\n" +
                     (emotive.empty() ? std::string() : "Current emotive moment: " + emotive + "\n") +
+                    (emotive_style.empty() ? std::string() : emotive_style + "\n") +
                     (context_summary.empty() ? std::string() : context_summary + "\n\n") +
                     (task.react_retry_feedback.empty() ? std::string() :
                             "Previous control step failed validation: " + task.react_retry_feedback + "\n\n") +
@@ -2960,6 +3015,7 @@ private:
                             "") +
                     "Do not invent any parallel transcript or selector policy.\n\n" +
                     (emotive.empty() ? std::string() : "Current emotive moment: " + emotive + "\n") +
+                    (emotive_style.empty() ? std::string() : emotive_style + "\n") +
                     (context_summary.empty() ? std::string() : context_summary + "\n\n") +
                     (task.react_retry_feedback.empty() ? std::string() :
                             "Previous control step failed validation: " + task.react_retry_feedback + "\n\n") +

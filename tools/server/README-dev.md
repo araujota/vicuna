@@ -212,6 +212,12 @@ bounded `[0,1]` affective registers, projects them onto a Warriner-style
 deterministic natural-language description that includes those norm-aligned
 scores together with social closeness, tension, and goal pressure.
 
+That same typed affective vector now also compiles into a deterministic
+`Emotive style directive` injected into both active and DMN authoritative ReAct
+prompts. The directive steers tone, stance, social posture, and verbosity for
+natural-language generation while explicitly leaving tool XML, tool arguments,
+JSON, and other structured output untouched.
+
 The `/health` payload now also exposes the current self-model revision, current
 emotive-moment revision, and current shared-context-window state so operators
 can verify what the ReAct loop is being seeded with on a live runtime.
