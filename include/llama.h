@@ -3518,6 +3518,10 @@ extern "C" {
     LLAMA_API int32_t llama_cognitive_authoritative_react_set_enabled(
             struct llama_context * ctx,
             bool enabled);
+    LLAMA_API int32_t llama_cognitive_active_authoritative_prepare(
+            struct llama_context * ctx,
+            const struct llama_self_state_event * event,
+            struct llama_active_loop_trace * out_trace);
     LLAMA_API int32_t llama_cognitive_active_authoritative_begin_tool(
             struct llama_context * ctx,
             int32_t episode_id,

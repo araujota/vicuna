@@ -3314,7 +3314,6 @@ private:
         task.params.n_predict = params_base.n_predict;
         task.params.sampling = params_base.sampling;
         task.params.speculative = params_base.speculative;
-        task.skip_active_loop_preflight = true;
         task.react_origin = SERVER_REACT_ORIGIN_DMN;
         task.has_dmn_trace = true;
         task.dmn_trace = trace;
@@ -5153,36 +5152,6 @@ static bool telegram_dialogue_history_from_json(
         }
     }
 
-    void log_active_preflight_summary(const server_task & task, const char * phase_label) {
-        if (!task.has_active_trace) {
-            SRV_INF("active preflight %s task=%d trace=0 role=%d flags=%u prompt_tokens=%zu foreground_tokens=%zu\n",
-                    phase_label ? phase_label : "unknown",
-                    task.id,
-                    task.foreground_role,
-                    task.foreground_flags,
-                    task.tokens.size(),
-                    task.active_loop_tokens.size());
-            return;
-        }
-
-        const llama_active_loop_trace & trace = task.active_trace;
-        SRV_INF("active preflight %s task=%d trace=1 winner=%d score=%.3f runner=%d runner_score=%.3f emit=%d tool_followup=%d tool_valid=%d tool_kind=%d spec_index=%d reason=0x%x prompt_tokens=%zu foreground_tokens=%zu\n",
-                phase_label ? phase_label : "unknown",
-                task.id,
-                trace.winner_action,
-                trace.winner_score,
-                trace.runner_up_action,
-                trace.runner_up_score,
-                trace.emit_allowed ? 1 : 0,
-                trace.tool_followup_expected ? 1 : 0,
-                trace.tool_proposal.valid ? 1 : 0,
-                trace.tool_proposal.tool_kind,
-                trace.tool_proposal.spec_index,
-                trace.reason_mask,
-                task.tokens.size(),
-                task.active_loop_tokens.size());
-    }
-
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -6289,7 +6258,6 @@ static bool telegram_dialogue_history_from_json(
                     if (found_task) {
                         resumed_task.active_trace = active_trace;
                         resumed_task.has_active_trace = true;
-                        resumed_task.skip_active_loop_preflight = true;
                         resumed_task.react_resuming_from_tool_result = true;
                         if (server_task_should_prepare_authoritative_react(resumed_task)) {
                             append_react_tool_result(resumed_task, result);
@@ -6314,7 +6282,6 @@ static bool telegram_dialogue_history_from_json(
                         }
                     }
                     if (found_task) {
-                        resumed_task.skip_active_loop_preflight = true;
                         resumed_task.react_resuming_from_tool_result = true;
                         if (resumed_task.has_dmn_trace) {
                             resumed_task.dmn_trace.observation.valid = true;
@@ -7401,32 +7368,9 @@ static bool telegram_dialogue_history_from_json(
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
 
         {
-            const auto loop_tokens = make_self_state_token_view(
-                    task.tokens,
-                    &task.active_loop_tokens,
-                    core_system_prompt_prefix_tokens.size());
-            const llama_self_state_event loop_event = {
-                /*.tokens =*/ loop_tokens.data,
-                /*.n_tokens =*/ loop_tokens.size,
-                /*.role =*/ task.foreground_role,
-                /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
-                /*.flags =*/ task.foreground_flags,
-                /*.decoder_entropy =*/ 0.0f,
-                /*.decoder_top_margin =*/ 1.0f,
-            };
-            const bool ran_active_loop_here = !task.skip_active_loop_preflight;
-            if (!task.skip_active_loop_preflight) {
-                task.has_active_trace = llama_active_loop_process(ctx, &loop_event, &task.active_trace) == 0;
-            }
-            log_active_preflight_summary(task, "slot");
             if (task.has_active_trace) {
-                if (ran_active_loop_here) {
-                    capture_active_loop_provenance("active_loop", task.active_trace);
-                }
-                SLT_INF(slot, "active loop episode %d winner=%d score=%.3f deferred_background=%d\n",
+                SLT_INF(slot, "active authoritative episode %d deferred_background=%d\n",
                         task.active_trace.episode_id,
-                        task.active_trace.winner_action,
-                        task.active_trace.winner_score,
                         task.active_trace.deferred_background ? 1 : 0);
                 llama_cognitive_active_runner_status runner = {};
                 llama_cognitive_command command = {};
@@ -8339,7 +8283,10 @@ static bool telegram_dialogue_history_from_json(
                         }
                     }
 
-                    if (!task.skip_active_loop_preflight && !task.is_child()) {
+                    if (active_loop_enabled &&
+                            authoritative_react_control_enabled &&
+                            !task.is_child() &&
+                            task.foreground_role != LLAMA_SELF_STATE_EVENT_SYSTEM) {
                         const auto loop_tokens = make_self_state_token_view(
                                 task.tokens,
                                 &task.active_loop_tokens,
@@ -8348,19 +8295,14 @@ static bool telegram_dialogue_history_from_json(
                             /*.tokens =*/ loop_tokens.data,
                             /*.n_tokens =*/ loop_tokens.size,
                             /*.role =*/ task.foreground_role,
-                            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
-                            /*.flags =*/ task.foreground_flags,
-                            /*.decoder_entropy =*/ 0.0f,
-                            /*.decoder_top_margin =*/ 1.0f,
+                                /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+                                /*.flags =*/ task.foreground_flags,
+                                /*.decoder_entropy =*/ 0.0f,
+                                /*.decoder_top_margin =*/ 1.0f,
                         };
-                        task.has_active_trace = llama_active_loop_process(ctx, &loop_event, &task.active_trace) == 0;
-                        task.skip_active_loop_preflight = true;
-                        log_active_preflight_summary(task, "queue");
+                        task.has_active_trace =
+                                llama_cognitive_active_authoritative_prepare(ctx, &loop_event, &task.active_trace) == 0;
                         if (task.has_active_trace) {
-                            mark_runtime_state_dirty("active-loop-preflight");
-                            capture_active_loop_provenance("active_preflight", task.active_trace);
-                            (void) llama_active_loop_get_last_trace(ctx, &task.active_trace);
-
                             if (authoritative_react_control_enabled) {
                                 task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
                             }
@@ -10004,7 +9946,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->slot_n_ctx,
                     data);
             ctx_server.apply_core_system_prompt_prefix(task);
-            task.skip_active_loop_preflight = !ctx_server.active_loop_enabled;
             task.foreground_role = classify_foreground_role(data);
             const std::string foreground_text = extract_foreground_message_text(data);
             if (!foreground_text.empty()) {

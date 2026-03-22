@@ -1072,7 +1072,8 @@ int main(int argc, char ** argv) {
         };
 
         llama_active_loop_trace trace = {};
-        if (!expect_active_action("active-authoritative-react", ctx, event, LLAMA_ACTIVE_LOOP_ACTION_ACT, &trace)) {
+        if (llama_cognitive_active_authoritative_prepare(ctx, &event, &trace) != 0) {
+            std::fprintf(stderr, "failed to prepare authoritative active turn without CPU preflight\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -1093,7 +1094,7 @@ int main(int argc, char ** argv) {
             runner.pending_command_id != -1 ||
             runner.pending_tool_spec_index != -1 ||
             runner.steps_taken <= 0) {
-            std::fprintf(stderr, "authoritative active mode did not stop at propose without enqueuing a CPU-selected tool command\n");
+            std::fprintf(stderr, "authoritative active initialization did not stop at propose without enqueuing a CPU-selected tool command\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;

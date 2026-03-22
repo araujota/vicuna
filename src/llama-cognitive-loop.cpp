@@ -3484,6 +3484,280 @@ bool llama_cognitive_loop::cognitive_authoritative_react_set_enabled(bool enable
     return true;
 }
 
+bool llama_cognitive_loop::cognitive_active_authoritative_prepare(
+        const llama_self_state_event & event,
+        llama_active_loop_trace * out_trace) {
+    if (event.role != LLAMA_SELF_STATE_EVENT_USER && event.role != LLAMA_SELF_STATE_EVENT_TOOL) {
+        return false;
+    }
+
+    const bool resuming_active_tool =
+            event.role == LLAMA_SELF_STATE_EVENT_TOOL &&
+            active_runner.active &&
+            active_runner.waiting_on_tool &&
+            !active_runner.completed;
+
+    llama_active_loop_trace trace = {};
+    trace.episode_id = resuming_active_tool ? active_runner.episode_id : next_episode_id++;
+    trace.source_role = event.role;
+    trace.channel = event.channel;
+    trace.event_flags = event.flags;
+    trace.arrival_time_us = llama_time_us();
+    trace.authoritative_turn.valid = authoritative_react_control_enabled;
+    trace.authoritative_turn.turn_id = next_authoritative_turn_id++;
+    trace.authoritative_turn.origin = LLAMA_COG_COMMAND_ORIGIN_ACTIVE;
+    trace.authoritative_turn.status = LLAMA_AUTHORITATIVE_TURN_STATUS_DRAFTING;
+
+    if (event.role == LLAMA_SELF_STATE_EVENT_TOOL && host_state.pending_tool_followup_count > 0) {
+        --host_state.pending_tool_followup_count;
+    }
+
+    if (resuming_active_tool) {
+        active_runner.waiting_on_tool = false;
+        active_runner.pending_command_id = -1;
+        active_runner.pending_tool_spec_index = -1;
+        active_runner.completed = false;
+        active_runner.planning_active = true;
+    } else {
+        active_runner = {};
+        active_runner.episode_id = trace.episode_id;
+        active_runner.active = true;
+        active_runner.max_steps = LLAMA_COG_LOOP_UNBOUNDED_MAX_STEPS;
+        active_runner.pending_command_id = -1;
+        active_runner.pending_tool_spec_index = -1;
+        active_runner.last_command_id = -1;
+        active_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
+        active_runner.plan_id = -1;
+        active_runner.plan_mode = LLAMA_COG_PLAN_MODE_NONE;
+        active_runner.plan_status = LLAMA_COG_PLAN_STATUS_NONE;
+        active_runner.plan_revision_count = 0;
+        active_runner.current_plan_step = -1;
+    }
+
+    (void) ctx.self_state_set_channel_state(LLAMA_SELF_STATE_CHANNEL_ACTIVE);
+    if (event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
+        (void) ctx.self_state_note_tool_event();
+    } else {
+        (void) ctx.self_state_note_user_event();
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(&ctx.get_model());
+    llama_self_state_event mutable_event = event;
+
+    if (!ctx.self_state_build_prewrite_features(mutable_event, &trace.prewrite_features)) {
+        return false;
+    }
+    if (!ctx.self_state_apply_prewrite(mutable_event, trace.prewrite_features)) {
+        return false;
+    }
+
+    const bool admitted =
+            mutable_event.n_tokens > 0 ||
+            trace.prewrite_features.memory_write_pressure > 0.12f ||
+            mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL;
+    if (admitted) {
+        mutable_event.flags |= LLAMA_SELF_STATE_EVENT_ADMITTED;
+    }
+
+    if (!ctx.self_state_build_postwrite_features(mutable_event, &trace.postwrite_features)) {
+        return false;
+    }
+    if (!ctx.self_state_apply_postwrite(mutable_event, trace.postwrite_features)) {
+        return false;
+    }
+
+    (void) refresh_runtime_self_description(
+            ctx,
+            vocab,
+            LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+            LLAMA_COG_LOOP_PHASE_PROPOSE,
+            trace.episode_id,
+            active_plan.valid ? active_plan.plan_id : -1,
+            &current_canonical_self_model_revision,
+            &current_emotive_moment_revision,
+            &trace.context_window);
+    trace.self_model_revision = current_canonical_self_model_revision;
+    trace.emotive_moment_revision = current_emotive_moment_revision;
+    trace.authoritative_turn.source_emotive_revision_id = current_emotive_moment_revision.revision_id;
+    trace.authoritative_turn.source_context_revision = trace.context_window.head_revision;
+
+    const lexical_signals lex = analyze_event_lexicon(vocab, mutable_event);
+    const float uncertainty = clamp_unit(std::max(trace.postwrite_features.uncertainty_score, trace.prewrite_features.uncertainty_score));
+    const float inhibition = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_BROADCAST_INHIBITION));
+    const float goal_relevance = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_GOAL_RELEVANCE));
+    const float tool_affordance = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_AFFORDANCE));
+    const float answerability = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_ANSWERABILITY));
+    const float recovery_urgency = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_RECOVERY_URGENCY));
+    const float preference_uncertainty = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY));
+    const bool tool_completed = (mutable_event.flags & LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED) != 0;
+    const llama_favorable_state_profile pre_active_profile =
+            llama_cognitive_runtime_impl(ctx).compute_favorable_profile();
+    const llama_functional_outcome_snapshot active_before_snapshot =
+            capture_functional_snapshot(ctx, pre_active_profile);
+
+    auto activate_microphase = [&](int32_t microphase,
+                                   float tool_affinity_seed,
+                                   float planning_pressure_seed = 0.0f,
+                                   float plan_complexity_seed = 0.0f,
+                                   float plan_revision_seed = 0.0f) {
+        const float memory_pressure_seed = clamp_unit(std::max(
+                trace.prewrite_features.memory_write_pressure,
+                trace.postwrite_features.memory_write_pressure));
+        const float continuation_seed = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_FOLLOWUP_CONTINUATION));
+        llama_functional_activation_decision decision = route_functional_activation(
+                ctx,
+                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                microphase,
+                active_before_snapshot,
+                uncertainty,
+                tool_affinity_seed,
+                continuation_seed,
+                memory_pressure_seed,
+                planning_pressure_seed,
+                plan_complexity_seed,
+                plan_revision_seed);
+        const llama_cognitive_plan_trace * process_plan = trace.plan.valid ? &trace.plan : (active_plan.valid ? &active_plan : nullptr);
+        (void) ctx.process_functional_set_execution(
+                make_process_signature(
+                        LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                        primary_functional_family(decision),
+                        microphase,
+                        process_plan,
+                        nullptr,
+                        trace.episode_id));
+        (void) ctx.functional_lora_activate(decision);
+        llama_functional_lora_trace functional_trace = {};
+        trace.functional_activation =
+                ctx.functional_lora_get_last_trace(&functional_trace) ?
+                functional_trace.last_activation :
+                decision;
+        active_runner.functional_microphase = microphase;
+    };
+
+    activate_microphase(
+            mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL ?
+                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION :
+                    LLAMA_FUNCTIONAL_MICROPHASE_STATE_INTERPRET,
+            0.0f);
+
+    llama_self_social_state_info social = {};
+    (void) ctx.self_state_get_social_state(&social);
+
+    const float user_relevance = clamp_unit(
+            0.30f +
+            0.28f * (mutable_event.role == LLAMA_SELF_STATE_EVENT_USER ? 1.0f : 0.0f) +
+            0.25f * (tool_completed ? 1.0f : 0.0f) +
+            0.12f * goal_relevance +
+            0.10f * social.trust);
+    const float latency_pressure = clamp_unit(
+            0.25f +
+            0.32f * (mutable_event.role == LLAMA_SELF_STATE_EVENT_USER ? 1.0f : 0.0f) +
+            0.18f * lex.question +
+            0.18f * (tool_completed ? 1.0f : 0.0f));
+    const uint32_t base_reason = build_active_reason_mask(mutable_event, lex, uncertainty, inhibition, tool_completed);
+
+    const float control_priority = clamp_unit(
+            0.24f +
+            0.20f * goal_relevance +
+            0.16f * tool_affordance +
+            0.14f * user_relevance +
+            0.12f * latency_pressure +
+            0.10f * (1.0f - inhibition) +
+            0.10f * uncertainty);
+    const int32_t plan_id = resuming_active_tool && active_plan.valid ? active_plan.plan_id : next_plan_id++;
+    const int32_t plan_revision_count =
+            resuming_active_tool && active_plan.valid ? active_plan.revision_count + 1 : 0;
+    const float plan_complexity = clamp_unit(
+            0.36f +
+            0.18f * goal_relevance +
+            0.16f * tool_affordance +
+            0.14f * uncertainty +
+            0.16f * latency_pressure);
+    const float plan_ambiguity = clamp_unit(
+            0.32f * uncertainty +
+            0.24f * preference_uncertainty +
+            0.18f * recovery_urgency +
+            0.12f * (1.0f - answerability));
+
+    activate_microphase(
+            resuming_active_tool ? LLAMA_FUNCTIONAL_MICROPHASE_PLAN_REVISE : LLAMA_FUNCTIONAL_MICROPHASE_PLAN_DRAFT,
+            tool_affordance,
+            control_priority,
+            plan_complexity,
+            clamp_unit((float) plan_revision_count / 4.0f));
+
+    init_plan_trace(
+            trace.plan,
+            plan_id,
+            LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+            plan_revision_count,
+            control_priority,
+            plan_ambiguity,
+            base_reason);
+    (void) append_plan_step(
+            trace.plan,
+            LLAMA_COG_PLAN_STEP_WAIT,
+            LLAMA_COG_PLAN_STEP_STATUS_READY,
+            LLAMA_TOOL_KIND_NONE,
+            -1,
+            base_reason,
+            control_priority,
+            1,
+            false);
+    trace.plan.current_step_index = 0;
+    trace.plan.status = LLAMA_COG_PLAN_STATUS_EXECUTING;
+    trace.plan.terminal_reason = LLAMA_COG_TERMINAL_NONE;
+    active_plan = trace.plan;
+
+    activate_microphase(
+            LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE,
+            tool_affordance,
+            control_priority,
+            plan_complexity,
+            clamp_unit((float) plan_revision_count / 4.0f));
+
+    trace.candidate_count = 0;
+    trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_WAIT;
+    trace.winner_score = control_priority;
+    trace.runner_up_action = LLAMA_ACTIVE_LOOP_ACTION_WAIT;
+    trace.runner_up_score = control_priority;
+    trace.reason_mask = base_reason;
+    trace.emit_allowed = false;
+    trace.emit_noted = false;
+    trace.tool_followup_expected = false;
+    trace.authoritative_turn.valid = true;
+    trace.authoritative_turn.status = LLAMA_AUTHORITATIVE_TURN_STATUS_VALIDATING;
+    trace.authoritative_turn.action = LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT;
+    set_loop_state(
+            trace.loop_state,
+            LLAMA_COG_LOOP_PHASE_PROPOSE,
+            LLAMA_COG_TERMINAL_NONE,
+            active_runner.max_steps,
+            resuming_active_tool ? active_runner.steps_taken + 1 : 1,
+            true,
+            false,
+            tool_spec_count);
+    active_runner.steps_taken = trace.loop_state.steps_taken;
+    active_runner.waiting_on_tool = false;
+    active_runner.pending_command_id = -1;
+    active_runner.pending_tool_spec_index = -1;
+    active_runner.completed = false;
+    active_runner.active = true;
+    active_runner.plan_id = trace.plan.plan_id;
+    active_runner.plan_mode = trace.plan.mode;
+    active_runner.plan_status = trace.plan.status;
+    active_runner.plan_revision_count = trace.plan.revision_count;
+    active_runner.current_plan_step = trace.plan.current_step_index;
+    active_runner.planning_active = true;
+    tool_selection_episode_open = false;
+    last_active_trace = trace;
+    host_state.last_foreground_time_us = trace.completed_time_us;
+    if (out_trace) {
+        *out_trace = trace;
+    }
+    return true;
+}
+
 bool llama_cognitive_loop::cognitive_active_authoritative_begin_tool(
         int32_t episode_id,
         uint32_t reason_mask,
@@ -6230,6 +6504,12 @@ bool llama_context::cognitive_authoritative_react_set_enabled(bool enabled) {
     return cognitive_loop && cognitive_loop->cognitive_authoritative_react_set_enabled(enabled);
 }
 
+bool llama_context::cognitive_active_authoritative_prepare(
+        const llama_self_state_event & event,
+        llama_active_loop_trace * out_trace) {
+    return cognitive_loop && cognitive_loop->cognitive_active_authoritative_prepare(event, out_trace);
+}
+
 bool llama_context::cognitive_active_authoritative_begin_tool(
         int32_t episode_id,
         uint32_t reason_mask,
@@ -6455,6 +6735,13 @@ int32_t llama_cognitive_authoritative_react_set_enabled(
         struct llama_context * ctx,
         bool enabled) {
     return ctx && ctx->cognitive_authoritative_react_set_enabled(enabled) ? 0 : -1;
+}
+
+int32_t llama_cognitive_active_authoritative_prepare(
+        struct llama_context * ctx,
+        const struct llama_self_state_event * event,
+        struct llama_active_loop_trace * out_trace) {
+    return ctx && event && out_trace && ctx->cognitive_active_authoritative_prepare(*event, out_trace) ? 0 : -1;
 }
 
 int32_t llama_cognitive_active_authoritative_begin_tool(

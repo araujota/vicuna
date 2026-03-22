@@ -22,6 +22,7 @@ public:
     bool cognitive_command_begin_external_wait(int32_t command_id);
     bool cognitive_command_rebind_tool(int32_t command_id, int32_t tool_spec_index);
     bool cognitive_authoritative_react_set_enabled(bool enabled);
+    bool cognitive_active_authoritative_prepare(const llama_self_state_event & event, llama_active_loop_trace * out_trace);
     bool cognitive_active_authoritative_begin_tool(int32_t episode_id, uint32_t reason_mask, float priority, int32_t * out_command_id, int32_t * out_tool_job_id);
     bool cognitive_active_authoritative_finish(int32_t episode_id, int32_t terminal_reason);
     bool cognitive_dmn_authoritative_begin_tool(int32_t tick_id, uint32_t reason_mask, float priority, int32_t * out_command_id, int32_t * out_tool_job_id);

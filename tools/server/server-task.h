@@ -155,7 +155,6 @@ struct server_task {
     uint32_t foreground_flags = 0;
     llama_active_loop_trace active_trace = {};
     bool has_active_trace = false;
-    bool skip_active_loop_preflight = false;
     int32_t react_iteration = 0;
     int32_t react_origin = SERVER_REACT_ORIGIN_NONE;
     int32_t react_retry_count = 0;
