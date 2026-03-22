@@ -10,6 +10,67 @@ static void set_error(std::string * out_error, const std::string & value) {
     }
 }
 
+static bool schema_node_requires_description(const json & node, bool is_root) {
+    if (is_root || !node.is_object()) {
+        return false;
+    }
+    if (node.contains("type")) {
+        return true;
+    }
+    if (node.contains("properties") || node.contains("items")) {
+        return true;
+    }
+    return false;
+}
+
+static bool validate_schema_descriptions(
+        const json & node,
+        const std::string & path,
+        bool is_root,
+        std::string * out_error) {
+    if (!node.is_object()) {
+        return true;
+    }
+
+    if (schema_node_requires_description(node, is_root)) {
+        const std::string description = node.value("description", "");
+        if (description.empty()) {
+            set_error(out_error, "tool schema is missing a description at " + path);
+            return false;
+        }
+    }
+
+    if (node.contains("properties")) {
+        const json & properties = node.at("properties");
+        if (!properties.is_object()) {
+            set_error(out_error, "tool schema properties must be an object at " + path);
+            return false;
+        }
+        for (auto it = properties.begin(); it != properties.end(); ++it) {
+            if (!validate_schema_descriptions(it.value(), path + ".properties." + it.key(), false, out_error)) {
+                return false;
+            }
+        }
+    }
+
+    if (node.contains("items")) {
+        const json & items = node.at("items");
+        if (items.is_array()) {
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (!validate_schema_descriptions(items.at(i), path + ".items[" + std::to_string(i) + "]", false, out_error)) {
+                    return false;
+                }
+            }
+        } else {
+            if (!validate_schema_descriptions(items, path + ".items", false, out_error)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 bool openclaw_tool_capability_descriptor_validate(
         const openclaw_tool_capability_descriptor & descriptor,
         std::string * out_error) {
@@ -32,6 +93,18 @@ bool openclaw_tool_capability_descriptor_validate(
     if (descriptor.tool_kind <= 0) {
         set_error(out_error, "tool_kind must be positive");
         return false;
+    }
+    if (!descriptor.input_schema_json.empty()) {
+        json schema;
+        try {
+            schema = json::parse(descriptor.input_schema_json);
+        } catch (const std::exception & e) {
+            set_error(out_error, std::string("input_schema_json must be valid JSON: ") + e.what());
+            return false;
+        }
+        if (!validate_schema_descriptions(schema, "input_schema_json", true, out_error)) {
+            return false;
+        }
     }
     return true;
 }

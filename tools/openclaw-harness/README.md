@@ -22,6 +22,12 @@ shell tool for host-local observation and action, such as filesystem state,
 current working directory, repository state, environment state, running
 processes, and direct command output.
 
+The same rule applies to every OpenClaw capability in the harness: exposed
+parameters must carry descriptions, including nested object fields and array
+item surfaces. The harness and the server fabric share the same capability
+contract so ReAct sees one authoritative tool system rather than competing
+descriptor registries.
+
 Example:
 
 ```bash

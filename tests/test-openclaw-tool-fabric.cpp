@@ -30,7 +30,7 @@ int main() {
     descriptor.owner_plugin_id = "openclaw-core";
     descriptor.tool_name = "exec";
     descriptor.description = "Run a command";
-    descriptor.input_schema_json = R"({"type":"object","properties":{"command":{"type":"string"}}})";
+    descriptor.input_schema_json = R"({"type":"object","properties":{"command":{"type":"string","description":"The shell command to run."}}})";
     descriptor.output_contract = "pending_then_result";
     descriptor.side_effect_class = "system_exec";
     descriptor.approval_mode = "policy_driven";
@@ -44,6 +44,17 @@ int main() {
 
     std::string error;
     if (!expect(openclaw_tool_capability_descriptor_validate(descriptor, &error), error.c_str())) {
+        return 1;
+    }
+
+    openclaw_tool_capability_descriptor missing_description_descriptor = descriptor;
+    missing_description_descriptor.input_schema_json = R"({"type":"object","properties":{"command":{"type":"string"}}})";
+    if (!expect(!openclaw_tool_capability_descriptor_validate(missing_description_descriptor, &error),
+                "expected descriptor validation to reject missing parameter descriptions")) {
+        return 1;
+    }
+    if (!expect(error.find("input_schema_json.properties.command") != std::string::npos,
+                "expected missing-description error to identify the schema path")) {
         return 1;
     }
 
@@ -257,6 +268,9 @@ int main() {
         return 1;
     }
     if (!expect(!contracts[0].args.empty(), "expected schema-derived XML args")) {
+        return 1;
+    }
+    if (!expect(!contracts[0].args[0].description.empty(), "expected XML arg requirements to retain parameter descriptions")) {
         return 1;
     }
 

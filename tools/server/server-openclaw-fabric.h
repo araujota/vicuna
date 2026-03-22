@@ -37,6 +37,7 @@ enum server_openclaw_xml_arg_type_mask : uint32_t {
 
 struct server_openclaw_xml_arg_requirement {
     std::string name;
+    std::string description;
     uint32_t allowed_types = 0;
     bool required = false;
 };

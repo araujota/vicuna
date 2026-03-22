@@ -468,6 +468,7 @@ bool build_xml_tool_contract_from_capability(
     for (auto it = properties.begin(); it != properties.end(); ++it) {
         server_openclaw_xml_arg_requirement arg;
         arg.name = it.key();
+        arg.description = trim_ascii_copy_local(it.value().value("description", std::string()));
         arg.required = required_args.count(arg.name) > 0;
         arg.allowed_types = xml_type_mask_from_schema_type(it.value().value("type", nlohmann::json()));
         if (arg.allowed_types == 0) {
@@ -900,7 +901,16 @@ openclaw_tool_capability_descriptor build_hard_memory_descriptor() {
     memory.owner_plugin_id = "vicuna-memory";
     memory.tool_name = "hard_memory_query";
     memory.description = "Query Vicuña hard memory and return typed retrieval results";
-    memory.input_schema_json = R"({"type":"object","required":["query"],"properties":{"query":{"type":"string"}}})";
+    memory.input_schema_json = R"({
+        "type":"object",
+        "required":["query"],
+        "properties":{
+            "query":{
+                "type":"string",
+                "description":"The retrieval query to run against Vicuña hard memory when looking for relevant durable memories or prior tool observations."
+            }
+        }
+    })";
     memory.output_contract = "completed_result";
     memory.side_effect_class = "memory_read";
     memory.approval_mode = "none";
@@ -932,26 +942,32 @@ openclaw_tool_capability_descriptor build_hard_memory_write_descriptor() {
         "properties":{
             "memories":{
                 "type":"array",
+                "description":"The batch of durable memory primitives to archive into Vicuña hard memory and Supermemory.",
                 "minItems":1,
                 "items":{
                     "type":"object",
+                    "description":"One durable memory primitive to write, including its content and optional metadata.",
                     "required":["content"],
                     "properties":{
-                        "content":{"type":"string"},
-                        "title":{"type":"string"},
-                        "key":{"type":"string"},
-                        "kind":{"type":"string"},
-                        "domain":{"type":"string"},
-                        "tags":{"type":"array","items":{"type":"string"}},
-                        "importance":{"type":"number"},
-                        "confidence":{"type":"number"},
-                        "gainBias":{"type":"number"},
-                        "allostaticRelevance":{"type":"number"},
-                        "isStatic":{"type":"boolean"}
+                        "content":{"type":"string","description":"The durable memory content to archive."},
+                        "title":{"type":"string","description":"An optional short title for the memory."},
+                        "key":{"type":"string","description":"An optional stable key used to update the same semantic memory over time."},
+                        "kind":{"type":"string","description":"The primitive kind, such as TRAJECTORY, OUTCOME, TOOL_OBSERVATION, USER_MODEL, or SELF_MODEL_FRAGMENT."},
+                        "domain":{"type":"string","description":"An optional domain label that scopes the memory."},
+                        "tags":{
+                            "type":"array",
+                            "description":"Optional tags that help classify or retrieve the memory later.",
+                            "items":{"type":"string","description":"One tag for the memory."}
+                        },
+                        "importance":{"type":"number","description":"Normalized importance weight in the range [0, 1]."},
+                        "confidence":{"type":"number","description":"Normalized confidence score in the range [0, 1]."},
+                        "gainBias":{"type":"number","description":"Normalized gain-bias contribution for the archived memory."},
+                        "allostaticRelevance":{"type":"number","description":"Normalized allostatic relevance score in the range [0, 1]."},
+                        "isStatic":{"type":"boolean","description":"Whether this memory should be treated as static rather than updated dynamically."}
                     }
                 }
             },
-            "containerTag":{"type":"string"}
+            "containerTag":{"type":"string","description":"An optional container tag used to group this write batch."}
         }
     })";
     memory.output_contract = "completed_result";
@@ -979,7 +995,16 @@ openclaw_tool_capability_descriptor build_codex_descriptor() {
     codex.owner_plugin_id = "vicuna-runtime";
     codex.tool_name = "codex";
     codex.description = "Use the local Codex CLI to implement a repository change and rebuild the runtime";
-    codex.input_schema_json = R"({"type":"object","required":["task"],"properties":{"task":{"type":"string"}}})";
+    codex.input_schema_json = R"({
+        "type":"object",
+        "required":["task"],
+        "properties":{
+            "task":{
+                "type":"string",
+                "description":"The repository change or runtime task for the local Codex CLI to perform."
+            }
+        }
+    })";
     codex.output_contract = "pending_then_result";
     codex.side_effect_class = "self_modification";
     codex.approval_mode = "none";
@@ -1006,7 +1031,16 @@ openclaw_tool_capability_descriptor build_telegram_relay_descriptor() {
     relay.tool_name = "telegram_relay";
     relay.description = "Send a DMN-origin question, comment, or conclusion through the Telegram bridge";
     relay.input_schema_json =
-            R"({"type":"object","required":["text"],"properties":{"text":{"type":"string"},"intent":{"type":"string"},"dedupeKey":{"type":"string"},"urgency":{"type":"number"}}})";
+            R"({
+                "type":"object",
+                "required":["text"],
+                "properties":{
+                    "text":{"type":"string","description":"The plain-prose Telegram message to send to the user."},
+                    "intent":{"type":"string","description":"An optional intent label that classifies the Telegram contact, such as question, followup, or conclusion."},
+                    "dedupeKey":{"type":"string","description":"An optional dedupe key used to suppress repeated outbound messages."},
+                    "urgency":{"type":"number","description":"An optional normalized urgency score for the outbound Telegram message."}
+                }
+            })";
     relay.output_contract = "completed_result";
     relay.side_effect_class = "user_contact";
     relay.approval_mode = "none";
@@ -1031,7 +1065,22 @@ openclaw_tool_capability_descriptor build_telegram_ask_options_descriptor() {
     ask.tool_name = "ask_with_options";
     ask.description = "Ask the Telegram user a question with inline reply options and continue once they choose one";
     ask.input_schema_json =
-            R"({"type":"object","required":["question","options"],"properties":{"question":{"type":"string"},"options":{"type":"array","minItems":2,"maxItems":6,"items":{"type":"string"}},"dedupeKey":{"type":"string"},"urgency":{"type":"number"}}})";
+            R"({
+                "type":"object",
+                "required":["question","options"],
+                "properties":{
+                    "question":{"type":"string","description":"The plain-prose question to ask the Telegram user."},
+                    "options":{
+                        "type":"array",
+                        "description":"The inline reply options the user can choose from.",
+                        "minItems":2,
+                        "maxItems":6,
+                        "items":{"type":"string","description":"One selectable inline reply option."}
+                    },
+                    "dedupeKey":{"type":"string","description":"An optional dedupe key used to suppress repeated ask-with-options prompts."},
+                    "urgency":{"type":"number","description":"An optional normalized urgency score for the prompt."}
+                }
+            })";
     ask.output_contract = "completed_result";
     ask.side_effect_class = "user_contact";
     ask.approval_mode = "none";
@@ -1287,8 +1336,11 @@ bool server_openclaw_fabric::render_tool_call_xml_guidance(
         if (contract.tool_name == "exec" && arg.name == "command") {
             out << " [single command only; no pipes, redirects, chaining, or substitution]";
         }
+        if (!arg.description.empty()) {
+            out << " - " << arg.description;
+        }
         out << "\n";
-    }
+        }
     }
 
     const auto & example = contracts.front();

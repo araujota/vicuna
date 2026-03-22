@@ -57,6 +57,46 @@ export type ToolObservation = {
   observed_at_ms: number;
 };
 
+function schemaNodeRequiresDescription(node: unknown, isRoot: boolean): boolean {
+  if (isRoot || typeof node !== "object" || node === null || Array.isArray(node)) {
+    return false;
+  }
+  const record = node as Record<string, unknown>;
+  return "type" in record || "properties" in record || "items" in record;
+}
+
+function assertSchemaDescriptions(node: unknown, path: string, isRoot = false): void {
+  if (typeof node !== "object" || node === null || Array.isArray(node)) {
+    return;
+  }
+
+  const record = node as Record<string, unknown>;
+  if (schemaNodeRequiresDescription(record, isRoot)) {
+    if (typeof record.description !== "string" || record.description.trim() === "") {
+      throw new Error(`input_schema_json is missing a description at ${path}`);
+    }
+  }
+
+  if ("properties" in record && typeof record.properties === "object" && record.properties !== null && !Array.isArray(record.properties)) {
+    for (const [key, value] of Object.entries(record.properties as Record<string, unknown>)) {
+      assertSchemaDescriptions(value, `${path}.properties.${key}`);
+    }
+  }
+
+  if (!("items" in record)) {
+    return;
+  }
+
+  if (Array.isArray(record.items)) {
+    record.items.forEach((item, index) => {
+      assertSchemaDescriptions(item, `${path}.items[${index}]`);
+    });
+    return;
+  }
+
+  assertSchemaDescriptions(record.items, `${path}.items`);
+}
+
 export function assertCapabilityDescriptor(descriptor: CapabilityDescriptor): CapabilityDescriptor {
   if (!descriptor.capability_id) {
     throw new Error("capability_id is required");
@@ -70,6 +110,7 @@ export function assertCapabilityDescriptor(descriptor: CapabilityDescriptor): Ca
   if (!descriptor.provenance_namespace) {
     throw new Error("provenance_namespace is required");
   }
+  assertSchemaDescriptions(descriptor.input_schema_json, "input_schema_json", true);
   return descriptor;
 }
 

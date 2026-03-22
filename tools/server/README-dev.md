@@ -293,6 +293,9 @@ division of responsibility between the CPU loop and model generation:
 - instead, the server requests one hidden ReAct control step with explicit
   `Thought:` and `Action:` lines plus a canonical XML tool call when the
   action is `act`
+- every active and DMN tool exposed to that loop comes from the same
+  `server_openclaw_fabric` capability registry; there is no parallel
+  user-facing tool descriptor path outside the fabric
 - the hidden ReAct step is validated against the exposed tool registry and
   safety policy; invalid control output is critiqued and regenerated instead
   of being silently replaced by a fallback CPU tool choice
@@ -575,6 +578,11 @@ The `exec` tool descriptor is intentionally explicit. It tells the ReAct loop
 that `exec` is the bounded shell tool for host-local observation and action,
 including filesystem state, current working directory, repository state,
 environment state, running processes, and direct command output.
+
+Every OpenClaw tool schema is also expected to be self-describing. Parameter
+descriptions are required throughout the exposed schema, including nested
+object fields and array item surfaces, so the authoritative ReAct loop does
+not see bare types without semantics.
 
 ### Example trace of a request
 

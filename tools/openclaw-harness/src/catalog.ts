@@ -81,7 +81,11 @@ function hardMemoryCapability(): CapabilityDescriptor {
       type: "object",
       required: ["query"],
       properties: {
-        query: { type: "string" }
+        query: {
+          type: "string",
+          description:
+            "The retrieval query to run against Vicuña hard memory when looking for relevant durable memories or prior tool observations."
+        }
       }
     },
     output_contract: "completed_result",
@@ -116,26 +120,70 @@ function hardMemoryWriteCapability(): CapabilityDescriptor {
       properties: {
         memories: {
           type: "array",
+          description:
+            "The batch of durable memory primitives to archive into Vicuña hard memory and Supermemory.",
           minItems: 1,
           items: {
             type: "object",
+            description:
+              "One durable memory primitive to write, including its content and optional metadata.",
             required: ["content"],
             properties: {
-              content: { type: "string" },
-              title: { type: "string" },
-              key: { type: "string" },
-              kind: { type: "string" },
-              domain: { type: "string" },
-              tags: { type: "array", items: { type: "string" } },
-              importance: { type: "number" },
-              confidence: { type: "number" },
-              gainBias: { type: "number" },
-              allostaticRelevance: { type: "number" },
-              isStatic: { type: "boolean" }
+              content: {
+                type: "string",
+                description: "The durable memory content to archive."
+              },
+              title: {
+                type: "string",
+                description: "An optional short title for the memory."
+              },
+              key: {
+                type: "string",
+                description: "An optional stable key used to update the same semantic memory over time."
+              },
+              kind: {
+                type: "string",
+                description: "The primitive kind, such as TRAJECTORY, OUTCOME, TOOL_OBSERVATION, USER_MODEL, or SELF_MODEL_FRAGMENT."
+              },
+              domain: {
+                type: "string",
+                description: "An optional domain label that scopes the memory."
+              },
+              tags: {
+                type: "array",
+                description: "Optional tags that help classify or retrieve the memory later.",
+                items: {
+                  type: "string",
+                  description: "One tag for the memory."
+                }
+              },
+              importance: {
+                type: "number",
+                description: "Normalized importance weight in the range [0, 1]."
+              },
+              confidence: {
+                type: "number",
+                description: "Normalized confidence score in the range [0, 1]."
+              },
+              gainBias: {
+                type: "number",
+                description: "Normalized gain-bias contribution for the archived memory."
+              },
+              allostaticRelevance: {
+                type: "number",
+                description: "Normalized allostatic relevance score in the range [0, 1]."
+              },
+              isStatic: {
+                type: "boolean",
+                description: "Whether this memory should be treated as static rather than updated dynamically."
+              }
             }
           }
         },
-        containerTag: { type: "string" }
+        containerTag: {
+          type: "string",
+          description: "An optional container tag used to group this write batch."
+        }
       }
     },
     output_contract: "completed_result",
@@ -168,7 +216,11 @@ function codexCapability(): CapabilityDescriptor {
       type: "object",
       required: ["task"],
       properties: {
-        task: { type: "string" }
+        task: {
+          type: "string",
+          description:
+            "The repository change or runtime task for the local Codex CLI to perform."
+        }
       }
     },
     output_contract: "pending_then_result",
@@ -201,14 +253,52 @@ function tavilyWebSearchCapability(): CapabilityDescriptor {
       type: "object",
       required: ["query"],
       properties: {
-        query: { type: "string" },
-        topic: { type: "string", enum: ["general", "news", "finance"] },
-        search_depth: { type: "string", enum: ["basic", "advanced"] },
-        max_results: { type: "integer", minimum: 3, maximum: 8, default: 5 },
-        time_range: { type: "string", enum: ["day", "week", "month", "year"] },
-        include_domains: { type: "array", items: { type: "string" } },
-        exclude_domains: { type: "array", items: { type: "string" } },
-        country: { type: "string" }
+        query: {
+          type: "string",
+          description: "The live web search query to run through Tavily."
+        },
+        topic: {
+          type: "string",
+          enum: ["general", "news", "finance"],
+          description: "The retrieval topic that best matches the query."
+        },
+        search_depth: {
+          type: "string",
+          enum: ["basic", "advanced"],
+          description: "How aggressively Tavily should retrieve and expand source evidence."
+        },
+        max_results: {
+          type: "integer",
+          minimum: 3,
+          maximum: 8,
+          default: 5,
+          description: "The maximum number of ranked sources to return."
+        },
+        time_range: {
+          type: "string",
+          enum: ["day", "week", "month", "year"],
+          description: "An optional recency window for the search."
+        },
+        include_domains: {
+          type: "array",
+          description: "Optional domains that Tavily should prefer or restrict results to.",
+          items: {
+            type: "string",
+            description: "One domain to include in the search."
+          }
+        },
+        exclude_domains: {
+          type: "array",
+          description: "Optional domains that Tavily should exclude from the search.",
+          items: {
+            type: "string",
+            description: "One domain to exclude from the search."
+          }
+        },
+        country: {
+          type: "string",
+          description: "An optional country hint used to localize the search."
+        }
       }
     },
     output_contract: "completed_result",

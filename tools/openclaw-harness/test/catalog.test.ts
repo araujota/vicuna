@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 
 import { buildCatalog, buildRuntimeCatalog } from "../src/catalog.js";
 import { defaultPaths, loadToolSecrets, saveToolSecrets, upsertTavilyApiKey } from "../src/config.js";
+import { assertCapabilityDescriptor } from "../src/contracts.js";
 import { resolveInvocation } from "../src/invoke.js";
 import { writeRuntimeCatalog } from "../src/runtime-catalog.js";
 
@@ -64,6 +65,36 @@ test("exec capability description and parameters describe host-local observation
 
   assert.match(schema.properties.command.description ?? "", /pwd/i);
   assert.match(schema.properties.workdir.description ?? "", /working directory/i);
+});
+
+test("capability validation rejects missing parameter descriptions", () => {
+  assert.throws(() =>
+    assertCapabilityDescriptor({
+      capability_id: "openclaw.exec.command",
+      tool_surface_id: "vicuna.exec.main",
+      capability_kind: "tool",
+      owner_plugin_id: "openclaw-core",
+      tool_name: "exec",
+      description: "Run a command",
+      input_schema_json: {
+        type: "object",
+        properties: {
+          command: { type: "string" }
+        }
+      },
+      output_contract: "pending_then_result",
+      side_effect_class: "system_exec",
+      approval_mode: "policy_driven",
+      execution_modes: ["sync"],
+      provenance_namespace: "openclaw/openclaw-core/tool/exec",
+      tool_kind: 4,
+      tool_flags: COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      latency_class: 1,
+      max_steps_reserved: 1,
+      dispatch_backend: "legacy_bash"
+    }),
+  /input_schema_json\.properties\.command/
+  );
 });
 
 test("catalog capabilities declare explicit cognitive eligibility flags", () => {
@@ -173,6 +204,12 @@ test("runtime catalog includes Tavily only when the OpenClaw secret is present",
       "topic",
     ]
   );
+  const webSearchSchema = catalog.capabilities[0]?.input_schema_json as {
+    properties: Record<string, { description?: string }>;
+  };
+  for (const value of Object.values(webSearchSchema.properties)) {
+    assert.ok(typeof value.description === "string" && value.description.length > 0);
+  }
 });
 
 test("OpenClaw secrets persist Tavily config and emit a runtime catalog", () => {
