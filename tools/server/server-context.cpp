@@ -4127,13 +4127,21 @@ private:
         } else {
             tool_observation = format_react_bash_observation(result.bash_result);
         }
+        const int32_t source_id =
+                task.react_origin == SERVER_REACT_ORIGIN_DMN ?
+                        task.dmn_trace.tick_id :
+                        task.active_trace.episode_id;
+        const int32_t plan_id =
+                task.react_origin == SERVER_REACT_ORIGIN_DMN ?
+                        task.dmn_trace.plan.plan_id :
+                        task.active_trace.plan.plan_id;
         (void) admit_runtime_emit_text(
                 ctx,
                 tool_observation,
                 result.origin,
                 LLAMA_COG_LOOP_PHASE_OBSERVE,
-                result.command_id,
-                task.react_origin == SERVER_REACT_ORIGIN_DMN ? task.dmn_trace.plan.plan_id : task.active_trace.plan.plan_id,
+                source_id,
+                plan_id,
                 0,
                 LLAMA_SELF_COG_ARTIFACT_TOOL_OBSERVATION);
     }
