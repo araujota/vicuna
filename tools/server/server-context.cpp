@@ -7709,11 +7709,12 @@ static bool telegram_dialogue_history_from_json(
     void send_final_response(server_slot & slot) {
         if (slot.task) {
             SLT_INF(slot,
-                    "authoritative react finalize: type=%d prepare=%d ready=%d origin=%d active=%d dmn=%d prefill=%zu tools=%zu retry=%d\n",
+                    "authoritative react finalize: type=%d prepare=%d ready=%d origin=%d role=%d active=%d dmn=%d prefill=%zu tools=%zu retry=%d\n",
                     (int) slot.task->type,
                     server_task_should_prepare_authoritative_react(*slot.task) ? 1 : 0,
                     server_task_has_authoritative_react_surface(*slot.task) ? 1 : 0,
                     (int) slot.task->react_origin,
+                    (int) slot.task->foreground_role,
                     slot.task->has_active_trace ? 1 : 0,
                     slot.task->has_dmn_trace ? 1 : 0,
                     slot.task->react_assistant_prefill.size(),
@@ -7751,6 +7752,13 @@ static bool telegram_dialogue_history_from_json(
         }
 
         if (slot.task && server_task_has_authoritative_react_surface(*slot.task) && parsed_react) {
+            SLT_INF(slot,
+                    "authoritative react parsed: action=%d visible=%zu reasoning=%zu tool_calls=%zu xml=%zu\n",
+                    react_step.action,
+                    react_step.assistant_msg.content.size(),
+                    react_step.assistant_msg.reasoning_content.size(),
+                    react_step.assistant_msg.tool_calls.size(),
+                    react_step.tool_xml.size());
             server_task resumed_task = std::move(*slot.task);
             resumed_task.react_retry_feedback.clear();
             const std::string planner_reasoning = trim_ascii_copy(react_step.planner_reasoning);
