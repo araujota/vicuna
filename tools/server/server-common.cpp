@@ -304,6 +304,58 @@ bool authoritative_retry_requires_tool_escalation(const std::string & text, int3
     return foreground_request_requires_fresh_tool_grounding(text);
 }
 
+bool user_facing_text_violates_plain_prose_policy(const std::string & text) {
+    const std::string trimmed = trim_copy(text);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    const std::string lowered = lowercase_ascii_copy(trimmed);
+    if (contains_any_phrase(lowered, {
+                "as an ai",
+                "as a language model",
+                "as an assistant model",
+                "i am an ai",
+                "i'm an ai",
+                "i am a language model",
+                "i'm a language model",
+            })) {
+        return true;
+    }
+
+    if (trimmed.find("**") != std::string::npos ||
+            trimmed.find("__") != std::string::npos ||
+            trimmed.find("```") != std::string::npos ||
+            trimmed.find('`') != std::string::npos) {
+        return true;
+    }
+
+    std::istringstream in(trimmed);
+    std::string line;
+    while (std::getline(in, line)) {
+        const std::string normalized = trim_copy(line);
+        if (normalized.empty()) {
+            continue;
+        }
+        if (normalized.size() >= 2 &&
+                ((normalized[0] == '-' && normalized[1] == ' ') ||
+                 (normalized[0] == '*' && normalized[1] == ' '))) {
+            return true;
+        }
+        size_t pos = 0;
+        while (pos < normalized.size() && std::isdigit((unsigned char) normalized[pos])) {
+            ++pos;
+        }
+        if (pos > 0 && pos + 1 < normalized.size() &&
+                (normalized[pos] == '.' || normalized[pos] == ')') &&
+                normalized[pos + 1] == ' ') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 common_chat_params build_chat_completion_params(
         const server_chat_params & opt,
         const std::vector<common_chat_msg> & messages,

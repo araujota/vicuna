@@ -44,6 +44,28 @@ test("default catalog includes exec and hard-memory", () => {
   );
 });
 
+test("exec capability description and parameters describe host-local observation", () => {
+  const catalog = buildCatalog();
+  const execCapability = catalog.capabilities.find(
+    (capability) => capability.capability_id === "openclaw.exec.command"
+  );
+
+  assert.ok(execCapability);
+  assert.match(execCapability.description, /host-local state/i);
+  assert.match(execCapability.description, /current working directory/i);
+  assert.match(execCapability.description, /repository state/i);
+
+  const schema = execCapability.input_schema_json as {
+    properties: {
+      command: { description?: string };
+      workdir: { description?: string };
+    };
+  };
+
+  assert.match(schema.properties.command.description ?? "", /pwd/i);
+  assert.match(schema.properties.workdir.description ?? "", /working directory/i);
+});
+
 test("catalog capabilities declare explicit cognitive eligibility flags", () => {
   const catalog = buildCatalog();
   const flagsByCapability = new Map(

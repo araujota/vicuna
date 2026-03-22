@@ -16,6 +16,12 @@ Current scope:
 - explicit cognitive eligibility flags so external tools appear in the intended
   active and DMN ReAct loops
 
+The `exec` capability descriptor is meant to be semantically rich, not just
+syntactically valid. It should tell the ReAct loop that `exec` is the bounded
+shell tool for host-local observation and action, such as filesystem state,
+current working directory, repository state, environment state, running
+processes, and direct command output.
+
 Example:
 
 ```bash

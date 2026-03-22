@@ -3280,6 +3280,7 @@ private:
                     "Then add the Action line required for this step and close the block with </think>.\n"
                     "If Action is act, emit exactly one tool-call XML block immediately after the hidden reasoning. "
                     "If Action is answer or ask, put only the user-visible reply in visible assistant content. "
+                    "Any user-facing text must be plain prose only: no markdown emphasis, no code fences, no bullets, no numbered lists, and no 'as an AI' disclaimers. "
                     "If Action is wait, leave visible assistant content empty. "
                     "Your Action line must be exactly one of:\n"
                     "Action: answer|ask|act|wait\n"
@@ -3287,6 +3288,7 @@ private:
                     "Telegram dialogue memory, or prior admitted tool observations. "
                     "Otherwise, if any uncertainty remains and a relevant tool is available, choose Action: act and emit exactly one tool-call XML block. "
                     "For current, live, dated, external, runtime-state, repository-state, or otherwise mutable facts, strongly prefer Action: act unless the exact needed answer is already present in canonical context. "
+                    "Use exec when you need direct host-local observation such as filesystem state, the current working directory, repository state, environment state, running processes, or command output. "
                     "Do not disclaim lack of access when a relevant tool is available. "
                     "Do not answer from unsupported internal recall or habit memory.\n") +
                     (react_turn_requires_retry_tool_escalation(task) ?
@@ -3482,6 +3484,9 @@ private:
             const std::string visible = trim_ascii_copy(step.assistant_msg.content);
             if (authoritative_reply_is_procedural_non_answer(visible)) {
                 return "visible reply described intended work or lack of access instead of completing the turn";
+            }
+            if (user_facing_text_violates_plain_prose_policy(visible)) {
+                return "visible reply violated the plain-prose policy for user-facing text";
             }
         }
 
@@ -4106,6 +4111,20 @@ private:
                     }
                     return false;
                 }
+                if (user_facing_text_violates_plain_prose_policy(question)) {
+                    if (out_error) {
+                        *out_error = "ask_with_options question violated the plain-prose policy";
+                    }
+                    return false;
+                }
+                for (const auto & option : options) {
+                    if (user_facing_text_violates_plain_prose_policy(option)) {
+                        if (out_error) {
+                            *out_error = "ask_with_options option violated the plain-prose policy";
+                        }
+                        return false;
+                    }
+                }
 
                 const std::string dedupe_key = trim_ascii_copy(json_value(arguments, "dedupeKey", std::string()));
                 const std::string chat_scope =
@@ -4158,6 +4177,12 @@ private:
                 if (relay_text.empty()) {
                     if (out_error) {
                         *out_error = "telegram relay tool call did not include any text";
+                    }
+                    return false;
+                }
+                if (user_facing_text_violates_plain_prose_policy(relay_text)) {
+                    if (out_error) {
+                        *out_error = "telegram relay text violated the plain-prose policy";
                     }
                     return false;
                 }

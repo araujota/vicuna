@@ -33,13 +33,22 @@ function execCapability(): CapabilityDescriptor {
     capability_kind: "tool",
     owner_plugin_id: "openclaw-core",
     tool_name: "exec",
-    description: "Run one bounded command invocation through the execution policy; do not use shell chaining or redirection",
+    description:
+      "Inspect or act on host-local state by running one bounded shell command through the execution policy. Use this for filesystem state, the current working directory, repository state, environment variables, running processes, or command output. Keep the command narrow and direct, and do not use shell chaining or redirection.",
     input_schema_json: {
       type: "object",
       required: ["command"],
       properties: {
-        command: { type: "string" },
-        workdir: { type: "string" }
+        command: {
+          type: "string",
+          description:
+            "A single bounded shell command to execute for direct host-local observation or action. Prefer precise commands such as pwd, ls, git status, or cat path."
+        },
+        workdir: {
+          type: "string",
+          description:
+            "Optional working directory for the command when the observation or action should run in a specific repository or path."
+        }
       }
     },
     output_contract: "pending_then_result",

@@ -860,8 +860,21 @@ openclaw_tool_capability_descriptor build_exec_descriptor() {
     exec.capability_kind = "tool";
     exec.owner_plugin_id = "openclaw-core";
     exec.tool_name = "exec";
-    exec.description = "Run one bounded command invocation through the execution policy; do not use shell chaining or redirection";
-    exec.input_schema_json = R"({"type":"object","required":["command"],"properties":{"command":{"type":"string"},"workdir":{"type":"string"}}})";
+    exec.description = "Inspect or act on host-local state by running one bounded shell command through the execution policy. Use this for filesystem state, the current working directory, repository state, environment variables, running processes, or command output. Keep the command narrow and direct, and do not use shell chaining or redirection.";
+    exec.input_schema_json = R"({
+        "type":"object",
+        "required":["command"],
+        "properties":{
+            "command":{
+                "type":"string",
+                "description":"A single bounded shell command to execute for direct host-local observation or action. Prefer precise commands such as pwd, ls, git status, or cat path."
+            },
+            "workdir":{
+                "type":"string",
+                "description":"Optional working directory for the command when the observation or action should run in a specific repository or path."
+            }
+        }
+    })";
     exec.output_contract = "pending_then_result";
     exec.side_effect_class = "system_exec";
     exec.approval_mode = "policy_driven";

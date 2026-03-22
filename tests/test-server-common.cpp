@@ -76,6 +76,34 @@ int main() {
     }
 
     {
+        if (!expect(user_facing_text_violates_plain_prose_policy(
+                            "As an AI language model, I cannot do that."),
+                    "expected AI-disclaimer text to violate the plain-prose policy")) {
+            return 1;
+        }
+        if (!expect(user_facing_text_violates_plain_prose_policy(
+                            "1. First option\n2. Second option"),
+                    "expected numbered lists to violate the plain-prose policy")) {
+            return 1;
+        }
+        if (!expect(user_facing_text_violates_plain_prose_policy(
+                            "- first item\n- second item"),
+                    "expected dashed lists to violate the plain-prose policy")) {
+            return 1;
+        }
+        if (!expect(user_facing_text_violates_plain_prose_policy(
+                            "The answer is **here**."),
+                    "expected markdown emphasis to violate the plain-prose policy")) {
+            return 1;
+        }
+        if (!expect(!user_facing_text_violates_plain_prose_policy(
+                             "The present working directory is slash workspace slash vicuna."),
+                    "expected plain prose to remain allowed")) {
+            return 1;
+        }
+    }
+
+    {
         if (!expect(!authoritative_retry_requires_tool_escalation(
                              "What’s the temperature supposed to be like in Chicago tomorrow?",
                              1),

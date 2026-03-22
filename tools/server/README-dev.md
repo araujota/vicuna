@@ -324,6 +324,9 @@ basic parse validity:
 - after repeated rejected non-tool retries on a mutable active turn, the server
   escalates that turn to `tool_choice=required` so the loop converges onto a
   fresh observation instead of spinning indefinitely
+- user-facing text is plain prose only: visible answers, asks, Telegram relay
+  text, and ask-with-options prompts/options are rejected if they contain “as
+  an AI” disclaimers, markdown emphasis, or bullet/numbered list formatting
 - the continuation budget is effectively unbounded by default; the turn keeps
   cycling until it reaches a valid terminal condition or is externally stopped
 
@@ -567,6 +570,11 @@ The first-class tool surface now includes:
 - `hard_memory_query` for retrieval
 - `hard_memory_write` for explicit durable Supermemory writes
 - the Codex CLI wrapper for bounded self-modification work
+
+The `exec` tool descriptor is intentionally explicit. It tells the ReAct loop
+that `exec` is the bounded shell tool for host-local observation and action,
+including filesystem state, current working directory, repository state,
+environment state, running processes, and direct command output.
 
 ### Example trace of a request
 
