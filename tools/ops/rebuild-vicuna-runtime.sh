@@ -76,6 +76,48 @@ resolve_runtime_node_bin() {
     return 1
 }
 
+resolve_runtime_npm_bin() {
+    local node_bin
+    node_bin="$(resolve_runtime_node_bin)" || return 1
+    local sibling_npm
+    sibling_npm="$(dirname "$node_bin")/npm"
+    if [[ -x "$sibling_npm" ]]; then
+        printf '%s\n' "$sibling_npm"
+        return 0
+    fi
+    if command -v npm >/dev/null 2>&1; then
+        printf '%s\n' "$(command -v npm)"
+        return 0
+    fi
+    return 1
+}
+
+build_openclaw_harness_dist() {
+    local npm_bin
+    npm_bin="$(resolve_runtime_npm_bin)" || die "failed to resolve npm for OpenClaw harness build"
+
+    local repo_owner="${SUDO_USER:-${USER:-}}"
+    local -a build_cmd=(
+        "$npm_bin"
+        --prefix
+        "$REPO_ROOT/tools/openclaw-harness"
+        run
+        build
+    )
+
+    if (( DRY_RUN )); then
+        run_cmd "${build_cmd[@]}"
+        return 0
+    fi
+
+    if (( EUID == 0 )) && [[ -n "$repo_owner" ]] && id -u "$repo_owner" >/dev/null 2>&1; then
+        runuser -u "$repo_owner" -- "${build_cmd[@]}" >/dev/null
+        return 0
+    fi
+
+    "${build_cmd[@]}" >/dev/null
+}
+
 sync_runtime_catalog() {
     local catalog_path="${VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH:-}"
     [[ -n "$catalog_path" ]] || return 0
@@ -251,6 +293,7 @@ if [[ -z "${VICUNA_RUNTIME_STATE_PATH:-}" ]] && (( ! ALLOW_STATE_RESET )); then
     die "VICUNA_RUNTIME_STATE_PATH must be configured unless --allow-state-reset is used"
 fi
 
+build_openclaw_harness_dist
 sync_runtime_catalog
 
 had_snapshot=0

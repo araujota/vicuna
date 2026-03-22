@@ -123,6 +123,21 @@ resolve_node_bin() {
     die "could not resolve Node.js >= 20.16; set TELEGRAM_BRIDGE_NODE_BIN"
 }
 
+resolve_npm_bin() {
+    local node_bin="$1"
+    local sibling_npm
+    sibling_npm="$(dirname "$node_bin")/npm"
+    if [[ -x "$sibling_npm" ]]; then
+        printf '%s\n' "$sibling_npm"
+        return 0
+    fi
+    if command -v npm >/dev/null 2>&1; then
+        printf '%s\n' "$(command -v npm)"
+        return 0
+    fi
+    die "could not resolve npm for OpenClaw harness build"
+}
+
 resolve_codex_bin() {
     if [[ -n "${VICUNA_CODEX_TOOL_PATH:-}" && -x "${VICUNA_CODEX_TOOL_PATH:-}" ]]; then
         printf '%s\n' "$VICUNA_CODEX_TOOL_PATH"
@@ -305,6 +320,27 @@ sync_runtime_catalog() {
     fi
 }
 
+build_openclaw_harness_dist() {
+    local node_bin="$1"
+    local npm_bin
+    npm_bin="$(resolve_npm_bin "$node_bin")"
+
+    local -a build_cmd=(
+        "$npm_bin"
+        --prefix
+        "$REPO_ROOT/tools/openclaw-harness"
+        run
+        build
+    )
+
+    if (( DRY_RUN )); then
+        run_cmd "${build_cmd[@]}"
+        return 0
+    fi
+
+    runuser -u "$INTERACTIVE_OWNER" -- "${build_cmd[@]}" >/dev/null
+}
+
 while (($# > 0)); do
     case "$1" in
         --dry-run)
@@ -335,6 +371,7 @@ run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_ROOT" 
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$(dirname "$RUNTIME_STATE_PATH")" "$RUNTIME_BACKUP_DIR" "$(dirname "$TELEGRAM_STATE_PATH")"
 grant_repo_access
 write_env_file "$NODE_BIN" "$CODEX_BIN"
+build_openclaw_harness_dist "$NODE_BIN"
 sync_runtime_catalog "$NODE_BIN" "$CODEX_BIN"
 install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-runtime.system.service" "$SYSTEMD_DIR/vicuna-runtime.service"
 install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-telegram-bridge.system.service" "$SYSTEMD_DIR/vicuna-telegram-bridge.service"
