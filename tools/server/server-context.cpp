@@ -3058,6 +3058,16 @@ private:
             return false;
         }
 
+        const bool fresh_mutable_telegram_turn =
+                task.react_origin == SERVER_REACT_ORIGIN_ACTIVE &&
+                task.foreground_role == LLAMA_SELF_STATE_EVENT_USER &&
+                task.telegram_dialogue_active &&
+                !task.react_resuming_from_tool_result &&
+                foreground_request_requires_fresh_tool_grounding(task.foreground_text);
+        if (fresh_mutable_telegram_turn) {
+            return false;
+        }
+
         const std::vector<std::string> terms = foreground_grounding_terms(task.foreground_text);
         if (terms.empty()) {
             return false;
@@ -3089,6 +3099,19 @@ private:
         return false;
     }
 
+    bool react_turn_requires_retry_tool_escalation(const server_task & task) const {
+        if (task.react_origin != SERVER_REACT_ORIGIN_ACTIVE ||
+                task.foreground_role != LLAMA_SELF_STATE_EVENT_USER ||
+                task.react_resuming_from_tool_result ||
+                task.react_tools.empty()) {
+            return false;
+        }
+
+        return authoritative_retry_requires_tool_escalation(
+                task.foreground_text,
+                task.react_retry_count);
+    }
+
     bool canonical_context_has_direct_tool_answer_observation(const server_task & task) const {
         const std::vector<common_chat_msg> messages = canonical_react_messages(task);
         for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
@@ -3115,6 +3138,10 @@ private:
 
         if (!foreground_request_requires_fresh_tool_grounding(task.foreground_text)) {
             return false;
+        }
+
+        if (react_turn_requires_retry_tool_escalation(task)) {
+            return true;
         }
 
         return !canonical_context_has_grounded_answer_candidate(task);
@@ -3262,6 +3289,11 @@ private:
                     "For current, live, dated, external, runtime-state, repository-state, or otherwise mutable facts, strongly prefer Action: act unless the exact needed answer is already present in canonical context. "
                     "Do not disclaim lack of access when a relevant tool is available. "
                     "Do not answer from unsupported internal recall or habit memory.\n") +
+                    (react_turn_requires_retry_tool_escalation(task) ?
+                            "This mutable turn has already failed without using a tool. "
+                            "On this step, you must choose Action: act and emit exactly one tool-call XML block. "
+                            "Do not answer directly and do not ask the user for information the available tools can obtain.\n" :
+                            "") +
                     (task.react_resuming_from_tool_result ?
                             "A completed tool observation was just admitted. Based on that observation together with other admitted canonical context, choose act, answer, or ask. "
                             "Any answer or question must synthesize the observed tool results together with other admitted canonical context rather than unsupported internal recall. "
@@ -8345,10 +8377,12 @@ static bool telegram_dialogue_history_from_json(
                         react_step.action,
                         continuation_error.c_str());
                 resumed_task.react_retry_count += 1;
-                resumed_task.react_retry_feedback =
-                        continuation_error + ". Continue the same authoritative ReAct turn. "
-                        "If fresh external grounding is needed, emit Action: act with exactly one tool call. "
-                        "Do not narrate intended work as the final answer.";
+                resumed_task.react_retry_feedback = continuation_error + ". Continue the same authoritative ReAct turn. " +
+                        std::string(react_turn_requires_retry_tool_escalation(resumed_task) ?
+                                "This mutable turn has already failed without a tool. Emit Action: act with exactly one tool call now. "
+                                "Do not answer directly or narrate intended work. " :
+                                "If fresh external grounding is needed, emit Action: act with exactly one tool call. "
+                                "Do not narrate intended work as the final answer.");
                 if (prepare_react_prompt(resumed_task)) {
                     queue_tasks.post(std::move(resumed_task), true);
                     return;

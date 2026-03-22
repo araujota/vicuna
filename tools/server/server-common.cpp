@@ -296,6 +296,14 @@ bool authoritative_reply_is_procedural_non_answer(const std::string & text) {
     return false;
 }
 
+bool authoritative_retry_requires_tool_escalation(const std::string & text, int32_t retry_count) {
+    if (retry_count < 2) {
+        return false;
+    }
+
+    return foreground_request_requires_fresh_tool_grounding(text);
+}
+
 common_chat_params build_chat_completion_params(
         const server_chat_params & opt,
         const std::vector<common_chat_msg> & messages,

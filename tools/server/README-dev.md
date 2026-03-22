@@ -306,12 +306,19 @@ basic parse validity:
 - a first active user-origin step that clearly asks for current, dated, or
   otherwise mutable external facts can switch tool choice from `auto` to
   `required`
+- on fresh mutable Telegram turns, stale bounded Telegram assistant dialogue is
+  not trusted as grounding on its own; direct grounding comes from admitted
+  tool observations and same-turn canonical artifacts rather than old
+  conversational answers
 - a visible reply that only narrates intended work or lack of access, such as
   “I will use historical data” or “I do not have real-time access,” is not
   accepted as a terminal answer
 - unsupported terminal answers are retried within the same authoritative turn
   with explicit feedback instead of returning hidden-thought-adjacent
   procedural text to the user
+- after repeated rejected non-tool retries on a mutable active turn, the server
+  escalates that turn to `tool_choice=required` so the loop converges onto a
+  fresh observation instead of spinning indefinitely
 - the continuation budget is effectively unbounded by default; the turn keeps
   cycling until it reaches a valid terminal condition or is externally stopped
 

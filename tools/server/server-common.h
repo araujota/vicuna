@@ -92,6 +92,7 @@ int32_t classify_foreground_role_for_request(const std::string & raw_body, const
 std::string extract_foreground_message_text_for_request(const std::string & raw_body, const json & parsed_body);
 bool foreground_request_requires_fresh_tool_grounding(const std::string & text);
 bool authoritative_reply_is_procedural_non_answer(const std::string & text);
+bool authoritative_retry_requires_tool_escalation(const std::string & text, int32_t retry_count);
 common_chat_params build_chat_completion_params(
         const server_chat_params & opt,
         const std::vector<common_chat_msg> & messages,

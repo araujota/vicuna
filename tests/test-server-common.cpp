@@ -75,5 +75,26 @@ int main() {
         }
     }
 
+    {
+        if (!expect(!authoritative_retry_requires_tool_escalation(
+                             "What’s the temperature supposed to be like in Chicago tomorrow?",
+                             1),
+                    "expected mutable live-fact request to avoid escalation before repeated failures")) {
+            return 1;
+        }
+        if (!expect(authoritative_retry_requires_tool_escalation(
+                            "What’s the temperature supposed to be like in Chicago tomorrow?",
+                            2),
+                    "expected mutable live-fact request to escalate after repeated failures")) {
+            return 1;
+        }
+        if (!expect(!authoritative_retry_requires_tool_escalation(
+                             "Reply with exactly the single word orchid.",
+                             4),
+                    "expected stable request to avoid tool escalation even after retries")) {
+            return 1;
+        }
+    }
+
     return 0;
 }

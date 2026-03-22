@@ -174,6 +174,16 @@ Both loops share state, but they do not share identical triggers or output polic
   procedural non-answers such as “I will use historical data” are rejected and
   retried within the same authoritative turn instead of being surfaced to the
   user.
+- For fresh mutable Telegram turns, bounded Telegram assistant dialogue is
+  continuity context, not trusted grounding. Stale assistant prose from prior
+  turns must not suppress a fresh tool step on its own. Trusted grounding for
+  direct completion comes from admitted tool observations and same-turn
+  canonical runtime artifacts.
+- Because continuation is intentionally unbounded, CPU control also escalates
+  repeated mutable active retries into `tool_choice=required` after a small
+  number of rejected non-tool attempts. This still does not select a specific
+  tool on the model's behalf; it only constrains the next authoritative step to
+  emit one tool call.
 - Authoritative ReAct parsing treats emitted tool structure as first-class
   evidence. If the model emits a `<vicuna_tool_call ...>` block with trailing
   chatter or a partial close, the runtime salvages that emitted structure and

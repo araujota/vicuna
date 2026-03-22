@@ -79,6 +79,10 @@ int main() {
                 "expected authoritative ReAct continuation budget to default to effectively unbounded")) {
         return 1;
     }
+    if (!expect(active_react_task.react_retry_count == 0,
+                "expected active ReAct retry counter to start at zero")) {
+        return 1;
+    }
 
     server_task inactive_active_task(SERVER_TASK_TYPE_COMPLETION);
     if (!expect(!server_task_should_prepare_authoritative_react(inactive_active_task),
@@ -111,9 +115,14 @@ int main() {
     resumed_active_task.react_assistant_prefill = "<think>\nThought: ";
     resumed_active_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
     resumed_active_task.react_resuming_from_tool_result = true;
+    resumed_active_task.react_retry_count = 3;
     resumed_active_task.foreground_text = "Need the latest weather forecast.";
     if (!expect(resumed_active_task.react_resuming_from_tool_result,
                 "expected resumed active turn to preserve tool-observation resume state")) {
+        return 1;
+    }
+    if (!expect(resumed_active_task.react_retry_count == 3,
+                "expected resumed active turn to preserve retry state across continuation")) {
         return 1;
     }
     server_task parent_task(SERVER_TASK_TYPE_COMPLETION);
