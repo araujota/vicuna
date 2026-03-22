@@ -2812,6 +2812,85 @@ private:
         return summary.str();
     }
 
+    bool should_include_shared_context_item_for_task(
+            const server_task & task,
+            const llama_shared_cognitive_context_item & item,
+            bool use_telegram_dialogue) const {
+        if (!use_telegram_dialogue) {
+            return true;
+        }
+
+        if (item.kind == LLAMA_SHARED_CONTEXT_KIND_USER_MESSAGE ||
+            item.kind == LLAMA_SHARED_CONTEXT_KIND_VISIBLE_OUTPUT) {
+            return false;
+        }
+
+        const bool active_telegram_turn =
+                task.react_origin == SERVER_REACT_ORIGIN_ACTIVE &&
+                task.telegram_dialogue_active &&
+                !normalize_telegram_chat_scope(task.telegram_chat_scope).empty();
+        if (!active_telegram_turn) {
+            return true;
+        }
+
+        if (!task.react_resuming_from_tool_result) {
+            return false;
+        }
+
+        return item.episode_or_tick_id > 0 &&
+               item.episode_or_tick_id == task.active_trace.episode_id;
+    }
+
+    std::string shared_context_summary_text_for_task(const server_task & task, int32_t limit = 8) const {
+        if (!ctx) {
+            return {};
+        }
+
+        const std::vector<common_chat_msg> telegram_dialogue = telegram_dialogue_messages_for_task(task);
+        const bool use_telegram_dialogue = !telegram_dialogue.empty();
+
+        llama_shared_cognitive_context_window window = {};
+        const int32_t item_count = llama_shared_cognitive_context_count(ctx);
+        if (item_count <= 0 || llama_shared_cognitive_context_get_window(ctx, &window) != 0) {
+            return {};
+        }
+
+        std::vector<std::string> lines;
+        const int32_t start = std::max(0, item_count - 24);
+        for (int32_t i = start; i < item_count; ++i) {
+            llama_shared_cognitive_context_item item = {};
+            if (llama_shared_cognitive_context_get_item(ctx, i, &item) != 0) {
+                continue;
+            }
+            if (!should_include_shared_context_item_for_task(task, item, use_telegram_dialogue)) {
+                continue;
+            }
+
+            std::ostringstream line;
+            line << "[" << item.context_item_id << "] "
+                 << shared_context_origin_label(item.origin) << ' '
+                 << shared_context_kind_label(item.kind)
+                 << " phase=" << shared_context_phase_label(item.phase)
+                 << " source=" << item.episode_or_tick_id
+                 << " plan=" << item.plan_id;
+            lines.push_back(line.str());
+        }
+
+        if (lines.empty()) {
+            return {};
+        }
+
+        std::ostringstream summary;
+        summary << "Shared context window: items=" << window.item_count
+                << ", tokens=" << window.token_count
+                << ", head_revision=" << window.head_revision << ".";
+        const int32_t summary_start = std::max(0, (int32_t) lines.size() - std::max(1, limit));
+        for (int32_t i = summary_start; i < (int32_t) lines.size(); ++i) {
+            summary << "\n- " << lines[(size_t) i];
+        }
+        return summary.str();
+    }
+
     bool shared_context_item_text(int32_t index, std::string * out_text) const {
         if (!ctx || !out_text) {
             return false;
@@ -2882,15 +2961,12 @@ private:
         const int32_t start = std::max(0, item_count - 24);
         messages.reserve(messages.size() + (size_t) std::max(1, item_count - start));
         for (int32_t i = start; i < item_count; ++i) {
-            if (use_telegram_dialogue) {
-                llama_shared_cognitive_context_item item = {};
-                if (llama_shared_cognitive_context_get_item(ctx, i, &item) != 0) {
-                    continue;
-                }
-                if (item.kind == LLAMA_SHARED_CONTEXT_KIND_USER_MESSAGE ||
-                    item.kind == LLAMA_SHARED_CONTEXT_KIND_VISIBLE_OUTPUT) {
-                    continue;
-                }
+            llama_shared_cognitive_context_item item = {};
+            if (llama_shared_cognitive_context_get_item(ctx, i, &item) != 0) {
+                continue;
+            }
+            if (!should_include_shared_context_item_for_task(task, item, use_telegram_dialogue)) {
+                continue;
             }
             common_chat_msg msg;
             if (shared_context_item_to_chat_message(i, &msg)) {
@@ -3009,7 +3085,7 @@ private:
         phase_system.role = "system";
         const std::string emotive = current_emotive_moment_text();
         const std::string emotive_style = current_emotive_style_directive();
-        const std::string context_summary = shared_context_summary_text();
+        const std::string context_summary = shared_context_summary_text_for_task(task);
         if (task.react_origin == SERVER_REACT_ORIGIN_DMN) {
             phase_system.content =
                     std::string(
