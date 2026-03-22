@@ -35,7 +35,7 @@ Optional variables:
 - `TELEGRAM_BRIDGE_STATE_PATH` default: `/tmp/vicuna-telegram-bridge-state.json`
 - `TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS` default: `30`
 - `TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES` default: `12`
-- `TELEGRAM_BRIDGE_MAX_TOKENS` default: `200`
+- `TELEGRAM_BRIDGE_MAX_TOKENS` default: `-1` (unlimited)
 - `TELEGRAM_BRIDGE_MAX_DOCUMENT_CHARS` default: `12000`
 - `SUPERMEMORY_API_KEY` required for PDF/DOC/DOCX ingestion and linked
   Supermemory persistence

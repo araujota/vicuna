@@ -35,7 +35,10 @@ const env = {
   statePath: process.env.TELEGRAM_BRIDGE_STATE_PATH ?? '/tmp/vicuna-telegram-bridge-state.json',
   pollTimeoutSeconds: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS, 30)),
   maxHistoryMessages: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES, 12)),
-  maxTokens: Math.max(32, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_TOKENS, 200)),
+  maxTokens: (() => {
+    const configured = parseInteger(process.env.TELEGRAM_BRIDGE_MAX_TOKENS, -1);
+    return configured < 0 ? -1 : Math.max(32, configured);
+  })(),
   maxDocumentChars: Math.max(256, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_DOCUMENT_CHARS, 12000)),
   selfEmitAfter: Math.max(0, parseInteger(process.env.TELEGRAM_BRIDGE_SELF_EMIT_AFTER, 0)),
   vicunaApiKey: process.env.VICUNA_API_KEY ?? '',
@@ -576,7 +579,7 @@ async function main() {
   await persistState();
   log(`starting bridge with state ${env.statePath}`);
   log(`vicuna base url ${env.vicunaBaseUrl}`);
-  log(`bridge transcript settings history=${env.maxHistoryMessages} max_tokens=${env.maxTokens}`, {
+log(`bridge transcript settings history=${env.maxHistoryMessages} max_tokens=${env.maxTokens < 0 ? 'unlimited' : env.maxTokens}`, {
     chatCount: state.chatIds.length,
     sessionCount: Object.keys(state.chatSessions ?? {}).length,
   });
