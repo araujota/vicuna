@@ -3202,6 +3202,14 @@ private:
             }
         }
 
+        // Treat the concrete emitted structure as the strongest signal when the
+        // hidden label and the serialized tool call disagree. This keeps the
+        // parser authoritative without reintroducing a CPU-side selector.
+        if (!out_step->assistant_msg.tool_calls.empty() &&
+                out_step->action != LLAMA_AUTHORITATIVE_REACT_ACTION_ACT) {
+            out_step->action = LLAMA_AUTHORITATIVE_REACT_ACTION_ACT;
+        }
+
         if (task.react_origin == SERVER_REACT_ORIGIN_DMN) {
             if (out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER ||
                     out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ASK) {
