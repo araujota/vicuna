@@ -2,6 +2,7 @@
 #include "common/openclaw-tool-fabric-events.h"
 #include "common/openclaw-tool-fabric.h"
 #include "../tools/server/server-openclaw-fabric.h"
+#include "../tools/server/server-task.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -54,6 +55,64 @@ int main() {
         return 1;
     }
     if (!expect(parsed_descriptor.tool_surface_id == descriptor.tool_surface_id, "descriptor round-trip lost tool_surface_id")) {
+        return 1;
+    }
+
+    server_task tool_required_task(SERVER_TASK_TYPE_COMPLETION);
+    tool_required_task.react_enabled = true;
+    tool_required_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
+    tool_required_task.has_active_trace = true;
+    tool_required_task.react_tools.push_back(common_chat_tool{ "exec", "Run one bounded command invocation", "{}" });
+    tool_required_task.active_trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_ACT;
+    if (!expect(server_task_active_trace_requires_tool_progress(tool_required_task),
+                "expected active ACT winner_action to require tool progress")) {
+        return 1;
+    }
+
+    server_task answer_ready_task(SERVER_TASK_TYPE_COMPLETION);
+    answer_ready_task.react_enabled = true;
+    answer_ready_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
+    answer_ready_task.has_active_trace = true;
+    answer_ready_task.react_tools.push_back(common_chat_tool{ "exec", "Run one bounded command invocation", "{}" });
+    answer_ready_task.active_trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_ANSWER;
+    answer_ready_task.active_trace.plan.valid = true;
+    answer_ready_task.active_trace.plan.step_count = 1;
+    answer_ready_task.active_trace.plan.current_step_index = 0;
+    answer_ready_task.active_trace.plan.steps[0].kind = LLAMA_COG_PLAN_STEP_EMIT_ANSWER;
+    answer_ready_task.active_trace.plan.steps[0].status = LLAMA_COG_PLAN_STEP_STATUS_ACTIVE;
+    if (!expect(!server_task_active_trace_requires_tool_progress(answer_ready_task),
+                "expected active answer-ready trace to allow terminal response")) {
+        return 1;
+    }
+
+    server_task pending_observation_task(SERVER_TASK_TYPE_COMPLETION);
+    pending_observation_task.react_enabled = true;
+    pending_observation_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
+    pending_observation_task.has_active_trace = true;
+    pending_observation_task.react_tools.push_back(common_chat_tool{ "exec", "Run one bounded command invocation", "{}" });
+    pending_observation_task.active_trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_WAIT;
+    pending_observation_task.active_trace.plan.valid = true;
+    pending_observation_task.active_trace.plan.step_count = 2;
+    pending_observation_task.active_trace.plan.current_step_index = 1;
+    pending_observation_task.active_trace.plan.terminal_reason = LLAMA_COG_TERMINAL_TOOL_REQUIRED;
+    pending_observation_task.active_trace.plan.steps[0].kind = LLAMA_COG_PLAN_STEP_INVOKE_TOOL;
+    pending_observation_task.active_trace.plan.steps[0].status = LLAMA_COG_PLAN_STEP_STATUS_COMPLETED;
+    pending_observation_task.active_trace.plan.steps[1].kind = LLAMA_COG_PLAN_STEP_OBSERVE_TOOL;
+    pending_observation_task.active_trace.plan.steps[1].status = LLAMA_COG_PLAN_STEP_STATUS_ACTIVE;
+    pending_observation_task.active_trace.plan.steps[1].requires_tool_result = true;
+    if (!expect(server_task_active_trace_requires_tool_progress(pending_observation_task),
+                "expected pending tool observation to require further tool progress")) {
+        return 1;
+    }
+
+    server_task dmn_task(SERVER_TASK_TYPE_COMPLETION);
+    dmn_task.react_enabled = true;
+    dmn_task.react_origin = SERVER_REACT_ORIGIN_DMN;
+    dmn_task.has_active_trace = true;
+    dmn_task.react_tools.push_back(common_chat_tool{ "exec", "Run one bounded command invocation", "{}" });
+    dmn_task.active_trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_ACT;
+    if (!expect(!server_task_active_trace_requires_tool_progress(dmn_task),
+                "expected DMN traces to be ignored by active tool-progress predicate")) {
         return 1;
     }
 

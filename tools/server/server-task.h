@@ -301,6 +301,56 @@ struct server_task {
     }
 };
 
+static inline bool server_task_active_trace_requires_tool_progress(const server_task & task) {
+    if (!task.react_enabled ||
+            task.react_origin != SERVER_REACT_ORIGIN_ACTIVE ||
+            task.react_tools.empty() ||
+            !task.has_active_trace) {
+        return false;
+    }
+
+    if (task.active_trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
+        return true;
+    }
+    if (task.active_trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ANSWER ||
+            task.active_trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ASK) {
+        return false;
+    }
+    if (task.active_trace.loop_state.terminal_reason == LLAMA_COG_TERMINAL_TOOL_REQUIRED ||
+            task.active_trace.plan.terminal_reason == LLAMA_COG_TERMINAL_TOOL_REQUIRED) {
+        return true;
+    }
+
+    const llama_cognitive_plan_trace & plan = task.active_trace.plan;
+    if (!plan.valid || plan.step_count <= 0) {
+        return false;
+    }
+
+    const auto step_requires_tool = [](const llama_cognitive_plan_step & step) {
+        return step.requires_tool_result ||
+                step.kind == LLAMA_COG_PLAN_STEP_INVOKE_TOOL ||
+                step.kind == LLAMA_COG_PLAN_STEP_OBSERVE_TOOL;
+    };
+
+    if (plan.current_step_index >= 0 &&
+            plan.current_step_index < plan.step_count &&
+            step_requires_tool(plan.steps[plan.current_step_index])) {
+        return true;
+    }
+
+    for (int32_t i = 0; i < plan.step_count; ++i) {
+        const llama_cognitive_plan_step & step = plan.steps[i];
+        if ((step.status == LLAMA_COG_PLAN_STEP_STATUS_PENDING ||
+                    step.status == LLAMA_COG_PLAN_STEP_STATUS_READY ||
+                    step.status == LLAMA_COG_PLAN_STEP_STATUS_ACTIVE) &&
+                step_requires_tool(step)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 struct result_timings {
     int32_t cache_n = -1;
 

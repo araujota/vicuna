@@ -2903,6 +2903,7 @@ private:
                 return false;
             }
         }
+        const bool active_tool_progress_required = server_task_active_trace_requires_tool_progress(task);
 
         std::vector<common_chat_msg> prompt_messages = canonical_react_messages(task);
         common_chat_msg phase_system;
@@ -2950,6 +2951,11 @@ private:
                     "If Action is answer or ask, put only the user-visible reply in visible assistant content. "
                     "If Action is wait, leave visible assistant content empty. "
                     "If the latest user turn requests current, live, dated, or otherwise external facts and a relevant external tool is available, choose act and use that tool instead of disclaiming lack of access. ") +
+                    (active_tool_progress_required ?
+                            "The current typed active plan still requires tool progress. "
+                            "For this step, choose Action: act and emit exactly one tool-call XML block. "
+                            "Do not answer, ask, or wait yet because the work is not complete.\n" :
+                            "") +
                     (task.react_resuming_from_tool_result ?
                             "A completed tool observation was just admitted. Based on that observation, choose act, answer, or ask. "
                             "Do not choose wait unless another already-issued external tool is still outstanding.\n" :
@@ -2971,7 +2977,10 @@ private:
         common_chat_templates_inputs inputs;
         inputs.messages = prompt_messages;
         inputs.tools = task.react_tools;
-        inputs.tool_choice = task.react_tools.empty() ? COMMON_CHAT_TOOL_CHOICE_NONE : COMMON_CHAT_TOOL_CHOICE_AUTO;
+        inputs.tool_choice =
+                task.react_tools.empty() ? COMMON_CHAT_TOOL_CHOICE_NONE :
+                active_tool_progress_required ? COMMON_CHAT_TOOL_CHOICE_REQUIRED :
+                COMMON_CHAT_TOOL_CHOICE_AUTO;
         inputs.use_jinja = chat_params.use_jinja;
         inputs.parallel_tool_calls = false;
         inputs.add_generation_prompt = true;
@@ -3269,6 +3278,11 @@ private:
         } else {
             if (out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_INTERNAL_WRITE) {
                 out_step->error = "active turns may not choose internal_write";
+                return false;
+            }
+            if (server_task_active_trace_requires_tool_progress(task) &&
+                    out_step->action != LLAMA_AUTHORITATIVE_REACT_ACTION_ACT) {
+                out_step->error = "active turn still requires tool progress and must choose act";
                 return false;
             }
             if ((out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER ||
