@@ -18,4 +18,4 @@
 - [x] T005 Extend `/Users/tyleraraujo/vicuna/tests/test-openclaw-tool-fabric.cpp`
 - [x] T006 Extend `/Users/tyleraraujo/vicuna/tools/openclaw-harness/test/catalog.test.ts`
 - [x] T007 Update `/Users/tyleraraujo/vicuna/tools/server/README-dev.md` and `/Users/tyleraraujo/vicuna/tools/openclaw-harness/README.md`
-- [ ] T008 Validate locally where possible and redeploy the host runtime if needed
+- [x] T008 Validate locally where possible and redeploy the host runtime if needed
