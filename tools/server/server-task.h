@@ -299,16 +299,17 @@ struct server_task {
     }
 };
 
-static inline bool server_task_has_authoritative_react_surface(const server_task & task) {
+static inline bool server_task_should_prepare_authoritative_react(const server_task & task) {
     if (task.type != SERVER_TASK_TYPE_COMPLETION) {
         return false;
     }
 
-    if (task.react_assistant_prefill.empty()) {
-        return false;
-    }
-
     return task.has_active_trace || task.has_dmn_trace;
+}
+
+static inline bool server_task_has_authoritative_react_surface(const server_task & task) {
+    return !task.react_assistant_prefill.empty() &&
+            server_task_should_prepare_authoritative_react(task);
 }
 
 struct result_timings {

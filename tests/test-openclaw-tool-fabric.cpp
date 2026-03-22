@@ -60,6 +60,10 @@ int main() {
 
     server_task active_react_task(SERVER_TASK_TYPE_COMPLETION);
     active_react_task.has_active_trace = true;
+    if (!expect(server_task_should_prepare_authoritative_react(active_react_task),
+                "expected active completion task with an active trace to be eligible for ReAct prompt preparation")) {
+        return 1;
+    }
     active_react_task.react_assistant_prefill = "<think>\nThought: ";
     if (!expect(server_task_has_authoritative_react_surface(active_react_task),
                 "expected active completion task with a prepared ReAct prompt to be ReAct-ready")) {
@@ -67,7 +71,10 @@ int main() {
     }
 
     server_task inactive_active_task(SERVER_TASK_TYPE_COMPLETION);
-    inactive_active_task.has_active_trace = true;
+    if (!expect(!server_task_should_prepare_authoritative_react(inactive_active_task),
+                "expected active task without a trace to be ineligible for ReAct prompt preparation")) {
+        return 1;
+    }
     if (!expect(!server_task_has_authoritative_react_surface(inactive_active_task),
                 "expected active task without a prepared ReAct prompt to be non-ReAct-ready")) {
         return 1;
@@ -75,6 +82,10 @@ int main() {
 
     server_task dmn_react_task(SERVER_TASK_TYPE_COMPLETION);
     dmn_react_task.has_dmn_trace = true;
+    if (!expect(server_task_should_prepare_authoritative_react(dmn_react_task),
+                "expected DMN completion task with a DMN trace to be eligible for ReAct prompt preparation")) {
+        return 1;
+    }
     dmn_react_task.react_assistant_prefill = "<think>\nThought: ";
     if (!expect(server_task_has_authoritative_react_surface(dmn_react_task),
                 "expected DMN completion task with a prepared ReAct prompt to be ReAct-ready")) {
@@ -83,6 +94,10 @@ int main() {
 
     server_task wrong_type_task(SERVER_TASK_TYPE_EMBEDDING);
     wrong_type_task.has_active_trace = true;
+    if (!expect(!server_task_should_prepare_authoritative_react(wrong_type_task),
+                "expected non-completion task types to remain outside ReAct prompt preparation")) {
+        return 1;
+    }
     wrong_type_task.react_assistant_prefill = "<think>\nThought: ";
     if (!expect(!server_task_has_authoritative_react_surface(wrong_type_task),
                 "expected non-completion task types to remain outside authoritative ReAct")) {

@@ -2883,7 +2883,7 @@ private:
     }
 
     bool prepare_react_prompt(server_task & task) {
-        if (!server_task_has_authoritative_react_surface(task)) {
+        if (!server_task_should_prepare_authoritative_react(task)) {
             return false;
         }
 
@@ -6281,7 +6281,7 @@ static bool telegram_dialogue_history_from_json(
                         resumed_task.has_active_trace = true;
                         resumed_task.skip_active_loop_preflight = true;
                         resumed_task.react_resuming_from_tool_result = true;
-                        if (server_task_has_authoritative_react_surface(resumed_task)) {
+                        if (server_task_should_prepare_authoritative_react(resumed_task)) {
                             append_react_tool_result(resumed_task, result);
                             if (!prepare_react_prompt(resumed_task)) {
                                 SRV_WRN("failed to prepare resumed ReAct prompt for command %d\n", result.command_id);
@@ -6309,7 +6309,7 @@ static bool telegram_dialogue_history_from_json(
                         if (resumed_task.has_dmn_trace) {
                             resumed_task.dmn_trace.observation.valid = true;
                         }
-                        if (server_task_has_authoritative_react_surface(resumed_task)) {
+                        if (server_task_should_prepare_authoritative_react(resumed_task)) {
                             append_react_tool_result(resumed_task, result);
                             if (!prepare_react_prompt(resumed_task)) {
                                 SRV_WRN("failed to prepare resumed DMN ReAct prompt for command %d\n", result.command_id);
@@ -8298,7 +8298,9 @@ static bool telegram_dialogue_history_from_json(
                                 task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
                             }
 
-                            const bool use_react_step = server_task_has_authoritative_react_surface(task);
+                            const bool use_react_step =
+                                    authoritative_react_control_enabled &&
+                                    server_task_should_prepare_authoritative_react(task);
                             if (use_react_step) {
                                 if (!prepare_react_prompt(task)) {
                                     send_error(task, "Failed to prepare authoritative ReAct prompt", ERROR_TYPE_SERVER);
