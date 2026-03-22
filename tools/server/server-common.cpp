@@ -71,6 +71,19 @@ static std::string trim_copy(const std::string & value) {
     return value.substr(begin, end - begin);
 }
 
+static json parse_json_object_or_empty(const std::string & raw_body) {
+    if (raw_body.empty()) {
+        return json::object();
+    }
+
+    try {
+        const json parsed = json::parse(raw_body);
+        return parsed.is_object() ? parsed : json::object();
+    } catch (...) {
+        return json::object();
+    }
+}
+
 int32_t classify_foreground_role(const json & body) {
     if (!body.contains("messages") || !body.at("messages").is_array()) {
         return LLAMA_SELF_STATE_EVENT_USER;
@@ -151,6 +164,22 @@ std::string extract_foreground_message_text(const json & body) {
     }
 
     return {};
+}
+
+int32_t classify_foreground_role_for_request(const std::string & raw_body, const json & parsed_body) {
+    const json raw = parse_json_object_or_empty(raw_body);
+    if (raw.contains("messages") && raw.at("messages").is_array()) {
+        return classify_foreground_role(raw);
+    }
+    return classify_foreground_role(parsed_body);
+}
+
+std::string extract_foreground_message_text_for_request(const std::string & raw_body, const json & parsed_body) {
+    const json raw = parse_json_object_or_empty(raw_body);
+    if (raw.contains("messages") && raw.at("messages").is_array()) {
+        return extract_foreground_message_text(raw);
+    }
+    return extract_foreground_message_text(parsed_body);
 }
 
 common_chat_params build_chat_completion_params(

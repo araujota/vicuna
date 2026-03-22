@@ -162,6 +162,12 @@ Both loops share state, but they do not share identical triggers or output polic
   dialogue when a `callback_query` selection arrives. The original cognitive
   flow is resumed through bounded transcript continuity rather than by keeping a
   hidden prompt-only wait state in the bridge.
+- For Telegram-scoped active turns, host request handling must ground the
+  foreground event in the raw incoming request `messages` and must keep the
+  bounded Telegram dialogue slice terminal in the canonical ReAct prompt order.
+  Older shared hidden/tool context may still be present, but it must not be
+  appended after the latest Telegram user turn and thereby displace the current
+  conversational focus.
 - Authoritative ReAct parsing treats emitted tool structure as first-class
   evidence. If the model emits a `<vicuna_tool_call ...>` block with trailing
   chatter or a partial close, the runtime salvages that emitted structure and

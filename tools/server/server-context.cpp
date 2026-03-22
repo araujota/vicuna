@@ -2878,10 +2878,6 @@ private:
 
         const std::vector<common_chat_msg> telegram_dialogue = telegram_dialogue_messages_for_task(task);
         const bool use_telegram_dialogue = !telegram_dialogue.empty();
-        if (use_telegram_dialogue) {
-            messages.insert(messages.end(), telegram_dialogue.begin(), telegram_dialogue.end());
-        }
-
         const int32_t item_count = llama_shared_cognitive_context_count(ctx);
         const int32_t start = std::max(0, item_count - 24);
         messages.reserve(messages.size() + (size_t) std::max(1, item_count - start));
@@ -2900,6 +2896,10 @@ private:
             if (shared_context_item_to_chat_message(i, &msg)) {
                 messages.push_back(std::move(msg));
             }
+        }
+
+        if (use_telegram_dialogue) {
+            messages.insert(messages.end(), telegram_dialogue.begin(), telegram_dialogue.end());
         }
 
         if (messages.empty()) {
@@ -10290,8 +10290,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->slot_n_ctx,
                     data);
             ctx_server.apply_core_system_prompt_prefix(task);
-            task.foreground_role = classify_foreground_role(data);
-            const std::string foreground_text = extract_foreground_message_text(data);
+            task.foreground_role = classify_foreground_role_for_request(req.body, data);
+            const std::string foreground_text = extract_foreground_message_text_for_request(req.body, data);
             if (!foreground_text.empty()) {
                 task.active_loop_tokens = common_tokenize(ctx_server.vocab, foreground_text, true, true);
             }
