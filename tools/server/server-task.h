@@ -416,6 +416,7 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
     common_chat_msg    oaicompat_msg; // to be populated by update()
+    bool               has_precomputed_oaicompat_msg = false;
 
     std::vector<common_chat_msg_diff> oaicompat_msg_diffs; // to be populated by update()
     bool is_updated = false;
@@ -433,7 +434,13 @@ struct server_task_result_cmpl_final : server_task_result {
 
     virtual void update(task_result_state & state) override {
         is_updated = true;
-        oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
+        if (has_precomputed_oaicompat_msg) {
+            oaicompat_msg_diffs = common_chat_msg_diff::compute_diffs(state.chat_msg, oaicompat_msg);
+            state.chat_msg = oaicompat_msg;
+            state.generated_text = content;
+        } else {
+            oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
+        }
 
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;

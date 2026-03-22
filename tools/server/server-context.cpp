@@ -8096,6 +8096,12 @@ static bool telegram_dialogue_history_from_json(
         }
 
         res->generation_params = slot.task->params; // copy the parameters
+        if (parsed_react &&
+                slot.task &&
+                slot.task->react_origin == SERVER_REACT_ORIGIN_ACTIVE) {
+            res->has_precomputed_oaicompat_msg = true;
+            res->oaicompat_msg = react_step.assistant_msg;
+        }
 
         if (slot.n_sent_text > 0) {
             const std::string & emitted_buffer = !res->content.empty() ? res->content : slot.generated_text;
