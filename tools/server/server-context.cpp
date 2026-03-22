@@ -3087,6 +3087,22 @@ private:
         return false;
     }
 
+    bool canonical_context_has_direct_tool_answer_observation(const server_task & task) const {
+        const std::vector<common_chat_msg> messages = canonical_react_messages(task);
+        for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
+            if (it->role != "tool") {
+                continue;
+            }
+            const std::string lowered = lowercase_ascii_copy_local(trim_ascii_copy(it->content));
+            if (lowered.find("\"answer\":") != std::string::npos ||
+                    lowered.find("\nanswer:") != std::string::npos ||
+                    lowered.find("\nanswer=") != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool react_turn_requires_first_tool_call(const server_task & task) const {
         if (task.react_origin != SERVER_REACT_ORIGIN_ACTIVE ||
                 task.foreground_role != LLAMA_SELF_STATE_EVENT_USER ||
@@ -3438,6 +3454,12 @@ private:
         if (step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER &&
                 react_turn_requires_first_tool_call(task)) {
             return "latest active user turn requires fresh tool grounding before any direct answer";
+        }
+
+        if (step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ACT &&
+                task.react_resuming_from_tool_result &&
+                canonical_context_has_direct_tool_answer_observation(task)) {
+            return "latest admitted tool observation already contains a direct answer; synthesize it before issuing another tool call";
         }
 
         return {};
