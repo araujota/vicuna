@@ -12,6 +12,7 @@
 #include <chrono>
 #include <string>
 #include <vector>
+#include <limits>
 
 static bool expect(bool condition, const char * message) {
     if (!condition) {
@@ -60,6 +61,7 @@ int main() {
 
     server_task active_react_task(SERVER_TASK_TYPE_COMPLETION);
     active_react_task.has_active_trace = true;
+    active_react_task.foreground_text = "What is the weather in Chicago tomorrow?";
     if (!expect(server_task_should_prepare_authoritative_react(active_react_task),
                 "expected active completion task with an active trace to be eligible for ReAct prompt preparation")) {
         return 1;
@@ -71,6 +73,10 @@ int main() {
     }
     if (!expect(!active_react_task.react_resuming_from_tool_result,
                 "expected fresh active turn to remain outside resumed-from-tool-result state")) {
+        return 1;
+    }
+    if (!expect(active_react_task.react_retry_limit == std::numeric_limits<int32_t>::max(),
+                "expected authoritative ReAct continuation budget to default to effectively unbounded")) {
         return 1;
     }
 
@@ -105,8 +111,24 @@ int main() {
     resumed_active_task.react_assistant_prefill = "<think>\nThought: ";
     resumed_active_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
     resumed_active_task.react_resuming_from_tool_result = true;
+    resumed_active_task.foreground_text = "Need the latest weather forecast.";
     if (!expect(resumed_active_task.react_resuming_from_tool_result,
                 "expected resumed active turn to preserve tool-observation resume state")) {
+        return 1;
+    }
+    server_task parent_task(SERVER_TASK_TYPE_COMPLETION);
+    parent_task.foreground_text = "What is the stock price right now?";
+    parent_task.react_retry_limit = std::numeric_limits<int32_t>::max();
+    parent_task.add_child(100, 101);
+    if (!expect(parent_task.child_tasks.size() == 1, "expected one child task to be created")) {
+        return 1;
+    }
+    if (!expect(parent_task.child_tasks[0].foreground_text == parent_task.foreground_text,
+                "expected child task to preserve foreground text for continuation policy")) {
+        return 1;
+    }
+    if (!expect(parent_task.child_tasks[0].react_retry_limit == parent_task.react_retry_limit,
+                "expected child task to preserve unbounded continuation budget")) {
         return 1;
     }
 

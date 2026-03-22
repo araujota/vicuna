@@ -9,6 +9,8 @@
 
 #include "server-common.h"
 
+#include <algorithm>
+#include <cctype>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -69,6 +71,23 @@ static std::string trim_copy(const std::string & value) {
     }
 
     return value.substr(begin, end - begin);
+}
+
+static std::string lowercase_ascii_copy(const std::string & value) {
+    std::string lowered = value;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+        return (char) std::tolower(ch);
+    });
+    return lowered;
+}
+
+static bool contains_any_phrase(const std::string & haystack, const std::initializer_list<const char *> & phrases) {
+    for (const char * phrase : phrases) {
+        if (haystack.find(phrase) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static json parse_json_object_or_empty(const std::string & raw_body) {
@@ -180,6 +199,101 @@ std::string extract_foreground_message_text_for_request(const std::string & raw_
         return extract_foreground_message_text(raw);
     }
     return extract_foreground_message_text(parsed_body);
+}
+
+bool foreground_request_requires_fresh_tool_grounding(const std::string & text) {
+    const std::string lowered = lowercase_ascii_copy(trim_copy(text));
+    if (lowered.empty()) {
+        return false;
+    }
+
+    if (contains_any_phrase(lowered, {
+                "weather",
+                "temperature",
+                "forecast",
+                "stock price",
+                "share price",
+                "market cap",
+                "ticker",
+                "current price",
+                "latest price",
+                "news",
+                "headlines",
+                "score",
+                "runtime state",
+                "repo state",
+                "service status",
+                "journalctl",
+                "logs",
+            })) {
+        return true;
+    }
+
+    if (contains_any_phrase(lowered, {
+                "right now",
+                "currently",
+                "current ",
+                "latest",
+                "today",
+                "tomorrow",
+                "yesterday",
+                "tonight",
+                "this morning",
+                "this afternoon",
+                "this evening",
+                "this week",
+                "next week",
+                "as of ",
+            })) {
+        return true;
+    }
+
+    return false;
+}
+
+bool authoritative_reply_is_procedural_non_answer(const std::string & text) {
+    const std::string lowered = lowercase_ascii_copy(trim_copy(text));
+    if (lowered.empty()) {
+        return false;
+    }
+
+    if (contains_any_phrase(lowered, {
+                "i will use ",
+                "i'll use ",
+                "i will check ",
+                "i'll check ",
+                "i will look up",
+                "i'll look up",
+                "i will search",
+                "i'll search",
+                "to provide ",
+                "to answer ",
+                "to find ",
+                "historical data",
+                "real-time access",
+                "realtime access",
+                "accurate and up-to-date",
+                "recommend checking",
+                "please check",
+                "you should check",
+            })) {
+        return true;
+    }
+
+    if (contains_any_phrase(lowered, {
+                "i don't have access",
+                "i do not have access",
+                "i can't access",
+                "i cannot access",
+                "i don't have real-time access",
+                "i do not have real-time access",
+                "i can't provide live",
+                "i cannot provide live",
+            })) {
+        return true;
+    }
+
+    return false;
 }
 
 common_chat_params build_chat_completion_params(

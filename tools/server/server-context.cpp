@@ -2991,6 +2991,117 @@ private:
         return messages;
     }
 
+    static std::string lowercase_ascii_copy_local(const std::string & text) {
+        std::string lowered = text;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+            return (char) std::tolower(ch);
+        });
+        return lowered;
+    }
+
+    static std::vector<std::string> foreground_grounding_terms(const std::string & text) {
+        static const std::unordered_set<std::string> stop_words = {
+            "what", "when", "where", "which", "will", "would", "should", "could", "about",
+            "there", "their", "them", "this", "that", "with", "from", "your", "have",
+            "does", "than", "just", "into", "tell", "like", "supposed", "please", "right",
+            "current", "latest", "today", "tomorrow", "yesterday",
+        };
+
+        std::string normalized = lowercase_ascii_copy_local(text);
+        for (char & ch : normalized) {
+            if (!std::isalnum((unsigned char) ch)) {
+                ch = ' ';
+            }
+        }
+
+        std::istringstream in(normalized);
+        std::vector<std::string> terms;
+        std::unordered_set<std::string> seen;
+        std::string token;
+        while (in >> token) {
+            if (token.size() < 4 || stop_words.count(token) > 0 || seen.count(token) > 0) {
+                continue;
+            }
+            seen.insert(token);
+            terms.push_back(token);
+            if (terms.size() >= 8) {
+                break;
+            }
+        }
+        return terms;
+    }
+
+    static bool text_has_fact_like_payload(const std::string & text) {
+        bool has_digit = false;
+        for (char ch : text) {
+            if (std::isdigit((unsigned char) ch)) {
+                has_digit = true;
+                break;
+            }
+        }
+        if (has_digit) {
+            return true;
+        }
+
+        const std::string lowered = lowercase_ascii_copy_local(text);
+        return lowered.find('$') != std::string::npos ||
+               lowered.find("fahrenheit") != std::string::npos ||
+               lowered.find("celsius") != std::string::npos ||
+               lowered.find("degrees") != std::string::npos ||
+               lowered.find("forecast") != std::string::npos;
+    }
+
+    bool canonical_context_has_grounded_answer_candidate(const server_task & task) const {
+        if (task.foreground_text.empty()) {
+            return false;
+        }
+
+        const std::vector<std::string> terms = foreground_grounding_terms(task.foreground_text);
+        if (terms.empty()) {
+            return false;
+        }
+
+        const std::vector<common_chat_msg> messages = canonical_react_messages(task);
+        for (const auto & msg : messages) {
+            if (msg.role == "user" || msg.role == "system") {
+                continue;
+            }
+
+            const std::string lowered = lowercase_ascii_copy_local(trim_ascii_copy(msg.content));
+            if (lowered.empty()) {
+                continue;
+            }
+
+            int overlap = 0;
+            for (const std::string & term : terms) {
+                if (lowered.find(term) != std::string::npos) {
+                    overlap++;
+                }
+            }
+
+            if (overlap >= 2 && text_has_fact_like_payload(lowered)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool react_turn_requires_first_tool_call(const server_task & task) const {
+        if (task.react_origin != SERVER_REACT_ORIGIN_ACTIVE ||
+                task.foreground_role != LLAMA_SELF_STATE_EVENT_USER ||
+                task.react_resuming_from_tool_result ||
+                task.react_tools.empty()) {
+            return false;
+        }
+
+        if (!foreground_request_requires_fresh_tool_grounding(task.foreground_text)) {
+            return false;
+        }
+
+        return !canonical_context_has_grounded_answer_candidate(task);
+    }
+
     void apply_core_system_prompt_prefix(server_task & task) const {
         if (core_system_prompt_prefix_tokens.empty()) {
             return;
@@ -3162,7 +3273,9 @@ private:
         inputs.tools = task.react_tools;
         inputs.tool_choice =
                 task.react_tools.empty() ? COMMON_CHAT_TOOL_CHOICE_NONE :
-                COMMON_CHAT_TOOL_CHOICE_AUTO;
+                (react_turn_requires_first_tool_call(task) ?
+                        COMMON_CHAT_TOOL_CHOICE_REQUIRED :
+                        COMMON_CHAT_TOOL_CHOICE_AUTO);
         inputs.use_jinja = chat_params.use_jinja;
         inputs.parallel_tool_calls = false;
         inputs.add_generation_prompt = true;
@@ -3306,6 +3419,29 @@ private:
         std::string planner_reasoning;
         std::string error;
     };
+
+    std::string validate_authoritative_react_terminal_policy(
+            const server_task & task,
+            const parsed_react_step & step) const {
+        if (task.react_origin != SERVER_REACT_ORIGIN_ACTIVE) {
+            return {};
+        }
+
+        if (step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER ||
+                step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ASK) {
+            const std::string visible = trim_ascii_copy(step.assistant_msg.content);
+            if (authoritative_reply_is_procedural_non_answer(visible)) {
+                return "visible reply described intended work or lack of access instead of completing the turn";
+            }
+        }
+
+        if (step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER &&
+                react_turn_requires_first_tool_call(task)) {
+            return "latest active user turn requires fresh tool grounding before any direct answer";
+        }
+
+        return {};
+    }
 
     static std::string react_normalize_label(std::string label) {
         label = trim_ascii_copy(label);
@@ -8167,6 +8303,27 @@ static bool telegram_dialogue_history_from_json(
             resumed_task.react_retry_feedback.clear();
             const std::string planner_reasoning = trim_ascii_copy(react_step.planner_reasoning);
             const std::string tool_xml_payload = trim_ascii_copy(react_step.tool_xml);
+            const std::string continuation_error =
+                    validate_authoritative_react_terminal_policy(resumed_task, react_step);
+            if (!continuation_error.empty()) {
+                SRV_WRN("authoritative ReAct continuation reject: task=%d origin=%d retry=%d action=%d error=%s\n",
+                        resumed_task.id,
+                        (int) resumed_task.react_origin,
+                        resumed_task.react_retry_count,
+                        react_step.action,
+                        continuation_error.c_str());
+                resumed_task.react_retry_count += 1;
+                resumed_task.react_retry_feedback =
+                        continuation_error + ". Continue the same authoritative ReAct turn. "
+                        "If fresh external grounding is needed, emit Action: act with exactly one tool call. "
+                        "Do not narrate intended work as the final answer.";
+                if (prepare_react_prompt(resumed_task)) {
+                    queue_tasks.post(std::move(resumed_task), true);
+                    return;
+                }
+                send_error(slot, "Failed to continue authoritative ReAct turn after unsupported terminal step", ERROR_TYPE_SERVER);
+                return;
+            }
             llama_shared_cognitive_context_window context_window = {};
             if (!planner_reasoning.empty()) {
                 const int32_t source_id =
@@ -10368,6 +10525,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             ctx_server.apply_core_system_prompt_prefix(task);
             task.foreground_role = classify_foreground_role_for_request(req.body, data);
             const std::string foreground_text = extract_foreground_message_text_for_request(req.body, data);
+            task.foreground_text = foreground_text;
             if (!foreground_text.empty()) {
                 task.active_loop_tokens = common_tokenize(ctx_server.vocab, foreground_text, true, true);
             }

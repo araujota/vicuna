@@ -39,5 +39,41 @@ int main() {
         }
     }
 
+    {
+        if (!expect(foreground_request_requires_fresh_tool_grounding(
+                            "What’s the temperature supposed to be like in Chicago tomorrow?"),
+                    "expected tomorrow weather request to require fresh tool grounding")) {
+            return 1;
+        }
+        if (!expect(foreground_request_requires_fresh_tool_grounding(
+                            "What is Tesla stock price right now?"),
+                    "expected live stock-price request to require fresh tool grounding")) {
+            return 1;
+        }
+        if (!expect(!foreground_request_requires_fresh_tool_grounding(
+                             "Reply with exactly the single word orchid."),
+                    "expected stable direct reply request to avoid forced fresh tool grounding")) {
+            return 1;
+        }
+    }
+
+    {
+        if (!expect(authoritative_reply_is_procedural_non_answer(
+                            "To provide an estimate of the temperature in Chicago tomorrow, I will use historical data from previous years to inform my response."),
+                    "expected procedural weather deferral to be rejected as a non-answer")) {
+            return 1;
+        }
+        if (!expect(authoritative_reply_is_procedural_non_answer(
+                            "I don't have real-time access to current temperatures, so I can't provide live data."),
+                    "expected lack-of-access disclaimer to be rejected as a non-answer")) {
+            return 1;
+        }
+        if (!expect(!authoritative_reply_is_procedural_non_answer(
+                             "Chicago will be around 49 degrees Fahrenheit tomorrow with a chance of rain."),
+                    "expected substantive grounded weather answer to remain acceptable")) {
+            return 1;
+        }
+    }
+
     return 0;
 }

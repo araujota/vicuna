@@ -168,6 +168,12 @@ Both loops share state, but they do not share identical triggers or output polic
   Older shared hidden/tool context may still be present, but it must not be
   appended after the latest Telegram user turn and thereby displace the current
   conversational focus.
+- Authoritative ReAct termination is no longer “first parseable answer wins.”
+  CPU control now also owns an explicit continuation policy: clearly
+  live/mutable active requests can require a tool-first first step, and
+  procedural non-answers such as “I will use historical data” are rejected and
+  retried within the same authoritative turn instead of being surfaced to the
+  user.
 - Authoritative ReAct parsing treats emitted tool structure as first-class
   evidence. If the model emits a `<vicuna_tool_call ...>` block with trailing
   chatter or a partial close, the runtime salvages that emitted structure and

@@ -300,6 +300,21 @@ step chooses `act`, `answer`, or `ask` from the observation. A post-tool
 `wait` is treated as malformed control and retried; the CPU still does not pick
 an alternative action on the model's behalf.
 
+Active authoritative ReAct now also has an explicit continuation policy beyond
+basic parse validity:
+
+- a first active user-origin step that clearly asks for current, dated, or
+  otherwise mutable external facts can switch tool choice from `auto` to
+  `required`
+- a visible reply that only narrates intended work or lack of access, such as
+  “I will use historical data” or “I do not have real-time access,” is not
+  accepted as a terminal answer
+- unsupported terminal answers are retried within the same authoritative turn
+  with explicit feedback instead of returning hidden-thought-adjacent
+  procedural text to the user
+- the continuation budget is effectively unbounded by default; the turn keeps
+  cycling until it reaches a valid terminal condition or is externally stopped
+
 This is why active and DMN runners now stop in `LLAMA_COG_LOOP_PHASE_PROPOSE`
 with no pending command when authoritative mode is enabled: the cognitive loop
 is yielding to the planner/tool LoRA stream to write the authoritative control

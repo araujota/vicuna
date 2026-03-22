@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <limits>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -151,6 +152,7 @@ struct server_task {
     task_params   params;
     server_tokens tokens;
     llama_tokens active_loop_tokens;
+    std::string foreground_text;
     int32_t foreground_role = LLAMA_SELF_STATE_EVENT_USER;
     uint32_t foreground_flags = 0;
     llama_active_loop_trace active_trace = {};
@@ -158,7 +160,7 @@ struct server_task {
     int32_t react_iteration = 0;
     int32_t react_origin = SERVER_REACT_ORIGIN_NONE;
     int32_t react_retry_count = 0;
-    int32_t react_retry_limit = 2;
+    int32_t react_retry_limit = std::numeric_limits<int32_t>::max();
     std::string react_retry_feedback;
     std::string react_assistant_prefill;
     std::vector<common_chat_tool> react_tools;
@@ -257,6 +259,7 @@ struct server_task {
         copy.type      = type;
         copy.tokens    = tokens.clone();
         copy.active_loop_tokens = active_loop_tokens;
+        copy.foreground_text = foreground_text;
         copy.foreground_role = foreground_role;
         copy.foreground_flags = foreground_flags;
         copy.react_iteration = react_iteration;
