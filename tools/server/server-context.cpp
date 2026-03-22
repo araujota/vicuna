@@ -3122,6 +3122,29 @@ private:
         return LLAMA_AUTHORITATIVE_REACT_ACTION_NONE;
     }
 
+    static int32_t react_infer_action_from_structure(
+            const server_task & task,
+            const common_chat_msg & assistant_msg) {
+        if (!assistant_msg.tool_calls.empty()) {
+            return LLAMA_AUTHORITATIVE_REACT_ACTION_ACT;
+        }
+
+        const std::string visible = trim_ascii_copy(assistant_msg.content);
+        if (task.react_origin == SERVER_REACT_ORIGIN_DMN) {
+            return visible.empty() ?
+                    LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT :
+                    LLAMA_AUTHORITATIVE_REACT_ACTION_INTERNAL_WRITE;
+        }
+
+        if (!visible.empty()) {
+            return visible.find('?') != std::string::npos ?
+                    LLAMA_AUTHORITATIVE_REACT_ACTION_ASK :
+                    LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER;
+        }
+
+        return LLAMA_AUTHORITATIVE_REACT_ACTION_NONE;
+    }
+
     static bool react_reasoning_has_explanatory_text(const std::string & reasoning) {
         std::istringstream in(reasoning);
         std::string line;
@@ -3172,8 +3195,11 @@ private:
 
         out_step->action = react_parse_action_label(out_step->planner_reasoning);
         if (out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_NONE) {
-            out_step->error = "hidden reasoning did not include an explicit Action label";
-            return false;
+            out_step->action = react_infer_action_from_structure(task, out_step->assistant_msg);
+            if (out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_NONE) {
+                out_step->error = "hidden reasoning did not include an explicit Action label";
+                return false;
+            }
         }
 
         if (task.react_origin == SERVER_REACT_ORIGIN_DMN) {
