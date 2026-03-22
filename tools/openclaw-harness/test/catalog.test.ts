@@ -5,7 +5,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { buildCatalog, buildRuntimeCatalog } from "../src/catalog.js";
-import { defaultPaths, loadToolSecrets, saveToolSecrets, upsertTavilyApiKey } from "../src/config.js";
+import {
+  defaultPaths,
+  loadToolSecrets,
+  saveToolSecrets,
+  upsertServarrConfig,
+  upsertTavilyApiKey
+} from "../src/config.js";
 import { assertCapabilityDescriptor } from "../src/contracts.js";
 import { resolveInvocation } from "../src/invoke.js";
 import { writeRuntimeCatalog } from "../src/runtime-catalog.js";
@@ -169,8 +175,11 @@ test("tool surface and capability id must match exactly", () => {
   );
 });
 
-test("runtime catalog includes Tavily only when the OpenClaw secret is present", () => {
-  assert.equal(buildRuntimeCatalog().capabilities.length, 0);
+test("runtime catalog always includes Radarr and Sonarr and adds Tavily when configured", () => {
+  assert.deepEqual(
+    buildRuntimeCatalog().capabilities.map((capability) => capability.capability_id),
+    ["openclaw.servarr.radarr", "openclaw.servarr.sonarr"]
+  );
   const catalog = buildRuntimeCatalog({
     secrets: {
       tools: {
@@ -182,17 +191,25 @@ test("runtime catalog includes Tavily only when the OpenClaw secret is present",
   });
   assert.deepEqual(
     catalog.capabilities.map((capability) => capability.capability_id),
-    ["openclaw.tavily.web_search"]
+    [
+      "openclaw.servarr.radarr",
+      "openclaw.servarr.sonarr",
+      "openclaw.tavily.web_search"
+    ]
   );
+  const webSearchCapability = catalog.capabilities.find(
+    (capability) => capability.capability_id === "openclaw.tavily.web_search"
+  );
+  assert.ok(webSearchCapability);
   assert.equal(
-    catalog.capabilities[0]?.tool_flags,
+    webSearchCapability?.tool_flags,
     COG_TOOL_FLAG_ACTIVE_ELIGIBLE |
       COG_TOOL_FLAG_DMN_ELIGIBLE |
       COG_TOOL_FLAG_REMEDIATION_SAFE |
       COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
   );
   assert.deepEqual(
-    Object.keys((catalog.capabilities[0]?.input_schema_json as { properties: Record<string, unknown> }).properties).sort(),
+    Object.keys((webSearchCapability?.input_schema_json as { properties: Record<string, unknown> }).properties).sort(),
     [
       "country",
       "exclude_domains",
@@ -204,10 +221,42 @@ test("runtime catalog includes Tavily only when the OpenClaw secret is present",
       "topic",
     ]
   );
-  const webSearchSchema = catalog.capabilities[0]?.input_schema_json as {
+  const webSearchSchema = webSearchCapability?.input_schema_json as {
     properties: Record<string, { description?: string }>;
   };
   for (const value of Object.values(webSearchSchema.properties)) {
+    assert.ok(typeof value.description === "string" && value.description.length > 0);
+  }
+});
+
+test("runtime catalog exposes fully described Radarr and Sonarr schemas", () => {
+  const catalog = buildRuntimeCatalog();
+  const radarrCapability = catalog.capabilities.find(
+    (capability) => capability.capability_id === "openclaw.servarr.radarr"
+  );
+  const sonarrCapability = catalog.capabilities.find(
+    (capability) => capability.capability_id === "openclaw.servarr.sonarr"
+  );
+
+  assert.ok(radarrCapability);
+  assert.ok(sonarrCapability);
+
+  const radarrSchema = radarrCapability?.input_schema_json as {
+    properties: Record<string, { description?: string }>;
+  };
+  const sonarrSchema = sonarrCapability?.input_schema_json as {
+    properties: Record<string, { description?: string }>;
+  };
+
+  assert.match(radarrCapability?.description ?? "", /Radarr movie library/i);
+  assert.match(sonarrCapability?.description ?? "", /Sonarr series library/i);
+  assert.ok("action" in radarrSchema.properties);
+  assert.ok("action" in sonarrSchema.properties);
+
+  for (const value of Object.values(radarrSchema.properties)) {
+    assert.ok(typeof value.description === "string" && value.description.length > 0);
+  }
+  for (const value of Object.values(sonarrSchema.properties)) {
     assert.ok(typeof value.description === "string" && value.description.length > 0);
   }
 });
@@ -225,8 +274,22 @@ test("OpenClaw secrets persist Tavily config and emit a runtime catalog", () => 
   const runtimeCatalog = JSON.parse(fs.readFileSync(runtimeCatalogPath, "utf8"));
   assert.deepEqual(
     runtimeCatalog.capabilities.map((capability: { capability_id: string }) => capability.capability_id),
-    ["openclaw.tavily.web_search"]
+    [
+      "openclaw.servarr.radarr",
+      "openclaw.servarr.sonarr",
+      "openclaw.tavily.web_search"
+    ]
   );
+});
+
+test("OpenClaw secrets persist Servarr config while keeping the tools visible", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vicuna-openclaw-servarr-"));
+  const secretsPath = path.join(tempDir, "openclaw-tool-secrets.json");
+
+  const secrets = upsertServarrConfig({}, "radarr", "radarr-key", "http://10.0.0.218:7878");
+  saveToolSecrets(secretsPath, secrets);
+  assert.equal(loadToolSecrets(secretsPath).tools?.radarr?.api_key, "radarr-key");
+  assert.equal(loadToolSecrets(secretsPath).tools?.radarr?.base_url, "http://10.0.0.218:7878");
 });
 
 test("runtime catalog path honors the configured fabric catalog path", () => {

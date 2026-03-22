@@ -319,6 +319,268 @@ function tavilyWebSearchCapability(): CapabilityDescriptor {
   };
 }
 
+function radarrCapability(): CapabilityDescriptor {
+  return {
+    capability_id: "openclaw.servarr.radarr",
+    tool_surface_id: "vicuna.media.radarr",
+    capability_kind: "tool",
+    owner_plugin_id: "openclaw-servarr",
+    tool_name: "radarr",
+    description:
+      "Inspect and manage the Radarr movie library on the LAN-connected media server. Use this for Radarr system status, queue state, calendar, root folders, quality profiles, existing movies, movie lookup, and adding a movie after you have the right folder and quality profile.",
+    input_schema_json: {
+      type: "object",
+      required: ["action"],
+      properties: {
+        action: {
+          type: "string",
+          enum: [
+            "system_status",
+            "queue",
+            "calendar",
+            "root_folders",
+            "quality_profiles",
+            "list_movies",
+            "lookup_movie",
+            "add_movie",
+          ],
+          description:
+            "The Radarr operation to perform. Read actions inspect the movie library; add_movie looks up a movie and then adds it to Radarr."
+        },
+        term: {
+          type: "string",
+          description:
+            "Search term for lookup_movie or add_movie. Use a precise movie title, year, or other lookup phrase."
+        },
+        tmdb_id: {
+          type: "integer",
+          description:
+            "Optional TMDb movie id used to disambiguate the chosen lookup result when add_movie finds multiple candidates."
+        },
+        start: {
+          type: "string",
+          description:
+            "Inclusive ISO 8601 start timestamp for the calendar action."
+        },
+        end: {
+          type: "string",
+          description:
+            "Inclusive ISO 8601 end timestamp for the calendar action."
+        },
+        include_unmonitored: {
+          type: "boolean",
+          description:
+            "Whether the calendar action should include unmonitored movies."
+        },
+        root_folder_path: {
+          type: "string",
+          description:
+            "Destination Radarr root folder path. Required for add_movie."
+        },
+        quality_profile_id: {
+          type: "integer",
+          description:
+            "Radarr quality profile id to assign when adding a movie. Required for add_movie."
+        },
+        monitored: {
+          type: "boolean",
+          description:
+            "Whether the added movie should be monitored in Radarr."
+        },
+        minimum_availability: {
+          type: "string",
+          enum: ["tba", "announced", "inCinemas", "released"],
+          description:
+            "Minimum Radarr availability state to wait for when adding a movie."
+        },
+        monitor: {
+          type: "string",
+          enum: ["movieOnly", "movieAndCollection", "none"],
+          description:
+            "Radarr add-monitor mode used inside add_movie addOptions."
+        },
+        search_for_movie: {
+          type: "boolean",
+          description:
+            "Whether Radarr should immediately search for the movie after adding it."
+        },
+        tags: {
+          type: "array",
+          description:
+            "Optional Radarr tag ids to assign to the movie when adding it.",
+          items: {
+            type: "integer",
+            description: "One Radarr tag id."
+          }
+        }
+      }
+    },
+    output_contract: "completed_result",
+    side_effect_class: "service_api",
+    approval_mode: "policy_driven",
+    execution_modes: ["sync"],
+    provenance_namespace: "openclaw/openclaw-servarr/tool/radarr",
+    tool_kind: 4,
+    tool_flags: combineToolFlags(
+      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      COG_TOOL_FLAG_DMN_ELIGIBLE,
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+    ),
+    latency_class: 1,
+    max_steps_reserved: 3,
+    dispatch_backend: "legacy_bash"
+  };
+}
+
+function sonarrCapability(): CapabilityDescriptor {
+  return {
+    capability_id: "openclaw.servarr.sonarr",
+    tool_surface_id: "vicuna.media.sonarr",
+    capability_kind: "tool",
+    owner_plugin_id: "openclaw-servarr",
+    tool_name: "sonarr",
+    description:
+      "Inspect and manage the Sonarr series library on the LAN-connected media server. Use this for Sonarr system status, queue state, calendar, root folders, quality profiles, existing series, series lookup, and adding a series after you have the right folder and quality profile.",
+    input_schema_json: {
+      type: "object",
+      required: ["action"],
+      properties: {
+        action: {
+          type: "string",
+          enum: [
+            "system_status",
+            "queue",
+            "calendar",
+            "root_folders",
+            "quality_profiles",
+            "list_series",
+            "lookup_series",
+            "add_series",
+          ],
+          description:
+            "The Sonarr operation to perform. Read actions inspect the series library; add_series looks up a series and then adds it to Sonarr."
+        },
+        term: {
+          type: "string",
+          description:
+            "Search term for lookup_series or add_series. Use a precise series title, year, or other lookup phrase."
+        },
+        tvdb_id: {
+          type: "integer",
+          description:
+            "Optional TVDb series id used to disambiguate the chosen lookup result when add_series finds multiple candidates."
+        },
+        tmdb_id: {
+          type: "integer",
+          description:
+            "Optional TMDb series id used to disambiguate the chosen lookup result when add_series finds multiple candidates."
+        },
+        start: {
+          type: "string",
+          description:
+            "Inclusive ISO 8601 start timestamp for the calendar action."
+        },
+        end: {
+          type: "string",
+          description:
+            "Inclusive ISO 8601 end timestamp for the calendar action."
+        },
+        include_unmonitored: {
+          type: "boolean",
+          description:
+            "Whether the calendar action should include unmonitored series."
+        },
+        root_folder_path: {
+          type: "string",
+          description:
+            "Destination Sonarr root folder path. Required for add_series."
+        },
+        quality_profile_id: {
+          type: "integer",
+          description:
+            "Sonarr quality profile id to assign when adding a series. Required for add_series."
+        },
+        monitored: {
+          type: "boolean",
+          description:
+            "Whether the added series should be monitored in Sonarr."
+        },
+        season_folder: {
+          type: "boolean",
+          description:
+            "Whether Sonarr should create season folders for the added series."
+        },
+        series_type: {
+          type: "string",
+          enum: ["standard", "daily", "anime"],
+          description:
+            "Sonarr series type for the added series."
+        },
+        monitor_new_items: {
+          type: "string",
+          enum: ["all", "none"],
+          description:
+            "How Sonarr should monitor newly discovered items for the added series."
+        },
+        monitor: {
+          type: "string",
+          enum: [
+            "unknown",
+            "all",
+            "future",
+            "missing",
+            "existing",
+            "firstSeason",
+            "lastSeason",
+            "latestSeason",
+            "pilot",
+            "recent",
+            "monitorSpecials",
+            "unmonitorSpecials",
+            "none",
+            "skip",
+          ],
+          description:
+            "Sonarr episode-monitor mode used inside add_series addOptions."
+        },
+        search_for_missing_episodes: {
+          type: "boolean",
+          description:
+            "Whether Sonarr should immediately search for missing episodes after adding the series."
+        },
+        search_for_cutoff_unmet_episodes: {
+          type: "boolean",
+          description:
+            "Whether Sonarr should immediately search for cutoff-unmet episodes after adding the series."
+        },
+        tags: {
+          type: "array",
+          description:
+            "Optional Sonarr tag ids to assign to the series when adding it.",
+          items: {
+            type: "integer",
+            description: "One Sonarr tag id."
+          }
+        }
+      }
+    },
+    output_contract: "completed_result",
+    side_effect_class: "service_api",
+    approval_mode: "policy_driven",
+    execution_modes: ["sync"],
+    provenance_namespace: "openclaw/openclaw-servarr/tool/sonarr",
+    tool_kind: 4,
+    tool_flags: combineToolFlags(
+      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      COG_TOOL_FLAG_DMN_ELIGIBLE,
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+    ),
+    latency_class: 1,
+    max_steps_reserved: 3,
+    dispatch_backend: "legacy_bash"
+  };
+}
+
 const BUILTIN_CAPABILITIES: Record<BuiltinToolId, () => CapabilityDescriptor> = {
   exec: execCapability,
   hard_memory_query: hardMemoryCapability,
@@ -359,7 +621,7 @@ export function buildCatalog(options: CatalogOptions = {}): CapabilityCatalog {
 }
 
 export function buildRuntimeCatalog(options: RuntimeCatalogOptions = {}): CapabilityCatalog {
-  const capabilities: CapabilityDescriptor[] = [];
+  const capabilities: CapabilityDescriptor[] = [radarrCapability(), sonarrCapability()];
   const tavilyApiKey = options.secrets?.tools?.tavily?.api_key?.trim();
   if (tavilyApiKey) {
     capabilities.push(tavilyWebSearchCapability());

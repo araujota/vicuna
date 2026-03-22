@@ -9,6 +9,8 @@ Current scope:
 - external runtime-catalog emission for OpenClaw-managed tools
 - file-backed OpenClaw tool secrets under `.cache/vicuna`
 - Tavily-backed `web_search` wrapper command
+- Radarr-backed `radarr` wrapper command for movie-library inspection and add flows
+- Sonarr-backed `sonarr` wrapper command for series-library inspection and add flows
 - exact selector validation on `tool_surface_id` plus `capability_id`
 - simple CLI entrypoint for emitting the catalog and validating invocations
 - registry-style catalog construction so more tools can be added without
@@ -34,6 +36,8 @@ Example:
 npm test
 node dist/index.js catalog
 node dist/index.js install-tavily "$TAVILY_API_KEY"
+node dist/index.js install-radarr "$RADARR_API_KEY" "http://10.0.0.218:7878"
+node dist/index.js install-sonarr "$SONARR_API_KEY" "http://10.0.0.218:8989"
 node dist/index.js sync-runtime-catalog
 ```
 
@@ -64,3 +68,36 @@ The Tavily-backed `web_search` tool is intentionally source-first.
 
 The intended use is: retrieve evidence here, then let the authoritative ReAct
 loop synthesize from the returned URLs and excerpts.
+
+## Servarr Tools
+
+The harness now also ships two LAN media-service tools:
+
+- `radarr` for movie-library status, queue, calendar, folders, quality
+  profiles, movie lookup, and add-movie flows
+- `sonarr` for series-library status, queue, calendar, folders, quality
+  profiles, series lookup, and add-series flows
+
+Both tools are emitted through the same external OpenClaw runtime catalog as
+`web_search`; there is no second tool registry for media management.
+
+Secrets layout:
+
+```json
+{
+  "tools": {
+    "radarr": {
+      "base_url": "http://10.0.0.218:7878",
+      "api_key": "radarr-api-key"
+    },
+    "sonarr": {
+      "base_url": "http://10.0.0.218:8989",
+      "api_key": "sonarr-api-key"
+    }
+  }
+}
+```
+
+If the API keys are missing, the tools still remain visible in the runtime
+catalog, but each invocation returns a typed configuration/auth failure payload
+instead of silently disappearing from the OpenClaw surface.

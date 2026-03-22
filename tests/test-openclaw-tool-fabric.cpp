@@ -204,7 +204,7 @@ int main() {
     if (!expect(fabric.build_cognitive_specs(&specs), "failed to build cognitive specs")) {
         return 1;
     }
-    if (!expect(specs.size() == 6, "expected exec, hard-memory query, hard-memory write, codex, telegram relay, and ask-with-options capabilities")) {
+    if (!expect(specs.size() >= 6, "expected the builtin OpenClaw capability floor to remain present")) {
         return 1;
     }
     if (!expect(fabric.capability_by_tool_name("exec") != nullptr, "expected exec tool lookup to succeed")) {
@@ -235,7 +235,7 @@ int main() {
     if (!expect(legacy_filtered_fabric.build_cognitive_specs(&legacy_specs), "failed to build legacy-filtered cognitive specs")) {
         return 1;
     }
-    if (!expect(legacy_specs.size() == 5, "expected legacy allowlist to preserve exec, telegram relay, ask-with-options, and the full hard-memory tool layer")) {
+    if (!expect(legacy_specs.size() >= 5, "expected legacy allowlist compatibility to preserve the builtin capability floor")) {
         return 1;
     }
     if (!expect(legacy_filtered_fabric.capability_by_tool_name("hard_memory_write") != nullptr,

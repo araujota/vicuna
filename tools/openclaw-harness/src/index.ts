@@ -1,5 +1,11 @@
 import { buildCatalog } from "./catalog.js";
-import { defaultPaths, loadToolSecrets, saveToolSecrets, upsertTavilyApiKey } from "./config.js";
+import {
+  defaultPaths,
+  loadToolSecrets,
+  saveToolSecrets,
+  upsertServarrConfig,
+  upsertTavilyApiKey
+} from "./config.js";
 import { resolveInvocation } from "./invoke.js";
 import { loadRuntimeCatalog, writeRuntimeCatalog } from "./runtime-catalog.js";
 
@@ -56,6 +62,29 @@ if (import.meta.url === `file://${process.argv[1]}`) {
           secrets_path: paths.secretsPath,
           runtime_catalog_path: paths.runtimeCatalogPath,
           tavily_enabled: true
+        },
+        null,
+        2
+      )}\n`
+    );
+  } else if (command === "install-radarr" || command === "install-sonarr") {
+    const apiKey = process.argv[3];
+    if (!apiKey) {
+      throw new Error(`${command} requires an api key argument`);
+    }
+    const optionalBaseUrl = process.argv[4];
+    const paths = defaultCliPaths();
+    const toolId = command === "install-radarr" ? "radarr" : "sonarr";
+    const secrets = upsertServarrConfig(loadToolSecrets(paths.secretsPath), toolId, apiKey, optionalBaseUrl);
+    saveToolSecrets(paths.secretsPath, secrets);
+    writeRuntimeCatalog(paths.runtimeCatalogPath, paths.secretsPath);
+    process.stdout.write(
+      `${JSON.stringify(
+        {
+          secrets_path: paths.secretsPath,
+          runtime_catalog_path: paths.runtimeCatalogPath,
+          tool: toolId,
+          installed: true
         },
         null,
         2

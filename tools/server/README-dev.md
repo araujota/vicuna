@@ -261,6 +261,18 @@ wrapper no longer treats Tavily's generated `answer` field as authoritative by
 default; it retrieves bounded multi-source evidence instead and expects the
 authoritative ReAct loop to synthesize from returned URLs, scores, and excerpts.
 
+The OpenClaw external runtime catalog now also carries two Servarr tools:
+
+- `radarr` for movie-library status, queue, calendar, folders, quality
+  profiles, lookup, and add flows
+- `sonarr` for series-library status, queue, calendar, folders, quality
+  profiles, lookup, and add flows
+
+These are not server-local special cases masquerading as tools. Their
+descriptors come from the same external catalog contract as `web_search`, and
+`server_context` only provides explicit dispatch construction to launch the
+wrapper binaries under the existing `legacy_bash` path.
+
 Runtime snapshot restore now accepts snapshot schema version `6`, which is the
 first version that persists the Telegram dialogue object. That keeps bounded
 Telegram continuity available after a service restart instead of forcing the

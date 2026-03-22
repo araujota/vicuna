@@ -3960,6 +3960,18 @@ private:
                         command_text += " --exclude-domains=" + percent_encode_query(joined.str());
                     }
                 }
+            } else if (capability->descriptor.capability_id == "openclaw.servarr.radarr") {
+                command_text =
+                        "tools/openclaw-harness/bin/radarr-api --payload-base64=" +
+                        base64::encode(arguments.dump());
+                request.login_shell = false;
+                std::snprintf(request.allowed_commands, sizeof(request.allowed_commands), "%s", "radarr-api");
+            } else if (capability->descriptor.capability_id == "openclaw.servarr.sonarr") {
+                command_text =
+                        "tools/openclaw-harness/bin/sonarr-api --payload-base64=" +
+                        base64::encode(arguments.dump());
+                request.login_shell = false;
+                std::snprintf(request.allowed_commands, sizeof(request.allowed_commands), "%s", "sonarr-api");
             }
 
             command_text = trim_ascii_copy(command_text);

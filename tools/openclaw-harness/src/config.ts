@@ -7,6 +7,14 @@ export type OpenClawToolSecrets = {
     tavily?: {
       api_key?: string;
     };
+    radarr?: {
+      base_url?: string;
+      api_key?: string;
+    };
+    sonarr?: {
+      base_url?: string;
+      api_key?: string;
+    };
   };
 };
 
@@ -16,7 +24,14 @@ export type OpenClawPaths = {
   secretsPath: string;
   runtimeCatalogPath: string;
   tavilyWrapperPath: string;
+  radarrWrapperPath: string;
+  sonarrWrapperPath: string;
 };
+
+export type OpenClawServarrToolId = "radarr" | "sonarr";
+
+export const DEFAULT_RADARR_BASE_URL = "http://10.0.0.218:7878";
+export const DEFAULT_SONARR_BASE_URL = "http://10.0.0.218:8989";
 
 function moduleDir(): string {
   return path.dirname(fileURLToPath(import.meta.url));
@@ -36,7 +51,9 @@ export function defaultPaths(repoRoot = defaultRepoRoot()): OpenClawPaths {
     stateDir,
     secretsPath: path.join(stateDir, "openclaw-tool-secrets.json"),
     runtimeCatalogPath,
-    tavilyWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "tavily-web-search")
+    tavilyWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "tavily-web-search"),
+    radarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "radarr-api"),
+    sonarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "sonarr-api")
   };
 }
 
@@ -72,4 +89,25 @@ export function upsertTavilyApiKey(secrets: OpenClawToolSecrets, apiKey: string)
     }
   };
   return next;
+}
+
+export function upsertServarrConfig(
+  secrets: OpenClawToolSecrets,
+  toolId: OpenClawServarrToolId,
+  apiKey: string,
+  baseUrl?: string
+): OpenClawToolSecrets {
+  const existing = toolId === "radarr" ? secrets.tools?.radarr : secrets.tools?.sonarr;
+  const nextConfig = {
+    ...existing,
+    api_key: apiKey,
+    ...(baseUrl ? { base_url: baseUrl } : {})
+  };
+  return {
+    ...secrets,
+    tools: {
+      ...secrets.tools,
+      [toolId]: nextConfig
+    }
+  };
 }
