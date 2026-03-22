@@ -304,14 +304,11 @@ static inline bool server_task_has_authoritative_react_surface(const server_task
         return false;
     }
 
-    switch (task.react_origin) {
-        case SERVER_REACT_ORIGIN_ACTIVE:
-            return task.has_active_trace;
-        case SERVER_REACT_ORIGIN_DMN:
-            return task.has_dmn_trace;
-        default:
-            return false;
+    if (task.react_assistant_prefill.empty()) {
+        return false;
     }
+
+    return task.has_active_trace || task.has_dmn_trace;
 }
 
 struct result_timings {

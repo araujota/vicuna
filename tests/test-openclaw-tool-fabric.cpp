@@ -59,31 +59,31 @@ int main() {
     }
 
     server_task active_react_task(SERVER_TASK_TYPE_COMPLETION);
-    active_react_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
     active_react_task.has_active_trace = true;
+    active_react_task.react_assistant_prefill = "<think>\nThought: ";
     if (!expect(server_task_has_authoritative_react_surface(active_react_task),
-                "expected active completion task with an active trace to be ReAct-ready")) {
+                "expected active completion task with a prepared ReAct prompt to be ReAct-ready")) {
         return 1;
     }
 
     server_task inactive_active_task(SERVER_TASK_TYPE_COMPLETION);
-    inactive_active_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
+    inactive_active_task.has_active_trace = true;
     if (!expect(!server_task_has_authoritative_react_surface(inactive_active_task),
-                "expected active-origin task without an active trace to be non-ReAct-ready")) {
+                "expected active task without a prepared ReAct prompt to be non-ReAct-ready")) {
         return 1;
     }
 
     server_task dmn_react_task(SERVER_TASK_TYPE_COMPLETION);
-    dmn_react_task.react_origin = SERVER_REACT_ORIGIN_DMN;
     dmn_react_task.has_dmn_trace = true;
+    dmn_react_task.react_assistant_prefill = "<think>\nThought: ";
     if (!expect(server_task_has_authoritative_react_surface(dmn_react_task),
-                "expected DMN completion task with a DMN trace to be ReAct-ready")) {
+                "expected DMN completion task with a prepared ReAct prompt to be ReAct-ready")) {
         return 1;
     }
 
     server_task wrong_type_task(SERVER_TASK_TYPE_EMBEDDING);
-    wrong_type_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
     wrong_type_task.has_active_trace = true;
+    wrong_type_task.react_assistant_prefill = "<think>\nThought: ";
     if (!expect(!server_task_has_authoritative_react_surface(wrong_type_task),
                 "expected non-completion task types to remain outside authoritative ReAct")) {
         return 1;
