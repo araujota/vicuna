@@ -3231,6 +3231,14 @@ private:
 
         out_step->action = react_parse_action_label(out_step->planner_reasoning);
         if (out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_NONE) {
+            const std::string parse_text =
+                    task.react_assistant_prefill.empty() ? text : task.react_assistant_prefill + text;
+            std::string raw_reasoning;
+            std::string raw_visible;
+            split_hidden_reasoning_text(parse_text, &raw_reasoning, &raw_visible);
+            if (trim_ascii_copy(out_step->assistant_msg.content).empty() && !raw_visible.empty()) {
+                out_step->assistant_msg.content = std::move(raw_visible);
+            }
             out_step->action = react_infer_action_from_structure(task, out_step->assistant_msg);
             if (out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_NONE) {
                 out_step->error = "hidden reasoning did not include an explicit Action label";
