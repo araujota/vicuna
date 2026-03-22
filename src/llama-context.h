@@ -229,6 +229,8 @@ struct llama_context {
     bool self_state_get_tool_state(llama_self_tool_state_info * out_info) const;
     bool self_state_get_social_state(llama_self_social_state_info * out_info) const;
     bool self_state_get_model_state(llama_self_model_state_info * out_info) const;
+    bool self_state_get_self_model_revision(llama_self_model_revision * out_info) const;
+    bool self_state_get_emotive_moment_revision(llama_emotive_moment_revision * out_info) const;
     int32_t self_state_model_extension_count() const;
     bool self_state_get_model_extension(int32_t index, llama_self_model_extension_info * out_info) const;
     bool self_state_upsert_model_extension(const llama_self_model_extension_update & update);
@@ -236,6 +238,9 @@ struct llama_context {
     int32_t self_state_trace_count() const;
     int32_t self_state_trace_token_count() const;
     bool self_state_trace_get_item(int32_t index, llama_self_trace_item_info * out_info) const;
+    bool self_state_trace_get_item_tokens(int32_t index, const llama_token ** out_tokens, size_t * out_count) const;
+    bool shared_cognitive_context_get_item(int32_t index, llama_shared_cognitive_context_item * out_info) const;
+    bool shared_cognitive_context_get_window(llama_shared_cognitive_context_window * out_info) const;
     bool self_state_clear_trace();
     bool self_state_replay_trace(int32_t upto_count);
     bool self_state_replay_trace_on_channel(int32_t upto_count, int32_t replay_channel);

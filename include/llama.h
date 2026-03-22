@@ -934,6 +934,40 @@ extern "C" {
         LLAMA_SELF_COG_ARTIFACT_GOVERNANCE          = 5,
         LLAMA_SELF_COG_ARTIFACT_FUNCTIONAL_UPDATE   = 6,
         LLAMA_SELF_COG_ARTIFACT_CONTEXT_EVICTION    = 7,
+        LLAMA_SELF_COG_ARTIFACT_HIDDEN_THOUGHT      = 8,
+        LLAMA_SELF_COG_ARTIFACT_TOOL_CALL           = 9,
+        LLAMA_SELF_COG_ARTIFACT_TOOL_OBSERVATION    = 10,
+        LLAMA_SELF_COG_ARTIFACT_VISIBLE_OUTPUT      = 11,
+        LLAMA_SELF_COG_ARTIFACT_EMOTIVE_MOMENT      = 12,
+        LLAMA_SELF_COG_ARTIFACT_INTERNAL_SUMMARY    = 13,
+    };
+
+    enum llama_shared_cognitive_context_origin {
+        LLAMA_SHARED_CONTEXT_ORIGIN_ACTIVE = 0,
+        LLAMA_SHARED_CONTEXT_ORIGIN_DMN    = 1,
+        LLAMA_SHARED_CONTEXT_ORIGIN_TOOL   = 2,
+        LLAMA_SHARED_CONTEXT_ORIGIN_SYSTEM = 3,
+    };
+
+    enum llama_shared_cognitive_context_kind {
+        LLAMA_SHARED_CONTEXT_KIND_USER_MESSAGE     = 0,
+        LLAMA_SHARED_CONTEXT_KIND_HIDDEN_THOUGHT   = 1,
+        LLAMA_SHARED_CONTEXT_KIND_TOOL_CALL        = 2,
+        LLAMA_SHARED_CONTEXT_KIND_TOOL_OBSERVATION = 3,
+        LLAMA_SHARED_CONTEXT_KIND_VISIBLE_OUTPUT   = 4,
+        LLAMA_SHARED_CONTEXT_KIND_EMOTIVE_MOMENT   = 5,
+        LLAMA_SHARED_CONTEXT_KIND_CONTEXT_EVICTION = 6,
+        LLAMA_SHARED_CONTEXT_KIND_INTERNAL_SUMMARY = 7,
+    };
+
+    enum llama_shared_cognitive_context_phase {
+        LLAMA_SHARED_CONTEXT_PHASE_THINK          = 0,
+        LLAMA_SHARED_CONTEXT_PHASE_SELECT_TOOL    = 1,
+        LLAMA_SHARED_CONTEXT_PHASE_PREPARE_TOOL   = 2,
+        LLAMA_SHARED_CONTEXT_PHASE_OBSERVE        = 3,
+        LLAMA_SHARED_CONTEXT_PHASE_EMIT           = 4,
+        LLAMA_SHARED_CONTEXT_PHASE_COMPRESS       = 5,
+        LLAMA_SHARED_CONTEXT_PHASE_COUNTERFACTUAL = 6,
     };
 
     enum llama_self_tool_job_status {
@@ -1109,17 +1143,49 @@ extern "C" {
 
     struct llama_self_trace_item_info {
         struct llama_self_state_time_point time_point;
+        int64_t  context_item_id;
         int32_t  role;
         int32_t  channel;
         uint32_t flags;
         float    decoder_entropy;
         float    decoder_top_margin;
         int32_t  artifact_kind;
+        int32_t  context_kind;
         int32_t  loop_origin;
         int32_t  phase;
         int32_t  source_id;
         int32_t  plan_id;
+        int32_t  revision_id;
         int32_t  token_count;
+    };
+
+    struct llama_shared_cognitive_context_item {
+        int64_t  context_item_id;
+        int32_t  origin;
+        int32_t  kind;
+        int32_t  phase;
+        int32_t  turn_id;
+        int32_t  episode_or_tick_id;
+        int32_t  plan_id;
+        int32_t  tool_request_id;
+        int32_t  token_count;
+        uint64_t admitted_at_us;
+        int32_t  revision_id;
+        uint32_t flags;
+        int32_t  role;
+        int32_t  channel;
+    };
+
+    struct llama_shared_cognitive_context_window {
+        int64_t head_revision;
+        int32_t item_count;
+        int32_t token_count;
+        int32_t max_item_count;
+        int32_t max_token_count;
+        int64_t oldest_item_id;
+        int64_t newest_item_id;
+        int64_t last_eviction_revision;
+        int32_t eviction_count;
     };
 
     struct llama_self_state_feature_vector {
@@ -2236,6 +2302,23 @@ extern "C" {
         LLAMA_AUTHORITATIVE_REACT_ACTION_INTERNAL_WRITE = 5,
     };
 
+    enum llama_authoritative_turn_status {
+        LLAMA_AUTHORITATIVE_TURN_STATUS_DRAFTING        = 0,
+        LLAMA_AUTHORITATIVE_TURN_STATUS_VALIDATING      = 1,
+        LLAMA_AUTHORITATIVE_TURN_STATUS_WAITING_ON_TOOL = 2,
+        LLAMA_AUTHORITATIVE_TURN_STATUS_COMPLETED       = 3,
+        LLAMA_AUTHORITATIVE_TURN_STATUS_FAILED          = 4,
+    };
+
+    enum llama_authoritative_turn_validation_error_kind {
+        LLAMA_AUTHORITATIVE_TURN_VALIDATION_NONE             = 0,
+        LLAMA_AUTHORITATIVE_TURN_VALIDATION_PARSE_FAILED     = 1,
+        LLAMA_AUTHORITATIVE_TURN_VALIDATION_BAD_ACTION       = 2,
+        LLAMA_AUTHORITATIVE_TURN_VALIDATION_BAD_TOOL         = 3,
+        LLAMA_AUTHORITATIVE_TURN_VALIDATION_BAD_TOOL_PAYLOAD = 4,
+        LLAMA_AUTHORITATIVE_TURN_VALIDATION_POLICY_REJECTED  = 5,
+    };
+
     struct llama_dmn_reportable_concept {
         bool valid;
         int32_t kind;
@@ -2254,18 +2337,78 @@ extern "C" {
         bool requires_prompt_regen;
     };
 
-    struct llama_dmn_prompt_revision {
+    struct llama_self_model_revision {
         bool valid;
-        int32_t prompt_revision_id;
-        int32_t source_revision_id;
-        uint64_t prompt_hash;
-        bool regenerated;
-        int32_t concept_count;
-        float user_contact_affinity;
-        float tool_affinity;
-        char macro_outline[LLAMA_DMN_PROMPT_OUTLINE_MAX_CHARS];
-        char rendered_prompt[LLAMA_DMN_PROMPT_MAX_CHARS];
-        struct llama_dmn_reportable_concept concepts[LLAMA_DMN_MAX_REPORTABLE_CONCEPTS];
+        int32_t revision_id;
+        uint64_t source_hash;
+        uint64_t changed_register_mask;
+        bool belief_changed;
+        bool forecast_changed;
+        bool social_changed;
+        bool tool_changed;
+        bool extension_changed;
+        float allostatic_distance;
+        float materiality_score;
+        uint32_t materiality_reason_mask;
+        bool requires_emotive_recompute;
+    };
+
+    struct llama_emotive_affective_vector {
+        float valence;
+        float arousal;
+        float dominance;
+        float social_closeness;
+        float cognitive_tension;
+        float goal_pressure;
+    };
+
+    struct llama_emotive_moment_revision {
+        bool valid;
+        int32_t revision_id;
+        int32_t source_self_model_revision_id;
+        uint64_t source_hash;
+        struct llama_emotive_affective_vector affective_vector;
+        int32_t lexical_profile_id;
+        float materiality_score;
+        uint64_t text_hash;
+        char text[LLAMA_HARD_MEMORY_MAX_TEXT_CHARS];
+    };
+
+    struct llama_authoritative_react_turn_state {
+        bool valid;
+        int32_t turn_id;
+        int32_t origin;
+        int32_t status;
+        int64_t thought_context_item_id;
+        int32_t action;
+        int32_t selected_tool_kind;
+        int32_t selected_tool_spec_index;
+        int64_t tool_call_context_item_id;
+        int64_t visible_output_context_item_id;
+        int64_t observation_context_item_id;
+        int32_t retry_count;
+        int32_t validation_error_kind;
+        int32_t source_emotive_revision_id;
+        int64_t source_context_revision;
+        int32_t tool_job_id;
+        char selected_tool_name[LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS];
+        char tool_call_payload[LLAMA_DMN_PROMPT_MAX_CHARS];
+    };
+
+    struct llama_learning_attribution_record {
+        bool valid;
+        int32_t attribution_id;
+        int32_t turn_id;
+        int64_t preceding_thought_context_item_id;
+        int64_t selected_tool_context_item_id;
+        int64_t tool_call_context_item_id;
+        int64_t observation_context_item_id;
+        int64_t post_observation_thought_context_item_id;
+        float self_state_delta;
+        float allostatic_distance_before;
+        float allostatic_distance_after;
+        float update_magnitude;
+        float update_polarity;
     };
 
     struct llama_cognitive_hard_memory_request {
@@ -2530,7 +2673,9 @@ extern "C" {
         int32_t plan_revision_count;
         int32_t current_plan_step;
         int32_t self_model_revision_id;
-        int32_t prompt_revision_id;
+        int32_t emotive_revision_id;
+        int64_t context_revision;
+        int32_t turn_id;
     };
 
     struct llama_active_loop_candidate {
@@ -2569,6 +2714,10 @@ extern "C" {
         uint32_t reason_mask;
         struct llama_cognitive_plan_trace plan;
         struct llama_functional_activation_decision functional_activation;
+        struct llama_self_model_revision self_model_revision;
+        struct llama_emotive_moment_revision emotive_moment_revision;
+        struct llama_shared_cognitive_context_window context_window;
+        struct llama_authoritative_react_turn_state authoritative_turn;
     };
 
     struct llama_cognitive_host_state {
@@ -2610,7 +2759,10 @@ extern "C" {
         bool deferred_for_foreground;
         struct llama_dmn_pressure_vector pressure;
         struct llama_dmn_self_model_revision self_model_revision;
-        struct llama_dmn_prompt_revision prompt_revision;
+        struct llama_self_model_revision canonical_self_model_revision;
+        struct llama_emotive_moment_revision emotive_moment_revision;
+        struct llama_shared_cognitive_context_window context_window;
+        struct llama_authoritative_react_turn_state authoritative_turn;
         int32_t reactivation_count;
         struct llama_self_reactivation_info reactivation_targets[LLAMA_DMN_MAX_REACTIVATION_TARGETS];
         uint32_t seed_source_mask;
@@ -3201,6 +3353,14 @@ extern "C" {
     LLAMA_API int32_t llama_self_state_get_model_state(
             const struct llama_context * ctx,
             struct llama_self_model_state_info * out_info);
+
+    LLAMA_API int32_t llama_self_state_get_self_model_revision(
+            const struct llama_context * ctx,
+            struct llama_self_model_revision * out_info);
+
+    LLAMA_API int32_t llama_self_state_get_emotive_moment_revision(
+            const struct llama_context * ctx,
+            struct llama_emotive_moment_revision * out_info);
     LLAMA_API struct llama_self_model_extension_update llama_self_model_extension_default_update(void);
     LLAMA_API int32_t llama_self_state_model_extension_count(const struct llama_context * ctx);
     LLAMA_API int32_t llama_self_state_get_model_extension(
@@ -3219,6 +3379,17 @@ extern "C" {
             const struct llama_context * ctx,
             int32_t index,
             struct llama_self_trace_item_info * out_info);
+
+    LLAMA_API int32_t llama_shared_cognitive_context_count(const struct llama_context * ctx);
+
+    LLAMA_API int32_t llama_shared_cognitive_context_get_item(
+            const struct llama_context * ctx,
+            int32_t index,
+            struct llama_shared_cognitive_context_item * out_info);
+
+    LLAMA_API int32_t llama_shared_cognitive_context_get_window(
+            const struct llama_context * ctx,
+            struct llama_shared_cognitive_context_window * out_info);
     LLAMA_API int32_t llama_self_state_clear_trace(struct llama_context * ctx);
     LLAMA_API int32_t llama_self_state_replay_trace(struct llama_context * ctx, int32_t upto_count);
     LLAMA_API int32_t llama_self_state_replay_trace_on_channel(

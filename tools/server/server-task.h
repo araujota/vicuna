@@ -157,18 +157,16 @@ struct server_task {
     bool has_active_trace = false;
     bool skip_active_loop_preflight = false;
     bool react_enabled = false;
-    bool react_transcript_seeded = false;
-    bool react_waiting_for_final_answer = false;
     int32_t react_iteration = 0;
     int32_t react_origin = SERVER_REACT_ORIGIN_NONE;
     int32_t react_retry_count = 0;
     int32_t react_retry_limit = 2;
-    size_t react_initial_message_count = 0;
-    std::string react_visible_prefix;
-    std::string react_last_planner_reasoning;
-    std::string react_last_tool_xml_payload;
-    std::vector<common_chat_msg> react_messages;
+    std::string react_retry_feedback;
     std::vector<common_chat_tool> react_tools;
+    bool telegram_dialogue_active = false;
+    std::string telegram_chat_scope;
+    int64_t telegram_message_id = 0;
+    int32_t telegram_history_turn_limit = 0;
     llama_dmn_tick_trace dmn_trace = {};
     bool has_dmn_trace = false;
 
@@ -262,18 +260,16 @@ struct server_task {
         copy.foreground_role = foreground_role;
         copy.foreground_flags = foreground_flags;
         copy.react_enabled = react_enabled;
-        copy.react_transcript_seeded = react_transcript_seeded;
-        copy.react_waiting_for_final_answer = react_waiting_for_final_answer;
         copy.react_iteration = react_iteration;
         copy.react_origin = react_origin;
         copy.react_retry_count = react_retry_count;
         copy.react_retry_limit = react_retry_limit;
-        copy.react_initial_message_count = react_initial_message_count;
-        copy.react_visible_prefix = react_visible_prefix;
-        copy.react_last_planner_reasoning = react_last_planner_reasoning;
-        copy.react_last_tool_xml_payload = react_last_tool_xml_payload;
-        copy.react_messages = react_messages;
+        copy.react_retry_feedback = react_retry_feedback;
         copy.react_tools = react_tools;
+        copy.telegram_dialogue_active = telegram_dialogue_active;
+        copy.telegram_chat_scope = telegram_chat_scope;
+        copy.telegram_message_id = telegram_message_id;
+        copy.telegram_history_turn_limit = telegram_history_turn_limit;
         copy.dmn_trace = dmn_trace;
         copy.has_dmn_trace = has_dmn_trace;
         copy.id_slot   = -1; // child tasks cannot specify slot

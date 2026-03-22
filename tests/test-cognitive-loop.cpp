@@ -1090,6 +1090,11 @@ int main(int argc, char ** argv) {
             trace.loop_state.phase != LLAMA_COG_LOOP_PHASE_PROPOSE ||
             trace.loop_state.waiting_on_tool ||
             trace.tool_proposal.valid ||
+            !trace.self_model_revision.valid ||
+            !trace.emotive_moment_revision.valid ||
+            trace.context_window.head_revision <= 0 ||
+            !trace.authoritative_turn.valid ||
+            trace.authoritative_turn.status != LLAMA_AUTHORITATIVE_TURN_STATUS_VALIDATING ||
             llama_cognitive_active_runner_get(ctx, &runner) != 0 ||
             !runner.active ||
             runner.waiting_on_tool ||
@@ -2629,7 +2634,6 @@ int main(int argc, char ** argv) {
             !trace.admitted ||
             trace.winner_action != LLAMA_DMN_ACTION_INVOKE_TOOL ||
             trace.tool_kind != LLAMA_TOOL_KIND_TELEGRAM_RELAY ||
-            !trace.prompt_revision.valid ||
             !trace.self_model_revision.valid) {
             std::fprintf(stderr, "failed to route high-continuation DMN through telegram relay\n");
             llama_free(ctx);
@@ -2638,10 +2642,8 @@ int main(int argc, char ** argv) {
         }
         if (!trace.tool_proposal.valid ||
             trace.tool_proposal.tool_kind != LLAMA_TOOL_KIND_TELEGRAM_RELAY ||
-            trace.prompt_revision.prompt_revision_id <= 0 ||
-            trace.self_model_revision.revision_id <= 0 ||
-            trace.prompt_revision.source_revision_id != trace.self_model_revision.revision_id) {
-            std::fprintf(stderr, "DMN relay trace did not expose prompt/self-model revisions\n");
+            trace.self_model_revision.revision_id <= 0) {
+            std::fprintf(stderr, "DMN relay trace did not expose self-model revision state\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -2667,7 +2669,6 @@ int main(int argc, char ** argv) {
         }
 
         const int32_t first_self_model_revision_id = trace.self_model_revision.revision_id;
-        const int32_t first_prompt_revision_id = trace.prompt_revision.prompt_revision_id;
 
         llama_telegram_relay_result relay_result = {};
         relay_result.command_id = command.command_id;
@@ -2704,11 +2705,8 @@ int main(int argc, char ** argv) {
         if (llama_dmn_tick(ctx, 8001, &refreshed_trace) != 0 ||
             !refreshed_trace.admitted ||
             !refreshed_trace.self_model_revision.valid ||
-            !refreshed_trace.prompt_revision.valid ||
-            refreshed_trace.self_model_revision.revision_id <= first_self_model_revision_id ||
-            refreshed_trace.prompt_revision.prompt_revision_id <= first_prompt_revision_id ||
-            refreshed_trace.prompt_revision.source_revision_id != refreshed_trace.self_model_revision.revision_id) {
-            std::fprintf(stderr, "DMN prompt revision did not regenerate after self-model update\n");
+            refreshed_trace.self_model_revision.revision_id <= first_self_model_revision_id) {
+            std::fprintf(stderr, "DMN self-model revision did not regenerate after state update\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;
@@ -2770,7 +2768,11 @@ int main(int argc, char ** argv) {
             trace.loop_state.waiting_on_tool ||
             trace.loop_state.terminal_reason != LLAMA_COG_TERMINAL_NONE ||
             trace.tool_proposal.valid ||
-            !trace.prompt_revision.valid ||
+            !trace.canonical_self_model_revision.valid ||
+            !trace.emotive_moment_revision.valid ||
+            trace.context_window.head_revision <= 0 ||
+            !trace.authoritative_turn.valid ||
+            trace.authoritative_turn.status != LLAMA_AUTHORITATIVE_TURN_STATUS_VALIDATING ||
             !trace.self_model_revision.valid ||
             llama_cognitive_command_count(ctx) != 0) {
             std::fprintf(stderr, "authoritative DMN mode did not stop at propose without enqueuing a CPU-selected tool command\n");
@@ -2785,9 +2787,11 @@ int main(int argc, char ** argv) {
             runner.waiting_on_tool ||
             runner.pending_command_id != -1 ||
             runner.pending_tool_spec_index != -1 ||
-            runner.prompt_revision_id != trace.prompt_revision.prompt_revision_id ||
+            runner.emotive_revision_id != trace.emotive_moment_revision.revision_id ||
+            runner.context_revision != trace.context_window.head_revision ||
+            runner.turn_id != trace.authoritative_turn.turn_id ||
             runner.self_model_revision_id != trace.self_model_revision.revision_id) {
-            std::fprintf(stderr, "authoritative DMN runner did not retain prompt/self-model state while awaiting model-authored control\n");
+            std::fprintf(stderr, "authoritative DMN runner did not retain self-model state while awaiting model-authored control\n");
             llama_free(ctx);
             llama_model_free(model);
             return 1;

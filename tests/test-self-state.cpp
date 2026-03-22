@@ -793,6 +793,38 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    llama_self_model_revision self_revision = {};
+    llama_emotive_moment_revision emotive_revision = {};
+    llama_shared_cognitive_context_window context_window = {};
+    if (llama_self_state_get_self_model_revision(ctx, &self_revision) != 0 ||
+        llama_self_state_get_emotive_moment_revision(ctx, &emotive_revision) != 0 ||
+        llama_shared_cognitive_context_get_window(ctx, &context_window) != 0 ||
+        !self_revision.valid ||
+        self_revision.revision_id <= 0 ||
+        !emotive_revision.valid ||
+        emotive_revision.revision_id <= 0 ||
+        emotive_revision.source_self_model_revision_id != self_revision.revision_id ||
+        emotive_revision.text[0] == '\0' ||
+        context_window.item_count <= 0 ||
+        context_window.head_revision <= 0) {
+        std::fprintf(stderr, "canonical self-description surfaces were not populated\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+    const std::string emotive_text = emotive_revision.text;
+    if (emotive_revision.lexical_profile_id < 0 ||
+        emotive_text.find("valence") == std::string::npos ||
+        emotive_text.find("arousal") == std::string::npos ||
+        emotive_text.find("dominance") == std::string::npos ||
+        emotive_text.find("goal pressure") == std::string::npos ||
+        emotive_text.find("social closeness") == std::string::npos) {
+        std::fprintf(stderr, "emotive revision did not expose the norm-informed lexical surface\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
     const int32_t baseline_extension_count = llama_self_state_model_extension_count(ctx);
     if (baseline_extension_count <= 0 ||
         model_state.extension_summary.discovered_count <= 0 ||
@@ -989,6 +1021,8 @@ int main(int argc, char ** argv) {
     if (llama_self_state_trace_token_count(ctx) <= 0 ||
         trace_index < 0 ||
         llama_self_state_trace_get_item(ctx, trace_index, &last_trace_item) != 0 ||
+        last_trace_item.context_item_id <= 0 ||
+        last_trace_item.context_kind != LLAMA_SHARED_CONTEXT_KIND_INTERNAL_SUMMARY ||
         last_trace_item.artifact_kind != LLAMA_SELF_COG_ARTIFACT_DMN_INTERNAL_WRITE ||
         last_trace_item.loop_origin != LLAMA_COG_COMMAND_ORIGIN_DMN ||
         last_trace_item.phase != LLAMA_COG_LOOP_PHASE_OBSERVE ||

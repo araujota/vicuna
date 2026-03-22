@@ -56,6 +56,13 @@ What this means operationally:
 
 This is the runtime sense in which active engagement and DMN now form one train of thought in two modes: one shared self-state, one shared artifact tape, one shared compaction policy.
 
+Telegram-visible conversation continuity is separate from that internal tape.
+The server now keeps a bounded runtime-owned Telegram dialogue history object
+for the last `N` user-facing turns per chat scope plus broadcast DMN emits.
+This object is distinct from `/v1/responses/*` retention, which remains a
+transport/replay surface for proactive emissions rather than the authoritative
+dialogue-memory store.
+
 ### Client Integration Guide
 
 All routes below are relative to the server base URL. If you launch the server with `--api-prefix /proxy`, prepend that prefix to every path in this section.

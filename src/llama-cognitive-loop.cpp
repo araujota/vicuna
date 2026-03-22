@@ -62,44 +62,6 @@ bool contains_any(const std::string & piece, const char * const * patterns, size
     return false;
 }
 
-std::vector<std::string> split_normalized_words(const std::string & text) {
-    std::vector<std::string> out;
-    std::string current;
-    for (char ch : text) {
-        const unsigned char uch = (unsigned char) ch;
-        if (std::isalnum(uch) || ch == '_') {
-            current.push_back((char) std::tolower(uch));
-        } else if (!current.empty()) {
-            out.push_back(current);
-            current.clear();
-        }
-    }
-    if (!current.empty()) {
-        out.push_back(current);
-    }
-    return out;
-}
-
-float normalized_word_overlap(const std::string & haystack, const std::string & needle) {
-    const std::vector<std::string> hay_words = split_normalized_words(haystack);
-    const std::vector<std::string> needle_words = split_normalized_words(needle);
-    if (hay_words.empty() || needle_words.empty()) {
-        return 0.0f;
-    }
-    int32_t matches = 0;
-    for (const auto & needle_word : needle_words) {
-        for (const auto & hay_word : hay_words) {
-            if (hay_word == needle_word ||
-                    hay_word.find(needle_word) != std::string::npos ||
-                    needle_word.find(hay_word) != std::string::npos) {
-                ++matches;
-                break;
-            }
-        }
-    }
-    return clamp_unit((float) matches / (float) needle_words.size());
-}
-
 struct lexical_signals {
     float question = 0.0f;
     float tool = 0.0f;
@@ -166,48 +128,6 @@ lexical_signals analyze_event_lexicon(const llama_vocab * vocab, const llama_sel
     out.followup = clamp_unit(out.followup);
     out.uncertainty = clamp_unit(out.uncertainty);
     return out;
-}
-
-bool is_explicit_web_search_intent(const std::string & intent) {
-    return normalized_word_overlap(intent, "search web internet online latest current today news look up lookup browse tavily stock price quote market") > 0.0f;
-}
-
-bool is_explicit_tavily_intent(const std::string & intent) {
-    return normalized_word_overlap(intent, "tavily tavily search tavily tool web_search") > 0.0f;
-}
-
-bool should_prefer_active_planner(
-        const llama_self_state_event & event,
-        const lexical_signals & lex,
-        float goal_relevance,
-        float answerability,
-        float uncertainty,
-        float tool_affinity,
-        float tool_readiness,
-        int32_t tool_spec_count,
-        bool tool_completed,
-        bool explicit_web_search) {
-    if (event.role != LLAMA_SELF_STATE_EVENT_USER || tool_completed || tool_spec_count <= 0) {
-        return false;
-    }
-    if (explicit_web_search) {
-        return true;
-    }
-    if (lex.uncertainty >= 0.30f || uncertainty >= 0.55f) {
-        return false;
-    }
-
-    const float planner_pressure = clamp_unit(
-            0.26f +
-            0.24f * lex.question +
-            0.22f * lex.tool +
-            0.18f * lex.web +
-            0.14f * lex.followup +
-            0.18f * goal_relevance +
-            0.20f * tool_affinity +
-            0.14f * tool_readiness +
-            0.12f * (1.0f - answerability));
-    return planner_pressure >= 0.42f;
 }
 
 float get_scalar_register(const llama_context & ctx, int32_t register_id) {
@@ -766,6 +686,21 @@ llama_functional_activation_decision make_planner_only_functional_decision(
     return decision;
 }
 
+llama_functional_activation_decision make_tool_phase_functional_decision(
+        int32_t loop_origin,
+        int32_t microphase,
+        int32_t /* tool_kind */,
+        float gain) {
+    llama_functional_activation_decision decision = make_planner_only_functional_decision(loop_origin);
+    decision.microphase = microphase;
+    decision.top_family = LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
+    decision.eligible_mask |= (1ull << LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION);
+    decision.activated_mask |= (1ull << LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION);
+    decision.gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] = clamp_unit(gain);
+    decision.predicted_gains[LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION] = clamp_unit(gain);
+    return decision;
+}
+
 std::string functional_family_name(int32_t family) {
     switch (family) {
         case LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION: return "tool_selection";
@@ -829,58 +764,36 @@ std::string dmn_action_name(int32_t action) {
     }
 }
 
-std::string dmn_concept_hint(
-        const llama_dmn_prompt_revision & prompt_revision,
-        int32_t kind) {
-    for (int32_t i = 0; i < prompt_revision.concept_count; ++i) {
-        const auto & concept = prompt_revision.concepts[i];
-        if (concept.valid && concept.kind == kind) {
-            return trim_ascii(concept.hint);
-        }
-    }
-    return std::string();
-}
-
 std::string compose_dmn_reasoning_trace(
         const llama_dmn_tick_trace & trace,
         const llama_cognitive_tool_spec * selected_spec) {
-    const std::string motive = dmn_concept_hint(trace.prompt_revision, LLAMA_DMN_CONCEPT_MOTIVE);
-    const std::string tension = dmn_concept_hint(trace.prompt_revision, LLAMA_DMN_CONCEPT_TENSION);
-    const std::string question = dmn_concept_hint(trace.prompt_revision, LLAMA_DMN_CONCEPT_QUESTION);
-    const std::string next_action = dmn_concept_hint(trace.prompt_revision, LLAMA_DMN_CONCEPT_NEXT_ACTION);
-
     std::ostringstream oss;
-    if (!motive.empty()) {
-        oss << "Thought: " << motive << "\n";
-    }
-    if (!tension.empty()) {
-        oss << "State: " << tension << "\n";
-    }
-    if (!question.empty()) {
-        oss << "Question: " << question << "\n";
-    }
+    oss.setf(std::ios::fixed);
+    oss.precision(3);
+    oss << "Pressure: contradiction=" << trace.pressure.contradiction
+        << " uncertainty=" << trace.pressure.uncertainty
+        << " continuation=" << trace.pressure.continuation
+        << " tool_delta=" << trace.pressure.tool_delta
+        << " divergence=" << trace.favorable_divergence;
 
     switch (trace.winner_action) {
         case LLAMA_DMN_ACTION_INVOKE_TOOL:
             oss << "Action: use "
                 << (selected_spec ? trim_ascii(selected_spec->name) : std::string("tool"))
-                << " because the prompt revision favors external progress.";
+                << " because the mathematical state favors external progress.";
             break;
         case LLAMA_DMN_ACTION_INTERNAL_WRITE:
-            oss << "Action: write an internal reflection artifact because the current pressure profile still needs consolidation.";
+            oss << " Action: write an internal reflection artifact because the pressure profile still needs consolidation.";
             break;
         case LLAMA_DMN_ACTION_SILENT:
-            oss << "Action: remain silent because inhibition or governance is stronger than the current action affordance.";
+            oss << " Action: remain silent because inhibition or governance is stronger than the current action affordance.";
             break;
         case LLAMA_DMN_ACTION_EMIT:
-            oss << "Action: emit a background-facing message.";
+            oss << " Action: emit a background-facing message.";
             break;
         default:
-            oss << "Action: hold the current state.";
+            oss << " Action: hold the current state.";
             break;
-    }
-    if (!next_action.empty()) {
-        oss << "\nNext: " << next_action;
     }
     return trim_ascii(oss.str());
 }
@@ -1685,158 +1598,6 @@ void init_command(
     }
 }
 
-bool tool_spec_origin_eligible(const llama_cognitive_tool_spec & spec, int32_t origin) {
-    if (origin == LLAMA_COG_COMMAND_ORIGIN_DMN) {
-        return (spec.flags & LLAMA_COG_TOOL_DMN_ELIGIBLE) != 0;
-    }
-    return (spec.flags & LLAMA_COG_TOOL_ACTIVE_ELIGIBLE) != 0;
-}
-
-bool tool_spec_runtime_available(
-        llama_context & ctx,
-        const llama_cognitive_tool_spec & spec) {
-    switch (spec.tool_kind) {
-        case LLAMA_TOOL_KIND_BASH_CLI: {
-            llama_bash_tool_config config = {};
-            return ctx.bash_tool_get_config(&config) && config.enabled;
-        }
-        case LLAMA_TOOL_KIND_HARD_MEMORY_QUERY: {
-            llama_hard_memory_config config = {};
-            return ctx.hard_memory_get_config(&config) && config.enabled;
-        }
-        case LLAMA_TOOL_KIND_HARD_MEMORY_WRITE: {
-            llama_hard_memory_config config = {};
-            return ctx.hard_memory_get_config(&config) && config.enabled && config.archive_enabled;
-        }
-        case LLAMA_TOOL_KIND_CODEX_CLI: {
-            llama_codex_tool_config config = {};
-            return ctx.codex_tool_get_config(&config) && config.enabled;
-        }
-        default:
-            return true;
-    }
-}
-
-bool is_codex_development_intent(const std::string & intent) {
-    static const char * const cues[] = {
-        "build a feature",
-        "build feature",
-        "add a tool",
-        "edit the system",
-        "modify the system",
-        "change the code",
-        "implement",
-        "refactor",
-        "patch",
-        "fix this code",
-        "work on yourself",
-        "self modify",
-        "self-modify",
-    };
-    std::string lowered = intent;
-    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
-        return (char) std::tolower(ch);
-    });
-    for (const char * cue : cues) {
-        if (lowered.find(cue) != std::string::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
-float tool_spec_select_score(
-        llama_context & ctx,
-        const llama_cognitive_tool_spec & spec,
-        int32_t origin,
-        const std::string & intent,
-        bool prefer_memory,
-        bool prefer_side_effects) {
-    if (!tool_spec_origin_eligible(spec, origin) ||
-            !tool_spec_runtime_available(ctx, spec)) {
-        return -1.0f;
-    }
-
-    float score = 0.20f;
-    const bool is_memory = spec.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY;
-    const bool is_generic = spec.tool_kind == LLAMA_TOOL_KIND_GENERIC;
-    const bool has_side_effects = (spec.flags & LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT) != 0;
-    const bool explicit_web_search = is_explicit_web_search_intent(intent);
-    const bool explicit_tavily = is_explicit_tavily_intent(intent);
-    const bool tavily_capability = is_tavily_web_search_capability(&spec);
-    if (prefer_memory && is_memory) {
-        score += 0.45f;
-    }
-    if (prefer_side_effects && has_side_effects) {
-        score += 0.25f;
-    }
-    if (!prefer_side_effects && !has_side_effects) {
-        score += 0.10f;
-    }
-    if (is_generic) {
-        // Keep the generic placeholder available for degenerate cases, but
-        // prefer any concrete runtime-backed tool whenever one is usable.
-        score -= 0.35f;
-    }
-
-    const std::string descriptor_text =
-            std::string(spec.name) + " " +
-            std::string(spec.description) + " " +
-            std::string(spec.capability_id);
-    score += 0.35f * normalized_word_overlap(descriptor_text, intent);
-    if (explicit_web_search && is_memory) {
-        score -= 0.65f;
-    }
-    if (explicit_web_search && is_generic) {
-        score -= 0.35f;
-    }
-    if (explicit_web_search && tavily_capability) {
-        score += 0.50f;
-    }
-    if (explicit_tavily && tavily_capability) {
-        score += 0.80f;
-    }
-    if (explicit_tavily && is_generic) {
-        score -= 0.45f;
-    }
-    if (explicit_web_search && spec.tool_kind == LLAMA_TOOL_KIND_BASH_CLI && !tavily_capability) {
-        score -= 0.30f;
-    }
-    if (spec.tool_kind == LLAMA_TOOL_KIND_BASH_CLI) {
-        score += 0.05f;
-    }
-    if (spec.tool_kind == LLAMA_TOOL_KIND_CODEX_CLI && is_codex_development_intent(intent)) {
-        score += 0.40f;
-    }
-    return score;
-}
-
-const llama_cognitive_tool_spec * select_best_tool_spec(
-        llama_context & ctx,
-        const llama_cognitive_tool_spec * specs,
-        int32_t spec_count,
-        int32_t origin,
-        const std::string & intent,
-        bool prefer_memory,
-        bool prefer_side_effects,
-        int32_t * out_index) {
-    const llama_cognitive_tool_spec * best = nullptr;
-    int32_t best_index = -1;
-    float best_score = -1.0f;
-    for (int32_t i = 0; i < spec_count; ++i) {
-        const float score = tool_spec_select_score(ctx, specs[i], origin, intent, prefer_memory, prefer_side_effects);
-        if (score > best_score) {
-            best = &specs[i];
-            best_index = i;
-            best_score = score;
-        }
-    }
-    if (out_index) {
-        *out_index = best_index;
-    }
-    return best;
-}
-
 std::vector<llama_token> tokenize_text(const llama_vocab * vocab, const std::string & text) {
     if (!vocab || text.empty()) {
         return {};
@@ -1968,6 +1729,54 @@ bool emit_cognitive_artifact_text(
             plan_id,
             out_postwrite,
             extra_flags);
+}
+
+bool refresh_runtime_self_description(
+        llama_context & ctx,
+        const llama_vocab * vocab,
+        int32_t loop_origin,
+        int32_t phase,
+        int32_t source_id,
+        int32_t plan_id,
+        llama_self_model_revision * inout_self_model_revision,
+        llama_emotive_moment_revision * inout_emotive_moment_revision,
+        llama_shared_cognitive_context_window * out_window) {
+    (void) source_id;
+    llama_self_model_revision latest_self_model_revision = {};
+    llama_emotive_moment_revision latest_emotive_moment_revision = {};
+    if (!ctx.self_state_get_self_model_revision(&latest_self_model_revision) ||
+            !ctx.self_state_get_emotive_moment_revision(&latest_emotive_moment_revision)) {
+        return false;
+    }
+
+    const bool emotive_changed =
+            !inout_emotive_moment_revision ||
+            !inout_emotive_moment_revision->valid ||
+            inout_emotive_moment_revision->revision_id != latest_emotive_moment_revision.revision_id;
+    if (emotive_changed && vocab && latest_emotive_moment_revision.valid &&
+            trim_ascii(latest_emotive_moment_revision.text).size() > 0) {
+        (void) emit_cognitive_artifact_text(
+                ctx,
+                vocab,
+                latest_emotive_moment_revision.text,
+                LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+                LLAMA_SELF_COG_ARTIFACT_EMOTIVE_MOMENT,
+                loop_origin,
+                phase,
+                latest_emotive_moment_revision.revision_id,
+                plan_id);
+    }
+
+    if (inout_self_model_revision) {
+        *inout_self_model_revision = latest_self_model_revision;
+    }
+    if (inout_emotive_moment_revision) {
+        *inout_emotive_moment_revision = latest_emotive_moment_revision;
+    }
+    if (out_window) {
+        (void) ctx.shared_cognitive_context_get_window(out_window);
+    }
+    return true;
 }
 
 const char * verbosity_label(float value) {
@@ -3613,19 +3422,67 @@ bool llama_cognitive_loop::cognitive_command_rebind_tool(int32_t command_id, int
     command.tool_spec_index = tool_spec_index;
     set_bounded_cstr(command.capability_id, sizeof(command.capability_id), spec.capability_id);
 
-    if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE &&
-            active_runner.pending_command_id == command_id) {
-        active_runner.pending_tool_spec_index = tool_spec_index;
-    } else if (command.origin == LLAMA_COG_COMMAND_ORIGIN_DMN &&
-            dmn_runner.pending_command_id == command_id) {
-        dmn_runner.pending_tool_spec_index = tool_spec_index;
+    const llama_cognitive_plan_trace * process_plan = nullptr;
+    int32_t transient_source_id = -1;
+    if (command.origin == LLAMA_COG_COMMAND_ORIGIN_ACTIVE) {
+        process_plan = active_plan.valid ? &active_plan : nullptr;
+        transient_source_id = active_runner.episode_id;
+        if (active_runner.pending_command_id == command_id) {
+            active_runner.pending_tool_spec_index = tool_spec_index;
+            active_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP;
+        }
+        if (last_active_trace.authoritative_turn.valid &&
+                last_active_trace.episode_id == active_runner.episode_id) {
+            last_active_trace.authoritative_turn.action = LLAMA_AUTHORITATIVE_REACT_ACTION_ACT;
+            last_active_trace.authoritative_turn.selected_tool_kind = spec.tool_kind;
+            last_active_trace.authoritative_turn.selected_tool_spec_index = tool_spec_index;
+            last_active_trace.authoritative_turn.status = LLAMA_AUTHORITATIVE_TURN_STATUS_WAITING_ON_TOOL;
+            set_bounded_cstr(
+                    last_active_trace.authoritative_turn.selected_tool_name,
+                    sizeof(last_active_trace.authoritative_turn.selected_tool_name),
+                    spec.name);
+        }
+    } else if (command.origin == LLAMA_COG_COMMAND_ORIGIN_DMN) {
+        process_plan = dmn_plan.valid ? &dmn_plan : nullptr;
+        transient_source_id = dmn_runner.tick_id;
+        if (dmn_runner.pending_command_id == command_id) {
+            dmn_runner.pending_tool_spec_index = tool_spec_index;
+            dmn_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP;
+        }
+        if (last_dmn_trace.authoritative_turn.valid &&
+                last_dmn_trace.tick_id == dmn_runner.tick_id) {
+            last_dmn_trace.authoritative_turn.action = LLAMA_AUTHORITATIVE_REACT_ACTION_ACT;
+            last_dmn_trace.authoritative_turn.selected_tool_kind = spec.tool_kind;
+            last_dmn_trace.authoritative_turn.selected_tool_spec_index = tool_spec_index;
+            last_dmn_trace.authoritative_turn.status = LLAMA_AUTHORITATIVE_TURN_STATUS_WAITING_ON_TOOL;
+            set_bounded_cstr(
+                    last_dmn_trace.authoritative_turn.selected_tool_name,
+                    sizeof(last_dmn_trace.authoritative_turn.selected_tool_name),
+                    spec.name);
+        }
     }
+
+    (void) ctx.process_functional_set_execution(
+            make_process_signature(
+                    command.origin,
+                    LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION,
+                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP,
+                    process_plan,
+                    &spec,
+                    transient_source_id));
+    (void) ctx.functional_lora_activate(
+            make_tool_phase_functional_decision(
+                    command.origin,
+                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP,
+                    spec.tool_kind,
+                    1.0f));
 
     return true;
 }
 
 bool llama_cognitive_loop::cognitive_authoritative_react_set_enabled(bool enabled) {
-    authoritative_react_control_enabled = enabled;
+    (void) enabled;
+    authoritative_react_control_enabled = true;
     return true;
 }
 
@@ -4114,31 +3971,6 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
         return false;
     }
 
-    auto enqueue_command = [&](int32_t kind, int32_t episode_id, int32_t tool_kind, int32_t tool_spec_index, int32_t tool_job_id, uint32_t reason_mask, float priority, int32_t source_family, int32_t loop_phase, const llama_cognitive_tool_spec * spec) -> int32_t {
-        compact_command_queue(command_queue, &command_count);
-        if (command_count >= LLAMA_COGNITIVE_MAX_PENDING_COMMANDS) {
-            return -1;
-        }
-
-        const int32_t command_id = next_command_id++;
-        init_command(
-                command_queue[command_count++],
-                command_id,
-                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
-                kind,
-                episode_id,
-                0,
-                tool_kind,
-                tool_spec_index,
-                tool_job_id,
-                reason_mask,
-                priority,
-                source_family,
-                loop_phase,
-                spec);
-        return command_id;
-    };
-
     const bool resuming_active_tool =
             event.role == LLAMA_SELF_STATE_EVENT_TOOL &&
             active_runner.active &&
@@ -4151,6 +3983,10 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     trace.channel = event.channel;
     trace.event_flags = event.flags;
     trace.arrival_time_us = llama_time_us();
+    trace.authoritative_turn.valid = authoritative_react_control_enabled;
+    trace.authoritative_turn.turn_id = next_authoritative_turn_id;
+    trace.authoritative_turn.origin = LLAMA_COG_COMMAND_ORIGIN_ACTIVE;
+    trace.authoritative_turn.status = LLAMA_AUTHORITATIVE_TURN_STATUS_DRAFTING;
 
     if (event.role == LLAMA_SELF_STATE_EVENT_TOOL && host_state.pending_tool_followup_count > 0) {
         --host_state.pending_tool_followup_count;
@@ -4207,6 +4043,21 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
         return false;
     }
 
+    (void) refresh_runtime_self_description(
+            ctx,
+            vocab,
+            LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+            LLAMA_COG_LOOP_PHASE_PROPOSE,
+            trace.episode_id,
+            active_plan.valid ? active_plan.plan_id : -1,
+            &current_canonical_self_model_revision,
+            &current_emotive_moment_revision,
+            &trace.context_window);
+    trace.self_model_revision = current_canonical_self_model_revision;
+    trace.emotive_moment_revision = current_emotive_moment_revision;
+    trace.authoritative_turn.source_emotive_revision_id = current_emotive_moment_revision.revision_id;
+    trace.authoritative_turn.source_context_revision = trace.context_window.head_revision;
+
     if ((mutable_event.flags & LLAMA_SELF_STATE_EVENT_ADMITTED) && mutable_event.tokens && mutable_event.n_tokens > 0) {
         (void) ctx.active_lora_ingest(mutable_event, &trace.postwrite_features);
     }
@@ -4214,12 +4065,9 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
     const lexical_signals lex = analyze_event_lexicon(vocab, mutable_event);
     const float uncertainty = clamp_unit(std::max(trace.postwrite_features.uncertainty_score, trace.prewrite_features.uncertainty_score));
     const float inhibition = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_BROADCAST_INHIBITION));
-    const float broadcast_pressure = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_BROADCAST_PRESSURE));
     const float goal_relevance = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_GOAL_RELEVANCE));
     const float tool_affordance = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_AFFORDANCE));
-    const float satisfaction_risk = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK));
     const float answerability = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_ANSWERABILITY));
-    const float loop_inefficiency = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY));
     const float recovery_urgency = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_RECOVERY_URGENCY));
     const float preference_uncertainty = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_PREFERENCE_UNCERTAINTY));
     const bool tool_completed = (mutable_event.flags & LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED) != 0;
@@ -4302,9 +4150,7 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
             0.0f);
 
     llama_self_social_state_info social = {};
-    llama_self_tool_state_info tool_state = {};
     (void) ctx.self_state_get_social_state(&social);
-    (void) ctx.self_state_get_tool_state(&tool_state);
 
     const float user_relevance = clamp_unit(
             0.30f +
@@ -4317,303 +4163,85 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
             0.32f * (mutable_event.role == LLAMA_SELF_STATE_EVENT_USER ? 1.0f : 0.0f) +
             0.18f * lex.question +
             0.18f * (tool_completed ? 1.0f : 0.0f));
-    const float tool_affinity = clamp_unit(
-            0.45f * lex.tool +
-            0.25f * lex.web +
-            0.30f * trace.postwrite_features.tool_pending_pressure +
-            0.15f * tool_affordance +
-            0.10f * (tool_state.pending_jobs > 0 ? 1.0f : 0.0f));
-    const float direct_answer_signal = clamp_unit(
-            answerability *
-            (1.0f - std::max(lex.tool, lex.web)) *
-            (1.0f - 0.5f * lex.question));
-    const bool explicit_web_search = is_explicit_web_search_intent(event_text(vocab, mutable_event));
-    const bool planner_first_active = should_prefer_active_planner(
-            mutable_event,
-            lex,
-            goal_relevance,
-            answerability,
-            uncertainty,
-            tool_affinity,
-            trace.postwrite_features.tool_readiness_score,
-            tool_spec_count,
-            tool_completed,
-            explicit_web_search);
-
     const uint32_t base_reason = build_active_reason_mask(mutable_event, lex, uncertainty, inhibition, tool_completed);
 
-    trace.candidate_count = LLAMA_ACTIVE_LOOP_MAX_CANDIDATES;
-    fill_active_candidate(
-            trace.candidates[0],
-            LLAMA_ACTIVE_LOOP_ACTION_ANSWER,
-            0.10f + 0.34f * user_relevance + 0.10f * broadcast_pressure + 0.18f * answerability + 0.10f * (1.0f - uncertainty) + 0.14f * (tool_completed ? 1.0f : 0.0f) + 0.06f * (1.0f - inhibition) + 0.04f * satisfaction_risk + 0.24f * direct_answer_signal - (explicit_web_search ? 0.12f : 0.0f) - (planner_first_active ? (0.16f + 0.10f * tool_affinity) : 0.0f),
-            user_relevance,
-            latency_pressure,
-            tool_affinity,
-            inhibition,
-            base_reason);
-    fill_active_candidate(
-            trace.candidates[1],
-            LLAMA_ACTIVE_LOOP_ACTION_ASK,
-            0.12f + 0.32f * std::max(lex.question, lex.uncertainty) + 0.20f * uncertainty + 0.14f * preference_uncertainty + 0.10f * (1.0f - answerability) + 0.12f * (1.0f - mutable_event.decoder_top_margin) + 0.08f * (1.0f - social.trust),
-            user_relevance,
-            latency_pressure,
-            tool_affinity,
-            inhibition,
-            base_reason | LLAMA_COG_REASON_QUESTION_SIGNAL);
-    fill_active_candidate(
-            trace.candidates[2],
-            LLAMA_ACTIVE_LOOP_ACTION_ACT,
-            0.14f + 0.56f * tool_affinity + 0.16f * (tool_state.pending_jobs > 0 ? 1.0f : trace.postwrite_features.tool_readiness_score) + 0.10f * lex.question + 0.08f * goal_relevance + 0.06f * recovery_urgency + (explicit_web_search ? 0.22f : 0.0f) + (planner_first_active ? (0.20f + 0.08f * (1.0f - answerability)) : 0.0f) - 0.24f * uncertainty - 0.10f * lex.uncertainty - 0.28f * direct_answer_signal,
-            user_relevance,
-            latency_pressure,
-            tool_affinity,
-            inhibition,
-            base_reason | LLAMA_COG_REASON_TOOL_AFFORDANCE);
-    fill_active_candidate(
-            trace.candidates[3],
-            LLAMA_ACTIVE_LOOP_ACTION_WAIT,
-            0.06f + 0.56f * inhibition + 0.42f * (mutable_event.n_tokens == 0 ? 1.0f : 0.0f) + 0.10f * (1.0f - user_relevance) + 0.10f * (tool_state.running_jobs > 0 ? 1.0f : 0.0f) - 0.08f * recovery_urgency - 0.04f * loop_inefficiency,
-            user_relevance,
-            latency_pressure,
-            tool_affinity,
-            inhibition,
-            base_reason | LLAMA_COG_REASON_HIGH_INHIBITION);
+    if (authoritative_react_control_enabled) {
+        const float control_score = clamp_unit(
+                0.24f +
+                0.20f * goal_relevance +
+                0.16f * tool_affordance +
+                0.14f * user_relevance +
+                0.12f * latency_pressure +
+                0.10f * (1.0f - inhibition) +
+                0.10f * uncertainty);
+        const int32_t plan_id = resuming_active_tool && active_plan.valid ? active_plan.plan_id : next_plan_id++;
+        const int32_t plan_revision_count =
+                resuming_active_tool && active_plan.valid ? active_plan.revision_count + 1 : 0;
+        const float plan_complexity = clamp_unit(
+                0.36f +
+                0.18f * goal_relevance +
+                0.16f * tool_affordance +
+                0.14f * uncertainty +
+                0.16f * latency_pressure);
+        const float plan_ambiguity = clamp_unit(
+                0.32f * uncertainty +
+                0.24f * preference_uncertainty +
+                0.18f * recovery_urgency +
+                0.12f * (1.0f - answerability));
 
-    const std::string intent_text = event_text(vocab, mutable_event);
-    int32_t proposed_spec_index = -1;
-    const bool prefer_memory_tool =
-            normalized_word_overlap(intent_text, "memory remember previous earlier prior history recall") > 0.0f;
-    const bool prefer_side_effects = planner_first_active;
-    const llama_cognitive_tool_spec * proposed_spec =
-            (planner_first_active || mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL) ?
-                    select_best_tool_spec(
-                            ctx,
-                            tool_specs,
-                            tool_spec_count,
-                            LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
-                            intent_text,
-                            prefer_memory_tool,
-                            prefer_side_effects,
-                            &proposed_spec_index) :
-                    nullptr;
-    const int32_t proposed_tool_kind = proposed_spec ? proposed_spec->tool_kind : LLAMA_TOOL_KIND_NONE;
+        activate_microphase(
+                resuming_active_tool ? LLAMA_FUNCTIONAL_MICROPHASE_PLAN_REVISE : LLAMA_FUNCTIONAL_MICROPHASE_PLAN_DRAFT,
+                tool_affordance,
+                control_score,
+                plan_complexity,
+                clamp_unit((float) plan_revision_count / 4.0f));
 
-    int32_t best = -1;
-    int32_t second = -1;
-    pick_top_two(trace.candidates, trace.candidate_count, &best, &second);
-    if (best < 0) {
-        return false;
-    }
-    const bool self_contained_answer_turn =
-            mutable_event.role == LLAMA_SELF_STATE_EVENT_USER &&
-            !planner_first_active &&
-            !explicit_web_search &&
-            std::max(lex.tool, lex.web) < 0.10f &&
-            uncertainty <= 0.25f;
-    if (self_contained_answer_turn && best != 0) {
-        second = best;
-        best = 0;
-    }
-    if (planner_first_active && proposed_spec) {
-        const int32_t act_index = 2;
-        const float planner_override_margin = explicit_web_search ? 0.18f : 0.06f;
-        if (trace.candidates[act_index].score + planner_override_margin >= trace.candidates[best].score &&
-                best != act_index) {
-            second = best;
-            best = act_index;
-        }
-    }
-
-    trace.winner_action = trace.candidates[best].action;
-    trace.winner_score = trace.candidates[best].score;
-    trace.runner_up_action = second >= 0 ? trace.candidates[second].action : trace.candidates[best].action;
-    trace.runner_up_score = second >= 0 ? trace.candidates[second].score : trace.candidates[best].score;
-    trace.reason_mask = trace.candidates[best].reason_mask;
-    if (planner_first_active && trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
-        trace.reason_mask |= LLAMA_COG_REASON_TOOL_AFFORDANCE;
-    }
-    if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT && !proposed_spec) {
-        trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_ASK;
-        trace.reason_mask |= LLAMA_COG_REASON_HIGH_UNCERTAINTY;
-    }
-    trace.emit_allowed = trace.winner_action != LLAMA_ACTIVE_LOOP_ACTION_WAIT && trace.winner_score >= clamp_unit(0.15f + 0.40f * inhibition);
-    trace.emit_noted = false;
-    trace.tool_followup_expected = trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT;
-
-    const llama_cognitive_runtime_impl runtime(ctx);
-    const llama_dmn_pressure_vector dmn_pressure = runtime.compute_pressure();
-    trace.deferred_background = pressure_crossed(dmn_pressure);
-    if (trace.deferred_background) {
-        ++host_state.background_deferred_count;
-    }
-    const bool waiting_on_tool =
-            trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT ||
-            (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_WAIT && tool_state.running_jobs > 0);
-    const int32_t plan_id = resuming_active_tool && active_plan.valid ? active_plan.plan_id : next_plan_id++;
-    const int32_t plan_revision_count =
-            resuming_active_tool && active_plan.valid ? active_plan.revision_count + 1 : 0;
-    const float plan_complexity = clamp_unit(
-            0.40f +
-            0.25f * (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT ? 1.0f : 0.0f) +
-            0.20f * (resuming_active_tool ? 1.0f : 0.0f) +
-            0.15f * clamp_unit((float) trace.candidate_count / (float) LLAMA_ACTIVE_LOOP_MAX_CANDIDATES));
-    const float plan_ambiguity = clamp_unit(std::max(0.0f, trace.runner_up_score - trace.winner_score + 0.5f));
-    activate_microphase(
-            resuming_active_tool ? LLAMA_FUNCTIONAL_MICROPHASE_PLAN_REVISE : LLAMA_FUNCTIONAL_MICROPHASE_PLAN_DRAFT,
-            tool_affinity,
-            trace.winner_score,
-            plan_complexity,
-            clamp_unit((float) plan_revision_count / 4.0f));
-
-    init_plan_trace(
-            trace.plan,
-            plan_id,
-            LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
-            plan_revision_count,
-            trace.winner_score,
-            plan_ambiguity,
-            trace.reason_mask);
-    if (resuming_active_tool) {
-        (void) append_plan_step(
+        init_plan_trace(
                 trace.plan,
-                LLAMA_COG_PLAN_STEP_OBSERVE_TOOL,
-                LLAMA_COG_PLAN_STEP_STATUS_COMPLETED,
-                proposed_tool_kind,
-                -1,
-                trace.reason_mask,
-                trace.winner_score,
-                1,
-                true,
-                proposed_spec,
-                proposed_spec_index);
-    }
-
-    if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ANSWER) {
-        (void) append_plan_step(
-                trace.plan,
-                LLAMA_COG_PLAN_STEP_EMIT_ANSWER,
-                LLAMA_COG_PLAN_STEP_STATUS_READY,
-                LLAMA_TOOL_KIND_NONE,
-                -1,
-                trace.reason_mask,
-                trace.winner_score,
-                1,
-                false);
-    } else if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ASK) {
-        (void) append_plan_step(
-                trace.plan,
-                LLAMA_COG_PLAN_STEP_EMIT_ASK,
-                LLAMA_COG_PLAN_STEP_STATUS_READY,
-                LLAMA_TOOL_KIND_NONE,
-                -1,
-                trace.reason_mask,
-                trace.winner_score,
-                1,
-                false);
-    } else if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
-        (void) append_plan_step(
-                trace.plan,
-                LLAMA_COG_PLAN_STEP_INVOKE_TOOL,
-                LLAMA_COG_PLAN_STEP_STATUS_READY,
-                proposed_tool_kind,
-                -1,
-                trace.reason_mask,
-                trace.winner_score,
-                proposed_spec ? std::max(1, proposed_spec->max_steps_reserved) : 1,
-                false,
-                proposed_spec,
-                proposed_spec_index);
-        (void) append_plan_step(
-                trace.plan,
-                LLAMA_COG_PLAN_STEP_OBSERVE_TOOL,
-                LLAMA_COG_PLAN_STEP_STATUS_PENDING,
-                proposed_tool_kind,
-                -1,
-                trace.reason_mask,
-                trace.winner_score,
-                1,
-                true,
-                proposed_spec,
-                proposed_spec_index);
-    } else {
-        const int32_t wait_status = waiting_on_tool ?
-                LLAMA_COG_PLAN_STEP_STATUS_PENDING :
-                LLAMA_COG_PLAN_STEP_STATUS_COMPLETED;
+                plan_id,
+                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                plan_revision_count,
+                control_score,
+                plan_ambiguity,
+                base_reason);
         (void) append_plan_step(
                 trace.plan,
                 LLAMA_COG_PLAN_STEP_WAIT,
-                wait_status,
-                proposed_tool_kind,
+                LLAMA_COG_PLAN_STEP_STATUS_READY,
+                LLAMA_TOOL_KIND_NONE,
                 -1,
-                trace.reason_mask,
-                trace.winner_score,
+                base_reason,
+                control_score,
                 1,
-                waiting_on_tool,
-                proposed_spec,
-                proposed_spec_index);
-    }
-    trace.plan.current_step_index = first_ready_plan_step(trace.plan);
-    if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
-        trace.plan.status = LLAMA_COG_PLAN_STATUS_WAITING_TOOL;
-    } else if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_WAIT && !waiting_on_tool) {
-        trace.plan.status = LLAMA_COG_PLAN_STATUS_COMPLETED;
-    } else {
+                false);
+        trace.plan.current_step_index = 0;
         trace.plan.status = LLAMA_COG_PLAN_STATUS_EXECUTING;
-    }
-    active_plan = trace.plan;
-    active_runner.plan_id = trace.plan.plan_id;
-    active_runner.plan_mode = trace.plan.mode;
-    active_runner.plan_status = trace.plan.status;
-    active_runner.plan_revision_count = trace.plan.revision_count;
-    active_runner.current_plan_step = trace.plan.current_step_index;
-    active_runner.planning_active = true;
+        trace.plan.terminal_reason = LLAMA_COG_TERMINAL_NONE;
+        active_plan = trace.plan;
 
-    {
-        std::ostringstream artifact;
-        artifact.setf(std::ios::fixed);
-        artifact.precision(3);
-        artifact << "active plan winner=" << active_action_name(trace.winner_action)
-                 << " score=" << trace.winner_score
-                 << " uncertainty=" << uncertainty
-                 << " answerability=" << answerability
-                 << " steps=" << trace.plan.step_count
-                 << " revision=" << trace.plan.revision_count
-                 << " tool_kind=" << proposed_tool_kind;
-        (void) emit_cognitive_artifact_text(
-                ctx,
-                vocab,
-                artifact.str(),
-                LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
-                LLAMA_SELF_COG_ARTIFACT_ACTIVE_PLAN,
-                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+        activate_microphase(
                 LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE,
-                trace.episode_id,
-                trace.plan.plan_id);
-    }
+                tool_affordance,
+                control_score,
+                plan_complexity,
+                clamp_unit((float) plan_revision_count / 4.0f));
 
-    int32_t final_microphase =
-            mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL ?
-                    LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION :
-                    LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION;
-    if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
-        final_microphase = LLAMA_FUNCTIONAL_MICROPHASE_TOOL_CLASS_SELECTION;
-    } else if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_WAIT &&
-            trace.prewrite_features.memory_write_pressure > 0.45f) {
-        final_microphase = LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION;
-    } else if (uncertainty > 0.55f || preference_uncertainty > 0.55f || recovery_urgency > 0.50f) {
-        final_microphase = LLAMA_FUNCTIONAL_MICROPHASE_SELF_OBSERVE;
-    }
-
-    activate_microphase(
-            LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE,
-            tool_affinity,
-            trace.winner_score,
-            plan_complexity,
-            clamp_unit((float) plan_revision_count / 4.0f));
-    activate_microphase(final_microphase, tool_affinity);
-
-    if (authoritative_react_control_enabled) {
+        trace.candidate_count = 0;
+        trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_WAIT;
+        trace.winner_score = control_score;
+        trace.runner_up_action = LLAMA_ACTIVE_LOOP_ACTION_WAIT;
+        trace.runner_up_score = control_score;
+        trace.reason_mask = base_reason;
+        trace.emit_allowed = false;
+        trace.emit_noted = false;
+        trace.tool_followup_expected = false;
+        trace.authoritative_turn.valid = true;
+        trace.authoritative_turn.turn_id = next_authoritative_turn_id++;
+        trace.authoritative_turn.origin = LLAMA_COG_COMMAND_ORIGIN_ACTIVE;
+        trace.authoritative_turn.status = LLAMA_AUTHORITATIVE_TURN_STATUS_VALIDATING;
+        trace.authoritative_turn.action = LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT;
+        trace.authoritative_turn.source_emotive_revision_id = trace.emotive_moment_revision.revision_id;
+        trace.authoritative_turn.source_context_revision = trace.context_window.head_revision;
         set_loop_state(
                 trace.loop_state,
                 LLAMA_COG_LOOP_PHASE_PROPOSE,
@@ -4623,533 +4251,57 @@ bool llama_cognitive_loop::active_loop_process(const llama_self_state_event & ev
                 true,
                 false,
                 tool_spec_count);
-        trace.tool_followup_expected = false;
-        if (trace.plan.step_count > 0) {
-            const int32_t ready_step = first_ready_plan_step(trace.plan);
-            if (ready_step >= 0) {
-                trace.plan.steps[ready_step].status = LLAMA_COG_PLAN_STEP_STATUS_ACTIVE;
-            }
-            trace.plan.current_step_index = ready_step >= 0 ? ready_step : 0;
-            trace.plan.terminal_reason = LLAMA_COG_TERMINAL_NONE;
-            trace.plan.status = LLAMA_COG_PLAN_STATUS_EXECUTING;
-        }
         active_runner.steps_taken = trace.loop_state.steps_taken;
         active_runner.waiting_on_tool = false;
         active_runner.pending_command_id = -1;
         active_runner.pending_tool_spec_index = -1;
         active_runner.completed = false;
         active_runner.active = true;
-        active_runner.plan_status = LLAMA_COG_PLAN_STATUS_EXECUTING;
+        active_runner.plan_id = trace.plan.plan_id;
+        active_runner.plan_mode = trace.plan.mode;
+        active_runner.plan_status = trace.plan.status;
+        active_runner.plan_revision_count = trace.plan.revision_count;
         active_runner.current_plan_step = trace.plan.current_step_index;
-        active_plan = trace.plan;
+        active_runner.planning_active = true;
         tool_selection_episode_open = false;
-    } else if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ACT) {
-        const int32_t tool_job_id = next_tool_job_id++;
-        trace.tool_proposal.job_id = tool_job_id;
-        (void) ctx.self_state_upsert_tool_job(tool_job_id, LLAMA_SELF_TOOL_JOB_PENDING, clamp_unit(trace.winner_score));
-        set_loop_state(
-                trace.loop_state,
-                LLAMA_COG_LOOP_PHASE_PREPARE_TOOL,
-                LLAMA_COG_TERMINAL_TOOL_REQUIRED,
-                active_runner.max_steps,
-                resuming_active_tool ? active_runner.steps_taken + 1 : 2,
-                true,
-                true,
-                tool_spec_count);
-        const int32_t proposal_tool_kind = proposed_tool_kind;
-        const int32_t proposal_job_id = tool_job_id;
-        set_tool_proposal(
-                trace.tool_proposal,
-                proposed_spec,
-                proposed_spec_index,
-                proposal_tool_kind,
-                trace.reason_mask,
-                -1,
-                proposed_spec ? std::max(1, proposed_spec->max_steps_reserved) : 1,
-                0.55f * tool_affinity + 0.25f * uncertainty + 0.20f * goal_relevance,
-                proposal_job_id);
-        if (trace.plan.step_count > 0) {
-            trace.plan.steps[resuming_active_tool ? 1 : 0].status = LLAMA_COG_PLAN_STEP_STATUS_ACTIVE;
-            if (trace.plan.step_count > (resuming_active_tool ? 2 : 1)) {
-                trace.plan.steps[trace.plan.step_count - 1].status = LLAMA_COG_PLAN_STEP_STATUS_PENDING;
-            }
-            trace.plan.current_step_index = trace.plan.step_count - 1;
-            trace.plan.terminal_reason = LLAMA_COG_TERMINAL_TOOL_REQUIRED;
+        last_active_trace = trace;
+        host_state.last_foreground_time_us = trace.completed_time_us;
+        if (out_trace) {
+            *out_trace = trace;
         }
-        active_runner.steps_taken = trace.loop_state.steps_taken;
-        active_runner.waiting_on_tool = true;
-        active_runner.pending_command_id = enqueue_command(
-                LLAMA_COG_COMMAND_INVOKE_TOOL,
-                trace.episode_id,
-                proposed_tool_kind,
-                proposed_spec_index,
-                tool_job_id,
-                trace.reason_mask,
-                trace.winner_score,
-                -1,
-                trace.loop_state.phase,
-                proposed_spec);
-        active_runner.pending_tool_spec_index = proposed_spec_index;
-        active_runner.last_command_id = active_runner.pending_command_id > 0 ? active_runner.pending_command_id : active_runner.last_command_id;
-        llama_bash_tool_config bash_config = {};
-        llama_codex_tool_config codex_config = {};
-        bool prepared_tool_request = false;
-        if (active_runner.pending_command_id > 0) {
-            if (proposed_tool_kind == LLAMA_TOOL_KIND_BASH_CLI &&
-                    ctx.bash_tool_get_config(&bash_config)) {
-                activate_microphase(LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, tool_affinity);
-                const std::string command_text = infer_bash_command(intent_text, proposed_spec);
-                llama_bash_tool_request request = {};
-                init_bash_request(
-                        request,
-                        bash_config,
-                        active_runner.pending_command_id,
-                        LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
-                        tool_job_id,
-                        intent_text,
-                        command_text);
-                (void) ctx.bash_tool_set_request(request);
-                prepared_tool_request = true;
-            } else if (proposed_tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY) {
-                activate_microphase(LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, tool_affinity);
-                llama_cognitive_hard_memory_request request = {};
-                init_hard_memory_request(
-                        request,
-                        active_runner.pending_command_id,
-                        LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
-                        tool_job_id,
-                        intent_text,
-                        LLAMA_SERVING_LORA_LAYER_ACTIVE);
-                (void) ctx.hard_memory_set_request(request);
-                prepared_tool_request = true;
-            } else if (proposed_tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_WRITE) {
-                activate_microphase(LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, tool_affinity);
-                llama_cognitive_hard_memory_request request = {};
-                init_hard_memory_write_request(
-                        request,
-                        active_runner.pending_command_id,
-                        LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
-                        tool_job_id,
-                        intent_text);
-                (void) ctx.hard_memory_set_request(request);
-                prepared_tool_request = true;
-            } else if (proposed_tool_kind == LLAMA_TOOL_KIND_CODEX_CLI &&
-                    ctx.codex_tool_get_config(&codex_config)) {
-                activate_microphase(LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP, tool_affinity);
-                llama_codex_tool_request request = {};
-                init_codex_request(
-                        request,
-                        codex_config,
-                        active_runner.pending_command_id,
-                        LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
-                        tool_job_id,
-                        intent_text);
-                (void) ctx.cognitive_codex_tool_set_request(request);
-                prepared_tool_request = true;
-            }
-            if (prepared_tool_request) {
-                trace.functional_activation.microphase = LLAMA_FUNCTIONAL_MICROPHASE_TOOL_ARGUMENT_PREP;
-                trace.functional_activation.top_family = LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION;
-                trace.functional_activation.loop_origin = LLAMA_COG_COMMAND_ORIGIN_ACTIVE;
-                trace.functional_activation.activated_mask |= (1ull << LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION);
-            }
-        }
-        active_runner.plan_status = LLAMA_COG_PLAN_STATUS_WAITING_TOOL;
-        active_runner.current_plan_step = trace.plan.current_step_index;
-        active_plan = trace.plan;
-
-        if (!tool_selection_episode_open) {
-            tool_selection_episode_open = true;
-            tool_selection_before = active_before_snapshot;
-            tool_selection_tool_kind = proposed_tool_kind;
-            tool_selection_candidate_count = std::max(1, tool_spec_count);
-            tool_selection_uncertainty = uncertainty;
-        }
-    } else {
-        int32_t terminal_reason = LLAMA_COG_TERMINAL_WAITING_ON_TOOL;
-        if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ANSWER) {
-            terminal_reason = LLAMA_COG_TERMINAL_ANSWER_READY;
-        } else if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ASK) {
-            terminal_reason = LLAMA_COG_TERMINAL_ASK_USER;
-        }
-        set_loop_state(
-                trace.loop_state,
-                LLAMA_COG_LOOP_PHASE_FINISH,
-                terminal_reason,
-                active_runner.max_steps,
-                resuming_active_tool ? active_runner.steps_taken + 1 : 1,
-                trace.winner_action != LLAMA_ACTIVE_LOOP_ACTION_ANSWER,
-                waiting_on_tool,
-                tool_spec_count);
-        if (trace.plan.step_count > 0) {
-            const int32_t ready_step = first_ready_plan_step(trace.plan);
-            if (ready_step >= 0) {
-                trace.plan.steps[ready_step].status =
-                        trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_WAIT && !waiting_on_tool ?
-                                LLAMA_COG_PLAN_STEP_STATUS_COMPLETED :
-                                LLAMA_COG_PLAN_STEP_STATUS_ACTIVE;
-            }
-            trace.plan.current_step_index = ready_step >= 0 ? ready_step : 0;
-            trace.plan.terminal_reason = terminal_reason;
-        }
-        active_runner.steps_taken = trace.loop_state.steps_taken;
-        active_runner.waiting_on_tool = waiting_on_tool;
-        if (trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ANSWER || trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ASK) {
-            active_runner.pending_command_id = enqueue_command(
-                    trace.winner_action == LLAMA_ACTIVE_LOOP_ACTION_ANSWER ? LLAMA_COG_COMMAND_EMIT_ANSWER : LLAMA_COG_COMMAND_EMIT_ASK,
-                    trace.episode_id,
-                    LLAMA_TOOL_KIND_NONE,
-                    -1,
-                    -1,
-                    trace.reason_mask,
-                    trace.winner_score,
-                    -1,
-                    trace.loop_state.phase,
-                    nullptr);
-            active_runner.pending_tool_spec_index = -1;
-            active_runner.last_command_id = active_runner.pending_command_id > 0 ? active_runner.pending_command_id : active_runner.last_command_id;
-            active_runner.completed = false;
-            active_runner.active = active_runner.pending_command_id > 0;
-            active_runner.plan_status = LLAMA_COG_PLAN_STATUS_EXECUTING;
-        } else {
-            active_runner.pending_tool_spec_index = waiting_on_tool ? active_runner.pending_tool_spec_index : -1;
-            active_runner.completed = !waiting_on_tool;
-            active_runner.active = waiting_on_tool;
-            active_runner.plan_status = waiting_on_tool ? LLAMA_COG_PLAN_STATUS_WAITING_TOOL : LLAMA_COG_PLAN_STATUS_COMPLETED;
-        }
-        active_runner.current_plan_step = trace.plan.current_step_index;
-        active_plan = trace.plan;
+        return true;
     }
 
-    llama_bash_tool_result archive_bash_result = {};
-    bool have_archive_bash_result = false;
-    if (mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
-        have_archive_bash_result =
-                ctx.bash_tool_get_last_result(&archive_bash_result) &&
-                archive_bash_result.tool_job_id > 0;
-        int32_t observation_status = LLAMA_SELF_TOOL_JOB_RUNNING;
-        if ((mutable_event.flags & LLAMA_SELF_STATE_EVENT_TOOL_FAILED) != 0) {
-            observation_status = LLAMA_SELF_TOOL_JOB_FAILED;
-        } else if ((mutable_event.flags & LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED) != 0) {
-            observation_status = LLAMA_SELF_TOOL_JOB_COMPLETED;
-        }
-        const llama_cognitive_tool_spec * observation_spec =
-                active_runner.pending_tool_spec_index >= 0 &&
-                        active_runner.pending_tool_spec_index < tool_spec_count ?
-                        &tool_specs[active_runner.pending_tool_spec_index] :
-                        nullptr;
-        set_observation(
-                trace.observation,
-                true,
-                have_archive_bash_result ? LLAMA_TOOL_KIND_BASH_CLI : LLAMA_TOOL_KIND_GENERIC,
-                active_runner.pending_tool_spec_index,
-                have_archive_bash_result ? archive_bash_result.tool_job_id : -1,
-                observation_status,
-                0.55f * trace.winner_score + 0.45f * answerability,
-                0.50f * lex.followup + 0.30f * goal_relevance + 0.20f * recovery_urgency,
-                observation_spec);
-    }
-
-    const llama_favorable_state_profile post_active_profile =
-            llama_cognitive_runtime_impl(ctx).compute_favorable_profile();
-    const llama_functional_outcome_snapshot active_after_snapshot =
-            capture_functional_snapshot(ctx, post_active_profile);
-    const functional_delta_summary active_deltas =
-            compute_functional_deltas(active_before_snapshot, active_after_snapshot);
-
-    {
-        std::ostringstream artifact;
-        artifact.setf(std::ios::fixed);
-        artifact.precision(3);
-        artifact << "active reflection winner=" << active_action_name(trace.winner_action)
-                 << " final_microphase=" << functional_microphase_name(final_microphase)
-                 << " tool_followup=" << (trace.tool_followup_expected ? 1 : 0)
-                 << " delta_favorable=" << active_deltas.delta_favorable
-                 << " delta_answerability=" << active_deltas.delta_answerability
-                 << " delta_recovery=" << active_deltas.delta_recovery;
-        (void) emit_cognitive_artifact_text(
-                ctx,
-                vocab,
-                artifact.str(),
-                LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
-                LLAMA_SELF_COG_ARTIFACT_ACTIVE_REFLECTION,
-                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
-                final_microphase,
-                trace.episode_id,
-                trace.plan.plan_id);
-    }
-
-    auto apply_family_update = [&](int32_t family,
-                                   int32_t start_microphase,
-                                   int32_t settle_microphase,
-                                   int32_t selected_tool_kind,
-                                   int32_t candidate_count,
-                                   const float * metrics,
-                                   size_t metric_count,
-                                   float signed_outcome,
-                                   float magnitude,
-                                   const std::vector<llama_token> & update_tokens) {
-        if (update_tokens.empty()) {
-            return;
-        }
-        const llama_self_state_event update_event = {
-            /*.tokens =*/ update_tokens.data(),
-            /*.n_tokens =*/ update_tokens.size(),
-            /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
-            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
-            /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
-            /*.decoder_entropy =*/ 0.0f,
-            /*.decoder_top_margin =*/ 1.0f,
-        };
-        llama_self_state_feature_vector update_features = {};
-        const llama_self_state_feature_vector * feature_ptr =
-                ctx.self_state_build_postwrite_features(update_event, &update_features) ? &update_features : nullptr;
-        (void) ctx.functional_lora_apply_update(
-                family,
-                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
-                start_microphase,
-                settle_microphase,
-                active_before_snapshot,
-                active_after_snapshot,
-                selected_tool_kind,
-                candidate_count,
-                metrics,
-                metric_count,
-                clamp_signed_unit(signed_outcome),
-                clamp_unit(magnitude),
-                update_event,
-                feature_ptr);
-        (void) emit_cognitive_artifact_tokens(
-                ctx,
-                update_tokens,
-                LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
-                LLAMA_SELF_COG_ARTIFACT_FUNCTIONAL_UPDATE,
-                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
-                settle_microphase,
-                trace.episode_id,
-                trace.plan.plan_id);
-    };
-
-    if (tool_selection_episode_open && mutable_event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
-        const functional_delta_summary tool_deltas =
-                compute_functional_deltas(tool_selection_before, active_after_snapshot);
-        const float signed_outcome = clamp_signed_unit(
-                0.30f * tool_deltas.delta_favorable +
-                0.20f * tool_deltas.delta_answerability +
-                0.20f * tool_deltas.delta_user +
-                0.15f * tool_deltas.delta_preference +
-                0.15f * tool_deltas.delta_efficiency);
-        const float magnitude = clamp_unit(
-                0.45f * std::fabs(signed_outcome) +
-                0.25f * tool_selection_uncertainty +
-                0.20f * clamp_unit((float) tool_selection_candidate_count / 3.0f) +
-                0.10f * (tool_selection_tool_kind != LLAMA_TOOL_KIND_NONE ? 1.0f : 0.0f));
-        const float metrics[] = {
-            tool_deltas.delta_favorable,
-            tool_deltas.delta_answerability,
-            tool_deltas.delta_user,
-            tool_deltas.delta_preference,
-            tool_deltas.delta_efficiency,
-            tool_selection_uncertainty,
-        };
-        const std::vector<llama_token> update_tokens =
-                !active_tool_emission_tokens.empty() ?
-                        active_tool_emission_tokens :
-                        functional_update_tokens(
-                                vocab,
-                                LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION,
-                                LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION,
-                                "xml_only_fallback tool_kind " + std::to_string(tool_selection_tool_kind) +
-                                        " candidate_count " + std::to_string(tool_selection_candidate_count) +
-                                        " signed_outcome " + std::to_string(signed_outcome));
-        const llama_self_state_event_flags update_flags = update_tokens.empty() ?
-                (llama_self_state_event_flags) mutable_event.flags :
-                (llama_self_state_event_flags) LLAMA_SELF_STATE_EVENT_ADMITTED;
-        const llama_self_state_event update_event = {
-            /*.tokens =*/ update_tokens.empty() ? mutable_event.tokens : update_tokens.data(),
-            /*.n_tokens =*/ update_tokens.empty() ? mutable_event.n_tokens : update_tokens.size(),
-            /*.role =*/ update_tokens.empty() ? mutable_event.role : LLAMA_SELF_STATE_EVENT_SYSTEM,
-            /*.channel =*/ update_tokens.empty() ? mutable_event.channel : LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL,
-            /*.flags =*/ update_flags,
-            /*.decoder_entropy =*/ update_tokens.empty() ? mutable_event.decoder_entropy : 0.0f,
-            /*.decoder_top_margin =*/ update_tokens.empty() ? mutable_event.decoder_top_margin : 1.0f,
-        };
-        llama_self_state_feature_vector update_features = {};
-        const llama_self_state_feature_vector * feature_ptr = &trace.postwrite_features;
-        if (!update_tokens.empty()) {
-            feature_ptr = ctx.self_state_build_postwrite_features(update_event, &update_features) ? &update_features : nullptr;
-        }
-        (void) ctx.functional_lora_apply_update(
-                LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION,
-                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
-                LLAMA_FUNCTIONAL_MICROPHASE_TOOL_CLASS_SELECTION,
-                LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION,
-                tool_selection_before,
-                active_after_snapshot,
-                tool_selection_tool_kind,
-                tool_selection_candidate_count,
-                metrics,
-                sizeof(metrics)/sizeof(metrics[0]),
-                signed_outcome,
-                magnitude,
-                update_event,
-                feature_ptr);
-        tool_selection_episode_open = false;
-        tool_selection_before = {};
-        tool_selection_tool_kind = LLAMA_TOOL_KIND_NONE;
-        tool_selection_candidate_count = 0;
-        tool_selection_uncertainty = 0.0f;
-        active_tool_emission_command_id = -1;
-        active_tool_emission_tokens.clear();
-    }
-
-    {
-        const float signed_outcome = clamp_signed_unit(
-                0.26f * active_deltas.delta_favorable +
-                0.20f * active_deltas.delta_answerability +
-                0.18f * active_deltas.delta_user +
-                0.18f * active_deltas.delta_efficiency +
-                0.18f * active_deltas.delta_recovery);
-        const float magnitude = clamp_unit(
-                0.40f * std::fabs(signed_outcome) +
-                0.25f * plan_complexity +
-                0.20f * plan_ambiguity +
-                0.15f * clamp_unit((float) trace.plan.revision_count / 4.0f));
-        const float metrics[] = {
-            active_deltas.delta_favorable,
-            active_deltas.delta_answerability,
-            active_deltas.delta_user,
-            active_deltas.delta_efficiency,
-            plan_complexity,
-            plan_ambiguity,
-        };
-        apply_family_update(
-                LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION,
-                resuming_active_tool ? LLAMA_FUNCTIONAL_MICROPHASE_PLAN_REVISE :
-                        LLAMA_FUNCTIONAL_MICROPHASE_PLAN_DRAFT,
-                LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE,
-                proposed_tool_kind,
-                trace.plan.step_count,
-                metrics,
-                sizeof(metrics)/sizeof(metrics[0]),
-                signed_outcome,
-                magnitude,
-                active_planner_reasoning_episode_id == trace.episode_id &&
-                                !active_planner_reasoning_tokens.empty() ?
-                        active_planner_reasoning_tokens :
-                        functional_update_tokens(
-                                vocab,
-                                LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION,
-                                LLAMA_FUNCTIONAL_MICROPHASE_PLAN_COMPOSE,
-                                "reasoning_fallback plan_id " + std::to_string(trace.plan.plan_id) +
-                                        " steps " + std::to_string(trace.plan.step_count) +
-                                        " revision " + std::to_string(trace.plan.revision_count)));
-    }
-
-    if (final_microphase == LLAMA_FUNCTIONAL_MICROPHASE_SELF_OBSERVE ||
-            final_microphase == LLAMA_FUNCTIONAL_MICROPHASE_STATE_INTERPRET ||
-            final_microphase == LLAMA_FUNCTIONAL_MICROPHASE_TOOL_RESULT_INTEGRATION ||
-            final_microphase == LLAMA_FUNCTIONAL_MICROPHASE_POST_ACTION_REFLECTION) {
-        llama_self_model_state_info model_state = {};
-        const float pred_error = ctx.self_state_get_model_state(&model_state) ?
-                prediction_error_signal(model_state.prediction_error) :
-                0.0f;
-        const float signed_outcome = clamp_signed_unit(
-                0.22f * active_deltas.delta_favorable +
-                0.18f * active_deltas.delta_recovery +
-                0.18f * active_deltas.delta_answerability +
-                0.16f * active_deltas.delta_preference +
-                0.14f * active_deltas.delta_user +
-                0.12f * active_deltas.delta_efficiency);
-        const float magnitude = clamp_unit(
-                0.35f * std::fabs(signed_outcome) +
-                0.25f * uncertainty +
-                0.20f * pred_error +
-                0.20f * recovery_urgency);
-        const float metrics[] = {
-            active_deltas.delta_favorable,
-            active_deltas.delta_recovery,
-            active_deltas.delta_answerability,
-            active_deltas.delta_preference,
-            active_deltas.delta_user,
-            pred_error,
-        };
-        apply_family_update(
-                LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION,
-                LLAMA_FUNCTIONAL_MICROPHASE_STATE_INTERPRET,
-                final_microphase,
-                LLAMA_TOOL_KIND_NONE,
-                trace.candidate_count,
-                metrics,
-                sizeof(metrics)/sizeof(metrics[0]),
-                signed_outcome,
-                magnitude,
-                functional_update_tokens(
-                        vocab,
-                        LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION,
-                        final_microphase,
-                        "uncertainty " + std::to_string(uncertainty) +
-                                " answerability " + std::to_string(answerability)));
-    }
-
-    if (final_microphase == LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION ||
-            trace.prewrite_features.memory_write_pressure > 0.55f) {
-        const float compression_pressure =
-                clamp_unit(std::max(trace.prewrite_features.memory_write_pressure, trace.postwrite_features.memory_write_pressure));
-        const float signed_outcome = clamp_signed_unit(
-                0.24f * active_deltas.delta_favorable +
-                0.18f * active_deltas.delta_goal +
-                0.18f * active_deltas.delta_recovery +
-                0.16f * active_deltas.delta_user +
-                0.12f * active_deltas.delta_preference +
-                0.12f * active_deltas.delta_efficiency);
-        const float magnitude = clamp_unit(
-                0.35f * std::fabs(signed_outcome) +
-                0.35f * compression_pressure +
-                0.15f * clamp_unit((float) ctx.self_state_working_memory_count() / 8.0f) +
-                0.15f * goal_relevance);
-        const float metrics[] = {
-            active_deltas.delta_favorable,
-            active_deltas.delta_goal,
-            active_deltas.delta_recovery,
-            active_deltas.delta_user,
-            compression_pressure,
-            goal_relevance,
-        };
-        apply_family_update(
-                LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION,
-                LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION,
-                final_microphase == LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION ?
-                        LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_AUDIT :
-                        final_microphase,
-                LLAMA_TOOL_KIND_NONE,
-                trace.candidate_count,
-                metrics,
-                sizeof(metrics)/sizeof(metrics[0]),
-                signed_outcome,
-                magnitude,
-                functional_update_tokens(
-                        vocab,
-                        LLAMA_FUNCTIONAL_LORA_MEMORY_COMPRESSION,
-                        LLAMA_FUNCTIONAL_MICROPHASE_MEMORY_COMPRESSION,
-                        "memory_pressure " + std::to_string(compression_pressure) +
-                                " working_memory_count " + std::to_string(ctx.self_state_working_memory_count())));
-    }
-
-    if (hard_memory_archiving_enabled(ctx)) {
-        llama_hard_memory_primitive primitives[LLAMA_HARD_MEMORY_MAX_PRIMITIVES] = {};
-        const int32_t primitive_count = build_active_hard_memory_primitives(
-                trace,
-                active_deltas,
-                have_archive_bash_result ? &archive_bash_result : nullptr,
-                primitives);
-        if (primitive_count > 0) {
-            (void) ctx.hard_memory_archive_primitives(primitives, primitive_count);
-        }
-    }
+    trace.candidate_count = 0;
+    trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_WAIT;
+    trace.winner_score = 0.0f;
+    trace.runner_up_action = LLAMA_ACTIVE_LOOP_ACTION_WAIT;
+    trace.runner_up_score = 0.0f;
+    trace.reason_mask = base_reason;
+    trace.emit_allowed = false;
+    trace.emit_noted = false;
+    trace.tool_followup_expected = false;
+    set_loop_state(
+            trace.loop_state,
+            LLAMA_COG_LOOP_PHASE_FINISH,
+            LLAMA_COG_TERMINAL_GOVERNANCE_BLOCKED,
+            active_runner.max_steps,
+            resuming_active_tool ? active_runner.steps_taken + 1 : 1,
+            false,
+            false,
+            tool_spec_count);
+    active_runner.steps_taken = trace.loop_state.steps_taken;
+    active_runner.waiting_on_tool = false;
+    active_runner.pending_command_id = -1;
+    active_runner.pending_tool_spec_index = -1;
+    active_runner.completed = true;
+    active_runner.active = false;
+    active_runner.planning_active = false;
+    active_plan = {};
 
     trace.completed_time_us = llama_time_us();
     trace.plan = active_plan;
+    (void) ctx.shared_cognitive_context_get_window(&trace.context_window);
     host_state.shared_state_version += 1;
     host_state.active_episode_count += 1;
     host_state.last_foreground_time_us = trace.completed_time_us;
@@ -5202,6 +4354,7 @@ bool llama_cognitive_loop::active_loop_get_last_trace(llama_active_loop_trace * 
 
 bool llama_cognitive_loop::dmn_defer(uint64_t now_us, llama_dmn_tick_trace * out_trace) {
     const llama_cognitive_runtime_impl runtime(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(&ctx.get_model());
     llama_dmn_tick_trace trace = {};
     trace.pressure = runtime.compute_pressure();
     last_favorable_profile = runtime.compute_favorable_profile();
@@ -5237,9 +4390,22 @@ bool llama_cognitive_loop::dmn_defer(uint64_t now_us, llama_dmn_tick_trace * out
     dmn_runner.max_steps = LLAMA_COG_LOOP_UNBOUNDED_MAX_STEPS;
     dmn_runner.functional_microphase = LLAMA_FUNCTIONAL_MICROPHASE_NONE;
     dmn_runner.self_model_revision_id = current_self_model_revision.valid ? current_self_model_revision.revision_id : -1;
-    dmn_runner.prompt_revision_id = current_prompt_revision.valid ? current_prompt_revision.prompt_revision_id : -1;
+    (void) refresh_runtime_self_description(
+            ctx,
+            vocab,
+            LLAMA_COG_COMMAND_ORIGIN_DMN,
+            LLAMA_COG_LOOP_PHASE_FINISH,
+            dmn_runner.tick_id,
+            -1,
+            &current_canonical_self_model_revision,
+            &current_emotive_moment_revision,
+            &trace.context_window);
+    trace.canonical_self_model_revision = current_canonical_self_model_revision;
+    trace.emotive_moment_revision = current_emotive_moment_revision;
+    dmn_runner.emotive_revision_id = current_emotive_moment_revision.valid ? current_emotive_moment_revision.revision_id : -1;
+    dmn_runner.context_revision = trace.context_window.head_revision;
+    dmn_runner.turn_id = -1;
     trace.self_model_revision = current_self_model_revision;
-    trace.prompt_revision = current_prompt_revision;
     trace.functional_activation = make_inactive_functional_decision(LLAMA_COG_COMMAND_ORIGIN_DMN);
     (void) ctx.process_functional_set_execution(llama_process_functional_signature {});
     (void) ctx.functional_lora_activate(trace.functional_activation);
@@ -5280,6 +4446,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     };
 
     const llama_cognitive_runtime_impl runtime(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(&ctx.get_model());
     llama_dmn_tick_trace trace = {};
     trace.pressure = runtime.compute_pressure();
     const bool foreground_outstanding =
@@ -5317,7 +4484,24 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     dmn_runner.plan_revision_count = 0;
     dmn_runner.current_plan_step = -1;
     dmn_runner.self_model_revision_id = current_self_model_revision.valid ? current_self_model_revision.revision_id : -1;
-    dmn_runner.prompt_revision_id = current_prompt_revision.valid ? current_prompt_revision.prompt_revision_id : -1;
+    (void) refresh_runtime_self_description(
+            ctx,
+            vocab,
+            LLAMA_COG_COMMAND_ORIGIN_DMN,
+            LLAMA_COG_LOOP_PHASE_PROPOSE,
+            next_tick_id,
+            -1,
+            &current_canonical_self_model_revision,
+            &current_emotive_moment_revision,
+            &trace.context_window);
+    trace.canonical_self_model_revision = current_canonical_self_model_revision;
+    trace.emotive_moment_revision = current_emotive_moment_revision;
+    dmn_runner.emotive_revision_id = current_emotive_moment_revision.valid ? current_emotive_moment_revision.revision_id : -1;
+    dmn_runner.context_revision = trace.context_window.head_revision;
+    trace.authoritative_turn.valid = authoritative_react_control_enabled;
+    trace.authoritative_turn.origin = LLAMA_COG_COMMAND_ORIGIN_DMN;
+    trace.authoritative_turn.source_emotive_revision_id = current_emotive_moment_revision.revision_id;
+    trace.authoritative_turn.source_context_revision = trace.context_window.head_revision;
 
     if (!pressure_crossed(trace.pressure)) {
         trace.admitted = false;
@@ -5337,7 +4521,6 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         dmn_runner.completed = true;
         dmn_runner.max_steps = LLAMA_COG_LOOP_UNBOUNDED_MAX_STEPS;
         trace.self_model_revision = current_self_model_revision;
-        trace.prompt_revision = current_prompt_revision;
         last_dmn_trace = trace;
         host_state.last_dmn_time_us = now_us;
         if (out_trace) {
@@ -5485,19 +4668,12 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
             0.20f * trace.pressure.reactivation);
 
     const int32_t working_memory_count = ctx.self_state_working_memory_count();
-    auto select_dmn_spec = [&](const std::string & hint, int32_t * out_index) -> const llama_cognitive_tool_spec * {
-        const bool prefer_memory =
-                last_remediation_plan.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY ||
-                normalized_word_overlap(hint, "memory remember previous prior history search") > 0.0f;
-        return select_best_tool_spec(
-                ctx,
-                tool_specs,
-                tool_spec_count,
-                LLAMA_COG_COMMAND_ORIGIN_DMN,
-                hint,
-                prefer_memory,
-                !prefer_memory,
-                out_index);
+    auto preferred_dmn_spec = [&](int32_t fallback_tool_kind, int32_t * out_index) -> const llama_cognitive_tool_spec * {
+        const int32_t preferred_tool_kind =
+                last_remediation_plan.tool_kind != LLAMA_TOOL_KIND_NONE ?
+                        last_remediation_plan.tool_kind :
+                        fallback_tool_kind;
+        return find_tool_spec(tool_specs, tool_spec_count, preferred_tool_kind, out_index);
     };
 
     llama_self_model_state_info model_state = {};
@@ -5529,9 +4705,9 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     for (int32_t i = 0; i < trace.reactivation_count; ++i) {
         input_signature << "|r" << i << '=' << trace.reactivation_targets[i].priority;
     }
-    const uint64_t prompt_input_hash = fnv1a64_local(input_signature.str());
-    const bool prompt_changed = prompt_input_hash != current_dmn_prompt_input_hash;
-    const float prompt_materiality = prompt_changed ? clamp_unit(
+    const uint64_t dmn_input_hash = fnv1a64_local(input_signature.str());
+    const bool dmn_input_changed = dmn_input_hash != current_dmn_input_hash;
+    const float dmn_materiality = dmn_input_changed ? clamp_unit(
             0.18f * trace.pressure.total +
             0.18f * trace.pressure.contradiction +
             0.16f * trace.pressure.uncertainty +
@@ -5541,11 +4717,10 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
             0.10f * social_state.dissatisfaction) : 0.0f;
 
     current_self_model_revision.valid = true;
-    current_self_model_revision.input_hash = prompt_input_hash;
-    current_self_model_revision.materiality_score = prompt_materiality;
+    current_self_model_revision.input_hash = dmn_input_hash;
+    current_self_model_revision.materiality_score = dmn_materiality;
     current_self_model_revision.requires_prompt_regen =
-            !current_prompt_revision.valid ||
-            (prompt_changed && prompt_materiality >= 0.10f);
+            dmn_input_changed && dmn_materiality >= 0.10f;
     if (current_self_model_revision.requires_prompt_regen) {
         current_self_model_revision.revision_id = next_dmn_self_model_revision_id++;
     }
@@ -5563,138 +4738,8 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     const float non_social_tool_affinity = clamp_unit(
             tool_affinity +
             (last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO ? 0.20f : 0.0f));
-
-    if (current_self_model_revision.requires_prompt_regen) {
-        current_dmn_prompt_input_hash = prompt_input_hash;
-        current_prompt_revision = {};
-        current_prompt_revision.valid = true;
-        current_prompt_revision.prompt_revision_id = next_dmn_prompt_revision_id++;
-        current_prompt_revision.source_revision_id = current_self_model_revision.revision_id;
-        current_prompt_revision.regenerated = true;
-
-        auto add_concept = [&](int32_t kind,
-                               float salience,
-                               float confidence,
-                               float user_contact_affordance,
-                               float tool_contact_affordance,
-                               const std::string & hint) {
-            if (current_prompt_revision.concept_count >= LLAMA_DMN_MAX_REPORTABLE_CONCEPTS) {
-                return;
-            }
-            auto & concept = current_prompt_revision.concepts[current_prompt_revision.concept_count++];
-            concept.valid = true;
-            concept.kind = kind;
-            concept.salience = clamp_unit(salience);
-            concept.confidence = clamp_unit(confidence);
-            concept.user_contact_affordance = clamp_unit(user_contact_affordance);
-            concept.tool_affordance = clamp_unit(tool_contact_affordance);
-            set_bounded_cstr(concept.hint, sizeof(concept.hint), hint.c_str());
-        };
-
-        std::string motive_hint = "stabilize internal state";
-        if (last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO) {
-            motive_hint = "gather missing evidence before committing";
-        } else if (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR) {
-            motive_hint = "repair trust with the user without dropping internal continuity";
-        } else if (reflective_pressure >= non_social_tool_affinity) {
-            motive_hint = "translate contradiction and uncertainty into a coherent internal account";
-        } else {
-            motive_hint = "inspect available tools and external traces for leverage";
-        }
-        add_concept(
-                LLAMA_DMN_CONCEPT_MOTIVE,
-                std::max(reflective_pressure, non_social_tool_affinity),
-                clamp_unit(1.0f - trace.pressure.uncertainty * 0.35f),
-                user_contact_affinity,
-                non_social_tool_affinity,
-                motive_hint);
-
-        std::ostringstream tension;
-        tension.setf(std::ios::fixed);
-        tension.precision(2);
-        tension << "favorable divergence " << trace.favorable_divergence
-                << ", belief pressure " << model_state.belief_summary.residual_allostatic_pressure
-                << ", extension gain signal " << model_state.extension_summary.gain_signal;
-        add_concept(
-                LLAMA_DMN_CONCEPT_TENSION,
-                clamp_unit(0.50f * trace.favorable_divergence +
-                           0.30f * model_state.belief_summary.residual_allostatic_pressure +
-                           0.20f * std::fabs(model_state.extension_summary.gain_signal)),
-                clamp_unit(0.55f + 0.35f * model_state.belief_summary.belief_confidence),
-                0.0f,
-                0.0f,
-                tension.str());
-
-        std::string question_hint =
-                last_remediation_plan.action == LLAMA_REMEDIATION_ACTION_GATHER_INFO ?
-                        "What missing repository, memory, or runtime evidence would reduce uncertainty fastest?" :
-                user_contact_affinity >= 0.62f ?
-                        "Would a short user-facing question or conclusion reduce dissatisfaction or unblock the next step?" :
-                        "What internal uncertainty most needs to be resolved before acting?";
-        add_concept(
-                LLAMA_DMN_CONCEPT_QUESTION,
-                clamp_unit(0.55f * trace.pressure.uncertainty + 0.20f * continuation + 0.25f * trace.pressure.tool_delta),
-                clamp_unit(0.50f + 0.40f * trace.pressure.uncertainty),
-                relay_tool_affinity,
-                non_social_tool_affinity,
-                question_hint);
-
-        std::string next_action_hint =
-                relay_tool_affinity >= std::max(non_social_tool_affinity, reflective_pressure) ?
-                        "Route a concise Telegram relay if user contact is justified; otherwise keep the reasoning internal." :
-                non_social_tool_affinity >= reflective_pressure ?
-                        "Use a bounded tool call to gather evidence, then let the next self-model revision retranslate the motive." :
-                        "Write an internal synthesis, update the self-state, and let the next prompt revision continue the loop.";
-        add_concept(
-                LLAMA_DMN_CONCEPT_NEXT_ACTION,
-                clamp_unit(std::max(std::max(relay_tool_affinity, non_social_tool_affinity), reflective_pressure)),
-                0.75f,
-                relay_tool_affinity,
-                non_social_tool_affinity,
-                next_action_hint);
-
-        current_prompt_revision.user_contact_affinity = relay_tool_affinity;
-        current_prompt_revision.tool_affinity = std::max(relay_tool_affinity, non_social_tool_affinity);
-
-        std::string outline;
-        std::ostringstream prompt;
-        prompt << "Internal DMN prompt.\n";
-        for (int32_t i = 0; i < current_prompt_revision.concept_count; ++i) {
-            const auto & concept = current_prompt_revision.concepts[i];
-            if (i > 0) {
-                outline += " | ";
-            }
-            outline += trim_ascii(concept.hint);
-            switch (concept.kind) {
-                case LLAMA_DMN_CONCEPT_MOTIVE:
-                    prompt << "Current motive: ";
-                    break;
-                case LLAMA_DMN_CONCEPT_TENSION:
-                    prompt << "Primary tension: ";
-                    break;
-                case LLAMA_DMN_CONCEPT_QUESTION:
-                    prompt << "Open question: ";
-                    break;
-                case LLAMA_DMN_CONCEPT_NEXT_ACTION:
-                    prompt << "Next move: ";
-                    break;
-                default:
-                    prompt << "Concept: ";
-                    break;
-            }
-            prompt << trim_ascii(concept.hint) << '\n';
-        }
-        prompt << "Maintain the distinction between hidden self-model state and this reportable workspace. "
-               << "Use tools only when the translated motive justifies them.";
-        set_bounded_cstr(current_prompt_revision.macro_outline, sizeof(current_prompt_revision.macro_outline), outline.c_str());
-        set_bounded_cstr(current_prompt_revision.rendered_prompt, sizeof(current_prompt_revision.rendered_prompt), prompt.str().c_str());
-        current_prompt_revision.prompt_hash = fnv1a64_local(current_prompt_revision.rendered_prompt);
-    } else {
-        current_prompt_revision.regenerated = false;
-    }
-    trace.prompt_revision = current_prompt_revision;
+    current_dmn_input_hash = dmn_input_hash;
     dmn_runner.self_model_revision_id = trace.self_model_revision.revision_id;
-    dmn_runner.prompt_revision_id = trace.prompt_revision.prompt_revision_id;
 
     int32_t selected_dmn_spec_index = -1;
     const llama_cognitive_tool_spec * selected_dmn_spec = nullptr;
@@ -5703,9 +4748,16 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
 
     if (authoritative_react_control_enabled) {
         const float control_score = clamp_unit(std::max(std::max(
-                current_prompt_revision.user_contact_affinity,
-                current_prompt_revision.tool_affinity),
+                relay_tool_affinity,
+                non_social_tool_affinity),
                 reflective_pressure));
+        trace.authoritative_turn.valid = true;
+        trace.authoritative_turn.turn_id = next_authoritative_turn_id++;
+        trace.authoritative_turn.origin = LLAMA_COG_COMMAND_ORIGIN_DMN;
+        trace.authoritative_turn.status = LLAMA_AUTHORITATIVE_TURN_STATUS_VALIDATING;
+        trace.authoritative_turn.action = LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT;
+        trace.authoritative_turn.source_emotive_revision_id = trace.emotive_moment_revision.revision_id;
+        trace.authoritative_turn.source_context_revision = trace.context_window.head_revision;
         init_plan_trace(
                 trace.plan,
                 next_plan_id++,
@@ -5753,6 +4805,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
         dmn_runner.plan_status = trace.plan.status;
         dmn_runner.plan_revision_count = trace.plan.revision_count;
         dmn_runner.current_plan_step = trace.plan.current_step_index;
+        dmn_runner.turn_id = trace.authoritative_turn.turn_id;
         dmn_runner.planning_active = true;
         last_dmn_trace = trace;
         host_state.last_dmn_time_us = now_us;
@@ -5763,16 +4816,13 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     }
 
     const bool wants_user_contact =
-            current_prompt_revision.valid &&
-            current_prompt_revision.user_contact_affinity >= 0.62f &&
+            relay_tool_affinity >= 0.62f &&
             inhibition < 0.82f &&
             telegram_spec != nullptr;
     const bool wants_tool =
-            current_prompt_revision.valid &&
-            current_prompt_revision.tool_affinity >= 0.52f &&
+            non_social_tool_affinity >= 0.52f &&
             last_governance_trace.outcome != LLAMA_GOVERNANCE_OUTCOME_DENY;
     const bool wants_reflection =
-            current_prompt_revision.valid &&
             (trace.pressure.contradiction >= 0.18f ||
              trace.pressure.uncertainty >= 0.18f ||
              trace.reactivation_count > 0 ||
@@ -5785,15 +4835,19 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
 
     if (wants_user_contact) {
         trace.winner_action = LLAMA_DMN_ACTION_INVOKE_TOOL;
-        trace.winner_score = current_prompt_revision.user_contact_affinity;
+        trace.winner_score = relay_tool_affinity;
         selected_reason_mask |= LLAMA_COG_REASON_SOCIAL_RELEVANCE;
         selected_dmn_spec = telegram_spec;
         selected_dmn_spec_index = find_tool_spec_index(tool_specs, tool_spec_count, LLAMA_TOOL_KIND_TELEGRAM_RELAY);
     } else if (wants_tool) {
         trace.winner_action = LLAMA_DMN_ACTION_INVOKE_TOOL;
-        trace.winner_score = current_prompt_revision.tool_affinity;
+        trace.winner_score = non_social_tool_affinity;
         selected_reason_mask |= LLAMA_COG_REASON_TOOL_AFFORDANCE;
-        selected_dmn_spec = select_dmn_spec(current_prompt_revision.rendered_prompt, &selected_dmn_spec_index);
+        const int32_t preferred_tool_kind =
+                last_remediation_plan.tool_kind != LLAMA_TOOL_KIND_NONE ?
+                        last_remediation_plan.tool_kind :
+                        LLAMA_TOOL_KIND_HARD_MEMORY_QUERY;
+        selected_dmn_spec = find_tool_spec(tool_specs, tool_spec_count, preferred_tool_kind, &selected_dmn_spec_index);
         if (!selected_dmn_spec) {
             trace.winner_action = wants_reflection ? LLAMA_DMN_ACTION_INTERNAL_WRITE : LLAMA_DMN_ACTION_SILENT;
             trace.winner_score = wants_reflection ? reflective_pressure : clamp_unit(1.0f - inhibition);
@@ -5982,29 +5036,21 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                 last_governance_trace.repair_message[0] != '\0') {
             return trim_ascii(last_governance_trace.repair_message);
         }
-        for (int32_t i = 0; i < current_prompt_revision.concept_count; ++i) {
-            if (!current_prompt_revision.concepts[i].valid) {
-                continue;
-            }
-            if (current_prompt_revision.concepts[i].kind == LLAMA_DMN_CONCEPT_QUESTION) {
-                return trim_ascii(current_prompt_revision.concepts[i].hint);
-            }
+        if (trace.reasoning_text[0] != '\0') {
+            return trim_ascii(trace.reasoning_text);
         }
-        if (current_prompt_revision.concept_count > 0) {
-            return std::string("Background reflection: ") + trim_ascii(current_prompt_revision.concepts[0].hint);
+        if (trace.emotive_moment_revision.valid) {
+            return trim_ascii(trace.emotive_moment_revision.text);
         }
-        return trim_ascii(current_prompt_revision.rendered_prompt);
+        return "Background reflection: continue from the shared cognitive context.";
     };
 
     auto build_dmn_telegram_intent = [&]() -> int32_t {
         if (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR) {
             return LLAMA_TELEGRAM_RELAY_CONCLUSION;
         }
-        for (int32_t i = 0; i < current_prompt_revision.concept_count; ++i) {
-            if (current_prompt_revision.concepts[i].valid &&
-                    current_prompt_revision.concepts[i].kind == LLAMA_DMN_CONCEPT_QUESTION) {
-                return LLAMA_TELEGRAM_RELAY_QUESTION;
-            }
+        if (trace.pressure.uncertainty >= 0.45f || trace.pressure.contradiction >= 0.35f) {
+            return LLAMA_TELEGRAM_RELAY_QUESTION;
         }
         return LLAMA_TELEGRAM_RELAY_COMMENT;
     };
@@ -6064,7 +5110,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
 
         const bool should_contact_followup =
                 telegram_spec != nullptr &&
-                current_prompt_revision.user_contact_affinity >= 0.62f &&
+                relay_tool_affinity >= 0.62f &&
                 (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR ||
                  (continuation > 0.55f && inhibition < 0.60f));
         const bool should_gather_followup =
@@ -6075,10 +5121,10 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
             trace.winner_action = LLAMA_DMN_ACTION_INVOKE_TOOL;
             trace.tool_job_id = next_tool_job_id++;
             int32_t spec_index = -1;
-            const llama_cognitive_tool_spec * spec = select_dmn_spec(
-                    last_remediation_plan.tool_kind == LLAMA_TOOL_KIND_HARD_MEMORY_QUERY ?
-                            "memory retrieval prior state history search" :
-                            "inspect runtime repository state and execution context",
+            const llama_cognitive_tool_spec * spec = preferred_dmn_spec(
+                    last_remediation_plan.tool_kind == LLAMA_TOOL_KIND_NONE ?
+                            LLAMA_TOOL_KIND_HARD_MEMORY_QUERY :
+                            last_remediation_plan.tool_kind,
                     &spec_index);
             trace.tool_kind = spec ? spec->tool_kind : last_remediation_plan.tool_kind;
             trace.tool_spec_index = spec_index;
@@ -6203,9 +5249,9 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                             LLAMA_COG_COMMAND_ORIGIN_DMN,
                             trace.tool_job_id,
                             build_dmn_telegram_intent(),
-                            current_prompt_revision.user_contact_affinity,
+                            relay_tool_affinity,
                             build_dmn_telegram_text(),
-                            "dmn-relay-" + std::to_string(current_prompt_revision.prompt_revision_id) + "-" + std::to_string(trace.tool_job_id));
+                            "dmn-relay-" + std::to_string(trace.tick_id) + "-" + std::to_string(trace.tool_job_id));
                     (void) ctx.cognitive_telegram_relay_set_request(request);
                 }
             }
@@ -6232,7 +5278,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                     selected_reason_mask | LLAMA_COG_REASON_SOCIAL_RELEVANCE,
                     last_remediation_plan.source_family,
                     1,
-                    current_prompt_revision.user_contact_affinity,
+                    relay_tool_affinity,
                     trace.tool_job_id);
             (void) append_plan_step(
                     trace.plan,
@@ -6284,9 +5330,9 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                         LLAMA_COG_COMMAND_ORIGIN_DMN,
                         trace.tool_job_id,
                         build_dmn_telegram_intent(),
-                        current_prompt_revision.user_contact_affinity,
+                        relay_tool_affinity,
                         build_dmn_telegram_text(),
-                        "dmn-relay-" + std::to_string(current_prompt_revision.prompt_revision_id) + "-" + std::to_string(trace.tool_job_id));
+                        "dmn-relay-" + std::to_string(trace.tick_id) + "-" + std::to_string(trace.tool_job_id));
                 (void) ctx.cognitive_telegram_relay_set_request(request);
             }
         } else {
@@ -6427,9 +5473,9 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
                         LLAMA_COG_COMMAND_ORIGIN_DMN,
                         trace.tool_job_id,
                         build_dmn_telegram_intent(),
-                        current_prompt_revision.user_contact_affinity,
+                        relay_tool_affinity,
                         build_dmn_telegram_text(),
-                        "dmn-relay-" + std::to_string(current_prompt_revision.prompt_revision_id) + "-" + std::to_string(trace.tool_job_id));
+                        "dmn-relay-" + std::to_string(trace.tick_id) + "-" + std::to_string(trace.tool_job_id));
                 (void) ctx.cognitive_telegram_relay_set_request(request);
                 prepared_tool_request = true;
             }
@@ -6816,6 +5862,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
     host_state.last_dmn_time_us = now_us;
 
     trace.plan = dmn_plan;
+    (void) ctx.shared_cognitive_context_get_window(&trace.context_window);
     last_dmn_trace = trace;
     if (out_trace) {
         *out_trace = trace;

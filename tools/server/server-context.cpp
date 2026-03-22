@@ -49,6 +49,7 @@
 #include <nlohmann/json_fwd.hpp>
 #include <nlohmann/json.hpp>
 
+#include "../../src/llama-context.h"
 #include "../../src/llama-hard-memory.h"
 
 // fix problem with std::min and std::max
@@ -64,6 +65,9 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 constexpr uint64_t VICUNA_DMN_IDLE_TICK_MIN_INTERVAL_US = 5ULL * 1000ULL * 1000ULL;
+constexpr size_t VICUNA_TELEGRAM_DIALOGUE_MAX_TURNS_PER_SCOPE = 16;
+constexpr int32_t VICUNA_TELEGRAM_DIALOGUE_DEFAULT_TURN_LIMIT = 6;
+constexpr const char * VICUNA_TELEGRAM_DIALOGUE_SCOPE_BROADCAST = "__broadcast__";
 
 struct self_state_token_view {
     llama_tokens owned_tokens;
@@ -839,6 +843,33 @@ struct vicuna_mailbox_snapshot {
     int64_t last_publish_ms = 0;
 };
 
+struct vicuna_telegram_dialogue_turn {
+    uint64_t turn_id = 0;
+    std::string chat_scope;
+    std::string user_text;
+    std::string assistant_text;
+    std::string assistant_source;
+    std::string response_id;
+    std::string dedupe_key;
+    int64_t telegram_message_id = 0;
+    int64_t updated_at_ms = 0;
+};
+
+struct vicuna_telegram_dialogue_history {
+    mutable std::mutex mutex;
+    size_t max_turns_per_scope = VICUNA_TELEGRAM_DIALOGUE_MAX_TURNS_PER_SCOPE;
+    uint64_t next_turn_id = 1;
+    std::unordered_map<std::string, std::deque<vicuna_telegram_dialogue_turn>> turns_by_scope;
+    std::unordered_map<std::string, int64_t> latest_message_id_by_scope;
+};
+
+struct vicuna_telegram_dialogue_snapshot {
+    size_t max_turns_per_scope = VICUNA_TELEGRAM_DIALOGUE_MAX_TURNS_PER_SCOPE;
+    uint64_t next_turn_id = 1;
+    std::unordered_map<std::string, std::deque<vicuna_telegram_dialogue_turn>> turns_by_scope;
+    std::unordered_map<std::string, int64_t> latest_message_id_by_scope;
+};
+
 static std::string bounded_cstr_to_string(const char * value) {
     return value ? std::string(value) : std::string();
 }
@@ -1088,23 +1119,6 @@ static json dmn_reactivation_targets_to_json(const llama_dmn_tick_trace & trace)
     return targets;
 }
 
-static json dmn_prompt_concepts_to_json(const llama_dmn_prompt_revision & prompt_revision) {
-    json concepts = json::array();
-    for (int32_t i = 0; i < prompt_revision.concept_count && i < LLAMA_DMN_MAX_REPORTABLE_CONCEPTS; ++i) {
-        const auto & concept = prompt_revision.concepts[i];
-        concepts.push_back({
-            {"valid", concept.valid},
-            {"kind", concept.kind},
-            {"salience", concept.salience},
-            {"confidence", concept.confidence},
-            {"user_contact_affordance", concept.user_contact_affordance},
-            {"tool_affordance", concept.tool_affordance},
-            {"hint", bounded_cstr_to_string(concept.hint)},
-        });
-    }
-    return concepts;
-}
-
 static json active_trace_summary_to_json(const llama_active_loop_trace & trace) {
     return {
         {"episode_id", trace.episode_id},
@@ -1191,19 +1205,6 @@ static json dmn_trace_summary_to_json(const llama_dmn_tick_trace & trace) {
             {"input_hash", trace.self_model_revision.input_hash},
             {"materiality_score", trace.self_model_revision.materiality_score},
             {"requires_prompt_regen", trace.self_model_revision.requires_prompt_regen},
-        }},
-        {"prompt_revision", {
-            {"valid", trace.prompt_revision.valid},
-            {"prompt_revision_id", trace.prompt_revision.prompt_revision_id},
-            {"source_revision_id", trace.prompt_revision.source_revision_id},
-            {"prompt_hash", trace.prompt_revision.prompt_hash},
-            {"regenerated", trace.prompt_revision.regenerated},
-            {"concept_count", trace.prompt_revision.concept_count},
-            {"user_contact_affinity", trace.prompt_revision.user_contact_affinity},
-            {"tool_affinity", trace.prompt_revision.tool_affinity},
-            {"macro_outline", bounded_cstr_to_string(trace.prompt_revision.macro_outline)},
-            {"rendered_prompt", bounded_cstr_to_string(trace.prompt_revision.rendered_prompt)},
-            {"concepts", dmn_prompt_concepts_to_json(trace.prompt_revision)},
         }},
         {"favorable_divergence", trace.favorable_divergence},
         {"plan", cognitive_plan_trace_to_json(trace.plan)},
@@ -1491,26 +1492,6 @@ static std::string trim_ascii_copy(const std::string & value) {
     return value.substr(begin, end - begin);
 }
 
-static std::string active_narration_fallback_text(const llama_active_loop_trace & trace) {
-    std::ostringstream oss;
-    oss.setf(std::ios::fixed);
-    oss.precision(3);
-    oss << "Active loop winner action " << trace.winner_action
-        << " with score " << trace.winner_score;
-    if (trace.plan.valid) {
-        oss << ". Plan " << trace.plan.plan_id
-            << " has " << trace.plan.step_count
-            << " steps and current step " << trace.plan.current_step_index;
-    }
-    if (trace.tool_proposal.valid) {
-        oss << ". Proposed tool kind " << trace.tool_proposal.tool_kind;
-    }
-    if (trace.observation.valid) {
-        oss << ". Observation status " << trace.observation.status;
-    }
-    return oss.str();
-}
-
 static void split_hidden_reasoning_text(
         const std::string & text,
         std::string * out_reasoning,
@@ -1566,52 +1547,6 @@ static void split_hidden_reasoning_text(
     if (out_visible) {
         *out_visible = std::move(visible);
     }
-}
-
-static json build_active_narration_json(
-        const llama_active_loop_trace & trace,
-        const std::string & planner_reasoning,
-        const std::string & assistant_output,
-        const std::string & raw_tool_call_xml) {
-    const std::string trimmed_reasoning = trim_ascii_copy(planner_reasoning);
-    const std::string trimmed_output = trim_ascii_copy(assistant_output);
-    const std::string trimmed_tool_xml = trim_ascii_copy(raw_tool_call_xml);
-    const bool have_reasoning = !trimmed_reasoning.empty();
-    return {
-        {"source", have_reasoning ? "planner_reasoning" : "plan_fallback"},
-        {"resolved_text", have_reasoning ? trimmed_reasoning : active_narration_fallback_text(trace)},
-        {"planner_reasoning_text", trimmed_reasoning},
-        {"assistant_output_text", trimmed_output},
-        {"raw_tool_call_xml", trimmed_tool_xml},
-    };
-}
-
-static std::string dmn_narration_fallback_text(const llama_dmn_tick_trace & trace) {
-    std::ostringstream oss;
-    oss.setf(std::ios::fixed);
-    oss.precision(3);
-    oss << "DMN tick " << trace.tick_id
-        << " winner action " << trace.winner_action
-        << " with score " << trace.winner_score
-        << ", contradiction " << trace.pressure.contradiction
-        << ", uncertainty " << trace.pressure.uncertainty
-        << ", continuation " << trace.pressure.continuation;
-    return oss.str();
-}
-
-static json build_dmn_narration_json(const llama_dmn_tick_trace & trace) {
-    const std::string reasoning_text = trim_ascii_copy(bounded_cstr_to_string(trace.reasoning_text));
-    const std::string rendered_prompt = trim_ascii_copy(bounded_cstr_to_string(trace.prompt_revision.rendered_prompt));
-    const std::string macro_outline = trim_ascii_copy(bounded_cstr_to_string(trace.prompt_revision.macro_outline));
-    const bool have_reasoning = !reasoning_text.empty();
-    const bool have_prompt = !rendered_prompt.empty();
-    return {
-        {"source", have_reasoning ? "dmn_reasoning" : have_prompt ? "prompt_revision" : "dmn_fallback"},
-        {"resolved_text", have_reasoning ? reasoning_text : have_prompt ? rendered_prompt : dmn_narration_fallback_text(trace)},
-        {"planner_reasoning_text", reasoning_text},
-        {"macro_outline", macro_outline},
-        {"rendered_prompt", rendered_prompt},
-    };
 }
 
 static int32_t parse_hard_memory_kind_json(const json & value) {
@@ -1696,6 +1631,100 @@ static int32_t telegram_intent_kind_from_text(const std::string & value) {
         return LLAMA_TELEGRAM_RELAY_CONCLUSION;
     }
     return LLAMA_TELEGRAM_RELAY_COMMENT;
+}
+
+static std::string request_header_value_ci(const server_http_req & req, const std::string & key) {
+    auto fold_ascii = [](const std::string & input) {
+        std::string folded = trim_ascii_copy(input);
+        std::transform(
+                folded.begin(),
+                folded.end(),
+                folded.begin(),
+                [](unsigned char ch) { return (char) std::tolower(ch); });
+        return folded;
+    };
+
+    const std::string wanted = fold_ascii(key);
+    for (const auto & [header_key, header_value] : req.headers) {
+        if (fold_ascii(header_key) == wanted) {
+            return trim_ascii_copy(header_value);
+        }
+    }
+    return {};
+}
+
+static int64_t parse_int64_header_value(const std::string & value) {
+    if (value.empty()) {
+        return 0;
+    }
+    try {
+        return std::stoll(value);
+    } catch (...) {
+        return 0;
+    }
+}
+
+static std::string extract_chat_message_text_content(const json & content) {
+    if (content.is_string()) {
+        return trim_ascii_copy(content.get<std::string>());
+    }
+    if (!content.is_array()) {
+        return {};
+    }
+
+    std::string joined;
+    for (const auto & part : content) {
+        if (!part.is_object()) {
+            continue;
+        }
+        const std::string part_type = trim_ascii_copy(json_value(part, "type", std::string("text")));
+        if (part_type != "text") {
+            continue;
+        }
+        const std::string text = trim_ascii_copy(json_value(part, "text", std::string()));
+        if (text.empty()) {
+            continue;
+        }
+        if (!joined.empty()) {
+            joined.push_back('\n');
+        }
+        joined += text;
+    }
+    return joined;
+}
+
+static std::vector<common_chat_msg> extract_telegram_transcript_messages(const std::string & raw_body) {
+    std::vector<common_chat_msg> messages;
+    if (raw_body.empty()) {
+        return messages;
+    }
+
+    try {
+        const json body = json::parse(raw_body);
+        if (!body.contains("messages") || !body.at("messages").is_array()) {
+            return messages;
+        }
+        for (const auto & entry : body.at("messages")) {
+            if (!entry.is_object()) {
+                continue;
+            }
+            const std::string role = trim_ascii_copy(json_value(entry, "role", std::string()));
+            if (role != "user" && role != "assistant") {
+                continue;
+            }
+            const std::string content = extract_chat_message_text_content(entry.value("content", json()));
+            if (content.empty()) {
+                continue;
+            }
+            common_chat_msg msg;
+            msg.role = role;
+            msg.content = content;
+            messages.push_back(std::move(msg));
+        }
+    } catch (...) {
+    }
+
+    return messages;
 }
 
 static std::string percent_encode_query(const std::string & text) {
@@ -2570,7 +2599,8 @@ private:
     vicuna_provenance_repository_state provenance_repository;
     vicuna_external_observability external_observability;
     mutable vicuna_proactive_mailbox proactive_mailbox;
-    bool runtime_state_dirty = false;
+    mutable vicuna_telegram_dialogue_history telegram_dialogue_history;
+    mutable bool runtime_state_dirty = false;
     bool bash_tool_enabled = false;
     bool hard_memory_enabled = false;
     bool codex_tool_enabled = false;
@@ -2598,7 +2628,183 @@ private:
     }
 
     bool react_task_ready(const server_task & task) const {
-        return task.react_enabled && !task.react_messages.empty();
+        return task.react_enabled;
+    }
+
+    std::string shared_context_origin_label(int32_t origin) const {
+        switch (origin) {
+            case LLAMA_SHARED_CONTEXT_ORIGIN_ACTIVE: return "active";
+            case LLAMA_SHARED_CONTEXT_ORIGIN_DMN: return "dmn";
+            case LLAMA_SHARED_CONTEXT_ORIGIN_TOOL: return "tool";
+            default: return "system";
+        }
+    }
+
+    std::string shared_context_kind_label(int32_t kind) const {
+        switch (kind) {
+            case LLAMA_SHARED_CONTEXT_KIND_USER_MESSAGE: return "user_message";
+            case LLAMA_SHARED_CONTEXT_KIND_HIDDEN_THOUGHT: return "hidden_thought";
+            case LLAMA_SHARED_CONTEXT_KIND_TOOL_CALL: return "tool_call";
+            case LLAMA_SHARED_CONTEXT_KIND_TOOL_OBSERVATION: return "tool_observation";
+            case LLAMA_SHARED_CONTEXT_KIND_VISIBLE_OUTPUT: return "visible_output";
+            case LLAMA_SHARED_CONTEXT_KIND_EMOTIVE_MOMENT: return "emotive_moment";
+            case LLAMA_SHARED_CONTEXT_KIND_CONTEXT_EVICTION: return "context_eviction";
+            default: return "internal_summary";
+        }
+    }
+
+    std::string shared_context_phase_label(int32_t phase) const {
+        switch (phase) {
+            case LLAMA_SHARED_CONTEXT_PHASE_THINK: return "think";
+            case LLAMA_SHARED_CONTEXT_PHASE_SELECT_TOOL: return "select_tool";
+            case LLAMA_SHARED_CONTEXT_PHASE_PREPARE_TOOL: return "prepare_tool";
+            case LLAMA_SHARED_CONTEXT_PHASE_OBSERVE: return "observe";
+            case LLAMA_SHARED_CONTEXT_PHASE_EMIT: return "emit";
+            case LLAMA_SHARED_CONTEXT_PHASE_COMPRESS: return "compress";
+            default: return "counterfactual";
+        }
+    }
+
+    std::string current_emotive_moment_text() const {
+        llama_emotive_moment_revision emotive = {};
+        if (!ctx || llama_self_state_get_emotive_moment_revision(ctx, &emotive) != 0) {
+            return {};
+        }
+        return trim_ascii_copy(emotive.text);
+    }
+
+    std::string shared_context_summary_text(int32_t limit = 8) const {
+        if (!ctx) {
+            return {};
+        }
+
+        llama_shared_cognitive_context_window window = {};
+        const int32_t item_count = llama_shared_cognitive_context_count(ctx);
+        if (item_count <= 0 || llama_shared_cognitive_context_get_window(ctx, &window) != 0) {
+            return {};
+        }
+
+        std::ostringstream summary;
+        summary << "Shared context window: items=" << window.item_count
+                << ", tokens=" << window.token_count
+                << ", head_revision=" << window.head_revision << ".";
+        const int32_t start = std::max(0, item_count - std::max(1, limit));
+        for (int32_t i = start; i < item_count; ++i) {
+            llama_shared_cognitive_context_item item = {};
+            if (llama_shared_cognitive_context_get_item(ctx, i, &item) != 0) {
+                continue;
+            }
+            summary << "\n- [" << item.context_item_id << "] "
+                    << shared_context_origin_label(item.origin) << ' '
+                    << shared_context_kind_label(item.kind)
+                    << " phase=" << shared_context_phase_label(item.phase)
+                    << " source=" << item.episode_or_tick_id
+                    << " plan=" << item.plan_id;
+        }
+        return summary.str();
+    }
+
+    bool shared_context_item_text(int32_t index, std::string * out_text) const {
+        if (!ctx || !out_text) {
+            return false;
+        }
+
+        const llama_token * tokens = nullptr;
+        size_t n_tokens = 0;
+        if (!ctx->self_state_trace_get_item_tokens(index, &tokens, &n_tokens)) {
+            return false;
+        }
+
+        if (!tokens || n_tokens == 0) {
+            out_text->clear();
+            return true;
+        }
+
+        std::vector<llama_token> owned_tokens(tokens, tokens + n_tokens);
+        *out_text = trim_ascii_copy(common_detokenize(vocab, owned_tokens, true));
+        return true;
+    }
+
+    bool shared_context_item_to_chat_message(int32_t index, common_chat_msg * out_msg) const {
+        if (!ctx || !out_msg) {
+            return false;
+        }
+
+        llama_shared_cognitive_context_item item = {};
+        if (llama_shared_cognitive_context_get_item(ctx, index, &item) != 0) {
+            return false;
+        }
+
+        std::string content;
+        if (!shared_context_item_text(index, &content) || content.empty()) {
+            return false;
+        }
+
+        common_chat_msg msg;
+        switch (item.kind) {
+            case LLAMA_SHARED_CONTEXT_KIND_USER_MESSAGE:
+                msg.role = item.role == LLAMA_SELF_STATE_EVENT_USER ? "user" : "assistant";
+                break;
+            case LLAMA_SHARED_CONTEXT_KIND_TOOL_OBSERVATION:
+                msg.role = "tool";
+                break;
+            case LLAMA_SHARED_CONTEXT_KIND_HIDDEN_THOUGHT:
+            case LLAMA_SHARED_CONTEXT_KIND_TOOL_CALL:
+            case LLAMA_SHARED_CONTEXT_KIND_VISIBLE_OUTPUT:
+            case LLAMA_SHARED_CONTEXT_KIND_INTERNAL_SUMMARY:
+                msg.role = "assistant";
+                break;
+            default:
+                return false;
+        }
+        msg.content = std::move(content);
+        *out_msg = std::move(msg);
+        return true;
+    }
+
+    std::vector<common_chat_msg> canonical_react_messages(const server_task & task) const {
+        std::vector<common_chat_msg> messages;
+        if (!ctx) {
+            return messages;
+        }
+
+        const std::vector<common_chat_msg> telegram_dialogue = telegram_dialogue_messages_for_task(task);
+        const bool use_telegram_dialogue = !telegram_dialogue.empty();
+        if (use_telegram_dialogue) {
+            messages.insert(messages.end(), telegram_dialogue.begin(), telegram_dialogue.end());
+        }
+
+        const int32_t item_count = llama_shared_cognitive_context_count(ctx);
+        const int32_t start = std::max(0, item_count - 24);
+        messages.reserve(messages.size() + (size_t) std::max(1, item_count - start));
+        for (int32_t i = start; i < item_count; ++i) {
+            if (use_telegram_dialogue) {
+                llama_shared_cognitive_context_item item = {};
+                if (llama_shared_cognitive_context_get_item(ctx, i, &item) != 0) {
+                    continue;
+                }
+                if (item.kind == LLAMA_SHARED_CONTEXT_KIND_USER_MESSAGE ||
+                    item.kind == LLAMA_SHARED_CONTEXT_KIND_VISIBLE_OUTPUT) {
+                    continue;
+                }
+            }
+            common_chat_msg msg;
+            if (shared_context_item_to_chat_message(i, &msg)) {
+                messages.push_back(std::move(msg));
+            }
+        }
+
+        if (messages.empty()) {
+            common_chat_msg seed;
+            seed.role = "user";
+            seed.content =
+                    task.react_origin == SERVER_REACT_ORIGIN_DMN ?
+                    "Continue one hidden DMN reasoning step from the canonical shared cognitive context." :
+                    "Continue the active ReAct turn from the canonical shared cognitive context.";
+            messages.push_back(std::move(seed));
+        }
+
+        return messages;
     }
 
     void apply_core_system_prompt_prefix(server_task & task) const {
@@ -2637,44 +2843,6 @@ private:
     bool react_spec_index_exposed(const server_task & task, int32_t spec_index) const {
         const std::vector<int32_t> available = react_available_spec_indexes(task);
         return std::find(available.begin(), available.end(), spec_index) != available.end();
-    }
-
-    void seed_react_transcript(server_task & task) const {
-        if (task.react_transcript_seeded) {
-            return;
-        }
-
-        const std::string guidance =
-                task.react_origin == SERVER_REACT_ORIGIN_DMN ?
-                "The DMN runs as a hidden stepwise ReAct loop. "
-                "Keep planning in hidden reasoning only. "
-                "Use a hidden block with a natural-language Thought line and an explicit Action line. "
-                "Allowed actions are: act, internal_write, wait. "
-                "If Action is act, emit exactly one tool call after the hidden reasoning. "
-                "If Action is internal_write, place only the internal reflection text in visible assistant content. "
-                "Never leak hidden reasoning into user-visible output." :
-                "Active engagement runs as a stepwise hidden ReAct loop. "
-                "Keep planning in hidden reasoning only. "
-                "Use a hidden block with a natural-language Thought line and an explicit Action line. "
-                "Allowed actions are: answer, ask, act, wait. "
-                "If Action is act, emit exactly one tool call after the hidden reasoning. "
-                "If Action is answer or ask, place only the user-visible text in visible assistant content. "
-                "Never claim a tool ran unless you emitted the tool call.";
-
-        if (!task.react_messages.empty() && task.react_messages.front().role == "system") {
-            if (!task.react_messages.front().content.empty()) {
-                task.react_messages.front().content += "\n\n";
-            }
-            task.react_messages.front().content += guidance;
-        } else {
-            common_chat_msg system_msg;
-            system_msg.role = "system";
-            system_msg.content = guidance;
-            task.react_messages.insert(task.react_messages.begin(), std::move(system_msg));
-        }
-
-        task.react_initial_message_count = task.react_messages.size();
-        task.react_transcript_seeded = true;
     }
 
     bool apply_chat_prompt_to_task(server_task & task, const common_chat_params & chat_completion) {
@@ -2716,8 +2884,6 @@ private:
             return false;
         }
 
-        seed_react_transcript(task);
-
         task.react_tools.clear();
         std::string xml_guidance;
         const std::vector<int32_t> available_spec_indexes = react_available_spec_indexes(task);
@@ -2730,29 +2896,43 @@ private:
             }
         }
 
-        std::vector<common_chat_msg> prompt_messages = task.react_messages;
+        std::vector<common_chat_msg> prompt_messages = canonical_react_messages(task);
         common_chat_msg phase_system;
         phase_system.role = "system";
+        const std::string emotive = current_emotive_moment_text();
+        const std::string context_summary = shared_context_summary_text();
         if (task.react_origin == SERVER_REACT_ORIGIN_DMN) {
             phase_system.content =
-                    "Produce one authoritative hidden ReAct control step.\n"
+                    "Use only the canonical shared cognitive context as history. "
+                    "Produce one authoritative hidden DMN ReAct control step.\n"
                     "Format hidden reasoning as:\n"
                     "<think>\nThought: ...\nAction: act|internal_write|wait\n</think>\n"
                     "If Action is act, emit a tool-call XML block immediately after the hidden reasoning. "
                     "If Action is internal_write, put the internal reflection in visible assistant content. "
-                    "If Action is wait, leave visible assistant content empty.\n\n" +
+                    "If Action is wait, leave visible assistant content empty. "
+                    "Do not invent any parallel transcript or selector policy.\n\n" +
+                    (emotive.empty() ? std::string() : "Current emotive moment: " + emotive + "\n") +
+                    (context_summary.empty() ? std::string() : context_summary + "\n\n") +
+                    (task.react_retry_feedback.empty() ? std::string() :
+                            "Previous control step failed validation: " + task.react_retry_feedback + "\n\n") +
                     (xml_guidance.empty() ? std::string("No tools are currently available.") : xml_guidance);
         } else {
             phase_system.content =
-                    "Produce one authoritative hidden ReAct control step.\n"
+                    "Use only the canonical shared cognitive context as history. "
+                    "Produce one authoritative hidden active ReAct control step.\n"
                     "Format hidden reasoning as:\n"
                     "<think>\nThought: ...\nAction: answer|ask|act|wait\n</think>\n"
                     "If Action is act, emit a tool-call XML block immediately after the hidden reasoning. "
                     "If Action is answer or ask, put only the user-visible reply in visible assistant content. "
-                    "If Action is wait, leave visible assistant content empty.\n\n" +
+                    "If Action is wait, leave visible assistant content empty. "
+                    "Do not invent any parallel transcript or selector policy.\n\n" +
+                    (emotive.empty() ? std::string() : "Current emotive moment: " + emotive + "\n") +
+                    (context_summary.empty() ? std::string() : context_summary + "\n\n") +
+                    (task.react_retry_feedback.empty() ? std::string() :
+                            "Previous control step failed validation: " + task.react_retry_feedback + "\n\n") +
                     (xml_guidance.empty() ? std::string("No tools are currently available.") : xml_guidance);
         }
-        prompt_messages.push_back(std::move(phase_system));
+        prompt_messages.insert(prompt_messages.begin(), std::move(phase_system));
 
         const common_chat_params chat_completion = build_chat_completion_params(
                 chat_params,
@@ -2761,7 +2941,6 @@ private:
                 task.react_tools.empty() ? COMMON_CHAT_TOOL_CHOICE_NONE : COMMON_CHAT_TOOL_CHOICE_AUTO,
                 true);
         task.react_iteration += 1;
-        task.react_waiting_for_final_answer = false;
         return apply_chat_prompt_to_task(task, chat_completion);
     }
 
@@ -3008,24 +3187,7 @@ private:
         return true;
     }
 
-    common_chat_msg make_react_critique_message(const server_task & task, const std::string & error) const {
-        common_chat_msg critique;
-        critique.role = "system";
-        critique.content =
-                std::string("The previous control step was invalid: ") + error +
-                ". Produce a corrected hidden ReAct step with Thought and Action lines. " +
-                (task.react_origin == SERVER_REACT_ORIGIN_DMN ?
-                        "Allowed actions: act, internal_write, wait." :
-                        "Allowed actions: answer, ask, act, wait.");
-        return critique;
-    }
-
     bool enqueue_dmn_react_task(const llama_dmn_tick_trace & trace) {
-        const std::string prompt = trim_ascii_copy(bounded_cstr_to_string(trace.prompt_revision.rendered_prompt));
-        if (prompt.empty()) {
-            return false;
-        }
-
         server_task task(SERVER_TASK_TYPE_COMPLETION);
         task.id = queue_tasks.get_new_id();
         task.params.stream = false;
@@ -3039,11 +3201,6 @@ private:
         task.has_dmn_trace = true;
         task.dmn_trace = trace;
 
-        common_chat_msg user_msg;
-        user_msg.role = "user";
-        user_msg.content = prompt;
-        task.react_messages.push_back(std::move(user_msg));
-
         if (!prepare_react_prompt(task)) {
             return false;
         }
@@ -3052,36 +3209,26 @@ private:
         return true;
     }
 
-    void append_react_visible_prefix(server_task & task, const common_chat_msg & assistant_msg) const {
-        const std::string visible = trim_ascii_copy(assistant_msg.content);
-        if (visible.empty()) {
-            return;
-        }
-        if (!task.react_visible_prefix.empty()) {
-            task.react_visible_prefix += "\n\n";
-        }
-        task.react_visible_prefix += visible;
-    }
-
-    std::string latest_react_tool_call_id(const server_task & task) const {
-        for (auto it = task.react_messages.rbegin(); it != task.react_messages.rend(); ++it) {
-            if (!it->tool_calls.empty() && !it->tool_calls.front().id.empty()) {
-                return it->tool_calls.front().id;
+    std::string react_intent_hint(const server_task & /* task */) const {
+        if (ctx) {
+            for (int32_t i = llama_shared_cognitive_context_count(ctx) - 1; i >= 0; --i) {
+                llama_shared_cognitive_context_item item = {};
+                if (llama_shared_cognitive_context_get_item(ctx, i, &item) != 0 ||
+                        item.kind != LLAMA_SHARED_CONTEXT_KIND_USER_MESSAGE ||
+                        item.role != LLAMA_SELF_STATE_EVENT_USER) {
+                    continue;
+                }
+                std::string text;
+                if (shared_context_item_text(i, &text) && !text.empty()) {
+                    return text;
+                }
             }
         }
-        return {};
-    }
-
-    std::string react_intent_hint(const server_task & task) const {
-        for (auto it = task.react_messages.rbegin(); it != task.react_messages.rend(); ++it) {
-            if (it->role == "user" && !trim_ascii_copy(it->content).empty()) {
-                return trim_ascii_copy(it->content);
-            }
+        const std::string emotive = current_emotive_moment_text();
+        if (!emotive.empty()) {
+            return emotive;
         }
-        if (task.has_dmn_trace) {
-            return trim_ascii_copy(bounded_cstr_to_string(task.dmn_trace.prompt_revision.rendered_prompt));
-        }
-        return {};
+        return shared_context_summary_text(4);
     }
 
     bool configure_tool_request_from_chat_call(
@@ -3407,7 +3554,7 @@ private:
                     json_value(
                             arguments,
                             "urgency",
-                            task.has_dmn_trace ? task.dmn_trace.prompt_revision.user_contact_affinity : 0.5f),
+                            task.has_dmn_trace ? task.dmn_trace.winner_score : 0.5f),
                     0.0f,
                     1.0f);
             request.command_ready = true;
@@ -3442,26 +3589,26 @@ private:
     }
 
     void append_react_tool_result(server_task & task, const vicuna_external_work_result & result) const {
-        common_chat_msg tool_msg;
-        tool_msg.role = "tool";
-        tool_msg.tool_call_id = latest_react_tool_call_id(task);
-        for (auto it = task.react_messages.rbegin(); it != task.react_messages.rend(); ++it) {
-            if (!it->tool_calls.empty()) {
-                tool_msg.tool_name = it->tool_calls.front().name;
-                break;
-            }
-        }
+        std::string tool_observation;
         if (result.kind == VICUNA_EXTERNAL_WORK_HARD_MEMORY) {
-            tool_msg.content = format_react_hard_memory_observation(result.hard_memory_result);
+            tool_observation = format_react_hard_memory_observation(result.hard_memory_result);
         } else if (result.kind == VICUNA_EXTERNAL_WORK_CODEX) {
-            tool_msg.content = format_react_codex_observation(result.codex_result);
+            tool_observation = format_react_codex_observation(result.codex_result);
         } else {
-            tool_msg.content = format_react_bash_observation(result.bash_result);
+            tool_observation = format_react_bash_observation(result.bash_result);
         }
-        task.react_messages.push_back(std::move(tool_msg));
+        (void) admit_runtime_emit_text(
+                ctx,
+                tool_observation,
+                result.origin,
+                LLAMA_COG_LOOP_PHASE_OBSERVE,
+                result.command_id,
+                task.react_origin == SERVER_REACT_ORIGIN_DMN ? task.dmn_trace.plan.plan_id : task.active_trace.plan.plan_id,
+                0,
+                LLAMA_SELF_COG_ARTIFACT_TOOL_OBSERVATION);
     }
 
-    void mark_runtime_state_dirty(const char * reason) {
+    void mark_runtime_state_dirty(const char * reason) const {
         std::lock_guard<std::mutex> lock(runtime_state_mutex);
         runtime_state_dirty = true;
         if (reason && reason[0] != '\0') {
@@ -3704,9 +3851,133 @@ private:
         }
         if (out_process_trace) {
             *out_process_trace = process_trace;
-        }
-        return true;
     }
+    return true;
+}
+
+static std::string normalize_telegram_chat_scope(const std::string & value) {
+    const std::string normalized = trim_ascii_copy(value);
+    return normalized.empty() ? std::string() : normalized;
+}
+
+static bool telegram_dialogue_scope_is_broadcast(const std::string & scope) {
+    return scope == VICUNA_TELEGRAM_DIALOGUE_SCOPE_BROADCAST;
+}
+
+static vicuna_telegram_dialogue_snapshot telegram_dialogue_snapshot_copy(
+        const vicuna_telegram_dialogue_history & history) {
+    std::lock_guard<std::mutex> lock(history.mutex);
+
+    vicuna_telegram_dialogue_snapshot snapshot = {};
+    snapshot.max_turns_per_scope = history.max_turns_per_scope;
+    snapshot.next_turn_id = history.next_turn_id;
+    snapshot.turns_by_scope = history.turns_by_scope;
+    snapshot.latest_message_id_by_scope = history.latest_message_id_by_scope;
+    return snapshot;
+}
+
+static json telegram_dialogue_history_to_json(const vicuna_telegram_dialogue_history & history) {
+    const vicuna_telegram_dialogue_snapshot snapshot = telegram_dialogue_snapshot_copy(history);
+
+    json scopes = json::array();
+    for (const auto & [scope, turns] : snapshot.turns_by_scope) {
+        json scope_turns = json::array();
+        for (const auto & turn : turns) {
+            scope_turns.push_back({
+                {"turn_id", turn.turn_id},
+                {"chat_scope", turn.chat_scope},
+                {"user_text", turn.user_text},
+                {"assistant_text", turn.assistant_text},
+                {"assistant_source", turn.assistant_source},
+                {"response_id", turn.response_id},
+                {"dedupe_key", turn.dedupe_key},
+                {"telegram_message_id", turn.telegram_message_id},
+                {"updated_at_ms", turn.updated_at_ms},
+            });
+        }
+        const auto latest_it = snapshot.latest_message_id_by_scope.find(scope);
+        scopes.push_back({
+            {"chat_scope", scope},
+            {"latest_message_id", latest_it != snapshot.latest_message_id_by_scope.end() ? latest_it->second : int64_t(0)},
+            {"turns", scope_turns},
+        });
+    }
+
+    return json {
+        {"max_turns_per_scope", snapshot.max_turns_per_scope},
+        {"next_turn_id", snapshot.next_turn_id},
+        {"scopes", scopes},
+    };
+}
+
+static bool telegram_dialogue_history_from_json(
+        const json & data,
+        vicuna_telegram_dialogue_history * out_history) {
+    if (!out_history || !data.is_object()) {
+        return false;
+    }
+
+    vicuna_telegram_dialogue_snapshot restored = {};
+    restored.max_turns_per_scope = std::max<size_t>(
+            1,
+            json_value(data, "max_turns_per_scope", restored.max_turns_per_scope));
+    restored.next_turn_id = std::max<uint64_t>(1, json_value(data, "next_turn_id", restored.next_turn_id));
+
+    if (data.contains("scopes") && data.at("scopes").is_array()) {
+        for (const auto & scope_entry : data.at("scopes")) {
+            if (!scope_entry.is_object()) {
+                continue;
+            }
+            const std::string scope = normalize_telegram_chat_scope(
+                    json_value(scope_entry, "chat_scope", std::string()));
+            if (scope.empty()) {
+                continue;
+            }
+
+            std::deque<vicuna_telegram_dialogue_turn> turns;
+            if (scope_entry.contains("turns") && scope_entry.at("turns").is_array()) {
+                for (const auto & turn_entry : scope_entry.at("turns")) {
+                    if (!turn_entry.is_object()) {
+                        continue;
+                    }
+                    vicuna_telegram_dialogue_turn turn = {};
+                    turn.turn_id = std::max<uint64_t>(1, json_value(turn_entry, "turn_id", uint64_t(0)));
+                    turn.chat_scope = scope;
+                    turn.user_text = trim_ascii_copy(json_value(turn_entry, "user_text", std::string()));
+                    turn.assistant_text = trim_ascii_copy(json_value(turn_entry, "assistant_text", std::string()));
+                    turn.assistant_source = trim_ascii_copy(json_value(turn_entry, "assistant_source", std::string()));
+                    turn.response_id = trim_ascii_copy(json_value(turn_entry, "response_id", std::string()));
+                    turn.dedupe_key = trim_ascii_copy(json_value(turn_entry, "dedupe_key", std::string()));
+                    turn.telegram_message_id = json_value(turn_entry, "telegram_message_id", int64_t(0));
+                    turn.updated_at_ms = json_value(turn_entry, "updated_at_ms", int64_t(0));
+                    if (turn.user_text.empty() && turn.assistant_text.empty()) {
+                        continue;
+                    }
+                    turns.push_back(std::move(turn));
+                }
+            }
+
+            if (!turns.empty()) {
+                while (turns.size() > restored.max_turns_per_scope) {
+                    turns.pop_front();
+                }
+                restored.turns_by_scope[scope] = std::move(turns);
+            }
+
+            const int64_t latest_message_id = json_value(scope_entry, "latest_message_id", int64_t(0));
+            if (latest_message_id > 0) {
+                restored.latest_message_id_by_scope[scope] = latest_message_id;
+            }
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(out_history->mutex);
+    out_history->max_turns_per_scope = restored.max_turns_per_scope;
+    out_history->next_turn_id = restored.next_turn_id;
+    out_history->turns_by_scope = std::move(restored.turns_by_scope);
+    out_history->latest_message_id_by_scope = std::move(restored.latest_message_id_by_scope);
+    return true;
+}
 
     void note_provenance_progress_locked(const vicuna_progress_snapshot & snapshot, const std::string & event_kind) {
         if (!snapshot.valid) {
@@ -3829,58 +4100,9 @@ private:
     }
 
     json active_waiting_task_provenance_extra(int32_t command_id, const llama_active_loop_trace * active_trace = nullptr) {
-        std::string planner_reasoning;
-        std::string raw_tool_xml;
-        std::string assistant_role;
-        std::string assistant_content;
-        json assistant_tool_calls = json::array();
-        llama_active_loop_trace stored_trace = {};
-        bool found = false;
-        {
-            std::lock_guard<std::mutex> lock(runtime_state_mutex);
-            auto it = waiting_active_tasks.find(command_id);
-            if (it != waiting_active_tasks.end()) {
-                planner_reasoning = it->second.react_last_planner_reasoning;
-                raw_tool_xml = it->second.react_last_tool_xml_payload;
-                stored_trace = it->second.active_trace;
-                if (!it->second.react_messages.empty()) {
-                    const auto & final_msg = it->second.react_messages.back();
-                    assistant_role = final_msg.role;
-                    assistant_content = final_msg.content;
-                    for (const auto & tool_call : final_msg.tool_calls) {
-                        assistant_tool_calls.push_back({
-                            {"name", tool_call.name},
-                            {"arguments", tool_call.arguments},
-                            {"id", tool_call.id},
-                        });
-                    }
-                }
-                found = true;
-            }
-        }
-        if (!found) {
-            return json::object();
-        }
-
-        const llama_active_loop_trace & trace_for_narration =
-                active_trace ? *active_trace : stored_trace;
-        json extra = {
-            {"narration", build_active_narration_json(
-                    trace_for_narration,
-                    planner_reasoning,
-                    assistant_content,
-                    raw_tool_xml)},
-        };
-        if (!assistant_role.empty() || !assistant_content.empty() || !assistant_tool_calls.empty()) {
-            extra["assistant_message"] = {
-                {"role", assistant_role},
-                {"content", assistant_content},
-            };
-            if (!assistant_tool_calls.empty()) {
-                extra["assistant_message"]["tool_calls"] = std::move(assistant_tool_calls);
-            }
-        }
-        return extra;
+        (void) command_id;
+        (void) active_trace;
+        return json::object();
     }
 
     void capture_tool_call_provenance(
@@ -3932,7 +4154,6 @@ private:
             llama_dmn_tick_trace dmn_trace = {};
             if (llama_dmn_get_last_trace(ctx, &dmn_trace) == 0) {
                 payload["dmn"] = dmn_trace_summary_to_json(dmn_trace);
-                payload["narration"] = build_dmn_narration_json(dmn_trace);
             }
         }
 
@@ -3993,7 +4214,6 @@ private:
 
         json payload = {
             {"dmn", dmn_trace_summary_to_json(dmn_trace)},
-            {"narration", build_dmn_narration_json(dmn_trace)},
             {"counterfactual", counterfactual_trace_summary_to_json(counterfactual)},
             {"governance", governance_trace_summary_to_json(governance)},
             {"remediation", remediation_plan_to_json(remediation)},
@@ -4219,6 +4439,227 @@ private:
         };
     }
 
+    void telegram_dialogue_prune_scope_locked(const std::string & scope) const {
+        auto it = telegram_dialogue_history.turns_by_scope.find(scope);
+        if (it == telegram_dialogue_history.turns_by_scope.end()) {
+            return;
+        }
+        while (it->second.size() > telegram_dialogue_history.max_turns_per_scope) {
+            it->second.pop_front();
+        }
+        if (it->second.empty()) {
+            telegram_dialogue_history.turns_by_scope.erase(it);
+            telegram_dialogue_history.latest_message_id_by_scope.erase(scope);
+        }
+    }
+
+    std::string dmn_telegram_dialogue_scope_locked() const {
+        std::string selected_scope;
+        int scope_count = 0;
+        for (const auto & [scope, turns] : telegram_dialogue_history.turns_by_scope) {
+            if (turns.empty() || telegram_dialogue_scope_is_broadcast(scope)) {
+                continue;
+            }
+            selected_scope = scope;
+            ++scope_count;
+            if (scope_count > 1) {
+                return std::string();
+            }
+        }
+        return scope_count == 1 ? selected_scope : std::string();
+    }
+
+    void sync_telegram_dialogue_history(
+            const std::string & chat_scope,
+            int64_t telegram_message_id,
+            const std::vector<common_chat_msg> & transcript_messages) const {
+        const std::string normalized_scope = normalize_telegram_chat_scope(chat_scope);
+        if (normalized_scope.empty() || transcript_messages.empty()) {
+            return;
+        }
+
+        const int64_t now_ms = ggml_time_ms();
+        std::lock_guard<std::mutex> lock(telegram_dialogue_history.mutex);
+        std::deque<vicuna_telegram_dialogue_turn> rebuilt_turns;
+        rebuilt_turns.clear();
+
+        auto append_turn = [&](const common_chat_msg & msg) {
+            const std::string role = trim_ascii_copy(msg.role);
+            const std::string content = trim_ascii_copy(msg.content);
+            if (content.empty()) {
+                return;
+            }
+
+            if (role == "user") {
+                vicuna_telegram_dialogue_turn turn = {};
+                turn.turn_id = telegram_dialogue_history.next_turn_id++;
+                turn.chat_scope = normalized_scope;
+                turn.user_text = content;
+                turn.updated_at_ms = now_ms;
+                rebuilt_turns.push_back(std::move(turn));
+            } else if (role == "assistant") {
+                if (!rebuilt_turns.empty() &&
+                    rebuilt_turns.back().assistant_text.empty() &&
+                    !rebuilt_turns.back().user_text.empty()) {
+                    rebuilt_turns.back().assistant_text = content;
+                    rebuilt_turns.back().assistant_source = "telegram_bridge_request";
+                    rebuilt_turns.back().updated_at_ms = now_ms;
+                } else {
+                    vicuna_telegram_dialogue_turn turn = {};
+                    turn.turn_id = telegram_dialogue_history.next_turn_id++;
+                    turn.chat_scope = normalized_scope;
+                    turn.assistant_text = content;
+                    turn.assistant_source = "telegram_bridge_request";
+                    turn.updated_at_ms = now_ms;
+                    rebuilt_turns.push_back(std::move(turn));
+                }
+            }
+        };
+
+        for (const auto & msg : transcript_messages) {
+            append_turn(msg);
+        }
+
+        while (rebuilt_turns.size() > telegram_dialogue_history.max_turns_per_scope) {
+            rebuilt_turns.pop_front();
+        }
+
+        if (!rebuilt_turns.empty()) {
+            telegram_dialogue_history.turns_by_scope[normalized_scope] = std::move(rebuilt_turns);
+            if (telegram_message_id > 0) {
+                telegram_dialogue_history.latest_message_id_by_scope[normalized_scope] = std::max(
+                        telegram_dialogue_history.latest_message_id_by_scope[normalized_scope],
+                        telegram_message_id);
+            }
+        }
+    }
+
+    void append_telegram_dialogue_assistant_turn(
+            const std::string & chat_scope,
+            const std::string & text,
+            const char * source,
+            const std::string & response_id = std::string(),
+            const std::string & dedupe_key = std::string()) const {
+        const std::string normalized_scope = normalize_telegram_chat_scope(chat_scope);
+        const std::string trimmed = trim_ascii_copy(text);
+        if (normalized_scope.empty() || trimmed.empty()) {
+            return;
+        }
+
+        const int64_t now_ms = ggml_time_ms();
+        std::lock_guard<std::mutex> lock(telegram_dialogue_history.mutex);
+        std::deque<vicuna_telegram_dialogue_turn> & turns =
+                telegram_dialogue_history.turns_by_scope[normalized_scope];
+
+        if (!turns.empty() &&
+            turns.back().assistant_text.empty() &&
+            !turns.back().user_text.empty()) {
+            turns.back().assistant_text = trimmed;
+            turns.back().assistant_source = source ? source : "";
+            turns.back().response_id = response_id;
+            turns.back().dedupe_key = dedupe_key;
+            turns.back().updated_at_ms = now_ms;
+        } else {
+            vicuna_telegram_dialogue_turn turn = {};
+            turn.turn_id = telegram_dialogue_history.next_turn_id++;
+            turn.chat_scope = normalized_scope;
+            turn.assistant_text = trimmed;
+            turn.assistant_source = source ? source : "";
+            turn.response_id = response_id;
+            turn.dedupe_key = dedupe_key;
+            turn.updated_at_ms = now_ms;
+            turns.push_back(std::move(turn));
+        }
+
+        telegram_dialogue_prune_scope_locked(normalized_scope);
+    }
+
+    std::vector<common_chat_msg> telegram_dialogue_messages_for_task(const server_task & task) const {
+        const bool active_scope = task.telegram_dialogue_active &&
+                                  !normalize_telegram_chat_scope(task.telegram_chat_scope).empty();
+        const bool dmn_scope = task.react_origin == SERVER_REACT_ORIGIN_DMN;
+        if (!active_scope && !dmn_scope) {
+            return {};
+        }
+
+        const int32_t turn_limit = std::max(
+                1,
+                task.telegram_history_turn_limit > 0 ?
+                        task.telegram_history_turn_limit :
+                        VICUNA_TELEGRAM_DIALOGUE_DEFAULT_TURN_LIMIT);
+
+        std::vector<vicuna_telegram_dialogue_turn> selected_turns;
+        {
+            std::lock_guard<std::mutex> lock(telegram_dialogue_history.mutex);
+            const std::string scope =
+                    active_scope ?
+                            normalize_telegram_chat_scope(task.telegram_chat_scope) :
+                            dmn_telegram_dialogue_scope_locked();
+
+            auto append_scope_turns = [&](const std::string & target_scope) {
+                const auto it = telegram_dialogue_history.turns_by_scope.find(target_scope);
+                if (it == telegram_dialogue_history.turns_by_scope.end()) {
+                    return;
+                }
+                selected_turns.insert(selected_turns.end(), it->second.begin(), it->second.end());
+            };
+
+            append_scope_turns(VICUNA_TELEGRAM_DIALOGUE_SCOPE_BROADCAST);
+            if (!scope.empty() && !telegram_dialogue_scope_is_broadcast(scope)) {
+                append_scope_turns(scope);
+            }
+        }
+
+        if (selected_turns.empty()) {
+            return {};
+        }
+
+        std::sort(
+                selected_turns.begin(),
+                selected_turns.end(),
+                [](const vicuna_telegram_dialogue_turn & lhs, const vicuna_telegram_dialogue_turn & rhs) {
+                    if (lhs.updated_at_ms != rhs.updated_at_ms) {
+                        return lhs.updated_at_ms < rhs.updated_at_ms;
+                    }
+                    return lhs.turn_id < rhs.turn_id;
+                });
+
+        if ((int32_t) selected_turns.size() > turn_limit) {
+            selected_turns.erase(selected_turns.begin(), selected_turns.end() - turn_limit);
+        }
+
+        std::vector<common_chat_msg> messages;
+        for (const auto & turn : selected_turns) {
+            if (!turn.user_text.empty()) {
+                messages.push_back(common_chat_msg{
+                        /*.role =*/ "user",
+                        /*.content =*/ turn.user_text,
+                });
+            }
+            if (!turn.assistant_text.empty()) {
+                messages.push_back(common_chat_msg{
+                        /*.role =*/ "assistant",
+                        /*.content =*/ turn.assistant_text,
+                });
+            }
+        }
+        return messages;
+    }
+
+    json build_telegram_dialogue_health_json() const {
+        const vicuna_telegram_dialogue_snapshot snapshot = telegram_dialogue_snapshot_copy(telegram_dialogue_history);
+        size_t total_turns = 0;
+        for (const auto & [scope, turns] : snapshot.turns_by_scope) {
+            GGML_UNUSED(scope);
+            total_turns += turns.size();
+        }
+        return {
+            {"scope_count", (int) snapshot.turns_by_scope.size()},
+            {"turn_count", (int) total_turns},
+            {"max_turns_per_scope", (int) snapshot.max_turns_per_scope},
+        };
+    }
+
     bool dispatch_pending_self_emit_commands(int32_t origin_filter) {
         if (!ctx) {
             return false;
@@ -4266,13 +4707,20 @@ private:
                     governance,
                     directness_preference,
                     verbosity_preference);
-            if (!proactive_mailbox_publish(message, "dmn")) {
+            std::string response_id;
+            if (!proactive_mailbox_publish(message, "dmn", &response_id)) {
                 {
                     std::lock_guard<std::mutex> lock(proactive_mailbox.mutex);
                     proactive_mailbox.fail_total++;
                 }
                 SRV_WRN("proactive emit command %d produced an empty message\n", command.command_id);
             } else {
+                append_telegram_dialogue_assistant_turn(
+                        VICUNA_TELEGRAM_DIALOGUE_SCOPE_BROADCAST,
+                        message,
+                        "telegram_relay_dmn",
+                        response_id,
+                        std::string("dmn-self-emit-") + std::to_string(command.command_id));
                 if (!admit_runtime_emit_text(
                             ctx,
                             message,
@@ -4640,7 +5088,7 @@ private:
 
         try {
             json snapshot = json::object();
-            snapshot["version"] = 5;
+            snapshot["version"] = 6;
             snapshot["saved_at_unix_ms"] = ggml_time_ms();
             snapshot["reason"] = reason ? reason : "";
 
@@ -4662,6 +5110,7 @@ private:
             snapshot["self_state_updater_program_b64"] = base64::encode((const char *) &updater, sizeof(updater));
             snapshot["self_state_trace_b64"] = base64::encode((const char *) trace_blob.data(), trace_blob.size());
             snapshot["proactive_mailbox"] = proactive_mailbox_to_json(proactive_mailbox);
+            snapshot["telegram_dialogue"] = telegram_dialogue_history_to_json(telegram_dialogue_history);
 
             json extensions = json::array();
             const int32_t extension_count = llama_self_state_model_extension_count(ctx);
@@ -4966,6 +5415,12 @@ private:
             if (snapshot_version >= 2 && snapshot.contains("proactive_mailbox")) {
                 if (!proactive_mailbox_from_json(snapshot.at("proactive_mailbox"), &proactive_mailbox)) {
                     throw std::runtime_error("failed to restore proactive mailbox");
+                }
+            }
+
+            if (snapshot_version >= 6 && snapshot.contains("telegram_dialogue")) {
+                if (!telegram_dialogue_history_from_json(snapshot.at("telegram_dialogue"), &telegram_dialogue_history)) {
+                    throw std::runtime_error("failed to restore telegram dialogue history");
                 }
             }
 
@@ -5360,6 +5815,13 @@ private:
                     continue;
                 }
 
+                append_telegram_dialogue_assistant_turn(
+                        VICUNA_TELEGRAM_DIALOGUE_SCOPE_BROADCAST,
+                        relay_text,
+                        command.origin == LLAMA_COG_COMMAND_ORIGIN_DMN ? "telegram_relay_dmn" : "telegram_relay_active",
+                        response_id,
+                        request.dedupe_key);
+
                 if (!admit_runtime_emit_text(
                             ctx,
                             relay_text,
@@ -5600,7 +6062,7 @@ private:
                     std::lock_guard<std::mutex> lock(runtime_state_mutex);
                     auto it = waiting_active_tasks.find(result.command_id);
                     if (it != waiting_active_tasks.end()) {
-                        active_tool_xml = it->second.react_last_tool_xml_payload;
+                        active_tool_xml = trim_ascii_copy(it->second.active_trace.authoritative_turn.tool_call_payload);
                     }
                 }
                 if (!active_tool_xml.empty()) {
@@ -6451,6 +6913,7 @@ private:
             {"external_bash_pending", count_pending_external_work(bash_work)},
             {"external_hard_memory_pending", count_pending_external_work(hard_memory_work)},
             {"proactive_mailbox", build_proactive_mailbox_health_json()},
+            {"telegram_dialogue", build_telegram_dialogue_health_json()},
             {"runtime_persistence", {
                 {"enabled", false},
                 {"healthy", true},
@@ -6494,6 +6957,7 @@ private:
             std::lock_guard<std::mutex> lock(runtime_state_mutex);
             health["waiting_active_tasks"] = waiting_active_tasks.size();
             health["proactive_mailbox"] = build_proactive_mailbox_health_json();
+            health["telegram_dialogue"] = build_telegram_dialogue_health_json();
             health["runtime_persistence"] = {
                 {"enabled", runtime_persistence.enabled},
                 {"healthy", runtime_persistence.healthy},
@@ -7131,7 +7595,7 @@ private:
             server_task retry_task = std::move(*slot.task);
             if (retry_task.react_retry_count < retry_task.react_retry_limit) {
                 retry_task.react_retry_count += 1;
-                retry_task.react_messages.push_back(make_react_critique_message(retry_task, react_step.error));
+                retry_task.react_retry_feedback = react_step.error;
                 if (prepare_react_prompt(retry_task)) {
                     queue_tasks.post(std::move(retry_task), true);
                     return;
@@ -7143,9 +7607,32 @@ private:
 
         if (slot.task && react_task_ready(*slot.task) && parsed_react) {
             server_task resumed_task = std::move(*slot.task);
-            resumed_task.react_messages.push_back(react_step.assistant_msg);
-            resumed_task.react_last_planner_reasoning = trim_ascii_copy(react_step.planner_reasoning);
-            resumed_task.react_last_tool_xml_payload = react_step.tool_xml;
+            resumed_task.react_retry_feedback.clear();
+            const std::string planner_reasoning = trim_ascii_copy(react_step.planner_reasoning);
+            const std::string tool_xml_payload = trim_ascii_copy(react_step.tool_xml);
+            llama_shared_cognitive_context_window context_window = {};
+            if (!planner_reasoning.empty()) {
+                const int32_t source_id =
+                        resumed_task.react_origin == SERVER_REACT_ORIGIN_DMN ?
+                                resumed_task.dmn_trace.tick_id :
+                                resumed_task.active_trace.episode_id;
+                const int32_t plan_id =
+                        resumed_task.react_origin == SERVER_REACT_ORIGIN_DMN ?
+                                resumed_task.dmn_trace.plan.plan_id :
+                                resumed_task.active_trace.plan.plan_id;
+                (void) admit_runtime_emit_text(
+                        ctx,
+                        planner_reasoning,
+                        resumed_task.react_origin == SERVER_REACT_ORIGIN_DMN ?
+                                LLAMA_COG_COMMAND_ORIGIN_DMN :
+                                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                        LLAMA_COG_LOOP_PHASE_PROPOSE,
+                        source_id,
+                        plan_id,
+                        0,
+                        LLAMA_SELF_COG_ARTIFACT_HIDDEN_THOUGHT);
+                (void) llama_shared_cognitive_context_get_window(ctx, &context_window);
+            }
 
             if (resumed_task.react_origin == SERVER_REACT_ORIGIN_ACTIVE) {
                 switch (react_step.action) {
@@ -7174,9 +7661,9 @@ private:
                         resumed_task.active_trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_ACT;
                         break;
                 }
-                if (!resumed_task.react_last_planner_reasoning.empty()) {
+                if (!planner_reasoning.empty()) {
                     const std::vector<llama_token> reasoning_tokens =
-                            common_tokenize(vocab, resumed_task.react_last_planner_reasoning, true, true);
+                            common_tokenize(vocab, planner_reasoning, true, true);
                     if (!reasoning_tokens.empty()) {
                         (void) llama_cognitive_active_planner_reasoning_note(
                                 ctx,
@@ -7185,30 +7672,19 @@ private:
                                 reasoning_tokens.size());
                     }
                 }
-                json assistant_message = {
-                    {"role", react_step.assistant_msg.role},
-                    {"content", react_step.assistant_msg.content},
-                };
-                if (!react_step.assistant_msg.tool_calls.empty()) {
-                    json tool_calls = json::array();
-                    for (const auto & tool_call : react_step.assistant_msg.tool_calls) {
-                        tool_calls.push_back({
-                            {"name", tool_call.name},
-                            {"arguments", tool_call.arguments},
-                            {"id", tool_call.id},
-                        });
-                    }
-                    assistant_message["tool_calls"] = std::move(tool_calls);
-                }
-                const json extra = {
-                    {"narration", build_active_narration_json(
-                            resumed_task.active_trace,
-                            resumed_task.react_last_planner_reasoning,
-                            react_step.assistant_msg.content,
-                            react_step.tool_xml)},
-                    {"assistant_message", std::move(assistant_message)},
-                };
-                capture_active_loop_provenance("active_final", resumed_task.active_trace, &extra);
+                resumed_task.active_trace.authoritative_turn.valid = true;
+                resumed_task.active_trace.authoritative_turn.action = react_step.action;
+                resumed_task.active_trace.authoritative_turn.thought_context_item_id = context_window.newest_item_id;
+                std::snprintf(
+                        resumed_task.active_trace.authoritative_turn.tool_call_payload,
+                        sizeof(resumed_task.active_trace.authoritative_turn.tool_call_payload),
+                        "%s",
+                        tool_xml_payload.c_str());
+                resumed_task.active_trace.authoritative_turn.status =
+                        react_step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ACT ?
+                                LLAMA_AUTHORITATIVE_TURN_STATUS_WAITING_ON_TOOL :
+                                LLAMA_AUTHORITATIVE_TURN_STATUS_COMPLETED;
+                capture_active_loop_provenance("active_final", resumed_task.active_trace);
 
                 if (react_step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ACT) {
                     int32_t pending_command_id = -1;
@@ -7223,6 +7699,19 @@ private:
                     if (!queued) {
                         send_error(resumed_task, "Failed to queue authoritative ReAct tool dispatch: " + request_error, ERROR_TYPE_SERVER);
                         return;
+                    }
+                    if (!tool_xml_payload.empty()) {
+                        (void) admit_runtime_emit_text(
+                                ctx,
+                                tool_xml_payload,
+                                LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                                LLAMA_COG_LOOP_PHASE_PREPARE_TOOL,
+                                pending_command_id,
+                                resumed_task.active_trace.plan.plan_id,
+                                0,
+                                LLAMA_SELF_COG_ARTIFACT_TOOL_CALL);
+                        (void) llama_shared_cognitive_context_get_window(ctx, &context_window);
+                        resumed_task.active_trace.authoritative_turn.tool_call_context_item_id = context_window.newest_item_id;
                     }
                     {
                         std::lock_guard<std::mutex> lock(runtime_state_mutex);
@@ -7240,8 +7729,36 @@ private:
                     return;
                 }
 
+                if (!trim_ascii_copy(react_step.assistant_msg.content).empty()) {
+                    (void) admit_runtime_emit_text(
+                            ctx,
+                            react_step.assistant_msg.content,
+                            LLAMA_COG_COMMAND_ORIGIN_ACTIVE,
+                            LLAMA_COG_LOOP_PHASE_FINISH,
+                            resumed_task.active_trace.episode_id,
+                            resumed_task.active_trace.plan.plan_id,
+                            0,
+                            LLAMA_SELF_COG_ARTIFACT_VISIBLE_OUTPUT);
+                    (void) llama_shared_cognitive_context_get_window(ctx, &context_window);
+                    resumed_task.active_trace.authoritative_turn.visible_output_context_item_id = context_window.newest_item_id;
+                    if (resumed_task.telegram_dialogue_active) {
+                        append_telegram_dialogue_assistant_turn(
+                                resumed_task.telegram_chat_scope,
+                                react_step.assistant_msg.content,
+                                "telegram_relay_active");
+                        mark_runtime_state_dirty("telegram-dialogue-active-output");
+                    }
+                }
                 slot.generated_text = react_step.assistant_msg.content;
             } else {
+                resumed_task.dmn_trace.authoritative_turn.valid = true;
+                resumed_task.dmn_trace.authoritative_turn.action = react_step.action;
+                resumed_task.dmn_trace.authoritative_turn.thought_context_item_id = context_window.newest_item_id;
+                std::snprintf(
+                        resumed_task.dmn_trace.authoritative_turn.tool_call_payload,
+                        sizeof(resumed_task.dmn_trace.authoritative_turn.tool_call_payload),
+                        "%s",
+                        tool_xml_payload.c_str());
                 if (react_step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ACT) {
                     int32_t pending_command_id = -1;
                     std::string request_error;
@@ -7260,12 +7777,26 @@ private:
                                 LLAMA_COG_TERMINAL_GOVERNANCE_BLOCKED);
                         return;
                     }
+                    if (!tool_xml_payload.empty()) {
+                        (void) admit_runtime_emit_text(
+                                ctx,
+                                tool_xml_payload,
+                                LLAMA_COG_COMMAND_ORIGIN_DMN,
+                                LLAMA_COG_LOOP_PHASE_PREPARE_TOOL,
+                                pending_command_id,
+                                resumed_task.dmn_trace.plan.plan_id,
+                                0,
+                                LLAMA_SELF_COG_ARTIFACT_TOOL_CALL);
+                        (void) llama_shared_cognitive_context_get_window(ctx, &context_window);
+                        resumed_task.dmn_trace.authoritative_turn.tool_call_context_item_id = context_window.newest_item_id;
+                    }
                     resumed_task.dmn_trace.winner_action = LLAMA_DMN_ACTION_INVOKE_TOOL;
+                    resumed_task.dmn_trace.authoritative_turn.status = LLAMA_AUTHORITATIVE_TURN_STATUS_WAITING_ON_TOOL;
                     std::snprintf(
                             resumed_task.dmn_trace.reasoning_text,
                             sizeof(resumed_task.dmn_trace.reasoning_text),
                             "%s",
-                            resumed_task.react_last_planner_reasoning.c_str());
+                            planner_reasoning.c_str());
                     capture_dmn_provenance("dmn_authoritative_final", resumed_task.dmn_trace);
                     {
                         std::lock_guard<std::mutex> lock(runtime_state_mutex);
@@ -7291,13 +7822,16 @@ private:
                             resumed_task.dmn_trace.tick_id,
                             resumed_task.dmn_trace.plan.plan_id,
                             0,
-                            LLAMA_SELF_COG_ARTIFACT_DMN_INTERNAL_WRITE);
+                            LLAMA_SELF_COG_ARTIFACT_INTERNAL_SUMMARY);
+                    (void) llama_shared_cognitive_context_get_window(ctx, &context_window);
+                    resumed_task.dmn_trace.authoritative_turn.visible_output_context_item_id = context_window.newest_item_id;
                     resumed_task.dmn_trace.winner_action = LLAMA_DMN_ACTION_INTERNAL_WRITE;
+                    resumed_task.dmn_trace.authoritative_turn.status = LLAMA_AUTHORITATIVE_TURN_STATUS_COMPLETED;
                     std::snprintf(
                             resumed_task.dmn_trace.reasoning_text,
                             sizeof(resumed_task.dmn_trace.reasoning_text),
                             "%s",
-                            resumed_task.react_last_planner_reasoning.c_str());
+                            planner_reasoning.c_str());
                     capture_dmn_provenance("dmn_authoritative_final", resumed_task.dmn_trace);
                     (void) llama_cognitive_dmn_authoritative_finish(
                             ctx,
@@ -7307,11 +7841,12 @@ private:
                 }
 
                 resumed_task.dmn_trace.winner_action = LLAMA_DMN_ACTION_SILENT;
+                resumed_task.dmn_trace.authoritative_turn.status = LLAMA_AUTHORITATIVE_TURN_STATUS_COMPLETED;
                 std::snprintf(
                         resumed_task.dmn_trace.reasoning_text,
                         sizeof(resumed_task.dmn_trace.reasoning_text),
                         "%s",
-                        resumed_task.react_last_planner_reasoning.c_str());
+                        planner_reasoning.c_str());
                 capture_dmn_provenance("dmn_authoritative_final", resumed_task.dmn_trace);
                 (void) llama_cognitive_dmn_authoritative_finish(
                         ctx,
@@ -7597,10 +8132,15 @@ private:
                             capture_active_loop_provenance("active_preflight", task.active_trace);
                             (void) llama_active_loop_get_last_trace(ctx, &task.active_trace);
 
-                            const bool use_react_step = react_task_ready(task);
+                            if (authoritative_react_control_enabled) {
+                                task.react_enabled = true;
+                                task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
+                            }
+
+                            const bool use_react_step = task.react_enabled;
                             if (use_react_step) {
                                 if (!prepare_react_prompt(task)) {
-                                    send_error(task, "Failed to prepare planner transcript prompt", ERROR_TYPE_SERVER);
+                                    send_error(task, "Failed to prepare authoritative ReAct prompt", ERROR_TYPE_SERVER);
                                     break;
                                 }
                             } else {
@@ -9184,6 +9724,24 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
     try {
         std::vector<server_task> tasks;
+        const std::string telegram_chat_scope = trim_ascii_copy(
+                request_header_value_ci(req, "X-Vicuna-Telegram-Chat-Id"));
+        const int64_t telegram_message_id = parse_int64_header_value(
+                request_header_value_ci(req, "X-Vicuna-Telegram-Message-Id"));
+        const int32_t telegram_history_turn_limit = std::max(
+                0,
+                (int32_t) parse_int64_header_value(
+                        request_header_value_ci(req, "X-Vicuna-Telegram-History-Turns")));
+        const std::vector<common_chat_msg> telegram_transcript_messages =
+                telegram_chat_scope.empty() ? std::vector<common_chat_msg>() :
+                extract_telegram_transcript_messages(req.body);
+        if (!telegram_chat_scope.empty() && !telegram_transcript_messages.empty()) {
+            ctx_server.sync_telegram_dialogue_history(
+                    telegram_chat_scope,
+                    telegram_message_id,
+                    telegram_transcript_messages);
+            ctx_server.mark_runtime_state_dirty("telegram-dialogue-sync");
+        }
 
         const auto & prompt = data.at("prompt");
         // TODO: this log can become very long, put it behind a flag or think about a more compact format
@@ -9220,6 +9778,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             if (!foreground_text.empty()) {
                 task.active_loop_tokens = common_tokenize(ctx_server.vocab, foreground_text, true, true);
             }
+            if (!telegram_chat_scope.empty()) {
+                task.telegram_dialogue_active = true;
+                task.telegram_chat_scope = telegram_chat_scope;
+                task.telegram_message_id = telegram_message_id;
+                task.telegram_history_turn_limit = telegram_history_turn_limit;
+            }
             if (task.foreground_role == LLAMA_SELF_STATE_EVENT_TOOL) {
                 task.foreground_flags |= LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED;
             }
@@ -9229,16 +9793,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
-
-            if (!task.params.stream &&
-                    data.contains("messages") &&
-                    data.at("messages").is_array() &&
-                    res_type != TASK_RESPONSE_TYPE_OAI_CMPL &&
-                    ctx_server.openclaw_fabric.enabled()) {
-                task.react_enabled = true;
-                task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
-                task.react_messages = common_chat_msgs_parse_oaicompat(data.at("messages"));
-            }
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {

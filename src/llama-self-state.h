@@ -64,6 +64,7 @@ struct llama_self_tool_job {
 };
 
 struct llama_self_trace_item {
+    int64_t context_item_id = -1;
     llama_self_state_time_point time_point = {};
     llama_self_state_event event = {};
     std::vector<llama_token> tokens;
@@ -130,6 +131,8 @@ public:
     bool get_tool_state(llama_self_tool_state_info * out_info) const;
     bool get_social_state(llama_self_social_state_info * out_info) const;
     bool get_model_state(llama_self_model_state_info * out_info) const;
+    bool get_self_model_revision(llama_self_model_revision * out_info) const;
+    bool get_emotive_moment_revision(llama_emotive_moment_revision * out_info) const;
     int32_t model_extension_count() const;
     bool get_model_extension(int32_t index, llama_self_model_extension_info * out_info) const;
     bool upsert_model_extension(const llama_self_model_extension_update & update);
@@ -140,6 +143,9 @@ public:
     int32_t trace_count() const;
     int32_t trace_token_count() const;
     bool get_trace_item(int32_t index, llama_self_trace_item_info * out_info) const;
+    bool get_trace_item_tokens(int32_t index, const llama_token ** out_tokens, size_t * out_count) const;
+    bool get_shared_context_item(int32_t index, llama_shared_cognitive_context_item * out_info) const;
+    bool get_shared_context_window(llama_shared_cognitive_context_window * out_info) const;
     bool clear_trace();
     bool replay_trace(const llama_vocab * vocab, int32_t upto_count, int32_t override_channel);
     bool set_updater_program(const llama_self_updater_program & program);
@@ -163,6 +169,7 @@ public:
     static const char * register_name(int32_t register_id);
 
 private:
+    void refresh_self_description_cache() const;
     bool ensure_time_initialized();
     bool apply_time_point(const llama_self_state_time_point & time_point, uint32_t source_mask);
     bool is_valid_time_point(const llama_self_state_time_point & time_point) const;
@@ -258,4 +265,14 @@ private:
     std::vector<llama_self_trace_item> trace_items;
     std::vector<llama_self_trace_item> compacted_trace_items;
     size_t trace_token_count_total = 0;
+    int64_t last_eviction_revision = 0;
+    int32_t eviction_count = 0;
+    int64_t next_context_item_id = 1;
+
+    mutable llama_self_model_revision cached_self_model_revision = {};
+    mutable llama_emotive_moment_revision cached_emotive_moment_revision = {};
+    mutable uint64_t cached_self_model_source_hash = 0;
+    mutable uint64_t cached_emotive_source_hash = 0;
+    mutable int32_t next_self_model_revision_id = 1;
+    mutable int32_t next_emotive_revision_id = 1;
 };

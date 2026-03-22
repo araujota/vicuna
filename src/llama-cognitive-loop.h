@@ -74,7 +74,7 @@ private:
     llama_governance_trace last_governance_trace = {};
     llama_temporal_self_improvement_trace last_temporal_self_trace = {};
     llama_cognitive_host_state host_state = {};
-    bool authoritative_react_control_enabled = false;
+    bool authoritative_react_control_enabled = true;
     bool tool_selection_episode_open = false;
     llama_functional_outcome_snapshot tool_selection_before = {};
     int32_t tool_selection_tool_kind = LLAMA_TOOL_KIND_NONE;
@@ -94,8 +94,9 @@ private:
     llama_telegram_relay_result last_telegram_result = {};
     bool has_last_telegram_result = false;
     llama_dmn_self_model_revision current_self_model_revision = {};
-    llama_dmn_prompt_revision current_prompt_revision = {};
-    uint64_t current_dmn_prompt_input_hash = 0;
+    llama_self_model_revision current_canonical_self_model_revision = {};
+    llama_emotive_moment_revision current_emotive_moment_revision = {};
+    uint64_t current_dmn_input_hash = 0;
     uint64_t temporal_self_next_trigger_us = 0;
     int32_t next_episode_id = 1;
     int32_t next_tick_id = 1;
@@ -103,5 +104,5 @@ private:
     int32_t next_command_id = 1;
     int32_t next_plan_id = 1;
     int32_t next_dmn_self_model_revision_id = 1;
-    int32_t next_dmn_prompt_revision_id = 1;
+    int32_t next_authoritative_turn_id = 1;
 };

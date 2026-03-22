@@ -189,7 +189,7 @@ prompt-eviction behavior instead of living only in side-channel artifacts.
 
 The planner phase now sees the full currently installed tool surface instead of
 an internally preselected singleton. Tool preference should emerge from the
-planner transcript and learned LoRA state, not from server-side hardcoded
+canonical shared-context prompt reconstruction and learned LoRA state, not from server-side hardcoded
 tool-specific routing.
 
 If a selected tool path already has a learned functional/process-functional

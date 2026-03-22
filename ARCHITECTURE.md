@@ -143,10 +143,32 @@ Both loops share state, but they do not share identical triggers or output polic
 - The runtime now exposes a shared bounded tool-loop substrate under both paths:
   explicit phase, terminal reason, tool proposal, observation, and tool-registry
   metadata are public trace surfaces.
-- This is intentionally not "generic ReAct everywhere." The active loop and DMN
-  use different policies on top of the same bounded scaffold.
+- The authoritative decision surface for both paths is now the same hidden
+  ReAct turn contract. CPU policy may validate, reject, expose tools, dispatch,
+  and integrate observations, but it must not substitute its own action or tool
+  choice for an invalid turn.
+- Host-side prompt assembly must rebuild each ReAct turn from the canonical
+  shared cognitive context and current emotive moment instead of maintaining a
+  parallel transcript authority in server memory.
+- Telegram-visible dialogue is now also tracked as its own bounded runtime
+  object separate from the shared cognitive context and separate from the
+  proactive mailbox transport store. When the runtime is answering a Telegram
+  user or preparing a proactive Telegram message, it consumes only the last `N`
+  Telegram turns from that object.
 - Both loops now also assign explicit functional microphases and route the
   functional LoRA bank through the same public activation substrate.
+
+The self-model-to-language path is also explicit:
+
+- self-model registers remain bounded typed state
+- the emotive projection maps those bounded values into valence, arousal, and
+  dominance dimensions
+- lexical realization is deterministic and norm-aligned: the runtime converts
+  the internal unit interval onto a Warriner/Mohammad-style `[1,9]` VAD scale
+  before emitting natural-language emotive text for the ReAct loop
+- DMN-origin Telegram contact remains live through the bridge. Proactive
+  self-emits and explicit Telegram relay actions both append to the Telegram
+  dialogue object so subsequent Telegram-visible behavior is continuity-aware.
 
 The shared functional microphase vocabulary currently includes:
 

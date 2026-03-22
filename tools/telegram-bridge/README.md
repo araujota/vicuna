@@ -114,6 +114,9 @@ even simple allowed commands from forking on a busy workstation.
 - `/start` registers the chat for proactive relay and returns a confirmation
 - plain text user messages are sent to the local Vicuña runtime and the
   assistant reply is sent back to the same Telegram chat
+- forwarded chat requests now include Telegram chat metadata headers so the
+  runtime can maintain its own bounded last-`N` turn dialogue object instead of
+  depending only on bridge-local transcript state
 - supported PDF, DOC, and DOCX messages are converted into plain text before
   they enter the local transcript and are also persisted to Supermemory as both
   a raw file record and an extracted-text record linked by shared metadata
@@ -127,6 +130,10 @@ even simple allowed commands from forking on a busy workstation.
 - proactive runtime self-emits are consumed from `/v1/responses/stream` and
   sent to all registered chats while also being recorded into each chat's local
   transcript window
+- those proactive emits are also represented inside the runtime as broadcast
+  Telegram dialogue turns, so DMN-origin or bridge-origin follow-ups can reuse
+  recent user-facing continuity without treating the SSE mailbox as dialogue
+  memory
 - the bridge intentionally reconnects the proactive SSE stream when the server
   closes an idle stream; it always reconnects with `after=0` and deduplicates
   by retained `response_id`, so retained self-emits are replay-safe across

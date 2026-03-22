@@ -180,22 +180,37 @@ accessible in the rebuilt registry, and publishes the final user-visible
 message. The message should include any required manual follow-up such as API
 keys or secrets copied from Codex's `Manual requirements:` line.
 
-### DMN Self-Model Translation and Telegram Relay
+### Shared Context, Emotive Moment, and DMN Seeding
 
-The DMN no longer seeds itself from the old fixed-width candidate/seed path.
-Instead, each admitted tick compiles the current hidden self-model state into a
-bounded `llama_dmn_prompt_revision` and uses that translated natural-language
-workspace as the prompt substrate for the same planner/tool loop used by active
-engagement.
+The runtime now treats foreground and DMN cognition as one authoritative ReAct
+surface over one shared cognitive context. The DMN no longer seeds itself from
+its own prompt-only translation layer. Instead, each admitted tick reads:
 
-That translation is explicit and inspectable:
+- the current typed `llama_self_model_revision`
+- the deterministic natural-language `llama_emotive_moment_revision`
+- the current `llama_shared_cognitive_context_window`
 
-- `llama_dmn_self_model_revision` tracks the hashed hidden-state inputs that
-  produced the current reportable view
-- `llama_dmn_prompt_revision` stores the rendered natural-language prompt,
-  macro outline, concept list, and user-contact/tool affinities
-- every material self-model update forces a new prompt revision before the next
-  DMN phase begins
+`server_context` derives each temporary planner prompt from that canonical
+context instead of treating task-local messages as their own authority. Hidden
+thoughts, tool calls, tool observations, visible outputs, emotive moments, and
+context evictions are all admitted back into the same bounded context tape.
+There is no longer a serialized server-side ReAct transcript shadowing that
+state; each planner prompt is rebuilt directly from the canonical shared
+context items plus the current emotive moment.
+
+Telegram-visible dialogue is now tracked separately from that internal context.
+`server_context` keeps a bounded runtime-owned Telegram dialogue history keyed
+by chat scope plus a broadcast scope for proactive emits. That object is not a
+mailbox transport cache and not a substitute for shared cognitive context. It
+exists so Telegram-origin replies and DMN-origin Telegram emits can reuse only
+the last `N` user-facing turns when continuity matters.
+
+The emotive moment surface is also now lexicalized against VAD-style norms
+instead of a small hand-picked mood table. Internally the runtime keeps
+bounded `[0,1]` affective registers, projects them onto a Warriner-style
+`[1,9]` valence/arousal/dominance scale for language realization, and emits a
+deterministic natural-language description that includes those norm-aligned
+scores together with social closeness, tension, and goal pressure.
 
 DMN user contact now routes through the typed `LLAMA_TOOL_KIND_TELEGRAM_RELAY`
 tool instead of `LLAMA_COG_COMMAND_EMIT_BACKGROUND`. `server_context` handles
@@ -203,6 +218,12 @@ that tool locally by publishing the requested text to the proactive mailbox,
 admitting the emitted text back into self-state, and then submitting a typed
 `llama_telegram_relay_result` so the DMN loop can continue without being
 treated as a foreground assistant reply.
+
+The bridge now tags Telegram-origin `/v1/chat/completions` requests with chat
+metadata headers, and `server_context` absorbs the bounded Telegram transcript
+window into runtime-owned dialogue history before preparing the next
+authoritative ReAct step. That keeps runtime-side Telegram dialogue continuity
+alive across active replies, DMN emits, and runtime snapshot restore.
 
 Active and DMN continuation are no longer governed by the old tiny hardcoded
 runner ceilings. The runner status surfaces still expose `steps_taken` and
@@ -234,7 +255,9 @@ This is why active and DMN runners now stop in `LLAMA_COG_LOOP_PHASE_PROPOSE`
 with no pending command when authoritative mode is enabled: the cognitive loop
 is yielding to the planner/tool LoRA stream to write the authoritative control
 step, and the CPU side resumes responsibility only for validation, dispatch,
-and observation integration.
+and observation integration. The validated step is then admitted into the
+canonical shared context as hidden thought, tool call, tool observation, or
+visible output instead of surviving only as task-local transcript state.
 
 ### ReAct Tool-Call XML Contract
 
@@ -366,16 +389,12 @@ Current event kinds are:
 - `dmn_tick` for admitted DMN work, including counterfactual, governance, and
   remediation summaries plus the rendered DMN prompt narration
 
-Narration and exact tool-call capture now follow this policy:
+Hidden-thought capture and exact tool-call capture now follow this policy:
 
-- active-loop provenance records plan detail, candidate detail, and hidden
-  planner reasoning when available; that reasoning is retained internally in
-  the continuing ReAct transcript via `reasoning_content`, but the outward
-  assistant response is scrubbed to visible answer text only
-- if the active model did not emit hidden planner reasoning, the server records
-  a deterministic plan-based fallback narration instead
-- DMN provenance records the translated prompt revision, concept frames, plan
-  detail, candidate detail, and a resolved hidden DMN reasoning trace
+- active-loop provenance records plan detail and hidden thought when available;
+  outward assistant response remains scrubbed to visible answer text only
+- DMN provenance records mathematical pressure state, plan detail, and a
+  resolved hidden DMN reasoning trace
 - DMN hidden reasoning is also admitted as a cognitive artifact in the
   counterfactual channel so later runtime context can reuse it without routing
   it to user-visible outputs

@@ -192,8 +192,9 @@ async function broadcastToChats(text) {
   );
 }
 
-async function callVicunaForTelegramMessage(chatId) {
+async function callVicunaForTelegramMessage(chatId, messageId = 0) {
   const transcript = getChatTranscript(state, chatId);
+  const historyTurns = Math.max(1, Math.ceil(transcript.length / 2));
   const baseSystemPrompt = 'You are replying to a Telegram user through middleware. Keep responses clear and concise unless the user asks for depth. Maintain continuity across the provided transcript. When the user explicitly asks to search the web or needs fresh current information, prefer the web search tool if the runtime makes it available. Use direct command-execution tools only when appropriate instead of pretending a command ran.';
 
   async function requestCompletion(extraSystemMessages = []) {
@@ -207,7 +208,12 @@ async function callVicunaForTelegramMessage(chatId) {
     ];
     const response = await fetch(`${env.vicunaBaseUrl}/v1/chat/completions`, {
       method: 'POST',
-      headers: vicunaHeaders(),
+      headers: {
+        ...vicunaHeaders(),
+        'X-Vicuna-Telegram-Chat-Id': String(chatId),
+        'X-Vicuna-Telegram-Message-Id': String(messageId || 0),
+        'X-Vicuna-Telegram-History-Turns': String(historyTurns),
+      },
       body: JSON.stringify({
         model: env.model,
         temperature: 0.2,
@@ -319,7 +325,7 @@ async function handleTelegramMessage(message) {
     await persistState();
     log('appended Telegram document user turn', transcriptSummary(message.chat.id));
 
-    const reply = await callVicunaForTelegramMessage(message.chat.id);
+    const reply = await callVicunaForTelegramMessage(message.chat.id, message.message_id);
     const finalReply = reply || 'The runtime returned an empty response.';
     state = appendChatTranscriptMessage(
       state,
@@ -358,7 +364,7 @@ async function handleTelegramMessage(message) {
   await persistState();
   log('appended Telegram user turn', transcriptSummary(message.chat.id));
 
-  const reply = await callVicunaForTelegramMessage(message.chat.id);
+  const reply = await callVicunaForTelegramMessage(message.chat.id, message.message_id);
 
   const finalReply = reply || 'The runtime returned an empty response.';
   state = appendChatTranscriptMessage(
