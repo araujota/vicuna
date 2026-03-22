@@ -2916,7 +2916,9 @@ private:
                     "Produce one authoritative hidden DMN ReAct control step.\n"
                     "The assistant reply is prefilled with an already-open hidden reasoning block that starts with:\n"
                     "<think>\nThought: "
-                    "Continue that Thought line, then add a new line with exactly:\n"
+                    "Continue that Thought line in at most two short sentences and roughly 40 words total. "
+                    "Do not narrate recall attempts, filler, or stream-of-consciousness. "
+                    "Then add a new line with exactly:\n"
                     "Action: act|internal_write|wait\n"
                     "Then close the block with </think>.\n"
                     "If Action is act, emit a tool-call XML block immediately after the hidden reasoning. "
@@ -2939,7 +2941,9 @@ private:
                     "Produce one authoritative hidden active ReAct control step.\n"
                     "The assistant reply is prefilled with an already-open hidden reasoning block that starts with:\n"
                     "<think>\nThought: "
-                    "Continue that Thought line, then add a new line with exactly:\n"
+                    "Continue that Thought line in at most two short sentences and roughly 40 words total. "
+                    "Do not narrate recall attempts, filler, or stream-of-consciousness. "
+                    "Then add a new line with exactly:\n"
                     "Action: answer|ask|act|wait\n"
                     "Then close the block with </think>.\n"
                     "If Action is act, emit a tool-call XML block immediately after the hidden reasoning. "
@@ -4590,12 +4594,19 @@ static bool telegram_dialogue_history_from_json(
             }
 
             if (role == "user") {
-                vicuna_telegram_dialogue_turn turn = {};
-                turn.turn_id = telegram_dialogue_history.next_turn_id++;
-                turn.chat_scope = normalized_scope;
-                turn.user_text = content;
-                turn.updated_at_ms = now_ms;
-                rebuilt_turns.push_back(std::move(turn));
+                if (!rebuilt_turns.empty() &&
+                    rebuilt_turns.back().assistant_text.empty() &&
+                    !rebuilt_turns.back().user_text.empty()) {
+                    rebuilt_turns.back().user_text = content;
+                    rebuilt_turns.back().updated_at_ms = now_ms;
+                } else {
+                    vicuna_telegram_dialogue_turn turn = {};
+                    turn.turn_id = telegram_dialogue_history.next_turn_id++;
+                    turn.chat_scope = normalized_scope;
+                    turn.user_text = content;
+                    turn.updated_at_ms = now_ms;
+                    rebuilt_turns.push_back(std::move(turn));
+                }
             } else if (role == "assistant") {
                 if (!rebuilt_turns.empty() &&
                     rebuilt_turns.back().assistant_text.empty() &&
