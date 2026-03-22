@@ -1433,7 +1433,7 @@ static json telegram_relay_request_to_json(const llama_telegram_relay_request & 
 
 static json telegram_ask_options_request_to_json(const llama_telegram_ask_options_request & request) {
     json options = json::array();
-    const int32_t option_count = std::clamp(request.option_count, 0, LLAMA_TELEGRAM_ASK_MAX_OPTIONS);
+    const int32_t option_count = std::clamp(request.option_count, 0, (int32_t) LLAMA_TELEGRAM_ASK_MAX_OPTIONS);
     for (int32_t i = 0; i < option_count; ++i) {
         options.push_back(bounded_cstr_to_string(request.options[i].label));
     }
@@ -6235,7 +6235,7 @@ static bool telegram_dialogue_history_from_json(
                 const std::string question = trim_ascii_copy(request.question);
                 const std::string chat_scope = trim_ascii_copy(request.chat_scope);
                 std::vector<std::string> options;
-                const int32_t option_count = std::clamp(request.option_count, 0, LLAMA_TELEGRAM_ASK_MAX_OPTIONS);
+                const int32_t option_count = std::clamp(request.option_count, 0, (int32_t) LLAMA_TELEGRAM_ASK_MAX_OPTIONS);
                 for (int32_t i = 0; i < option_count; ++i) {
                     const std::string label = trim_ascii_copy(request.options[i].label);
                     if (!label.empty()) {
