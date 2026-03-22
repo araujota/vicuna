@@ -3081,16 +3081,16 @@ private:
                 }
             }
         }
-        if (out_msg->reasoning_content.empty()) {
-            std::string reasoning_text;
-            std::string visible_text;
-            split_hidden_reasoning_text(parse_text, &reasoning_text, &visible_text);
-            if (!reasoning_text.empty()) {
-                out_msg->role = "assistant";
-                out_msg->reasoning_content = std::move(reasoning_text);
-                if (out_msg->tool_calls.empty()) {
-                    out_msg->content = std::move(visible_text);
-                }
+        std::string reasoning_text;
+        std::string visible_text;
+        split_hidden_reasoning_text(parse_text, &reasoning_text, &visible_text);
+        if (!reasoning_text.empty()) {
+            out_msg->role = "assistant";
+            if (out_msg->reasoning_content.empty()) {
+                out_msg->reasoning_content = reasoning_text;
+            }
+            if (out_msg->tool_calls.empty() && trim_ascii_copy(out_msg->content).empty() && !visible_text.empty()) {
+                out_msg->content = std::move(visible_text);
             }
         }
         if (out_tool_xml) {
