@@ -2904,7 +2904,6 @@ private:
         phase_system.role = "system";
         const std::string emotive = current_emotive_moment_text();
         const std::string context_summary = shared_context_summary_text();
-        const bool active_initial_tool_call_required = server_task_active_requires_initial_tool_call(task);
         if (task.react_origin == SERVER_REACT_ORIGIN_DMN) {
             phase_system.content =
                     std::string(
@@ -2943,25 +2942,22 @@ private:
                     "If Action is act, emit exactly one tool-call XML block immediately after the hidden reasoning. "
                     "If Action is answer or ask, put only the user-visible reply in visible assistant content. "
                     "If Action is wait, leave visible assistant content empty. "
-                    "If the latest user turn requests current, live, dated, or otherwise external facts and a relevant external tool is available, choose act and use that tool instead of disclaiming lack of access. ") +
-                    (active_initial_tool_call_required ?
-                            "This is the first active control step for a live user turn. "
-                            "Your Action line must be exactly:\n"
-                            "Action: act\n"
-                            "After that, close </think> and emit exactly one tool-call XML block. "
-                            "Do not emit visible assistant text. Do not answer, ask, wait, or conclude anything yet. "
-                            "The final answer must wait for a tool observation.\n" :
-                            "Your Action line must be exactly one of:\n"
-                            "Action: answer|ask|act|wait\n") +
-                    (!active_initial_tool_call_required && task.react_resuming_from_tool_result ?
-                            "Because a tool observation is already present, any answer or question must be grounded in that observation. "
-                            "If you still need more evidence, choose Action: act and emit exactly one further tool call.\n" :
-                            "") +
+                    "Your Action line must be exactly one of:\n"
+                    "Action: answer|ask|act|wait\n"
+                    "Only choose Action: answer or Action: ask if the needed content is already grounded in canonical shared context, "
+                    "Telegram dialogue memory, or prior admitted tool observations. "
+                    "Otherwise, if any uncertainty remains and a relevant tool is available, choose Action: act and emit exactly one tool-call XML block. "
+                    "For current, live, dated, external, runtime-state, repository-state, or otherwise mutable facts, strongly prefer Action: act unless the exact needed answer is already present in canonical context. "
+                    "Do not disclaim lack of access when a relevant tool is available. "
+                    "Do not answer from unsupported internal recall or habit memory.\n") +
                     (task.react_resuming_from_tool_result ?
-                            "A completed tool observation was just admitted. Based only on that tool observation, choose act, answer, or ask. "
-                            "Any answer or question must synthesize the observed tool results rather than unsupported internal recall. "
+                            "A completed tool observation was just admitted. Based on that observation together with other admitted canonical context, choose act, answer, or ask. "
+                            "Any answer or question must synthesize the observed tool results together with other admitted canonical context rather than unsupported internal recall. "
                             "If the observation is insufficient, emit exactly one further tool call instead of guessing. "
                             "Do not choose wait unless another already-issued external tool is still outstanding.\n" :
+                            "If the latest user turn requests current, live, dated, or otherwise external facts and a relevant tool is available, choose act unless the exact needed answer is already present in canonical context.\n") +
+                    (!task.react_resuming_from_tool_result ?
+                            "If the canonical context already contains the exact answer, answer directly and keep the answer grounded in that admitted context.\n" :
                             "") +
                     "Do not invent any parallel transcript or selector policy.\n\n" +
                     (emotive.empty() ? std::string() : "Current emotive moment: " + emotive + "\n") +
@@ -2982,7 +2978,6 @@ private:
         inputs.tools = task.react_tools;
         inputs.tool_choice =
                 task.react_tools.empty() ? COMMON_CHAT_TOOL_CHOICE_NONE :
-                active_initial_tool_call_required ? COMMON_CHAT_TOOL_CHOICE_REQUIRED :
                 COMMON_CHAT_TOOL_CHOICE_AUTO;
         inputs.use_jinja = chat_params.use_jinja;
         inputs.parallel_tool_calls = false;
@@ -3283,21 +3278,10 @@ private:
                 out_step->error = "active turns may not choose internal_write";
                 return false;
             }
-            if (server_task_active_requires_initial_tool_call(task) &&
-                    out_step->action != LLAMA_AUTHORITATIVE_REACT_ACTION_ACT) {
-                out_step->error = "active turns must emit exactly one tool call before any conclusion";
-                return false;
-            }
             if ((out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER ||
                         out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ASK) &&
                     trim_ascii_copy(out_step->assistant_msg.content).empty()) {
                 out_step->error = "answer and ask actions require visible assistant content";
-                return false;
-            }
-            if ((out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER ||
-                        out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ASK) &&
-                    !server_task_active_allows_grounded_conclusion(task)) {
-                out_step->error = "active answers and questions are only valid after a tool observation";
                 return false;
             }
             if (out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT &&
