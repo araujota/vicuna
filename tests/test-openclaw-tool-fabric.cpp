@@ -277,6 +277,44 @@ int main() {
         return 1;
     }
 
+    const std::string trailing_tool_xml =
+            "<think>\n"
+            "Thought: I should inspect the filesystem first.\n"
+            "</think>\n"
+            "<vicuna_tool_call tool=\"exec\">\n"
+            "  <arg name=\"command\" type=\"string\">pwd</arg>\n"
+            "</vicuna_tool_call>\n"
+            "Visible trailing content that should not remain authoritative.";
+    if (!expect(fabric.recover_tool_call_xml(trailing_tool_xml, &parsed, &exec_only, &error), error.c_str())) {
+        return 1;
+    }
+    if (!expect(parsed.message.tool_calls.size() == 1 &&
+                parsed.message.tool_calls[0].name == "exec" &&
+                parsed.message.tool_calls[0].arguments == "{\"command\":\"pwd\"}",
+                "expected recovery to preserve a strict XML tool call when trailing content is emitted")) {
+        return 1;
+    }
+
+    const std::string partial_tool_xml =
+            "<think>\n"
+            "Thought: I should inspect the filesystem first.\n"
+            "</think>\n"
+            "<vicuna_tool_call tool=\"exec\">\n"
+            "  <arg name=\"command\" type=\"string\">pwd</arg>\n";
+    if (!expect(fabric.recover_tool_call_xml(partial_tool_xml, &parsed, &exec_only, &error), error.c_str())) {
+        return 1;
+    }
+    if (!expect(parsed.message.tool_calls.size() == 1 &&
+                parsed.message.tool_calls[0].name == "exec" &&
+                parsed.message.tool_calls[0].arguments == "{\"command\":\"pwd\"}",
+                "expected recovery to salvage the emitted tool call from a partial XML block")) {
+        return 1;
+    }
+    if (!expect(parsed.message.reasoning_content == "Thought: I should inspect the filesystem first.",
+                "expected recovery to preserve hidden reasoning while salvaging partial XML")) {
+        return 1;
+    }
+
     const std::string stripped = fabric.strip_tool_call_xml_markup(valid_tool_xml);
     if (!expect(stripped == "I should inspect the filesystem first.",
                 "expected XML markup stripping to preserve only visible prefix")) {

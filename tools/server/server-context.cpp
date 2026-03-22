@@ -3001,6 +3001,21 @@ private:
                 return !out_msg->empty();
             }
 
+            if (openclaw_fabric.recover_tool_call_xml(
+                        parse_text,
+                        &parsed,
+                        selected_spec_indexes.empty() ? nullptr : &selected_spec_indexes,
+                        &xml_error)) {
+                *out_msg = parsed.message;
+                if (out_tool_xml) {
+                    *out_tool_xml = parsed.captured_tool_xml;
+                }
+                if (out_planner_reasoning) {
+                    *out_planner_reasoning = parsed.captured_planner_reasoning;
+                }
+                return !out_msg->empty();
+            }
+
             const std::string sanitized = openclaw_fabric.strip_tool_call_xml_markup(parse_text);
             if (sanitized != trim_ascii_copy(parse_text)) {
                 std::string reasoning_text;
@@ -5445,7 +5460,12 @@ static bool telegram_dialogue_history_from_json(
             buffer << in.rdbuf();
             const json snapshot = json::parse(buffer.str());
             const int snapshot_version = json_value(snapshot, "version", 0);
-            if (snapshot_version != 1 && snapshot_version != 2 && snapshot_version != 3 && snapshot_version != 4 && snapshot_version != 5) {
+            if (snapshot_version != 1 &&
+                    snapshot_version != 2 &&
+                    snapshot_version != 3 &&
+                    snapshot_version != 4 &&
+                    snapshot_version != 5 &&
+                    snapshot_version != 6) {
                 throw std::runtime_error("unsupported runtime snapshot version");
             }
 

@@ -212,6 +212,13 @@ bounded `[0,1]` affective registers, projects them onto a Warriner-style
 deterministic natural-language description that includes those norm-aligned
 scores together with social closeness, tension, and goal pressure.
 
+Authoritative ReAct parsing is also hardened around emitted structure. When the
+model emits a `<vicuna_tool_call ...>` block with trailing chatter or a partial
+closing tag, the server now salvages the emitted tool-call structure and
+routes it through the normal typed tool-dispatch validation path instead of
+downgrading it into reasoning-only text and failing before action
+classification.
+
 DMN user contact now routes through the typed `LLAMA_TOOL_KIND_TELEGRAM_RELAY`
 tool instead of `LLAMA_COG_COMMAND_EMIT_BACKGROUND`. `server_context` handles
 that tool locally by publishing the requested text to the proactive mailbox,
@@ -224,6 +231,11 @@ metadata headers, and `server_context` absorbs the bounded Telegram transcript
 window into runtime-owned dialogue history before preparing the next
 authoritative ReAct step. That keeps runtime-side Telegram dialogue continuity
 alive across active replies, DMN emits, and runtime snapshot restore.
+
+Runtime snapshot restore now accepts snapshot schema version `6`, which is the
+first version that persists the Telegram dialogue object. That keeps bounded
+Telegram continuity available after a service restart instead of forcing the
+dialogue object to repopulate only from fresh bridge traffic.
 
 Managed deployment now also owns one explicit reasoning-capable GGUF base model
 instead of pointing at an Ollama blob. The launcher defaults to

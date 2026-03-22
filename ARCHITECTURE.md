@@ -155,6 +155,11 @@ Both loops share state, but they do not share identical triggers or output polic
   proactive mailbox transport store. When the runtime is answering a Telegram
   user or preparing a proactive Telegram message, it consumes only the last `N`
   Telegram turns from that object.
+- Authoritative ReAct parsing treats emitted tool structure as first-class
+  evidence. If the model emits a `<vicuna_tool_call ...>` block with trailing
+  chatter or a partial close, the runtime salvages that emitted structure and
+  routes it through the same typed tool-dispatch validation path instead of
+  falling back to CPU-side action selection or discarding the tool intent.
 - Both loops now also assign explicit functional microphases and route the
   functional LoRA bank through the same public activation substrate.
 
@@ -169,6 +174,9 @@ The self-model-to-language path is also explicit:
 - DMN-origin Telegram contact remains live through the bridge. Proactive
   self-emits and explicit Telegram relay actions both append to the Telegram
   dialogue object so subsequent Telegram-visible behavior is continuity-aware.
+- runtime snapshot schema version `6` now restores that Telegram dialogue
+  object on boot, so Telegram-visible continuity survives restart instead of
+  waiting for the bridge to repopulate it from fresh traffic.
 - the managed runtime base model is now owned as an explicit local GGUF plus a
   repo-owned Jinja template, not as an Ollama blob indirection; the current
   managed default is `DeepSeek-R1-Distill-Llama-8B-Q6_K.gguf` with DeepSeek

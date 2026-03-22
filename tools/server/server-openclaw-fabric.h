@@ -83,6 +83,11 @@ public:
             server_openclaw_parsed_tool_call * out_parsed,
             const std::vector<int32_t> * spec_indexes = nullptr,
             std::string * out_error = nullptr) const;
+    bool recover_tool_call_xml(
+            const std::string & text,
+            server_openclaw_parsed_tool_call * out_parsed,
+            const std::vector<int32_t> * spec_indexes = nullptr,
+            std::string * out_error = nullptr) const;
     std::string strip_tool_call_xml_markup(const std::string & text) const;
     const server_openclaw_capability_runtime * capability_by_spec_index(int32_t spec_index) const;
     const server_openclaw_capability_runtime * capability_by_tool_name(const std::string & tool_name) const;

@@ -622,6 +622,158 @@ std::string join_payload(const std::string & prefix, const std::string & xml_blo
     return trimmed_prefix + "\n" + xml_block;
 }
 
+const server_openclaw_xml_tool_contract * find_contract_by_tool_name(
+        const std::vector<server_openclaw_xml_tool_contract> & contracts,
+        const std::string & tool_name) {
+    for (const auto & contract : contracts) {
+        if (contract.tool_name == tool_name) {
+            return &contract;
+        }
+    }
+    return nullptr;
+}
+
+bool extract_tool_call_xml_region(
+        const std::string & text,
+        size_t * out_root_start,
+        size_t * out_root_end,
+        bool * out_has_closing_tag,
+        std::string * out_error) {
+    if (!out_root_start || !out_root_end || !out_has_closing_tag) {
+        set_error(out_error, "tool-call XML region extraction requires output storage");
+        return false;
+    }
+
+    const size_t root_start = text.find(std::string("<") + SERVER_OPENCLAW_XML_ROOT);
+    if (root_start == std::string::npos) {
+        set_error(out_error, "tool-call XML root was not found");
+        return false;
+    }
+
+    const std::string root_close = std::string("</") + SERVER_OPENCLAW_XML_ROOT + ">";
+    const size_t root_end = text.find(root_close, root_start);
+    *out_root_start = root_start;
+    if (root_end == std::string::npos) {
+        *out_root_end = text.size();
+        *out_has_closing_tag = false;
+        return true;
+    }
+
+    *out_root_end = root_end + root_close.size();
+    *out_has_closing_tag = true;
+    return true;
+}
+
+bool recover_partial_tool_call_message(
+        const std::string & raw_prefix,
+        const std::string & xml_block,
+        const std::vector<server_openclaw_xml_tool_contract> & contracts,
+        server_openclaw_parsed_tool_call * out_parsed,
+        std::string * out_error) {
+    if (!out_parsed) {
+        set_error(out_error, "tool-call XML recovery requires output storage");
+        return false;
+    }
+
+    size_t root_pos = 0;
+    std::string root_name;
+    std::map<std::string, std::string> root_attrs;
+    if (!parse_xml_start_tag(xml_block, &root_pos, &root_name, &root_attrs) || root_name != SERVER_OPENCLAW_XML_ROOT) {
+        set_error(out_error, "partial tool-call XML recovery requires a valid root start tag");
+        return false;
+    }
+
+    const auto root_tool_it = root_attrs.find("tool");
+    if (root_tool_it == root_attrs.end()) {
+        set_error(out_error, "partial tool-call XML recovery requires a quoted tool attribute");
+        return false;
+    }
+
+    const std::string tool_name = trim_ascii_copy_local(root_tool_it->second);
+    const server_openclaw_xml_tool_contract * contract = find_contract_by_tool_name(contracts, tool_name);
+    if (!contract) {
+        set_error(out_error, "partial tool-call XML selected an unknown or disallowed tool: " + tool_name);
+        return false;
+    }
+
+    std::map<std::string, server_openclaw_xml_arg_requirement> arg_requirements;
+    for (const auto & arg : contract->args) {
+        arg_requirements[arg.name] = arg;
+    }
+
+    nlohmann::json arguments = nlohmann::json::object();
+    std::set<std::string> seen_args;
+    size_t search_pos = root_pos;
+    while (true) {
+        const size_t arg_start = xml_block.find(std::string("<") + SERVER_OPENCLAW_XML_ARG, search_pos);
+        if (arg_start == std::string::npos) {
+            break;
+        }
+        const size_t arg_close = xml_block.find(">", arg_start);
+        if (arg_close == std::string::npos) {
+            break;
+        }
+
+        const std::string arg_start_tag = xml_block.substr(arg_start, arg_close - arg_start + 1);
+        size_t arg_pos = 0;
+        std::string arg_name_tag;
+        std::map<std::string, std::string> arg_attrs;
+        if (!parse_xml_start_tag(arg_start_tag, &arg_pos, &arg_name_tag, &arg_attrs) || arg_name_tag != SERVER_OPENCLAW_XML_ARG) {
+            search_pos = arg_close + 1;
+            continue;
+        }
+
+        const auto arg_name_it = arg_attrs.find("name");
+        const auto arg_type_it = arg_attrs.find("type");
+        if (arg_name_it == arg_attrs.end() || arg_type_it == arg_attrs.end()) {
+            search_pos = arg_close + 1;
+            continue;
+        }
+
+        const std::string arg_name = trim_ascii_copy_local(arg_name_it->second);
+        const std::string arg_type_label = trim_ascii_copy_local(arg_type_it->second);
+        const auto requirement_it = arg_requirements.find(arg_name);
+        const uint32_t declared_type = xml_type_mask_from_label(arg_type_label);
+        if (arg_name.empty() ||
+                seen_args.count(arg_name) > 0 ||
+                requirement_it == arg_requirements.end() ||
+                declared_type == 0 ||
+                (requirement_it->second.allowed_types & declared_type) == 0) {
+            search_pos = arg_close + 1;
+            continue;
+        }
+
+        const size_t value_start = arg_close + 1;
+        const size_t value_end = xml_block.find(std::string("</") + SERVER_OPENCLAW_XML_ARG + ">", value_start);
+        if (value_end == std::string::npos) {
+            break;
+        }
+
+        nlohmann::json parsed_value;
+        std::string ignored_error;
+        if (parse_arg_value_json(xml_block.substr(value_start, value_end - value_start), declared_type, &parsed_value, &ignored_error)) {
+            arguments[arg_name] = std::move(parsed_value);
+            seen_args.insert(arg_name);
+        }
+        search_pos = value_end + std::strlen("</arg>");
+    }
+
+    out_parsed->message = {};
+    out_parsed->message.role = "assistant";
+    std::string planner_reasoning;
+    std::string visible_prefix;
+    extract_hidden_reasoning_and_visible_text(raw_prefix, &planner_reasoning, &visible_prefix);
+    out_parsed->message.content = visible_prefix;
+    out_parsed->message.reasoning_content = planner_reasoning;
+    out_parsed->message.tool_calls = { common_chat_tool_call { tool_name, arguments.dump(), "" } };
+    out_parsed->visible_prefix = visible_prefix;
+    out_parsed->xml_block = xml_block;
+    out_parsed->captured_planner_reasoning = planner_reasoning;
+    out_parsed->captured_tool_xml = xml_block;
+    out_parsed->captured_payload = join_payload(raw_prefix, xml_block);
+    return true;
+}
+
 server_openclaw_capability_runtime make_runtime(
         const openclaw_tool_capability_descriptor & descriptor,
         server_openclaw_dispatch_backend backend) {
@@ -1140,17 +1292,16 @@ bool server_openclaw_fabric::parse_tool_call_xml(
         return false;
     }
 
-    const size_t root_start = text.find(std::string("<") + SERVER_OPENCLAW_XML_ROOT);
-    if (root_start == std::string::npos) {
-        set_error(out_error, "tool-call XML root was not found");
+    size_t root_start = 0;
+    size_t root_close_end = 0;
+    bool has_closing_tag = false;
+    if (!extract_tool_call_xml_region(text, &root_start, &root_close_end, &has_closing_tag, out_error)) {
         return false;
     }
-    const size_t root_end = text.rfind(std::string("</") + SERVER_OPENCLAW_XML_ROOT + ">");
-    if (root_end == std::string::npos || root_end < root_start) {
+    if (!has_closing_tag) {
         set_error(out_error, "tool-call XML closing tag was not found");
         return false;
     }
-    const size_t root_close_end = root_end + std::strlen(SERVER_OPENCLAW_XML_ROOT) + 3;
     const std::string raw_prefix = trim_ascii_copy_local(text.substr(0, root_start));
     const std::string xml_block = text.substr(root_start, root_close_end - root_start);
     if (!trim_ascii_copy_local(text.substr(root_close_end)).empty()) {
@@ -1172,13 +1323,7 @@ bool server_openclaw_fabric::parse_tool_call_xml(
     }
     const std::string tool_name = trim_ascii_copy_local(root_tool_it->second);
 
-    const server_openclaw_xml_tool_contract * contract = nullptr;
-    for (const auto & candidate : contracts) {
-        if (candidate.tool_name == tool_name) {
-            contract = &candidate;
-            break;
-        }
-    }
+    const server_openclaw_xml_tool_contract * contract = find_contract_by_tool_name(contracts, tool_name);
     if (!contract) {
         set_error(out_error, "tool-call XML selected an unknown or disallowed tool: " + tool_name);
         return false;
@@ -1296,6 +1441,55 @@ bool server_openclaw_fabric::parse_tool_call_xml(
     out_parsed->captured_planner_reasoning = planner_reasoning;
     out_parsed->captured_tool_xml = xml_block;
     out_parsed->captured_payload = join_payload(raw_prefix, xml_block);
+    return true;
+}
+
+bool server_openclaw_fabric::recover_tool_call_xml(
+        const std::string & text,
+        server_openclaw_parsed_tool_call * out_parsed,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_parsed) {
+        set_error(out_error, "tool-call XML recovery requires output storage");
+        return false;
+    }
+
+    std::vector<server_openclaw_xml_tool_contract> contracts;
+    if (!build_xml_tool_contracts(&contracts, spec_indexes, out_error)) {
+        return false;
+    }
+    if (contracts.empty()) {
+        set_error(out_error, "tool-call XML recovery requires at least one available contract");
+        return false;
+    }
+
+    size_t root_start = 0;
+    size_t root_close_end = 0;
+    bool has_closing_tag = false;
+    if (!extract_tool_call_xml_region(text, &root_start, &root_close_end, &has_closing_tag, out_error)) {
+        return false;
+    }
+
+    const std::string raw_prefix = trim_ascii_copy_local(text.substr(0, root_start));
+    const std::string xml_block = trim_ascii_copy_local(text.substr(root_start, root_close_end - root_start));
+    if (xml_block.empty()) {
+        set_error(out_error, "tool-call XML recovery found an empty XML block");
+        return false;
+    }
+
+    if (has_closing_tag) {
+        server_openclaw_parsed_tool_call strict = {};
+        std::string strict_error;
+        if (parse_tool_call_xml(join_payload(raw_prefix, xml_block), &strict, spec_indexes, &strict_error)) {
+            *out_parsed = std::move(strict);
+            return true;
+        }
+    }
+
+    if (!recover_partial_tool_call_message(raw_prefix, xml_block, contracts, out_parsed, out_error)) {
+        return false;
+    }
+
     return true;
 }
 
