@@ -69,6 +69,14 @@ int main() {
                 "expected active completion task with a prepared ReAct prompt to be ReAct-ready")) {
         return 1;
     }
+    if (!expect(server_task_active_requires_initial_tool_call(active_react_task),
+                "expected prepared active user turn to require an initial tool call")) {
+        return 1;
+    }
+    if (!expect(!server_task_active_allows_grounded_conclusion(active_react_task),
+                "expected initial active user turn to reject terminal conclusions before a tool observation")) {
+        return 1;
+    }
 
     server_task inactive_active_task(SERVER_TASK_TYPE_COMPLETION);
     if (!expect(!server_task_should_prepare_authoritative_react(inactive_active_task),
@@ -89,6 +97,28 @@ int main() {
     dmn_react_task.react_assistant_prefill = "<think>\nThought: ";
     if (!expect(server_task_has_authoritative_react_surface(dmn_react_task),
                 "expected DMN completion task with a prepared ReAct prompt to be ReAct-ready")) {
+        return 1;
+    }
+    if (!expect(!server_task_active_requires_initial_tool_call(dmn_react_task),
+                "expected DMN turn to remain outside active initial-tool-call policy")) {
+        return 1;
+    }
+    if (!expect(!server_task_active_allows_grounded_conclusion(dmn_react_task),
+                "expected DMN turn to remain outside active conclusion gating")) {
+        return 1;
+    }
+
+    server_task resumed_active_task(SERVER_TASK_TYPE_COMPLETION);
+    resumed_active_task.has_active_trace = true;
+    resumed_active_task.react_assistant_prefill = "<think>\nThought: ";
+    resumed_active_task.react_origin = SERVER_REACT_ORIGIN_ACTIVE;
+    resumed_active_task.react_resuming_from_tool_result = true;
+    if (!expect(!server_task_active_requires_initial_tool_call(resumed_active_task),
+                "expected resumed active turn to stop requiring an initial tool call")) {
+        return 1;
+    }
+    if (!expect(server_task_active_allows_grounded_conclusion(resumed_active_task),
+                "expected resumed active turn to allow a tool-grounded conclusion")) {
         return 1;
     }
 

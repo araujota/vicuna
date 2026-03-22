@@ -2904,6 +2904,7 @@ private:
         phase_system.role = "system";
         const std::string emotive = current_emotive_moment_text();
         const std::string context_summary = shared_context_summary_text();
+        const bool active_initial_tool_call_required = server_task_active_requires_initial_tool_call(task);
         if (task.react_origin == SERVER_REACT_ORIGIN_DMN) {
             phase_system.content =
                     std::string(
@@ -2941,12 +2942,19 @@ private:
                     "Then add a new line with exactly:\n"
                     "Action: answer|ask|act|wait\n"
                     "Then close the block with </think>.\n"
-                    "If Action is act, emit a tool-call XML block immediately after the hidden reasoning. "
+                    "If Action is act, emit exactly one tool-call XML block immediately after the hidden reasoning. "
                     "If Action is answer or ask, put only the user-visible reply in visible assistant content. "
                     "If Action is wait, leave visible assistant content empty. "
                     "If the latest user turn requests current, live, dated, or otherwise external facts and a relevant external tool is available, choose act and use that tool instead of disclaiming lack of access. ") +
+                    (active_initial_tool_call_required ?
+                            "This is the first active control step for a live user turn. "
+                            "You must choose Action: act and emit exactly one tool-call XML block. "
+                            "Do not answer, ask, or conclude anything yet. The final answer must wait for a tool observation.\n" :
+                            "") +
                     (task.react_resuming_from_tool_result ?
-                            "A completed tool observation was just admitted. Based on that observation, choose act, answer, or ask. "
+                            "A completed tool observation was just admitted. Based only on that tool observation, choose act, answer, or ask. "
+                            "Any answer or question must synthesize the observed tool results rather than unsupported internal recall. "
+                            "If the observation is insufficient, emit exactly one further tool call instead of guessing. "
                             "Do not choose wait unless another already-issued external tool is still outstanding.\n" :
                             "") +
                     "Do not invent any parallel transcript or selector policy.\n\n" +
@@ -2968,6 +2976,7 @@ private:
         inputs.tools = task.react_tools;
         inputs.tool_choice =
                 task.react_tools.empty() ? COMMON_CHAT_TOOL_CHOICE_NONE :
+                active_initial_tool_call_required ? COMMON_CHAT_TOOL_CHOICE_REQUIRED :
                 COMMON_CHAT_TOOL_CHOICE_AUTO;
         inputs.use_jinja = chat_params.use_jinja;
         inputs.parallel_tool_calls = false;
@@ -3268,10 +3277,21 @@ private:
                 out_step->error = "active turns may not choose internal_write";
                 return false;
             }
+            if (server_task_active_requires_initial_tool_call(task) &&
+                    out_step->action != LLAMA_AUTHORITATIVE_REACT_ACTION_ACT) {
+                out_step->error = "active turns must emit exactly one tool call before any conclusion";
+                return false;
+            }
             if ((out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER ||
                         out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ASK) &&
                     trim_ascii_copy(out_step->assistant_msg.content).empty()) {
                 out_step->error = "answer and ask actions require visible assistant content";
+                return false;
+            }
+            if ((out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER ||
+                        out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ASK) &&
+                    !server_task_active_allows_grounded_conclusion(task)) {
+                out_step->error = "active answers and questions are only valid after a tool observation";
                 return false;
             }
             if (out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT &&
@@ -3282,8 +3302,9 @@ private:
             }
         }
 
-        const bool have_tool_call = !out_step->assistant_msg.tool_calls.empty();
-        if (out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ACT && !have_tool_call) {
+        const size_t tool_call_count = out_step->assistant_msg.tool_calls.size();
+        const bool have_tool_call = tool_call_count > 0;
+        if (out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_ACT && tool_call_count != 1) {
             out_step->error = "act requires exactly one tool call";
             return false;
         }

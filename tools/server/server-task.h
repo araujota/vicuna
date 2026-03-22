@@ -312,6 +312,18 @@ static inline bool server_task_has_authoritative_react_surface(const server_task
             server_task_should_prepare_authoritative_react(task);
 }
 
+static inline bool server_task_active_requires_initial_tool_call(const server_task & task) {
+    return server_task_has_authoritative_react_surface(task) &&
+            task.react_origin == SERVER_REACT_ORIGIN_ACTIVE &&
+            !task.react_resuming_from_tool_result;
+}
+
+static inline bool server_task_active_allows_grounded_conclusion(const server_task & task) {
+    return server_task_has_authoritative_react_surface(task) &&
+            task.react_origin == SERVER_REACT_ORIGIN_ACTIVE &&
+            task.react_resuming_from_tool_result;
+}
+
 struct result_timings {
     int32_t cache_n = -1;
 
