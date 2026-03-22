@@ -162,6 +162,7 @@ struct server_task {
     int32_t react_retry_count = 0;
     int32_t react_retry_limit = 2;
     std::string react_retry_feedback;
+    std::string react_assistant_prefill;
     std::vector<common_chat_tool> react_tools;
     bool telegram_dialogue_active = false;
     std::string telegram_chat_scope;

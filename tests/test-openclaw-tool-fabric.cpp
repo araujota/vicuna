@@ -172,7 +172,10 @@ int main() {
 
     server_openclaw_parsed_tool_call parsed = {};
     const std::string valid_tool_xml =
-            "<think>I should inspect the filesystem first.</think>\n"
+            "<think>\n"
+            "Thought: I should inspect the filesystem first.\n"
+            "Action: act\n"
+            "</think>\n"
             "<vicuna_tool_call tool=\"exec\">\n"
             "  <arg name=\"command\" type=\"string\">pwd</arg>\n"
             "</vicuna_tool_call>";
@@ -193,11 +196,13 @@ int main() {
                 "expected hidden reasoning to be removed from visible assistant content")) {
         return 1;
     }
-    if (!expect(parsed.message.reasoning_content == "I should inspect the filesystem first.",
+    if (!expect(parsed.message.reasoning_content ==
+                    "Thought: I should inspect the filesystem first.\nAction: act",
                 "expected hidden reasoning to populate assistant reasoning_content")) {
         return 1;
     }
-    if (!expect(parsed.captured_planner_reasoning == "I should inspect the filesystem first.",
+    if (!expect(parsed.captured_planner_reasoning ==
+                    "Thought: I should inspect the filesystem first.\nAction: act",
                 "expected planner reasoning capture to preserve hidden reasoning text")) {
         return 1;
     }

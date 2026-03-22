@@ -2884,6 +2884,7 @@ private:
             return false;
         }
 
+        task.react_assistant_prefill = "<think>\nThought: ";
         task.react_tools.clear();
         std::string xml_guidance;
         const std::vector<int32_t> available_spec_indexes = react_available_spec_indexes(task);
@@ -2905,8 +2906,11 @@ private:
             phase_system.content =
                     "Use only the canonical shared cognitive context as history. "
                     "Produce one authoritative hidden DMN ReAct control step.\n"
-                    "Format hidden reasoning as:\n"
-                    "<think>\nThought: ...\nAction: act|internal_write|wait\n</think>\n"
+                    "The assistant reply is prefilled with an already-open hidden reasoning block that starts with:\n"
+                    "<think>\nThought: "
+                    "Continue that Thought line, then add a new line with exactly:\n"
+                    "Action: act|internal_write|wait\n"
+                    "Then close the block with </think>.\n"
                     "If Action is act, emit a tool-call XML block immediately after the hidden reasoning. "
                     "If Action is internal_write, put the internal reflection in visible assistant content. "
                     "If Action is wait, leave visible assistant content empty. "
@@ -2920,8 +2924,11 @@ private:
             phase_system.content =
                     "Use only the canonical shared cognitive context as history. "
                     "Produce one authoritative hidden active ReAct control step.\n"
-                    "Format hidden reasoning as:\n"
-                    "<think>\nThought: ...\nAction: answer|ask|act|wait\n</think>\n"
+                    "The assistant reply is prefilled with an already-open hidden reasoning block that starts with:\n"
+                    "<think>\nThought: "
+                    "Continue that Thought line, then add a new line with exactly:\n"
+                    "Action: answer|ask|act|wait\n"
+                    "Then close the block with </think>.\n"
                     "If Action is act, emit a tool-call XML block immediately after the hidden reasoning. "
                     "If Action is answer or ask, put only the user-visible reply in visible assistant content. "
                     "If Action is wait, leave visible assistant content empty. "
@@ -2934,12 +2941,23 @@ private:
         }
         prompt_messages.insert(prompt_messages.begin(), std::move(phase_system));
 
-        const common_chat_params chat_completion = build_chat_completion_params(
-                chat_params,
-                prompt_messages,
-                task.react_tools,
-                task.react_tools.empty() ? COMMON_CHAT_TOOL_CHOICE_NONE : COMMON_CHAT_TOOL_CHOICE_AUTO,
-                true);
+        prompt_messages.push_back(common_chat_msg{
+                /*.role =*/ "assistant",
+                /*.content =*/ task.react_assistant_prefill,
+        });
+
+        common_chat_templates_inputs inputs;
+        inputs.messages = prompt_messages;
+        inputs.tools = task.react_tools;
+        inputs.tool_choice = task.react_tools.empty() ? COMMON_CHAT_TOOL_CHOICE_NONE : COMMON_CHAT_TOOL_CHOICE_AUTO;
+        inputs.use_jinja = chat_params.use_jinja;
+        inputs.parallel_tool_calls = false;
+        inputs.add_generation_prompt = true;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+        inputs.enable_thinking = false;
+        inputs.chat_template_kwargs = chat_params.chat_template_kwargs;
+
+        const common_chat_params chat_completion = common_chat_templates_apply(chat_params.tmpls.get(), inputs);
         task.react_iteration += 1;
         return apply_chat_prompt_to_task(task, chat_completion);
     }
@@ -2953,12 +2971,13 @@ private:
         if (!out_msg) {
             return false;
         }
+        const std::string parse_text = task.react_assistant_prefill.empty() ? text : task.react_assistant_prefill + text;
         if (!task.react_tools.empty()) {
             server_openclaw_parsed_tool_call parsed = {};
             const std::vector<int32_t> selected_spec_indexes = react_available_spec_indexes(task);
             std::string xml_error;
             if (openclaw_fabric.parse_tool_call_xml(
-                        text,
+                        parse_text,
                         &parsed,
                         selected_spec_indexes.empty() ? nullptr : &selected_spec_indexes,
                         &xml_error)) {
@@ -2972,8 +2991,8 @@ private:
                 return !out_msg->empty();
             }
 
-            const std::string sanitized = openclaw_fabric.strip_tool_call_xml_markup(text);
-            if (sanitized != trim_ascii_copy(text)) {
+            const std::string sanitized = openclaw_fabric.strip_tool_call_xml_markup(parse_text);
+            if (sanitized != trim_ascii_copy(parse_text)) {
                 std::string reasoning_text;
                 std::string visible_text;
                 split_hidden_reasoning_text(sanitized, &reasoning_text, &visible_text);
@@ -2991,9 +3010,9 @@ private:
         }
         task_result_state state(task.params.chat_parser_params);
         std::vector<common_chat_msg_diff> diffs;
-        *out_msg = state.update_chat_msg(text, false, diffs);
+        *out_msg = state.update_chat_msg(parse_text, false, diffs);
         if (out_msg->tool_calls.empty() && !task.react_tools.empty()) {
-            const std::string trimmed = trim_ascii_copy(text);
+            const std::string trimmed = trim_ascii_copy(parse_text);
             const auto parse_fallback_call = [&](const std::string & candidate, std::string * out_prefix) -> bool {
                 for (const auto & tool : task.react_tools) {
                     const std::string prefix = tool.name + "(";
@@ -3027,6 +3046,18 @@ private:
                     (void) parse_fallback_call(last_line, &prefix_content);
                 } else {
                     (void) parse_fallback_call(trimmed, nullptr);
+                }
+            }
+        }
+        if (out_msg->reasoning_content.empty()) {
+            std::string reasoning_text;
+            std::string visible_text;
+            split_hidden_reasoning_text(parse_text, &reasoning_text, &visible_text);
+            if (!reasoning_text.empty()) {
+                out_msg->role = "assistant";
+                out_msg->reasoning_content = std::move(reasoning_text);
+                if (out_msg->tool_calls.empty()) {
+                    out_msg->content = std::move(visible_text);
                 }
             }
         }
