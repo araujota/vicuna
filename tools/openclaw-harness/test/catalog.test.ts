@@ -9,6 +9,12 @@ import { defaultPaths, loadToolSecrets, saveToolSecrets, upsertTavilyApiKey } fr
 import { resolveInvocation } from "../src/invoke.js";
 import { writeRuntimeCatalog } from "../src/runtime-catalog.js";
 
+const COG_TOOL_FLAG_ACTIVE_ELIGIBLE = 1 << 0;
+const COG_TOOL_FLAG_DMN_ELIGIBLE = 1 << 1;
+const COG_TOOL_FLAG_SIMULATION_SAFE = 1 << 2;
+const COG_TOOL_FLAG_REMEDIATION_SAFE = 1 << 3;
+const COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT = 1 << 4;
+
 test("default catalog includes exec and hard-memory", () => {
   const catalog = buildCatalog();
   assert.equal(catalog.capabilities.length, 4);
@@ -35,6 +41,42 @@ test("default catalog includes exec and hard-memory", () => {
         capability_id: "openclaw.vicuna.codex_cli"
       }
     ]
+  );
+});
+
+test("catalog capabilities declare explicit cognitive eligibility flags", () => {
+  const catalog = buildCatalog();
+  const flagsByCapability = new Map(
+    catalog.capabilities.map((capability) => [capability.capability_id, capability.tool_flags])
+  );
+
+  assert.equal(
+    flagsByCapability.get("openclaw.exec.command"),
+    COG_TOOL_FLAG_ACTIVE_ELIGIBLE |
+      COG_TOOL_FLAG_DMN_ELIGIBLE |
+      COG_TOOL_FLAG_REMEDIATION_SAFE |
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+  );
+  assert.equal(
+    flagsByCapability.get("openclaw.vicuna.hard_memory_query"),
+    COG_TOOL_FLAG_ACTIVE_ELIGIBLE |
+      COG_TOOL_FLAG_DMN_ELIGIBLE |
+      COG_TOOL_FLAG_SIMULATION_SAFE |
+      COG_TOOL_FLAG_REMEDIATION_SAFE
+  );
+  assert.equal(
+    flagsByCapability.get("openclaw.vicuna.hard_memory_write"),
+    COG_TOOL_FLAG_ACTIVE_ELIGIBLE |
+      COG_TOOL_FLAG_DMN_ELIGIBLE |
+      COG_TOOL_FLAG_REMEDIATION_SAFE |
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+  );
+  assert.equal(
+    flagsByCapability.get("openclaw.vicuna.codex_cli"),
+    COG_TOOL_FLAG_ACTIVE_ELIGIBLE |
+      COG_TOOL_FLAG_DMN_ELIGIBLE |
+      COG_TOOL_FLAG_REMEDIATION_SAFE |
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
   );
 });
 
@@ -88,6 +130,13 @@ test("runtime catalog includes Tavily only when the OpenClaw secret is present",
   assert.deepEqual(
     catalog.capabilities.map((capability) => capability.capability_id),
     ["openclaw.tavily.web_search"]
+  );
+  assert.equal(
+    catalog.capabilities[0]?.tool_flags,
+    COG_TOOL_FLAG_ACTIVE_ELIGIBLE |
+      COG_TOOL_FLAG_DMN_ELIGIBLE |
+      COG_TOOL_FLAG_REMEDIATION_SAFE |
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
   );
 });
 

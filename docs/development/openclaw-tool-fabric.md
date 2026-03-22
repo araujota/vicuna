@@ -213,6 +213,20 @@ commits to the final user-facing answer.
 The invariant is simple: if a tool is not present in both registries, it is not
 selectable and it is not dispatchable.
 
+The runtime now enforces one more invariant for external catalog entries: a
+descriptor must carry explicit cognitive eligibility flags, not just a backend
+and schema. In practice that means external tools must set the relevant
+`tool_flags` bits for the origins that should see them:
+
+- `LLAMA_COG_TOOL_ACTIVE_ELIGIBLE` for normal active ReAct turns
+- `LLAMA_COG_TOOL_DMN_ELIGIBLE` for DMN ReAct turns
+- optional `LLAMA_COG_TOOL_SIMULATION_SAFE` and
+  `LLAMA_COG_TOOL_REMEDIATION_SAFE` for narrower internal use
+
+If an external catalog entry omits both active and DMN eligibility, the runtime
+now rejects the catalog instead of silently installing a tool that the model
+can never see.
+
 ## Exec Policy
 
 `exec` remains intentionally narrower than a shell script surface. Planner XML

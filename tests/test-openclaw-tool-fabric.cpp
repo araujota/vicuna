@@ -363,7 +363,7 @@ int main() {
                 "execution_modes": ["sync"],
                 "provenance_namespace": "openclaw/openclaw-initial/tool/exec_initial",
                 "tool_kind": 4,
-                "tool_flags": 0,
+                "tool_flags": 27,
                 "latency_class": 1,
                 "max_steps_reserved": 2,
                 "dispatch_backend": "legacy_bash"
@@ -403,7 +403,7 @@ int main() {
                 "execution_modes": ["sync"],
                 "provenance_namespace": "openclaw/openclaw-extra/tool/exec_extra",
                 "tool_kind": 4,
-                "tool_flags": 0,
+                "tool_flags": 27,
                 "latency_class": 1,
                 "max_steps_reserved": 2,
                 "dispatch_backend": "legacy_bash"
@@ -439,6 +439,51 @@ int main() {
     external_command.tool_spec_index = (int32_t) specs.size() - 1;
     std::snprintf(external_command.capability_id, sizeof(external_command.capability_id), "%s", specs.back().capability_id);
     if (!expect(reloadable_fabric.resolve_command(external_command, &error) != nullptr, error.c_str())) {
+        return 1;
+    }
+
+    const char * invalid_catalog = R"({
+        "catalog_version": 1,
+        "capabilities": [
+            {
+                "capability_id": "openclaw.exec.invalid",
+                "tool_surface_id": "vicuna.exec.invalid",
+                "capability_kind": "tool",
+                "owner_plugin_id": "openclaw-invalid",
+                "tool_name": "exec_invalid",
+                "description": "Run an invalid bounded command",
+                "input_schema_json": {
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": { "type": "string" }
+                    }
+                },
+                "output_contract": "pending_then_result",
+                "side_effect_class": "system_exec",
+                "approval_mode": "policy_driven",
+                "execution_modes": ["sync"],
+                "provenance_namespace": "openclaw/openclaw-invalid/tool/exec_invalid",
+                "tool_kind": 4,
+                "tool_flags": 0,
+                "latency_class": 1,
+                "max_steps_reserved": 2,
+                "dispatch_backend": "legacy_bash"
+            }
+        ]
+    })";
+    {
+        std::ofstream out(catalog_path, std::ios::binary | std::ios::trunc);
+        out << invalid_catalog;
+    }
+    server_openclaw_fabric invalid_fabric;
+    error.clear();
+    if (!expect(!invalid_fabric.configure(true, true, true, &error),
+                "expected external catalog without react eligibility flags to be rejected")) {
+        return 1;
+    }
+    if (!expect(error.find("no active/DMN cognitive eligibility flags") != std::string::npos,
+                "expected invalid external catalog error to mention missing react eligibility flags")) {
         return 1;
     }
 

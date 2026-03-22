@@ -16,6 +16,16 @@ export type RuntimeCatalogOptions = {
   secrets?: OpenClawToolSecrets;
 };
 
+const COG_TOOL_FLAG_ACTIVE_ELIGIBLE = 1 << 0;
+const COG_TOOL_FLAG_DMN_ELIGIBLE = 1 << 1;
+const COG_TOOL_FLAG_SIMULATION_SAFE = 1 << 2;
+const COG_TOOL_FLAG_REMEDIATION_SAFE = 1 << 3;
+const COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT = 1 << 4;
+
+function combineToolFlags(...flags: number[]): number {
+  return flags.reduce((mask, flag) => mask | flag, 0);
+}
+
 function execCapability(): CapabilityDescriptor {
   return {
     capability_id: "openclaw.exec.command",
@@ -38,7 +48,12 @@ function execCapability(): CapabilityDescriptor {
     execution_modes: ["sync", "background", "approval_gated"],
     provenance_namespace: "openclaw/openclaw-core/tool/exec",
     tool_kind: 4,
-    tool_flags: 0,
+    tool_flags: combineToolFlags(
+      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      COG_TOOL_FLAG_DMN_ELIGIBLE,
+      COG_TOOL_FLAG_REMEDIATION_SAFE,
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+    ),
     latency_class: 1,
     max_steps_reserved: 2,
     dispatch_backend: "legacy_bash"
@@ -66,7 +81,12 @@ function hardMemoryCapability(): CapabilityDescriptor {
     execution_modes: ["sync"],
     provenance_namespace: "openclaw/vicuna-memory/memory_adapter/hard_memory_query",
     tool_kind: 2,
-    tool_flags: 0,
+    tool_flags: combineToolFlags(
+      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      COG_TOOL_FLAG_DMN_ELIGIBLE,
+      COG_TOOL_FLAG_SIMULATION_SAFE,
+      COG_TOOL_FLAG_REMEDIATION_SAFE
+    ),
     latency_class: 1,
     max_steps_reserved: 2,
     dispatch_backend: "legacy_hard_memory"
@@ -115,7 +135,12 @@ function hardMemoryWriteCapability(): CapabilityDescriptor {
     execution_modes: ["sync"],
     provenance_namespace: "openclaw/vicuna-memory/memory_adapter/hard_memory_write",
     tool_kind: 3,
-    tool_flags: 0,
+    tool_flags: combineToolFlags(
+      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      COG_TOOL_FLAG_DMN_ELIGIBLE,
+      COG_TOOL_FLAG_REMEDIATION_SAFE,
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+    ),
     latency_class: 2,
     max_steps_reserved: 3,
     dispatch_backend: "legacy_hard_memory"
@@ -143,7 +168,12 @@ function codexCapability(): CapabilityDescriptor {
     execution_modes: ["background"],
     provenance_namespace: "openclaw/vicuna-runtime/tool/codex",
     tool_kind: 5,
-    tool_flags: 0,
+    tool_flags: combineToolFlags(
+      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      COG_TOOL_FLAG_DMN_ELIGIBLE,
+      COG_TOOL_FLAG_REMEDIATION_SAFE,
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+    ),
     latency_class: 2,
     max_steps_reserved: 3,
     dispatch_backend: "legacy_codex"
@@ -174,7 +204,12 @@ function tavilyWebSearchCapability(): CapabilityDescriptor {
     execution_modes: ["sync"],
     provenance_namespace: "openclaw/openclaw-tavily/tool/web_search",
     tool_kind: 4,
-    tool_flags: 0,
+    tool_flags: combineToolFlags(
+      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      COG_TOOL_FLAG_DMN_ELIGIBLE,
+      COG_TOOL_FLAG_REMEDIATION_SAFE,
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+    ),
     latency_class: 1,
     max_steps_reserved: 2,
     dispatch_backend: "legacy_bash"

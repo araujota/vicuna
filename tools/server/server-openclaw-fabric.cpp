@@ -83,6 +83,14 @@ bool builtin_tool_enabled_for_env(const char * tool_id) {
     return false;
 }
 
+constexpr uint32_t SERVER_OPENCLAW_REQUIRED_REACT_ELIGIBILITY_MASK =
+        LLAMA_COG_TOOL_ACTIVE_ELIGIBLE |
+        LLAMA_COG_TOOL_DMN_ELIGIBLE;
+
+bool descriptor_has_react_eligibility(const openclaw_tool_capability_descriptor & descriptor) {
+    return (descriptor.tool_flags & SERVER_OPENCLAW_REQUIRED_REACT_ELIGIBILITY_MASK) != 0;
+}
+
 void set_bounded(char * dst, size_t dst_size, const std::string & src) {
     if (!dst || dst_size == 0) {
         return;
@@ -1620,6 +1628,13 @@ bool server_openclaw_fabric::load_external_catalog(
         }
 
         for (const auto & descriptor : external_catalog.capabilities) {
+            if (!descriptor_has_react_eligibility(descriptor)) {
+                set_error(
+                        out_error,
+                        "external capability \"" + descriptor.capability_id +
+                                "\" has no active/DMN cognitive eligibility flags");
+                return false;
+            }
             server_openclaw_dispatch_backend backend = SERVER_OPENCLAW_DISPATCH_NONE;
             std::string backend_error;
             if (!dispatch_backend_from_string(descriptor.dispatch_backend, &backend, &backend_error)) {

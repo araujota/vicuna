@@ -13,6 +13,8 @@ Current scope:
 - simple CLI entrypoint for emitting the catalog and validating invocations
 - registry-style catalog construction so more tools can be added without
   changing the call contract
+- explicit cognitive eligibility flags so external tools appear in the intended
+  active and DMN ReAct loops
 
 Example:
 
@@ -22,3 +24,14 @@ node dist/index.js catalog
 node dist/index.js install-tavily "$TAVILY_API_KEY"
 node dist/index.js sync-runtime-catalog
 ```
+
+External descriptors must declare the same cognitive eligibility contract that
+the runtime enforces for built-ins. At minimum, a live tool should set one or
+both of:
+
+- `LLAMA_COG_TOOL_ACTIVE_ELIGIBLE`
+- `LLAMA_COG_TOOL_DMN_ELIGIBLE`
+
+If an emitted external catalog entry omits both active and DMN eligibility, the
+runtime now rejects that catalog instead of silently loading an unreachable
+tool.
