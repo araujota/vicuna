@@ -2948,7 +2948,8 @@ private:
                     "Then close the block with </think>.\n"
                     "If Action is act, emit a tool-call XML block immediately after the hidden reasoning. "
                     "If Action is answer or ask, put only the user-visible reply in visible assistant content. "
-                    "If Action is wait, leave visible assistant content empty. ") +
+                    "If Action is wait, leave visible assistant content empty. "
+                    "If the latest user turn requests current, live, dated, or otherwise external facts and a relevant external tool is available, choose act and use that tool instead of disclaiming lack of access. ") +
                     (task.react_resuming_from_tool_result ?
                             "A completed tool observation was just admitted. Based on that observation, choose act, answer, or ask. "
                             "Do not choose wait unless another already-issued external tool is still outstanding.\n" :
