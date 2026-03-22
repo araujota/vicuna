@@ -2904,6 +2904,7 @@ private:
         const std::string context_summary = shared_context_summary_text();
         if (task.react_origin == SERVER_REACT_ORIGIN_DMN) {
             phase_system.content =
+                    std::string(
                     "Use only the canonical shared cognitive context as history. "
                     "Produce one authoritative hidden DMN ReAct control step.\n"
                     "The assistant reply is prefilled with an already-open hidden reasoning block that starts with:\n"
@@ -2913,7 +2914,11 @@ private:
                     "Then close the block with </think>.\n"
                     "If Action is act, emit a tool-call XML block immediately after the hidden reasoning. "
                     "If Action is internal_write, put the internal reflection in visible assistant content. "
-                    "If Action is wait, leave visible assistant content empty. "
+                    "If Action is wait, leave visible assistant content empty. ") +
+                    (task.react_resuming_from_tool_result ?
+                            "A completed tool observation was just admitted. Prefer act or internal_write from that observation. "
+                            "Only choose wait if another already-issued external tool is still outstanding.\n" :
+                            "") +
                     "Do not invent any parallel transcript or selector policy.\n\n" +
                     (emotive.empty() ? std::string() : "Current emotive moment: " + emotive + "\n") +
                     (context_summary.empty() ? std::string() : context_summary + "\n\n") +
@@ -2922,6 +2927,7 @@ private:
                     (xml_guidance.empty() ? std::string("No tools are currently available.") : xml_guidance);
         } else {
             phase_system.content =
+                    std::string(
                     "Use only the canonical shared cognitive context as history. "
                     "Produce one authoritative hidden active ReAct control step.\n"
                     "The assistant reply is prefilled with an already-open hidden reasoning block that starts with:\n"
@@ -2931,7 +2937,11 @@ private:
                     "Then close the block with </think>.\n"
                     "If Action is act, emit a tool-call XML block immediately after the hidden reasoning. "
                     "If Action is answer or ask, put only the user-visible reply in visible assistant content. "
-                    "If Action is wait, leave visible assistant content empty. "
+                    "If Action is wait, leave visible assistant content empty. ") +
+                    (task.react_resuming_from_tool_result ?
+                            "A completed tool observation was just admitted. Based on that observation, choose act, answer, or ask. "
+                            "Do not choose wait unless another already-issued external tool is still outstanding.\n" :
+                            "") +
                     "Do not invent any parallel transcript or selector policy.\n\n" +
                     (emotive.empty() ? std::string() : "Current emotive moment: " + emotive + "\n") +
                     (context_summary.empty() ? std::string() : context_summary + "\n\n") +
@@ -3232,7 +3242,9 @@ private:
                 out_step->error = "answer and ask actions require visible assistant content";
                 return false;
             }
-            if (out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT && task.foreground_role != LLAMA_SELF_STATE_EVENT_TOOL) {
+            if (out_step->action == LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT &&
+                    !task.react_resuming_from_tool_result &&
+                    task.foreground_role != LLAMA_SELF_STATE_EVENT_TOOL) {
                 out_step->error = "active wait is only valid while integrating an earlier tool result";
                 return false;
             }
@@ -6225,6 +6237,7 @@ static bool telegram_dialogue_history_from_json(
                         resumed_task.active_trace = active_trace;
                         resumed_task.has_active_trace = true;
                         resumed_task.skip_active_loop_preflight = true;
+                        resumed_task.react_resuming_from_tool_result = true;
                         if (react_task_ready(resumed_task)) {
                             append_react_tool_result(resumed_task, result);
                             if (!prepare_react_prompt(resumed_task)) {
@@ -6249,6 +6262,7 @@ static bool telegram_dialogue_history_from_json(
                     }
                     if (found_task) {
                         resumed_task.skip_active_loop_preflight = true;
+                        resumed_task.react_resuming_from_tool_result = true;
                         if (resumed_task.has_dmn_trace) {
                             resumed_task.dmn_trace.observation.valid = true;
                         }
@@ -7700,6 +7714,22 @@ static bool telegram_dialogue_history_from_json(
             }
 
             if (resumed_task.react_origin == SERVER_REACT_ORIGIN_ACTIVE) {
+                if (react_step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT &&
+                        resumed_task.react_resuming_from_tool_result) {
+                    if (resumed_task.react_retry_count < resumed_task.react_retry_limit) {
+                        resumed_task.react_retry_count += 1;
+                        resumed_task.react_retry_feedback =
+                                "The previous control step chose wait immediately after a completed tool observation. "
+                                "Based on that observation, choose answer, ask, or act. Only choose wait if another external tool is still pending.";
+                        if (prepare_react_prompt(resumed_task)) {
+                            queue_tasks.post(std::move(resumed_task), true);
+                            return;
+                        }
+                    }
+                    send_error(slot, "Authoritative ReAct chose wait after a completed tool observation without scheduling further work", ERROR_TYPE_SERVER);
+                    return;
+                }
+
                 switch (react_step.action) {
                     case LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER:
                         resumed_task.active_trace.winner_action = LLAMA_ACTIVE_LOOP_ACTION_ANSWER;
@@ -7792,6 +7822,7 @@ static bool telegram_dialogue_history_from_json(
                     }
                     {
                         std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                        resumed_task.react_resuming_from_tool_result = false;
                         waiting_active_tasks[pending_command_id] = std::move(resumed_task);
                     }
                     const bool dispatched = dispatch_pending_tool_commands(LLAMA_COG_COMMAND_ORIGIN_ACTIVE);
@@ -7877,6 +7908,7 @@ static bool telegram_dialogue_history_from_json(
                     capture_dmn_provenance("dmn_authoritative_final", resumed_task.dmn_trace);
                     {
                         std::lock_guard<std::mutex> lock(runtime_state_mutex);
+                        resumed_task.react_resuming_from_tool_result = false;
                         waiting_dmn_tasks[pending_command_id] = std::move(resumed_task);
                     }
                     if (dispatch_pending_tool_commands(LLAMA_COG_COMMAND_ORIGIN_DMN)) {
@@ -9410,7 +9442,9 @@ static bool telegram_dialogue_history_from_json(
         SRV_DBG("decoding batch, n_tokens = %d\n", batch.n_tokens);
 
         if (slot_batched) {
-            // apply lora, only need to do it once per batch
+            // Treat adapter changes as a hard boundary: finish any prior backend
+            // work, apply the slot's request/runtime stack, then decode.
+            llama_synchronize(ctx);
             common_set_adapter_lora(ctx, slot_batched->lora);
 
             // if the lora is temporarily disabled for an alora, re-enable it

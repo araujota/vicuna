@@ -225,6 +225,13 @@ window into runtime-owned dialogue history before preparing the next
 authoritative ReAct step. That keeps runtime-side Telegram dialogue continuity
 alive across active replies, DMN emits, and runtime snapshot restore.
 
+Managed deployment now also owns one explicit reasoning-capable GGUF base model
+instead of pointing at an Ollama blob. The launcher defaults to
+`DeepSeek-R1-Distill-Llama-8B-Q6_K.gguf` plus the repo-owned
+DeepSeek Jinja template file and `--reasoning-format deepseek`. The runtime
+service starts only after that GGUF is present locally, fetching it through the
+repo helper when necessary.
+
 Active and DMN continuation are no longer governed by the old tiny hardcoded
 runner ceilings. The runner status surfaces still expose `steps_taken` and
 `max_steps`, but `max_steps` now acts as an effectively unbounded observability
@@ -250,6 +257,12 @@ division of responsibility between the CPU loop and model generation:
   of being silently replaced by a fallback CPU tool choice
 - only after validation does host code bind the selected tool request and
   dispatch it
+
+When an active turn is resuming from a completed tool observation, the server
+marks that state explicitly and tightens the planner prompt so the next control
+step chooses `act`, `answer`, or `ask` from the observation. A post-tool
+`wait` is treated as malformed control and retried; the CPU still does not pick
+an alternative action on the model's behalf.
 
 This is why active and DMN runners now stop in `LLAMA_COG_LOOP_PHASE_PROPOSE`
 with no pending command when authoritative mode is enabled: the cognitive loop

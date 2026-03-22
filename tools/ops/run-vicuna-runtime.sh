@@ -2,14 +2,27 @@
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-MODEL_PATH="/usr/share/ollama/.ollama/models/blobs/sha256-3603045b543e1c0dfb27f126a3642e7f805e480b84c4781e3d848ace971cba7a"
 
 cd "$REPO_ROOT"
 # shellcheck disable=SC1091
 source "$REPO_ROOT/tools/ops/runtime-env.sh"
 
+if [[ ! -f "$VICUNA_RUNTIME_MODEL_PATH" ]]; then
+  "$REPO_ROOT/tools/ops/fetch-runtime-model.sh"
+fi
+
+if [[ ! -f "$VICUNA_RUNTIME_MODEL_PATH" ]]; then
+  printf '[vicuna-runtime] error: managed runtime model missing at %s\n' "$VICUNA_RUNTIME_MODEL_PATH" >&2
+  exit 1
+fi
+
 exec "$REPO_ROOT/build-host-cuda-128/bin/llama-server" \
-  -m "$MODEL_PATH" \
+  -m "$VICUNA_RUNTIME_MODEL_PATH" \
+  --alias "$VICUNA_RUNTIME_MODEL_ALIAS" \
+  --jinja \
+  --chat-template-file "$VICUNA_RUNTIME_MODEL_CHAT_TEMPLATE_FILE" \
+  --reasoning-format "$VICUNA_RUNTIME_MODEL_REASONING_FORMAT" \
+  --reasoning-budget -1 \
   --port 8080 \
   --ctx-size 4096 \
   --api-surface openai \

@@ -164,6 +164,7 @@ struct server_task {
     std::string react_retry_feedback;
     std::string react_assistant_prefill;
     std::vector<common_chat_tool> react_tools;
+    bool react_resuming_from_tool_result = false;
     bool telegram_dialogue_active = false;
     std::string telegram_chat_scope;
     int64_t telegram_message_id = 0;
@@ -266,6 +267,7 @@ struct server_task {
         copy.react_retry_count = react_retry_count;
         copy.react_retry_limit = react_retry_limit;
         copy.react_retry_feedback = react_retry_feedback;
+        copy.react_resuming_from_tool_result = react_resuming_from_tool_result;
         copy.react_tools = react_tools;
         copy.telegram_dialogue_active = telegram_dialogue_active;
         copy.telegram_chat_scope = telegram_chat_scope;

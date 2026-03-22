@@ -31,7 +31,7 @@ const execFileAsync = promisify(execFile);
 const env = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
   vicunaBaseUrl: (process.env.TELEGRAM_BRIDGE_VICUNA_BASE_URL ?? 'http://127.0.0.1:8080').replace(/\/+$/, ''),
-  model: process.env.TELEGRAM_BRIDGE_MODEL ?? 'qwen2.5:7b-instruct-q8_0',
+  model: process.env.TELEGRAM_BRIDGE_MODEL ?? process.env.VICUNA_RUNTIME_MODEL_ALIAS ?? 'vicuna-runtime',
   statePath: process.env.TELEGRAM_BRIDGE_STATE_PATH ?? '/tmp/vicuna-telegram-bridge-state.json',
   pollTimeoutSeconds: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS, 30)),
   maxHistoryMessages: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES, 12)),

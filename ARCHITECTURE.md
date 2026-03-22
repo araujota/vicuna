@@ -169,6 +169,10 @@ The self-model-to-language path is also explicit:
 - DMN-origin Telegram contact remains live through the bridge. Proactive
   self-emits and explicit Telegram relay actions both append to the Telegram
   dialogue object so subsequent Telegram-visible behavior is continuity-aware.
+- the managed runtime base model is now owned as an explicit local GGUF plus a
+  repo-owned Jinja template, not as an Ollama blob indirection; the current
+  managed default is `DeepSeek-R1-Distill-Llama-8B-Q6_K.gguf` with DeepSeek
+  reasoning-format enabled
 
 The shared functional microphase vocabulary currently includes:
 
@@ -200,6 +204,9 @@ Family updates are outcome-weighted rather than generic:
 
 - tool-selection opens on tool commitment and settles only after tool output has
   actually been integrated into the active loop
+- request adapters and runtime functional/temporal LoRA state are applied
+  synchronously before decode; generation is not allowed to run against a stale
+  adapter stack
 - planning/composition opens during plan draft or revision and settles against
   the quality of the composed plan as judged by later favorable-state,
   answerability, efficiency, and recovery deltas

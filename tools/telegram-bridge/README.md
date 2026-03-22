@@ -31,7 +31,7 @@ Required variables:
 Optional variables:
 
 - `TELEGRAM_BRIDGE_VICUNA_BASE_URL` default: `http://127.0.0.1:8080`
-- `TELEGRAM_BRIDGE_MODEL` default: `qwen2.5:7b-instruct-q8_0`
+- `TELEGRAM_BRIDGE_MODEL` default: `vicuna-runtime`
 - `TELEGRAM_BRIDGE_STATE_PATH` default: `/tmp/vicuna-telegram-bridge-state.json`
 - `TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS` default: `30`
 - `TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES` default: `12`
@@ -85,6 +85,21 @@ The launchers they use are:
 
 - [run-vicuna-runtime.sh](/home/tyler-araujo/Projects/vicuna/tools/ops/run-vicuna-runtime.sh)
 - [run-telegram-bridge.sh](/home/tyler-araujo/Projects/vicuna/tools/ops/run-telegram-bridge.sh)
+
+The managed runtime launcher now owns an explicit reasoning GGUF instead of an
+Ollama blob path. By default it expects:
+
+- `VICUNA_RUNTIME_MODEL_PATH`:
+  `/home/tyler-araujo/Projects/vicuna/models/runtime/DeepSeek-R1-Distill-Llama-8B-Q6_K.gguf`
+- `VICUNA_RUNTIME_MODEL_URL`:
+  [bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF](https://huggingface.co/bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF)
+- `VICUNA_RUNTIME_MODEL_CHAT_TEMPLATE_FILE`:
+  [deepseek-ai-DeepSeek-R1-Distill-Llama-8B.jinja](/Users/tyleraraujo/vicuna/models/templates/deepseek-ai-DeepSeek-R1-Distill-Llama-8B.jinja)
+- `VICUNA_RUNTIME_MODEL_REASONING_FORMAT`: `deepseek`
+
+If the model file is missing, the launcher fetches it through
+[fetch-runtime-model.sh](/Users/tyleraraujo/vicuna/tools/ops/fetch-runtime-model.sh)
+before starting `llama-server`.
 
 The runtime launcher now enables the repo-owned cognitive bash tool path by
 default for managed operation. Override these if needed:
