@@ -1492,6 +1492,13 @@ static std::string trim_ascii_copy(const std::string & value) {
     return value.substr(begin, end - begin);
 }
 
+static std::string log_excerpt(const std::string & value, size_t max_chars = 1600) {
+    if (value.size() <= max_chars) {
+        return value;
+    }
+    return value.substr(0, max_chars) + "\n...[truncated]";
+}
+
 static void split_hidden_reasoning_text(
         const std::string & text,
         std::string * out_reasoning,
@@ -7692,6 +7699,16 @@ static bool telegram_dialogue_history_from_json(
 
         if (slot.task && react_task_ready(*slot.task) && !parsed_react) {
             server_task retry_task = std::move(*slot.task);
+            const std::string react_parse_input =
+                    retry_task.react_assistant_prefill.empty() ?
+                            slot.generated_text :
+                            retry_task.react_assistant_prefill + slot.generated_text;
+            SRV_WRN("authoritative ReAct parse failure: task=%d origin=%d retry=%d error=%s\nraw=%s\n",
+                    retry_task.id,
+                    (int) retry_task.react_origin,
+                    retry_task.react_retry_count,
+                    react_step.error.c_str(),
+                    log_excerpt(react_parse_input).c_str());
             if (retry_task.react_retry_count < retry_task.react_retry_limit) {
                 retry_task.react_retry_count += 1;
                 retry_task.react_retry_feedback = react_step.error;
