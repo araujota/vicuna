@@ -15,6 +15,10 @@ export type OpenClawToolSecrets = {
       base_url?: string;
       api_key?: string;
     };
+    chaptarr?: {
+      base_url?: string;
+      api_key?: string;
+    };
   };
 };
 
@@ -26,12 +30,15 @@ export type OpenClawPaths = {
   tavilyWrapperPath: string;
   radarrWrapperPath: string;
   sonarrWrapperPath: string;
+  chaptarrWrapperPath: string;
 };
 
 export type OpenClawServarrToolId = "radarr" | "sonarr";
+export type OpenClawMediaToolId = OpenClawServarrToolId | "chaptarr";
 
 export const DEFAULT_RADARR_BASE_URL = "http://10.0.0.218:7878";
 export const DEFAULT_SONARR_BASE_URL = "http://10.0.0.218:8989";
+export const DEFAULT_CHAPTARR_BASE_URL = "http://10.0.0.218:8789";
 
 function moduleDir(): string {
   return path.dirname(fileURLToPath(import.meta.url));
@@ -53,7 +60,8 @@ export function defaultPaths(repoRoot = defaultRepoRoot()): OpenClawPaths {
     runtimeCatalogPath,
     tavilyWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "tavily-web-search"),
     radarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "radarr-api"),
-    sonarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "sonarr-api")
+    sonarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "sonarr-api"),
+    chaptarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "chaptarr-api")
   };
 }
 
@@ -91,13 +99,18 @@ export function upsertTavilyApiKey(secrets: OpenClawToolSecrets, apiKey: string)
   return next;
 }
 
-export function upsertServarrConfig(
+export function upsertApiToolConfig(
   secrets: OpenClawToolSecrets,
-  toolId: OpenClawServarrToolId,
+  toolId: OpenClawMediaToolId,
   apiKey: string,
   baseUrl?: string
 ): OpenClawToolSecrets {
-  const existing = toolId === "radarr" ? secrets.tools?.radarr : secrets.tools?.sonarr;
+  const existing =
+    toolId === "radarr"
+      ? secrets.tools?.radarr
+      : toolId === "sonarr"
+        ? secrets.tools?.sonarr
+        : secrets.tools?.chaptarr;
   const nextConfig = {
     ...existing,
     api_key: apiKey,
@@ -110,4 +123,13 @@ export function upsertServarrConfig(
       [toolId]: nextConfig
     }
   };
+}
+
+export function upsertServarrConfig(
+  secrets: OpenClawToolSecrets,
+  toolId: OpenClawServarrToolId,
+  apiKey: string,
+  baseUrl?: string
+): OpenClawToolSecrets {
+  return upsertApiToolConfig(secrets, toolId, apiKey, baseUrl);
 }

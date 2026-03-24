@@ -9,7 +9,8 @@ It does two jobs in one process:
 - subscribes to `/v1/responses/stream` and relays proactive self-emits to every
   registered Telegram chat
 - polls `/v1/telegram/outbox` for runtime-owned `ask_with_options` prompts and
-  delivers them with Telegram `reply_markup.inline_keyboard`
+  approval-gate prompts, then delivers them with Telegram
+  `reply_markup.inline_keyboard`
 
 ## Environment
 
@@ -39,6 +40,10 @@ Optional variables:
 - `TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES` default: `12`
 - `TELEGRAM_BRIDGE_MAX_TOKENS` default: `-1` (unlimited)
 - `TELEGRAM_BRIDGE_MAX_DOCUMENT_CHARS` default: `12000`
+- `TELEGRAM_BRIDGE_REPLAY_RETAINED_OUTBOX` default: `0`
+  - when `0`, a fresh or reset bridge state fast-forwards to the newest
+    retained runtime outbox sequence instead of replaying historical follow-ups
+  - set to `1` only for an explicit operator replay of retained outbox items
 - `SUPERMEMORY_API_KEY` required for PDF/DOC/DOCX ingestion and linked
   Supermemory persistence
 - `VICUNA_API_KEY` if the server runs with bearer auth enabled
@@ -130,13 +135,28 @@ even simple allowed commands from forking on a busy workstation.
 
 - `/start` registers the chat for proactive relay and returns a confirmation
 - plain text user messages are sent to the local Vicuña runtime and the
-  assistant reply is sent back to the same Telegram chat
+  assistant follow-up is sent back to the same Telegram chat once the deferred
+  turn finishes
+- the bridge now tracks a per-chat Telegram conversation anchor so replies to
+  runtime-authored assistant messages, plus plain next messages when one latest
+  active conversation is clear, stay attached to the same bounded continuity
+  transcript instead of starting an unrelated follow-up thread
 - runtime-owned `ask_with_options` tool calls are delivered through a dedicated
   Telegram outbox surface, not through fallback assistant text
-- inline option clicks arrive as Telegram `callback_query` updates; the bridge
-  acknowledges the click, removes the consumed keyboard, rewrites the selected
-  option into the bounded Telegram transcript, and resumes the Telegram-origin
-  turn against the runtime
+- runtime-owned mutation approvals are delivered through the same outbox as
+  `approval_request` items; the bridge submits inline-button decisions back to
+  `/v1/telegram/approval` as structured approval events instead of rewriting
+  them into synthetic transcript text
+- before forwarding a fresh Telegram user message, the bridge calls the runtime
+  interruption surface so pending DMN-owned approval waits for that chat are
+  superseded cleanly rather than blocking the new foreground turn
+- inline option clicks arrive as Telegram `callback_query` updates; ordinary
+  `ask_with_options` prompts are still rewritten into the bounded transcript,
+  while approval prompts are resolved through the runtime-owned approval object
+  and do not create a synthetic user turn
+- plain-text answers sent in response to an `ask_with_options` prompt are still
+  treated as normal user messages rather than structured option selections, but
+  they remain attached to the same Telegram conversation anchor as the prompt
 - forwarded chat requests now include Telegram chat metadata headers so the
   runtime can maintain its own bounded last-`N` turn dialogue object instead of
   depending only on bridge-local transcript state
@@ -147,11 +167,17 @@ even simple allowed commands from forking on a busy workstation.
   Telegram `chat_id`, so follow-up turns reuse recent context after restarts
 - pending inline-option prompts are also kept in bounded persisted bridge state
   so callback selections can be resolved safely after bridge restart
+- the persisted bridge state now also records an explicit runtime outbox
+  checkpoint plus the last delivered runtime outbox receipt, including the
+  exact Telegram `message_id` returned for that follow-up
 - bounded transcript trimming drops any leading assistant-only orphan created by
   raw history clipping so the runtime keeps seeing a coherent conversation that
   still includes the latest user turn
 - each forwarded Telegram turn now logs transcript length and role sequence to
   the bridge journal for continuity debugging
+- normal Telegram text and document turns no longer send a bridge-authored
+  acknowledgement before the real work starts; the first bridge-authored reply
+  for a deferred turn is now the substantive final follow-up or failure message
 - proactive runtime self-emits are consumed from `/v1/responses/stream` and
   sent to all registered chats while also being recorded into each chat's local
   transcript window
@@ -167,6 +193,13 @@ even simple allowed commands from forking on a busy workstation.
   errors mean another bot poller is still running with the same token, either
   on this host or somewhere else; clear the extra poller before expecting
   stable message ingress
+- runtime-owned follow-up delivery now logs the runtime outbox sequence,
+  requested reply target, fallback mode, and returned Telegram `message_id`
+- if Telegram rejects a reply anchor, the bridge retries once without the reply
+  anchor so the user still sees the final message
+- fresh or transcript-reset bridge state does not replay the retained runtime
+  outbox backlog by default; explicit replay requires
+  `TELEGRAM_BRIDGE_REPLAY_RETAINED_OUTBOX=1`
 - if the bridge appears to answer an older Telegram topic, inspect the bridge
   state file and journal together: if `telegramOffset` is still increasing and
   new `appended Telegram user turn` entries appear, the defect is in transcript
@@ -174,6 +207,26 @@ even simple allowed commands from forking on a busy workstation.
 - intentionally empty completion text is now allowed on Telegram turns because
   the user-visible payload may already have been delivered by a tool such as
   `ask_with_options`
+
+## Reset Guidance
+
+For a clean transcript reset without replaying old runtime follow-ups:
+
+1. stop `vicuna-telegram-bridge.service`
+2. back up `/var/lib/vicuna/telegram-bridge-state.json`
+3. preserve:
+   - `telegramOffset`
+   - `telegramOutboxOffset`
+   - `telegramOutboxCheckpointInitialized`
+   - `telegramOutboxDeliveryReceipt`
+4. clear:
+   - `chatSessions`
+   - `chatConversationState`
+   - `pendingOptionPrompts`
+5. restart the bridge
+
+Do not clear the outbox checkpoint fields unless you explicitly intend to
+replay retained runtime outbox items.
 
 ## Test
 

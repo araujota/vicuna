@@ -1,4 +1,5 @@
 #include "../tools/server/server-common.h"
+#include "../tools/server/server-task.h"
 
 #include <cstdio>
 
@@ -11,6 +12,18 @@ static bool expect(bool condition, const char * message) {
 }
 
 int main() {
+    {
+        const std::string raw_body =
+                R"({"messages":[{"role":"system","content":"Write one short acknowledgement only."}]})";
+        const json parsed_body = {
+            {"prompt", "ignored"},
+        };
+        if (!expect(classify_foreground_role_for_request(raw_body, parsed_body) == LLAMA_SELF_STATE_EVENT_SYSTEM,
+                    "expected system-only requests to classify as system-origin")) {
+            return 1;
+        }
+    }
+
     {
         const std::string raw_body =
                 R"({"messages":[{"role":"assistant","content":"Old Tesla answer."},{"role":"user","content":"Ask which deployment target I want."}]})";
@@ -50,9 +63,37 @@ int main() {
                     "expected live stock-price request to require fresh tool grounding")) {
             return 1;
         }
+        if (!expect(foreground_request_requires_fresh_tool_grounding(
+                            "What TV shows do I have in Sonarr?"),
+                    "expected Sonarr library request to require fresh tool grounding")) {
+            return 1;
+        }
+        if (!expect(foreground_request_requires_fresh_tool_grounding(
+                            "Show me my Chaptarr queue status."),
+                    "expected Chaptarr queue request to require fresh tool grounding")) {
+            return 1;
+        }
         if (!expect(!foreground_request_requires_fresh_tool_grounding(
                              "Reply with exactly the single word orchid."),
                     "expected stable direct reply request to avoid forced fresh tool grounding")) {
+            return 1;
+        }
+    }
+
+    {
+        if (!expect(foreground_request_requires_external_action(
+                            "Download One Battle After Another via Radarr."),
+                    "expected explicit Radarr download request to require an external action")) {
+            return 1;
+        }
+        if (!expect(foreground_request_requires_external_action(
+                            "Please send the message to Telegram once the task is done."),
+                    "expected outbound contact request to require an external action")) {
+            return 1;
+        }
+        if (!expect(!foreground_request_requires_external_action(
+                             "What TV shows do I have in Sonarr?"),
+                    "expected read-only Sonarr library request to avoid external-action classification")) {
             return 1;
         }
     }
@@ -68,9 +109,83 @@ int main() {
                     "expected lack-of-access disclaimer to be rejected as a non-answer")) {
             return 1;
         }
+        if (!expect(authoritative_reply_is_procedural_non_answer(
+                            "I cannot interact with external surfaces for this request."),
+                    "expected false external-surface disclaimer to be rejected as a non-answer")) {
+            return 1;
+        }
+        if (!expect(authoritative_reply_is_procedural_non_answer(
+                            "To view the list of shows in Sonarr, you can access the web interface or use the command line."),
+                    "expected procedural Sonarr web-interface guidance to be rejected as a non-answer")) {
+            return 1;
+        }
         if (!expect(!authoritative_reply_is_procedural_non_answer(
                              "Chicago will be around 49 degrees Fahrenheit tomorrow with a chance of rain."),
                     "expected substantive grounded weather answer to remain acceptable")) {
+            return 1;
+        }
+    }
+
+    {
+        if (!expect(authoritative_visible_reply_looks_like_question(
+                            "Which deployment target should I use?"),
+                    "expected explicit question text to classify as a question-shaped reply")) {
+            return 1;
+        }
+        if (!expect(!authoritative_visible_reply_looks_like_question(
+                             "I removed Archer from Sonarr."),
+                    "expected declarative status text to remain a non-question reply")) {
+            return 1;
+        }
+    }
+
+    {
+        if (!expect(infer_authoritative_action_from_visible_surface(
+                            false,
+                            "Which deployment target should I use?",
+                            false,
+                            LLAMA_SELF_STATE_EVENT_USER) == LLAMA_AUTHORITATIVE_REACT_ACTION_ASK,
+                    "expected visible question text to infer ask for active turns")) {
+            return 1;
+        }
+        if (!expect(infer_authoritative_action_from_visible_surface(
+                            false,
+                            "I removed Archer from Sonarr.",
+                            false,
+                            LLAMA_SELF_STATE_EVENT_USER) == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER,
+                    "expected visible declarative text to infer answer for active turns")) {
+            return 1;
+        }
+        if (!expect(infer_authoritative_action_from_visible_surface(
+                            false,
+                            "",
+                            true,
+                            LLAMA_SELF_STATE_EVENT_USER) == LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT,
+                    "expected empty visible text after a tool result to infer wait")) {
+            return 1;
+        }
+        if (!expect(infer_authoritative_action_from_visible_surface(
+                            false,
+                            "",
+                            false,
+                            LLAMA_SELF_STATE_EVENT_USER) == LLAMA_AUTHORITATIVE_REACT_ACTION_NONE,
+                    "expected empty visible text without wait permission to remain uninferred")) {
+            return 1;
+        }
+        if (!expect(infer_authoritative_action_from_visible_surface(
+                            true,
+                            "Write a private reflection about the outcome.",
+                            false,
+                            LLAMA_SELF_STATE_EVENT_SYSTEM) == LLAMA_AUTHORITATIVE_REACT_ACTION_INTERNAL_WRITE,
+                    "expected visible DMN text to infer internal_write")) {
+            return 1;
+        }
+        if (!expect(infer_authoritative_action_from_visible_surface(
+                            true,
+                            "",
+                            false,
+                            LLAMA_SELF_STATE_EVENT_SYSTEM) == LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT,
+                    "expected empty visible DMN text to infer wait")) {
             return 1;
         }
     }
@@ -104,6 +219,68 @@ int main() {
     }
 
     {
+        if (!expect(bounded_runtime_log_excerpt("short reasoning", 64) == "short reasoning",
+                    "expected bounded runtime log excerpt to preserve short text")) {
+            return 1;
+        }
+        const std::string truncated = bounded_runtime_log_excerpt(
+                "abcdefghijklmnopqrstuvwxyz",
+                10);
+        if (!expect(truncated.find("abcdefghij") == 0 &&
+                            truncated.find("[truncated]") != std::string::npos,
+                    "expected bounded runtime log excerpt to append an explicit truncation marker")) {
+            return 1;
+        }
+    }
+
+    {
+        const std::string fallback = synthesize_deferred_terminal_failure_text("Delete The Simpsons off of Sonarr.");
+        if (!expect(fallback.find("could not produce a complete final status message") != std::string::npos,
+                    "expected deferred terminal fallback text to explain the final-status failure")) {
+            return 1;
+        }
+        if (!expect(fallback.find("Please try the request again if needed.") != std::string::npos,
+                    "expected deferred terminal fallback text to stay user-actionable")) {
+            return 1;
+        }
+    }
+
+    {
+        server_task task(SERVER_TASK_TYPE_COMPLETION);
+        task.has_active_trace = true;
+        task.disable_authoritative_react = true;
+        if (!expect(!server_task_should_prepare_authoritative_react(task),
+                    "expected explicit request-level bypass to disable authoritative ReAct preparation")) {
+            return 1;
+        }
+    }
+
+    {
+        server_task task(SERVER_TASK_TYPE_COMPLETION);
+        task.react_same_failure_count = 2;
+        task.react_last_failure_class = "terminal_policy_reject";
+        task.react_last_failure_detail = "example";
+        task.react_history.push_back({"emit_response", "reasoning", "Thought: answer"});
+        task.add_child(100, 101);
+        if (!expect(task.child_tasks.size() == 1,
+                    "expected add_child to create one child task")) {
+            return 1;
+        }
+        if (!expect(task.child_tasks.front().react_same_failure_count == 2,
+                    "expected add_child to preserve same-failure retry state")) {
+            return 1;
+        }
+        if (!expect(task.child_tasks.front().react_last_failure_class == "terminal_policy_reject",
+                    "expected add_child to preserve last failure class")) {
+            return 1;
+        }
+        if (!expect(task.child_tasks.front().react_history.size() == 1,
+                    "expected add_child to preserve staged history")) {
+            return 1;
+        }
+    }
+
+    {
         if (!expect(!authoritative_retry_requires_tool_escalation(
                              "What’s the temperature supposed to be like in Chicago tomorrow?",
                              1),
@@ -123,6 +300,93 @@ int main() {
             return 1;
         }
     }
+
+#ifdef TEST_SERVER_COMMON_VOCAB_MODEL
+    {
+        llama_model_params mparams = llama_model_default_params();
+        mparams.vocab_only = true;
+        llama_model * model = llama_model_load_from_file(TEST_SERVER_COMMON_VOCAB_MODEL, mparams);
+        if (!expect(model != nullptr,
+                    "expected vocab-only GGUF to load for think-block token budget coverage")) {
+            return 1;
+        }
+
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        if (!expect(vocab != nullptr,
+                    "expected loaded vocab-only model to expose a vocabulary")) {
+            llama_model_free(model);
+            return 1;
+        }
+
+        std::string oversized;
+        for (int i = 0; i < 1400; ++i) {
+            if (!oversized.empty()) {
+                oversized += ' ';
+            }
+            oversized += "token";
+        }
+
+        size_t kept_tokens = 0;
+        size_t original_tokens = 0;
+        bool truncated = false;
+        const std::string bounded = truncate_text_to_token_budget(
+                vocab,
+                oversized,
+                SERVER_THINK_BLOCK_TOKEN_CAP,
+                &kept_tokens,
+                &original_tokens,
+                &truncated);
+        if (!expect(truncated,
+                    "expected oversized think text to require token-budget truncation")) {
+            llama_model_free(model);
+            return 1;
+        }
+        if (!expect(original_tokens > SERVER_THINK_BLOCK_TOKEN_CAP,
+                    "expected oversized think text to exceed the configured token cap")) {
+            llama_model_free(model);
+            return 1;
+        }
+        if (!expect(kept_tokens == SERVER_THINK_BLOCK_TOKEN_CAP,
+                    "expected truncation to keep exactly the configured token cap")) {
+            llama_model_free(model);
+            return 1;
+        }
+        if (!expect(common_tokenize(vocab, bounded, true, true).size() <= SERVER_THINK_BLOCK_TOKEN_CAP,
+                    "expected bounded think text to tokenize within the configured cap")) {
+            llama_model_free(model);
+            return 1;
+        }
+
+        size_t short_kept_tokens = 0;
+        size_t short_original_tokens = 0;
+        bool short_truncated = false;
+        const std::string short_text = "short hidden thought";
+        const std::string short_bounded = truncate_text_to_token_budget(
+                vocab,
+                short_text,
+                SERVER_THINK_BLOCK_TOKEN_CAP,
+                &short_kept_tokens,
+                &short_original_tokens,
+                &short_truncated);
+        if (!expect(!short_truncated,
+                    "expected short think text to remain untruncated")) {
+            llama_model_free(model);
+            return 1;
+        }
+        if (!expect(short_kept_tokens == short_original_tokens,
+                    "expected short think text to preserve its token count")) {
+            llama_model_free(model);
+            return 1;
+        }
+        if (!expect(short_bounded == short_text,
+                    "expected short think text to round-trip without modification")) {
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_model_free(model);
+    }
+#endif
 
     return 0;
 }

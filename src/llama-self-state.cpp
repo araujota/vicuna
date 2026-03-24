@@ -33,7 +33,7 @@ static constexpr size_t   LLAMA_SELF_MAX_MEMORY_HANDLES = 24;
 static constexpr size_t   LLAMA_SELF_MAX_TRACE_ITEMS = 256;
 static constexpr size_t   LLAMA_SELF_MAX_TRACE_TOKENS = 2048;
 static constexpr uint32_t LLAMA_SELF_TRACE_MAGIC = 0x4c535354u; // LSST
-constexpr uint32_t LLAMA_SELF_TRACE_VERSION = 5;
+constexpr uint32_t LLAMA_SELF_TRACE_VERSION = 6;
 constexpr size_t   LLAMA_SELF_BELIEF_SIGNATURE_DIM = 4;
 constexpr float    LLAMA_SELF_DISCOVERY_HALF_LIFE_MS = 20.0f * 60.0f * 1000.0f;
 constexpr float    LLAMA_SELF_DISCOVERY_ADMISSION_THRESHOLD = 0.52f;
@@ -934,6 +934,17 @@ static bool is_internal_artifact_event(const llama_self_state_event & event) {
     return (event.flags & LLAMA_SELF_STATE_EVENT_INTERNAL_ARTIFACT) != 0;
 }
 
+static uint32_t disturbance_reason_mask_from_appraisal(const llama_self_appraisal_vector & appraisal) {
+    uint32_t reason_mask = 0;
+    if (appraisal.expectation_violation >= 0.10f) reason_mask |= 1u << 0;
+    if (appraisal.progress_error >= 0.10f) reason_mask |= 1u << 1;
+    if (appraisal.social_deficit >= 0.10f) reason_mask |= 1u << 2;
+    if (appraisal.controllability_deficit >= 0.10f) reason_mask |= 1u << 3;
+    if (appraisal.failure_severity >= 0.10f) reason_mask |= 1u << 4;
+    if (appraisal.unresolved_commitment >= 0.10f) reason_mask |= 1u << 5;
+    return reason_mask;
+}
+
 static llama_self_tool_state_info build_tool_state_info(const std::vector<llama_self_tool_job> & tool_jobs) {
     llama_self_tool_state_info info = {};
     info.active_status = LLAMA_SELF_TOOL_JOB_IDLE;
@@ -1327,6 +1338,7 @@ bool llama_self_state::apply_time_point(const llama_self_state_time_point & time
     }
 
     recompute_time_surface(source_mask);
+    recompute_social_contact_state();
     return true;
 }
 
@@ -1897,10 +1909,22 @@ bool llama_self_state::get_social_state(llama_self_social_state_info * out_info)
         /*.bond_strength =*/ bond_strength,
         /*.recent_user_valence =*/ social_recent_user_valence,
         /*.dissatisfaction =*/ social_dissatisfaction,
+        /*.contact_set_point_hours =*/ social_contact_set_point_hours,
+        /*.silence_hours =*/ social_silence_hours,
+        /*.silence_deficit =*/ social_silence_deficit,
         /*.user_turn_count =*/ social_user_turn_count,
         /*.system_turn_count =*/ social_system_turn_count,
         /*.last_update_monotonic_ms =*/ social_last_update_monotonic_ms,
+        /*.last_substantive_contact_monotonic_ms =*/ social_last_substantive_contact_monotonic_ms,
     };
+    return true;
+}
+
+bool llama_self_state::get_last_disturbance(llama_self_disturbance_state_info * out_info) const {
+    if (!out_info) {
+        return false;
+    }
+    *out_info = last_disturbance_state;
     return true;
 }
 
@@ -1957,11 +1981,16 @@ void llama_self_state::refresh_self_description_cache() const {
            << social_state.trust << '|'
            << social_state.reciprocity << '|'
            << social_state.dissatisfaction << '|'
+           << social_state.contact_set_point_hours << '|'
+           << social_state.silence_hours << '|'
+           << social_state.silence_deficit << '|'
            << tool_state.pending_jobs << '|'
            << tool_state.readiness << '|'
            << model_state.extension_summary.active_count << '|'
            << model_state.extension_summary.discovered_count << '|'
-           << model_state.extension_summary.gain_signal;
+           << model_state.extension_summary.gain_signal << '|'
+           << last_disturbance_state.valid << '|'
+           << last_disturbance_state.delta.total_disturbance;
     const uint64_t source_hash = fnv1a64_self_state(source.str());
 
     const bool belief_changed = model_state.belief_summary.valid &&
@@ -1977,18 +2006,21 @@ void llama_self_state::refresh_self_description_cache() const {
             0.42f * model_state.belief_summary.residual_allostatic_pressure +
             0.18f * current_scalar_register(LLAMA_SELF_REGISTER_CONTRADICTION) +
             0.16f * current_scalar_register(LLAMA_SELF_REGISTER_UNCERTAINTY) +
-            0.14f * social_state.dissatisfaction +
+            0.10f * social_state.dissatisfaction +
+            0.08f * social_state.silence_deficit +
             0.10f * clamp_unit((float) tool_state.pending_jobs / 4.0f));
     const float materiality = clamp_unit(
             0.34f * allostatic_distance +
             0.18f * current_scalar_register(LLAMA_SELF_REGISTER_GOAL_PROGRESS_PRESSURE) +
             0.16f * current_scalar_register(LLAMA_SELF_REGISTER_RECOVERY_URGENCY) +
             0.16f * current_scalar_register(LLAMA_SELF_REGISTER_FOLLOWUP_CONTINUATION) +
-            0.16f * std::fabs(model_state.extension_summary.gain_signal));
+            0.10f * std::fabs(model_state.extension_summary.gain_signal) +
+            0.06f * social_state.silence_deficit);
     uint32_t reason_mask = 0;
     if (current_scalar_register(LLAMA_SELF_REGISTER_CONTRADICTION) >= 0.10f) reason_mask |= 1u << 0;
     if (current_scalar_register(LLAMA_SELF_REGISTER_UNCERTAINTY) >= 0.10f) reason_mask |= 1u << 1;
     if (social_state.dissatisfaction >= 0.10f) reason_mask |= 1u << 2;
+    if (social_state.silence_deficit >= 0.10f) reason_mask |= 1u << 5;
     if (tool_state.pending_jobs > 0) reason_mask |= 1u << 3;
     if (std::fabs(model_state.extension_summary.gain_signal) >= 0.05f) reason_mask |= 1u << 4;
 
@@ -2022,6 +2054,7 @@ void llama_self_state::refresh_self_description_cache() const {
             std::to_string((double) allostatic_distance) + "|" +
             std::to_string((double) social_state.trust) + "|" +
             std::to_string((double) social_state.dissatisfaction) + "|" +
+            std::to_string((double) social_state.silence_deficit) + "|" +
             std::to_string((double) tool_state.readiness));
     if (!cached_emotive_moment_revision.valid || emotive_source_hash != cached_emotive_source_hash) {
         const float contradiction = current_scalar_register(LLAMA_SELF_REGISTER_CONTRADICTION);
@@ -2033,19 +2066,22 @@ void llama_self_state::refresh_self_description_cache() const {
                 0.45f * social_state.trust +
                 0.25f * social_state.familiarity +
                 0.20f * social_state.reciprocity +
-                0.10f * (1.0f - social_state.dissatisfaction));
+                0.06f * (1.0f - social_state.dissatisfaction) +
+                0.04f * (1.0f - social_state.silence_deficit));
         const float valence = clamp_unit(
                 0.55f +
                 0.20f * model_state.horizons[(size_t) LLAMA_SELF_HORIZON_INSTANT].user_outcome.satisfaction_estimate -
                 0.22f * contradiction -
                 0.20f * uncertainty -
-                0.18f * social_state.dissatisfaction);
+                0.12f * social_state.dissatisfaction -
+                0.10f * social_state.silence_deficit);
         const float arousal = clamp_unit(
                 0.18f +
                 0.32f * contradiction +
                 0.24f * uncertainty +
                 0.14f * goal_pressure +
-                0.12f * current_scalar_register(LLAMA_SELF_REGISTER_BROADCAST_PRESSURE));
+                0.08f * current_scalar_register(LLAMA_SELF_REGISTER_BROADCAST_PRESSURE) +
+                0.10f * social_state.silence_deficit);
         const float dominance = clamp_unit(
                 0.55f +
                 0.20f * model_state.horizons[(size_t) LLAMA_SELF_HORIZON_INSTANT].epistemic.answerability +
@@ -2855,7 +2891,7 @@ bool llama_self_state::get_updater_program(llama_self_updater_program * out_prog
 }
 
 size_t llama_self_state::trace_export_size() const {
-    size_t size = sizeof(uint32_t) * 4;
+    size_t size = sizeof(uint32_t) * 5;
 
     for (const auto & item : trace_items) {
         size += sizeof(int64_t);
@@ -2870,6 +2906,7 @@ size_t llama_self_state::trace_export_size() const {
     }
 
     size += model_extensions.size() * sizeof(llama_self_model_extension_entry);
+    size += tool_jobs.size() * sizeof(llama_self_tool_job);
 
     return size;
 }
@@ -2885,6 +2922,7 @@ bool llama_self_state::trace_export(void * dst, size_t size) const {
     append_bytes(buffer, LLAMA_SELF_TRACE_VERSION);
     append_bytes(buffer, (uint32_t) trace_items.size());
     append_bytes(buffer, (uint32_t) model_extensions.size());
+    append_bytes(buffer, (uint32_t) tool_jobs.size());
 
     for (const auto & item : trace_items) {
         append_bytes(buffer, item.context_item_id);
@@ -2909,6 +2947,10 @@ bool llama_self_state::trace_export(void * dst, size_t size) const {
         append_bytes(buffer, extension);
     }
 
+    for (const auto & tool_job : tool_jobs) {
+        append_bytes(buffer, tool_job);
+    }
+
     if (buffer.size() > size) {
         return false;
     }
@@ -2928,12 +2970,14 @@ bool llama_self_state::trace_import(const void * src, size_t size, bool replace_
     uint32_t version = 0;
     uint32_t count = 0;
     uint32_t extension_count = 0;
+    uint32_t tool_job_count = 0;
     if (!read_bytes(bytes, size, &cursor, &magic) ||
         !read_bytes(bytes, size, &cursor, &version) ||
         !read_bytes(bytes, size, &cursor, &count) ||
         magic != LLAMA_SELF_TRACE_MAGIC ||
-        (version != 1 && version != 2 && version != 3 && version != 4 && version != LLAMA_SELF_TRACE_VERSION) ||
-        (version >= 4 && !read_bytes(bytes, size, &cursor, &extension_count))) {
+        (version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != LLAMA_SELF_TRACE_VERSION) ||
+        (version >= 4 && !read_bytes(bytes, size, &cursor, &extension_count)) ||
+        (version >= 6 && !read_bytes(bytes, size, &cursor, &tool_job_count))) {
         return false;
     }
 
@@ -2941,6 +2985,8 @@ bool llama_self_state::trace_import(const void * src, size_t size, bool replace_
     imported.reserve(count);
     std::vector<llama_self_model_extension_entry> imported_extensions;
     imported_extensions.reserve(extension_count);
+    std::vector<llama_self_tool_job> imported_tool_jobs;
+    imported_tool_jobs.reserve(tool_job_count);
 
     for (uint32_t i = 0; i < count; ++i) {
         int64_t context_item_id = -1;
@@ -3009,6 +3055,15 @@ bool llama_self_state::trace_import(const void * src, size_t size, bool replace_
         }
     }
 
+    if (version >= 6) {
+        imported_tool_jobs.resize(tool_job_count);
+        for (uint32_t i = 0; i < tool_job_count; ++i) {
+            if (!read_bytes(bytes, size, &cursor, &imported_tool_jobs[(size_t) i])) {
+                return false;
+            }
+        }
+    }
+
     if (cursor != size) {
         return false;
     }
@@ -3016,10 +3071,21 @@ bool llama_self_state::trace_import(const void * src, size_t size, bool replace_
     if (replace_existing) {
         trace_items = std::move(imported);
         model_extensions = std::move(imported_extensions);
+        tool_jobs = std::move(imported_tool_jobs);
     } else {
         trace_items.insert(trace_items.end(), imported.begin(), imported.end());
         for (const auto & extension : imported_extensions) {
             model_extensions.push_back(extension);
+        }
+        for (const auto & tool_job : imported_tool_jobs) {
+            auto it = std::find_if(tool_jobs.begin(), tool_jobs.end(), [&tool_job](const llama_self_tool_job & existing) {
+                return existing.job_id == tool_job.job_id;
+            });
+            if (it == tool_jobs.end()) {
+                tool_jobs.push_back(tool_job);
+            } else if (tool_job.last_update_monotonic_ms > it->last_update_monotonic_ms) {
+                *it = tool_job;
+            }
         }
     }
 
@@ -3049,6 +3115,15 @@ bool llama_self_state::trace_import(const void * src, size_t size, bool replace_
         accumulate_model_extensions(model_extensions, neutral_context, false, &signal, &extension_summary);
     } else {
         refresh_model_extension_summary();
+    }
+
+    if (!tool_jobs.empty()) {
+        last_tool_monotonic_ms = -1;
+        for (const auto & tool_job : tool_jobs) {
+            last_tool_monotonic_ms = std::max(last_tool_monotonic_ms, tool_job.last_update_monotonic_ms);
+        }
+        datetime.delta_since_last_tool_event_ms = elapsed_or_unset(datetime.monotonic_ms, last_tool_monotonic_ms);
+        refresh_tool_surface(LLAMA_SELF_SOURCE_TOOL_EVENT);
     }
 
     return true;
@@ -3084,6 +3159,11 @@ void llama_self_state::reset_dynamic_state_preserve_static() {
     social_reciprocity = 0.5f;
     social_recent_user_valence = 0.0f;
     social_dissatisfaction = 0.0f;
+    social_contact_set_point_hours = 72.0f;
+    social_silence_hours = 0.0f;
+    social_silence_deficit = 0.0f;
+    social_last_substantive_contact_monotonic_ms = -1;
+    last_disturbance_state = {};
     initialize_model_state();
     session_start_wall_ms = -1;
     session_start_monotonic_ms = -1;
@@ -3147,6 +3227,7 @@ bool llama_self_state::replay_trace(const llama_vocab * vocab, int32_t upto_coun
     const size_t limit = std::min(trace_items.size(), (size_t) upto_count);
     auto saved_trace = trace_items;
     auto saved_model_extensions = model_extensions;
+    auto saved_tool_jobs = tool_jobs;
     repair_trace_item_pointers(saved_trace);
     trace_items.clear();
     reset_dynamic_state_preserve_static();
@@ -3183,6 +3264,15 @@ bool llama_self_state::replay_trace(const llama_vocab * vocab, int32_t upto_coun
         const std::array<float, 32> neutral_context = {};
         extension_domain_signal signal = {};
         accumulate_model_extensions(model_extensions, neutral_context, false, &signal, &extension_summary);
+    }
+    if (!saved_tool_jobs.empty()) {
+        tool_jobs = std::move(saved_tool_jobs);
+        last_tool_monotonic_ms = -1;
+        for (const auto & tool_job : tool_jobs) {
+            last_tool_monotonic_ms = std::max(last_tool_monotonic_ms, tool_job.last_update_monotonic_ms);
+        }
+        datetime.delta_since_last_tool_event_ms = elapsed_or_unset(datetime.monotonic_ms, last_tool_monotonic_ms);
+        refresh_tool_surface(LLAMA_SELF_SOURCE_TOOL_EVENT);
     }
     trace_items = saved_trace;
     return true;
@@ -3734,6 +3824,16 @@ bool llama_self_state::apply_postwrite(const llama_self_state_event & event, con
     if (event.channel != LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL &&
             !is_internal_artifact_event(event)) {
         update_social_state(event, features);
+    } else {
+        recompute_social_contact_state();
+    }
+
+    if (event.channel != LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL) {
+        update_disturbance_state(event, features, source_mask);
+    }
+
+    if (event.channel != LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL &&
+            !is_internal_artifact_event(event)) {
         update_expanded_model(event, features, source_mask);
         if ((event.flags & LLAMA_SELF_STATE_EVENT_ADMITTED) != 0) {
             (void) maybe_admit_event_discovered_state(event, features);
@@ -4056,6 +4156,227 @@ void llama_self_state::update_social_state(
             0.50f * social_recent_user_valence +
             0.30f * (1.0f - social_trust) +
             0.20f * (1.0f - social_reciprocity));
+
+    if (event_is_substantive_social_contact(event, features)) {
+        social_last_substantive_contact_monotonic_ms = datetime.monotonic_ms;
+    }
+    recompute_social_contact_state();
+}
+
+void llama_self_state::recompute_social_contact_state() {
+    const float continuation = current_scalar_register(LLAMA_SELF_REGISTER_FOLLOWUP_CONTINUATION);
+    const float broadcast_inhibition = current_scalar_register(LLAMA_SELF_REGISTER_BROADCAST_INHIBITION);
+    const float bond_strength = clamp_unit(
+            0.40f * social_familiarity +
+            0.35f * social_trust +
+            0.25f * social_reciprocity);
+
+    social_contact_set_point_hours = std::clamp(
+            72.0f -
+                    36.0f * bond_strength -
+                    18.0f * social_reciprocity -
+                    24.0f * clamp_unit(continuation) +
+                    12.0f * clamp_unit(broadcast_inhibition),
+            1.0f,
+            168.0f);
+
+    if (social_last_substantive_contact_monotonic_ms > 0 && datetime.monotonic_ms > social_last_substantive_contact_monotonic_ms) {
+        social_silence_hours = (float) (datetime.monotonic_ms - social_last_substantive_contact_monotonic_ms) / 3600000.0f;
+    } else {
+        social_silence_hours = 0.0f;
+    }
+
+    const float excess_hours = std::max(0.0f, social_silence_hours - social_contact_set_point_hours);
+    social_silence_deficit = clamp_unit(excess_hours / (social_contact_set_point_hours + 12.0f));
+}
+
+bool llama_self_state::event_is_substantive_social_contact(
+        const llama_self_state_event & event,
+        const llama_self_state_feature_vector & features) const {
+    if (event.n_tokens <= 0 || event.channel == LLAMA_SELF_STATE_EVENT_CHANNEL_COUNTERFACTUAL) {
+        return false;
+    }
+    if (event.role == LLAMA_SELF_STATE_EVENT_USER) {
+        return true;
+    }
+    if (event.role == LLAMA_SELF_STATE_EVENT_SYSTEM || (event.flags & LLAMA_SELF_STATE_EVENT_EMIT_FOLLOWUP) != 0) {
+        return (event.flags & LLAMA_SELF_STATE_EVENT_EMIT_FOLLOWUP) != 0 ||
+                features.token_count_log >= 0.22f ||
+                features.followup_hint >= 0.20f;
+    }
+    return false;
+}
+
+float llama_self_state::disturbance_source_reliability(const llama_self_state_event & event) {
+    if (event.role == LLAMA_SELF_STATE_EVENT_USER) {
+        return 1.00f;
+    }
+    if (event.role == LLAMA_SELF_STATE_EVENT_TOOL ||
+            (event.flags & (LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED | LLAMA_SELF_STATE_EVENT_TOOL_FAILED)) != 0) {
+        return 0.95f;
+    }
+    if ((event.flags & LLAMA_SELF_STATE_EVENT_INTERNAL_ARTIFACT) != 0) {
+        return 0.55f;
+    }
+    if ((event.flags & LLAMA_SELF_STATE_EVENT_EMIT_FOLLOWUP) != 0) {
+        return 0.75f;
+    }
+    if (event.role == LLAMA_SELF_STATE_EVENT_SYSTEM) {
+        return 0.70f;
+    }
+    return 0.60f;
+}
+
+int32_t llama_self_state::disturbance_source_kind(const llama_self_state_event & event) {
+    if (event.role == LLAMA_SELF_STATE_EVENT_USER) {
+        return LLAMA_SELF_DISTURBANCE_SOURCE_USER_MESSAGE;
+    }
+    if ((event.flags & LLAMA_SELF_STATE_EVENT_INTERNAL_ARTIFACT) != 0) {
+        return LLAMA_SELF_DISTURBANCE_SOURCE_HIDDEN_THOUGHT;
+    }
+    if (event.role == LLAMA_SELF_STATE_EVENT_TOOL ||
+            (event.flags & (LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED | LLAMA_SELF_STATE_EVENT_TOOL_FAILED)) != 0) {
+        return LLAMA_SELF_DISTURBANCE_SOURCE_TOOL_OBSERVATION;
+    }
+    if ((event.flags & LLAMA_SELF_STATE_EVENT_EMIT_FOLLOWUP) != 0) {
+        return LLAMA_SELF_DISTURBANCE_SOURCE_DMN_EMIT;
+    }
+    if (event.role == LLAMA_SELF_STATE_EVENT_SYSTEM) {
+        return LLAMA_SELF_DISTURBANCE_SOURCE_VISIBLE_OUTPUT;
+    }
+    return LLAMA_SELF_DISTURBANCE_SOURCE_NONE;
+}
+
+int32_t llama_self_state::disturbance_failure_class(const llama_self_state_event & event) {
+    if ((event.flags & LLAMA_SELF_STATE_EVENT_TOOL_FAILED) == 0) {
+        return LLAMA_SELF_DISTURBANCE_FAILURE_NONE;
+    }
+    if ((event.flags & LLAMA_SELF_STATE_EVENT_INTERNAL_ARTIFACT) != 0) {
+        return LLAMA_SELF_DISTURBANCE_FAILURE_WRONG_TOOL_OR_METHOD;
+    }
+    if (event.role == LLAMA_SELF_STATE_EVENT_TOOL) {
+        return LLAMA_SELF_DISTURBANCE_FAILURE_DOWNSTREAM_SERVICE;
+    }
+    return LLAMA_SELF_DISTURBANCE_FAILURE_LOCAL_DISPATCH;
+}
+
+void llama_self_state::update_disturbance_state(
+        const llama_self_state_event & event,
+        const llama_self_state_feature_vector & features,
+        uint32_t source_mask) {
+    const bool tool_failed = (event.flags & LLAMA_SELF_STATE_EVENT_TOOL_FAILED) != 0;
+    const bool tool_completed = (event.flags & LLAMA_SELF_STATE_EVENT_TOOL_COMPLETED) != 0;
+    const float source_reliability = disturbance_source_reliability(event);
+    const float goal_progress_estimate =
+            model_horizons[(size_t) LLAMA_SELF_HORIZON_INSTANT].goal_progress.goal_progress_estimate;
+    const float current_goal_pressure = current_scalar_register(LLAMA_SELF_REGISTER_GOAL_PROGRESS_PRESSURE);
+    const float current_loop_inefficiency = current_scalar_register(LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY);
+
+    llama_self_appraisal_vector appraisal = {
+        /*.novelty =*/ clamp_unit(features.novelty),
+        /*.goal_relevance =*/ clamp_unit(std::max(features.goal_top_similarity, current_scalar_register(LLAMA_SELF_REGISTER_GOAL_RELEVANCE))),
+        /*.progress_error =*/ clamp_unit(std::max(1.0f - goal_progress_estimate, current_goal_pressure)),
+        /*.progress_velocity_error =*/ clamp_unit(
+                0.45f * current_loop_inefficiency +
+                0.25f * features.tool_pending_pressure +
+                0.20f * features.uncertainty_score +
+                0.10f * (tool_failed ? 1.0f : 0.0f)),
+        /*.expectation_violation =*/ clamp_unit(std::max(
+                features.contradiction_score,
+                tool_failed ? 0.85f : 0.0f)),
+        /*.controllability_deficit =*/ clamp_unit(
+                0.55f * (1.0f - features.tool_readiness_score) +
+                0.25f * features.tool_pending_pressure +
+                0.20f * features.uncertainty_score),
+        /*.failure_severity =*/ clamp_unit(
+                tool_failed ? 1.0f :
+                (tool_completed ? 0.0f : 0.35f * features.error_ratio)),
+        /*.social_deficit =*/ clamp_unit(std::max(social_dissatisfaction, social_silence_deficit)),
+        /*.reciprocity_deficit =*/ clamp_unit(1.0f - social_reciprocity),
+        /*.unresolved_commitment =*/ clamp_unit(std::max(
+                current_scalar_register(LLAMA_SELF_REGISTER_FOLLOWUP_CONTINUATION),
+                features.followup_hint)),
+        /*.effort_cost =*/ clamp_unit(std::max(
+                features.memory_write_pressure,
+                features.tool_pending_pressure)),
+    };
+
+    const float total_disturbance = clamp_unit(source_reliability * (
+            0.24f * appraisal.expectation_violation +
+            0.18f * appraisal.progress_error +
+            0.14f * appraisal.progress_velocity_error +
+            0.14f * appraisal.controllability_deficit +
+            0.12f * appraisal.social_deficit +
+            0.10f * appraisal.failure_severity +
+            0.08f * appraisal.unresolved_commitment));
+
+    llama_self_disturbance_delta delta = {
+        /*.total_disturbance =*/ total_disturbance,
+        /*.contradiction_delta =*/ clamp_unit(source_reliability * (
+                0.45f * appraisal.expectation_violation +
+                0.20f * appraisal.failure_severity)),
+        /*.uncertainty_delta =*/ clamp_unit(source_reliability * (
+                0.40f * appraisal.controllability_deficit +
+                0.25f * appraisal.novelty +
+                0.20f * appraisal.progress_velocity_error)),
+        /*.goal_pressure_delta =*/ clamp_unit(source_reliability * (
+                0.35f * appraisal.progress_error +
+                0.30f * appraisal.unresolved_commitment +
+                0.20f * appraisal.goal_relevance)),
+        /*.recovery_urgency_delta =*/ clamp_unit(source_reliability * (
+                0.30f * appraisal.failure_severity +
+                0.25f * appraisal.expectation_violation +
+                0.20f * appraisal.social_deficit)),
+        /*.followup_continuation_delta =*/ clamp_unit(source_reliability * (
+                0.34f * appraisal.unresolved_commitment +
+                0.26f * appraisal.social_deficit +
+                0.20f * appraisal.progress_error)),
+        /*.social_relevance_delta =*/ clamp_unit(source_reliability * (
+                0.40f * appraisal.social_deficit +
+                0.25f * appraisal.reciprocity_deficit +
+                0.20f * appraisal.goal_relevance)),
+        /*.loop_inefficiency_delta =*/ clamp_unit(source_reliability * (
+                0.32f * appraisal.progress_velocity_error +
+                0.24f * appraisal.effort_cost +
+                0.20f * appraisal.expectation_violation)),
+        /*.satisfaction_risk_delta =*/ clamp_unit(source_reliability * (
+                0.45f * appraisal.social_deficit +
+                0.20f * appraisal.failure_severity +
+                0.15f * appraisal.expectation_violation)),
+        /*.reason_mask =*/ disturbance_reason_mask_from_appraisal(appraisal),
+        /*.requires_emotive_recompute =*/ total_disturbance >= 0.12f ||
+                appraisal.social_deficit >= 0.12f ||
+                appraisal.failure_severity >= 0.10f,
+    };
+
+    auto apply_positive_delta = [&](int32_t register_id, float value) {
+        if (value <= 0.0f) {
+            return;
+        }
+        update_scalar_register(register_id, clamp_unit(current_scalar_register(register_id) + value), source_mask);
+    };
+
+    apply_positive_delta(LLAMA_SELF_REGISTER_CONTRADICTION, delta.contradiction_delta);
+    apply_positive_delta(LLAMA_SELF_REGISTER_UNCERTAINTY, delta.uncertainty_delta);
+    apply_positive_delta(LLAMA_SELF_REGISTER_GOAL_PROGRESS_PRESSURE, delta.goal_pressure_delta);
+    apply_positive_delta(LLAMA_SELF_REGISTER_RECOVERY_URGENCY, delta.recovery_urgency_delta);
+    apply_positive_delta(LLAMA_SELF_REGISTER_FOLLOWUP_CONTINUATION, delta.followup_continuation_delta);
+    apply_positive_delta(LLAMA_SELF_REGISTER_SOCIAL_RELEVANCE, delta.social_relevance_delta);
+    apply_positive_delta(LLAMA_SELF_REGISTER_LOOP_INEFFICIENCY, delta.loop_inefficiency_delta);
+    apply_positive_delta(LLAMA_SELF_REGISTER_USER_SATISFACTION_RISK, delta.satisfaction_risk_delta);
+
+    last_disturbance_state = {
+        /*.valid =*/ true,
+        /*.source_kind =*/ disturbance_source_kind(event),
+        /*.failure_class =*/ disturbance_failure_class(event),
+        /*.source_reliability =*/ source_reliability,
+        /*.admitted_monotonic_ms =*/ datetime.monotonic_ms,
+        /*.appraisal =*/ appraisal,
+        /*.delta =*/ delta,
+    };
+    if (delta.requires_emotive_recompute) {
+        cached_self_model_revision.requires_emotive_recompute = true;
+    }
 }
 
 void llama_self_state::initialize_model_state() {
@@ -4604,7 +4925,8 @@ void llama_self_state::update_expanded_model(
     instant.goal_progress.urgency = clamp_unit(
             0.38f * goal_relevance +
             0.18f * features.followup_hint +
-            0.18f * social_dissatisfaction +
+            0.12f * social_dissatisfaction +
+            0.08f * social_silence_deficit +
             0.14f * features.recency_user +
             0.12f * continuation);
     instant.goal_progress.expected_next_action_gain = clamp_unit(
@@ -4632,7 +4954,8 @@ void llama_self_state::update_expanded_model(
             0.12f * instant.goal_progress.goal_progress_estimate);
     instant.user_outcome.frustration_risk = clamp_unit(
             0.40f * social_recent_user_valence +
-            0.20f * social_dissatisfaction +
+            0.12f * social_dissatisfaction +
+            0.08f * social_silence_deficit +
             0.15f * contradiction +
             0.10f * uncertainty +
             0.15f * (tool_failed ? 1.0f : 0.0f));
@@ -4646,6 +4969,7 @@ void llama_self_state::update_expanded_model(
             0.45f * (1.0f - social_trust) +
             0.30f * instant.user_outcome.frustration_risk +
             0.15f * contradiction +
+            0.05f * social_silence_deficit +
             0.10f * (tool_failed ? 1.0f : 0.0f));
     instant.user_outcome.preference_uncertainty = clamp_unit(
             0.40f * features.topic_shift +
@@ -5247,6 +5571,10 @@ bool llama_context::self_state_get_emotive_moment_revision(llama_emotive_moment_
     return self_state && self_state->get_emotive_moment_revision(out_info);
 }
 
+bool llama_context::self_state_get_last_disturbance(llama_self_disturbance_state_info * out_info) const {
+    return self_state && self_state->get_last_disturbance(out_info);
+}
+
 int32_t llama_context::self_state_model_extension_count() const {
     return self_state ? self_state->model_extension_count() : 0;
 }
@@ -5845,6 +6173,12 @@ int32_t llama_self_state_get_emotive_moment_revision(
         const struct llama_context * ctx,
         struct llama_emotive_moment_revision * out_info) {
     return ctx && ctx->self_state_get_emotive_moment_revision(out_info) ? 0 : -1;
+}
+
+int32_t llama_self_state_get_last_disturbance(
+        const struct llama_context * ctx,
+        struct llama_self_disturbance_state_info * out_info) {
+    return ctx && ctx->self_state_get_last_disturbance(out_info) ? 0 : -1;
 }
 
 int32_t llama_self_state_model_extension_count(const struct llama_context * ctx) {

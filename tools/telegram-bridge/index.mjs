@@ -11,6 +11,8 @@ import {
   appendProactiveId,
   appendChatTranscriptMessage,
   buildTelegramFileUrl,
+  buildTelegramRelaySystemPrompt,
+  bootstrapTelegramOutboxOffset,
   deletePendingOptionPrompt,
   extractChatCompletionText,
   extractResponseText,
@@ -18,12 +20,20 @@ import {
   getPendingOptionPrompt,
   getChatTranscript,
   ingestTelegramDocumentMessage,
+  isTelegramReplyTargetErrorMessage,
   loadState,
+  normalizeTelegramOutboxItem,
   parseInteger,
   parseSseChunk,
+  recordTelegramOutboxDeliveryReceipt,
+  reconcileTelegramOutboxOffset,
   registerChat,
+  resolveTelegramConversationForMessage,
+  resolveTelegramConversationForOutbound,
   saveState,
+  setTelegramOutboxCheckpoint,
   setPendingOptionPrompt,
+  shouldBootstrapTelegramOutboxOffset,
   splitSseBuffer,
   summarizeChatCompletion,
   updateTelegramOffset,
@@ -44,6 +54,7 @@ const env = {
   })(),
   maxDocumentChars: Math.max(256, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_DOCUMENT_CHARS, 12000)),
   selfEmitAfter: Math.max(0, parseInteger(process.env.TELEGRAM_BRIDGE_SELF_EMIT_AFTER, 0)),
+  replayRetainedOutbox: String(process.env.TELEGRAM_BRIDGE_REPLAY_RETAINED_OUTBOX ?? '').trim() === '1',
   vicunaApiKey: process.env.VICUNA_API_KEY ?? '',
   supermemoryApiKey: process.env.SUPERMEMORY_API_KEY ?? '',
 };
@@ -73,10 +84,11 @@ function log(message, extra = undefined) {
   console.log(`${prefix} ${message}`, extra);
 }
 
-function transcriptSummary(chatId) {
-  const transcript = getChatTranscript(state, chatId);
+function transcriptSummary(chatId, conversationId = '') {
+  const transcript = getChatTranscript(state, chatId, conversationId ? { conversationId } : {});
   return {
     chatId: String(chatId),
+    ...(conversationId ? { conversationId: String(conversationId) } : {}),
     messageCount: transcript.length,
     roles: transcript.map((entry) => entry.role).join(','),
     lastPreview: transcript.length > 0 ? transcript[transcript.length - 1].content.slice(0, 120) : '',
@@ -91,6 +103,19 @@ function vicunaHeaders() {
     headers.Authorization = `Bearer ${env.vicunaApiKey}`;
   }
   return headers;
+}
+
+async function postVicunaJson(pathname, payload) {
+  const response = await fetch(`${env.vicunaBaseUrl}${pathname}`, {
+    method: 'POST',
+    headers: vicunaHeaders(),
+    body: JSON.stringify(payload ?? {}),
+  });
+  const body = await response.json();
+  if (!response.ok) {
+    throw new Error(`vicuna ${pathname} failed: ${response.status} ${JSON.stringify(body)}`);
+  }
+  return body;
 }
 
 async function telegramRequest(method, payload) {
@@ -180,6 +205,141 @@ async function sendTelegramMessage(chatId, text, extra = {}) {
   });
 }
 
+async function sendTelegramOutboxMessage(chatId, text, replyToMessageId = 0) {
+  const normalizedReplyToMessageId = Math.max(0, Number(replyToMessageId ?? 0) || 0);
+  if (normalizedReplyToMessageId <= 0) {
+    const sent = await sendTelegramMessage(chatId, text);
+    return {
+      sent,
+      deliveryMode: 'no_reply',
+      requestedReplyToMessageId: 0,
+      fallbackError: '',
+    };
+  }
+
+  try {
+    const sent = await sendTelegramMessage(chatId, text, {
+      reply_to_message_id: normalizedReplyToMessageId,
+    });
+    return {
+      sent,
+      deliveryMode: 'reply',
+      requestedReplyToMessageId: normalizedReplyToMessageId,
+      fallbackError: '',
+    };
+  } catch (error) {
+    if (!isTelegramReplyTargetErrorMessage(error?.message)) {
+      throw error;
+    }
+    const fallbackError = error.message;
+    log('Telegram follow-up reply target rejected; retrying without reply anchor', {
+      chatId: String(chatId),
+      replyToMessageId: normalizedReplyToMessageId,
+      error: fallbackError,
+    });
+    const sent = await sendTelegramMessage(chatId, text);
+    return {
+      sent,
+      deliveryMode: 'fallback_no_reply',
+      requestedReplyToMessageId: normalizedReplyToMessageId,
+      fallbackError,
+    };
+  }
+}
+
+async function sendTelegramPromptMessage(chatId, text, promptMarkup, replyToMessageId = 0) {
+  const normalizedReplyToMessageId = Math.max(0, Number(replyToMessageId ?? 0) || 0);
+  const payload = {
+    reply_markup: promptMarkup,
+  };
+  if (normalizedReplyToMessageId <= 0) {
+    return {
+      sent: await sendTelegramMessage(chatId, text, payload),
+      deliveryMode: 'no_reply',
+      requestedReplyToMessageId: 0,
+      fallbackError: '',
+    };
+  }
+
+  try {
+    return {
+      sent: await sendTelegramMessage(chatId, text, {
+        ...payload,
+        reply_to_message_id: normalizedReplyToMessageId,
+      }),
+      deliveryMode: 'reply',
+      requestedReplyToMessageId: normalizedReplyToMessageId,
+      fallbackError: '',
+    };
+  } catch (error) {
+    if (!isTelegramReplyTargetErrorMessage(error?.message)) {
+      throw error;
+    }
+    const fallbackError = error.message;
+    log('Telegram prompt reply target rejected; retrying without reply anchor', {
+      chatId: String(chatId),
+      replyToMessageId: normalizedReplyToMessageId,
+      error: fallbackError,
+    });
+    return {
+      sent: await sendTelegramMessage(chatId, text, payload),
+      deliveryMode: 'fallback_no_reply',
+      requestedReplyToMessageId: normalizedReplyToMessageId,
+      fallbackError,
+    };
+  }
+}
+
+async function clearPromptReplyMarkup(chatId, telegramMessageId) {
+  const normalizedMessageId = Math.max(0, Number(telegramMessageId ?? 0) || 0);
+  if (!chatId || normalizedMessageId <= 0) {
+    return;
+  }
+  await telegramRequest('editMessageReplyMarkup', {
+    chat_id: chatId,
+    message_id: normalizedMessageId,
+    reply_markup: { inline_keyboard: [] },
+  }).catch(() => {});
+}
+
+async function interruptDmnApprovalsForChat(chatId, telegramMessageId = 0) {
+  const response = await postVicunaJson('/v1/telegram/interruption', {
+    chat_scope: String(chatId),
+    telegram_message_id: Math.max(0, Number(telegramMessageId ?? 0) || 0),
+    interrupt_kind: 'new_user_message',
+  });
+  const cancelledApprovalIds = Array.isArray(response?.cancelled_dmn_approval_ids)
+    ? response.cancelled_dmn_approval_ids.map((value) => String(value ?? '').trim()).filter(Boolean)
+    : [];
+  if (cancelledApprovalIds.length === 0) {
+    return;
+  }
+
+  const nextPromptEntries = [];
+  for (const [promptId, prompt] of Object.entries(state.pendingOptionPrompts ?? {})) {
+    if (
+      prompt?.kind === 'approval_request' &&
+      String(prompt?.chatId ?? '') === String(chatId) &&
+      cancelledApprovalIds.includes(String(prompt?.approvalId ?? '').trim())
+    ) {
+      await clearPromptReplyMarkup(chatId, prompt.telegramMessageId);
+      continue;
+    }
+    nextPromptEntries.push([promptId, prompt]);
+  }
+
+  state = {
+    ...state,
+    pendingOptionPrompts: Object.fromEntries(nextPromptEntries),
+  };
+  await persistState();
+  log('cancelled pending DMN approval prompts for new Telegram input', {
+    chatId: String(chatId),
+    telegramMessageId: Math.max(0, Number(telegramMessageId ?? 0) || 0),
+    cancelledApprovalIds,
+  });
+}
+
 function buildOptionCallbackData(promptId, optionIndex) {
   return `vopt:${promptId}:${optionIndex}`;
 }
@@ -213,10 +373,12 @@ async function broadcastToChats(text) {
   );
 }
 
-async function callVicunaForTelegramMessage(chatId, messageId = 0, extraSystemMessages = []) {
-  const transcript = getChatTranscript(state, chatId);
+async function callVicunaForTelegramMessage(chatId, messageId = 0, extraSystemMessages = [], options = {}) {
+  const conversationId = typeof options?.conversationId === 'string' ? options.conversationId.trim() : '';
+  const transcript = getChatTranscript(state, chatId, conversationId ? { conversationId } : {});
   const historyTurns = Math.max(1, Math.ceil(transcript.length / 2));
-  const baseSystemPrompt = 'You are replying to a Telegram user through middleware. Keep responses clear and concise unless the user asks for depth. Maintain continuity across the provided transcript. When the user explicitly asks to search the web or needs fresh current information, prefer the web search tool if the runtime makes it available. Use direct command-execution tools only when appropriate instead of pretending a command ran.';
+  const baseSystemPrompt = buildTelegramRelaySystemPrompt();
+  const deferredDelivery = options?.deferredDelivery === true;
 
   async function requestCompletion(retrySystemMessages = []) {
     const messages = [
@@ -233,14 +395,16 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, extraSystemMe
       headers: {
         ...vicunaHeaders(),
         'X-Vicuna-Telegram-Chat-Id': String(chatId),
+        ...(deferredDelivery ? { 'X-Vicuna-Telegram-Deferred-Delivery': '1' } : {}),
         'X-Vicuna-Telegram-Message-Id': String(messageId || 0),
         'X-Vicuna-Telegram-History-Turns': String(historyTurns),
+        ...(conversationId ? { 'X-Vicuna-Telegram-Conversation-Id': conversationId } : {}),
       },
       body: JSON.stringify({
         model: env.model,
         temperature: 0.2,
         messages,
-        max_tokens: env.maxTokens,
+        ...(env.maxTokens >= 0 ? { max_tokens: env.maxTokens } : {}),
       }),
     });
     const body = await response.json();
@@ -252,12 +416,21 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, extraSystemMe
 
   log('forwarding Telegram transcript to Vicuna', {
     chatId: String(chatId),
+    conversationId,
     messageCount: transcript.length,
     roles: transcript.map((entry) => entry.role),
     maxTokens: env.maxTokens,
+    deferredDelivery,
   });
 
   const firstBody = await requestCompletion();
+  if (deferredDelivery) {
+    log('Vicuna accepted deferred Telegram turn', {
+      chatId: String(chatId),
+      completion: summarizeChatCompletion(firstBody),
+    });
+    return '';
+  }
   let reply = extractChatCompletionText(firstBody);
   if (reply) {
     return reply;
@@ -293,6 +466,46 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, extraSystemMe
   return '';
 }
 
+async function runDeferredTelegramTurn({ chatId, messageId = 0, conversationId = '', extraSystemMessages = [] }) {
+  try {
+    await callVicunaForTelegramMessage(chatId, messageId, extraSystemMessages, {
+      deferredDelivery: true,
+      conversationId,
+    });
+  } catch (error) {
+    log('deferred Telegram turn failed', {
+      chatId: String(chatId),
+      messageId,
+      conversationId,
+      error: error.message,
+    });
+    const resolved = resolveTelegramConversationForOutbound(state, chatId, {
+      preferredConversationId: conversationId,
+      replyToMessageId: messageId,
+    });
+    state = resolved.state;
+    const sent = await sendTelegramMessage(
+      chatId,
+      `I ran into a problem while working on that request and could not complete it: ${error.message}`,
+      messageId ? { reply_to_message_id: messageId } : {},
+    ).catch(() => null);
+    if (sent?.message_id) {
+      state = appendChatTranscriptMessage(
+        state,
+        chatId,
+        'assistant',
+        `I ran into a problem while working on that request and could not complete it: ${error.message}`,
+        {
+          maxHistoryMessages: env.maxHistoryMessages,
+          conversationId: resolved.conversationId,
+          telegramMessageId: Number(sent.message_id) || 0,
+        },
+      );
+      await persistState();
+    }
+  }
+}
+
 async function persistState() {
   await saveState(env.statePath, state, { maxHistoryMessages: env.maxHistoryMessages });
 }
@@ -303,6 +516,7 @@ async function handleTelegramMessage(message) {
   }
   state = registerChat(state, message.chat.id);
   await persistState();
+  await interruptDmnApprovalsForChat(message.chat.id, message.message_id);
 
   const text = typeof message.text === 'string' ? message.text.trim() : '';
   const hasDocument = Boolean(message.document?.file_id);
@@ -317,6 +531,10 @@ async function handleTelegramMessage(message) {
   }
 
   if (hasDocument) {
+    const resolvedConversation = resolveTelegramConversationForMessage(state, message, {
+      maxHistoryMessages: env.maxHistoryMessages,
+    });
+    state = resolvedConversation.state;
     const ingestion = await ingestTelegramDocumentMessage({
       message,
       maxDocumentChars: env.maxDocumentChars,
@@ -342,34 +560,20 @@ async function handleTelegramMessage(message) {
       message.chat.id,
       'user',
       ingestion.transcriptText,
-      { maxHistoryMessages: env.maxHistoryMessages },
+      {
+        maxHistoryMessages: env.maxHistoryMessages,
+        conversationId: resolvedConversation.conversationId,
+        telegramMessageId: message.message_id,
+      },
     );
     await persistState();
-    log('appended Telegram document user turn', transcriptSummary(message.chat.id));
+    log('appended Telegram document user turn', transcriptSummary(message.chat.id, resolvedConversation.conversationId));
 
-    const reply = await callVicunaForTelegramMessage(message.chat.id, message.message_id);
-    if (reply) {
-      state = appendChatTranscriptMessage(
-        state,
-        message.chat.id,
-        'assistant',
-        reply,
-        { maxHistoryMessages: env.maxHistoryMessages },
-      );
-      await persistState();
-      log('appended Telegram assistant turn', transcriptSummary(message.chat.id));
-
-      await sendTelegramMessage(
-        message.chat.id,
-        reply,
-        { reply_to_message_id: message.message_id },
-      );
-    } else {
-      log('Telegram document turn produced no direct assistant text; assuming tool-delivered or deferred output', {
-        chatId: String(message.chat.id),
-        messageId: message.message_id,
-      });
-    }
+    void runDeferredTelegramTurn({
+      chatId: message.chat.id,
+      messageId: message.message_id,
+      conversationId: resolvedConversation.conversationId,
+    });
     return;
   }
 
@@ -382,39 +586,33 @@ async function handleTelegramMessage(message) {
     return;
   }
 
+  const resolvedConversation = resolveTelegramConversationForMessage(state, message, {
+    maxHistoryMessages: env.maxHistoryMessages,
+  });
+  state = resolvedConversation.state;
   state = appendChatTranscriptMessage(
     state,
     message.chat.id,
     'user',
     text,
-    { maxHistoryMessages: env.maxHistoryMessages },
+    {
+      maxHistoryMessages: env.maxHistoryMessages,
+      conversationId: resolvedConversation.conversationId,
+      telegramMessageId: message.message_id,
+    },
   );
   await persistState();
-  log('appended Telegram user turn', transcriptSummary(message.chat.id));
+  log('appended Telegram user turn', {
+    ...transcriptSummary(message.chat.id, resolvedConversation.conversationId),
+    continuitySource: resolvedConversation.reason,
+    replyToMessageId: Number(message?.reply_to_message?.message_id ?? 0) || 0,
+  });
 
-  const reply = await callVicunaForTelegramMessage(message.chat.id, message.message_id);
-  if (reply) {
-    state = appendChatTranscriptMessage(
-      state,
-      message.chat.id,
-      'assistant',
-      reply,
-      { maxHistoryMessages: env.maxHistoryMessages },
-    );
-    await persistState();
-    log('appended Telegram assistant turn', transcriptSummary(message.chat.id));
-
-    await sendTelegramMessage(
-      message.chat.id,
-      reply,
-      { reply_to_message_id: message.message_id },
-    );
-  } else {
-    log('Telegram turn produced no direct assistant text; assuming tool-delivered or deferred output', {
-      chatId: String(message.chat.id),
-      messageId: message.message_id,
-    });
-  }
+  void runDeferredTelegramTurn({
+    chatId: message.chat.id,
+    messageId: message.message_id,
+    conversationId: resolvedConversation.conversationId,
+  });
 }
 
 async function handleTelegramCallbackQuery(callbackQuery) {
@@ -442,19 +640,55 @@ async function handleTelegramCallbackQuery(callbackQuery) {
   const chatId = callbackQuery?.message?.chat?.id ?? prompt.chatId;
   const messageId = callbackQuery?.message?.message_id ?? prompt.telegramMessageId ?? 0;
 
+  if (prompt.kind === 'approval_request') {
+    let approvalResponse = null;
+    try {
+      approvalResponse = await postVicunaJson('/v1/telegram/approval', {
+        approval_id: prompt.approvalId,
+        chat_scope: String(chatId),
+        decision: selectedOption,
+        selected_option_index: parsed.optionIndex,
+        selected_option_label: selectedOption,
+        telegram_message_id: Number(messageId) || 0,
+        telegram_callback_query_id: String(callbackQuery?.id ?? ''),
+        decision_source: 'callback_query',
+      });
+    } catch (error) {
+      await telegramRequest('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: `Relay error: ${error.message}`,
+        show_alert: false,
+      });
+      throw error;
+    }
+
+    const approvalOk = approvalResponse?.ok === true;
+    await telegramRequest('answerCallbackQuery', {
+      callback_query_id: callbackQuery.id,
+      text: approvalOk
+        ? `Selected: ${selectedOption}`
+        : String(approvalResponse?.error ?? 'That approval prompt has expired.'),
+      show_alert: false,
+    });
+
+    if (
+      approvalOk ||
+      ['expired', 'superseded', 'denied', 'cancelled', 'dispatch_failed'].includes(String(approvalResponse?.status ?? ''))
+    ) {
+      await clearPromptReplyMarkup(chatId, messageId);
+      state = deletePendingOptionPrompt(state, parsed.promptId, { maxHistoryMessages: env.maxHistoryMessages });
+      await persistState();
+    }
+    return;
+  }
+
   await telegramRequest('answerCallbackQuery', {
     callback_query_id: callbackQuery.id,
     text: `Selected: ${selectedOption}`,
     show_alert: false,
   });
 
-  if (chatId && messageId) {
-    await telegramRequest('editMessageReplyMarkup', {
-      chat_id: chatId,
-      message_id: messageId,
-      reply_markup: { inline_keyboard: [] },
-    }).catch(() => {});
-  }
+  await clearPromptReplyMarkup(chatId, messageId);
 
   state = deletePendingOptionPrompt(state, parsed.promptId, { maxHistoryMessages: env.maxHistoryMessages });
   state = appendChatTranscriptMessage(
@@ -462,10 +696,13 @@ async function handleTelegramCallbackQuery(callbackQuery) {
     chatId,
     'user',
     `Selected option for "${prompt.question}": ${selectedOption}`,
-    { maxHistoryMessages: env.maxHistoryMessages },
+    {
+      maxHistoryMessages: env.maxHistoryMessages,
+      conversationId: prompt.conversationId,
+    },
   );
   await persistState();
-  log('appended Telegram option-selection user turn', transcriptSummary(chatId));
+  log('appended Telegram option-selection user turn', transcriptSummary(chatId, prompt.conversationId));
 
   const reply = await callVicunaForTelegramMessage(
     chatId,
@@ -474,29 +711,34 @@ async function handleTelegramCallbackQuery(callbackQuery) {
       role: 'system',
       content: 'The latest user turn is an inline-option selection answering an earlier assistant question. Continue from that selected option and the recent transcript.',
     }],
+    { conversationId: prompt.conversationId },
   );
 
   if (reply) {
+    const sent = await sendTelegramMessage(
+      chatId,
+      reply,
+      messageId ? { reply_to_message_id: messageId } : {},
+    );
     state = appendChatTranscriptMessage(
       state,
       chatId,
       'assistant',
       reply,
-      { maxHistoryMessages: env.maxHistoryMessages },
+      {
+        maxHistoryMessages: env.maxHistoryMessages,
+        conversationId: prompt.conversationId,
+        telegramMessageId: Number(sent?.message_id ?? 0) || 0,
+      },
     );
     await persistState();
-    log('appended Telegram assistant turn after option selection', transcriptSummary(chatId));
-
-    await sendTelegramMessage(
-      chatId,
-      reply,
-      messageId ? { reply_to_message_id: messageId } : {},
-    );
+    log('appended Telegram assistant turn after option selection', transcriptSummary(chatId, prompt.conversationId));
   } else {
     log('Telegram option-selection turn produced no direct assistant text; assuming tool-delivered or deferred output', {
       chatId: String(chatId),
       messageId,
       promptId: parsed.promptId,
+      conversationId: prompt.conversationId,
     });
   }
 }
@@ -511,54 +753,168 @@ async function pollTelegramAskOutboxLoop() {
         throw new Error(`vicuna telegram outbox failed: ${response.status}`);
       }
       const body = await response.json();
+      if (!env.replayRetainedOutbox && shouldBootstrapTelegramOutboxOffset(state, body)) {
+        const bootstrapOffset = Math.max(0, Number(body?.newest_sequence ?? 0) || 0);
+        state = bootstrapTelegramOutboxOffset(state, body, { maxHistoryMessages: env.maxHistoryMessages });
+        await persistState();
+        log('initialized Telegram outbox checkpoint without backlog replay', {
+          nextOffset: bootstrapOffset,
+          storedItems: Number(body?.stored_items ?? 0) || 0,
+          oldestSequence: Number(body?.oldest_sequence ?? 0) || 0,
+          newestSequence: Number(body?.newest_sequence ?? 0) || 0,
+        });
+        await delay(1000);
+        continue;
+      }
+      if (env.replayRetainedOutbox && !state.telegramOutboxCheckpointInitialized) {
+        state = setTelegramOutboxCheckpoint(state, state.telegramOutboxOffset, { maxHistoryMessages: env.maxHistoryMessages });
+        await persistState();
+        log('initialized Telegram outbox checkpoint for explicit backlog replay', {
+          currentOffset: state.telegramOutboxOffset,
+          storedItems: Number(body?.stored_items ?? 0) || 0,
+        });
+      }
+      const previousOutboxOffset = state.telegramOutboxOffset;
+      const reconciledOffset = reconcileTelegramOutboxOffset(state.telegramOutboxOffset, body);
+      if (reconciledOffset !== state.telegramOutboxOffset) {
+        state = setTelegramOutboxCheckpoint(state, reconciledOffset, { maxHistoryMessages: env.maxHistoryMessages });
+        await persistState();
+        log('reset Telegram outbox offset after runtime sequence change', {
+          previousOffset: Number(previousOutboxOffset ?? 0),
+          nextOffset: reconciledOffset,
+          storedItems: Number(body?.stored_items ?? 0) || 0,
+          oldestSequence: Number(body?.oldest_sequence ?? 0) || 0,
+          newestSequence: Number(body?.newest_sequence ?? 0) || 0,
+        });
+        continue;
+      }
       const items = Array.isArray(body?.items) ? body.items : [];
       for (const item of items) {
-        const sequenceNumber = Number(item?.sequence_number ?? 0) || 0;
-        if (item?.kind !== 'ask_with_options') {
-          state.telegramOutboxOffset = Math.max(state.telegramOutboxOffset, sequenceNumber);
+        const normalizedItem = normalizeTelegramOutboxItem(item);
+        if (!normalizedItem.ok) {
+          log('skipping malformed runtime telegram outbox item', {
+            error: normalizedItem.error,
+            kind: normalizedItem.kind,
+            sequenceNumber: normalizedItem.sequenceNumber,
+          });
+          if (normalizedItem.skippable) {
+            state = setTelegramOutboxCheckpoint(
+              state,
+              Math.max(state.telegramOutboxOffset, normalizedItem.sequenceNumber),
+              { maxHistoryMessages: env.maxHistoryMessages },
+            );
+            await persistState();
+            continue;
+          }
+          throw new Error(normalizedItem.error);
+        }
+
+        const sequenceNumber = normalizedItem.sequenceNumber;
+        if (normalizedItem.kind === 'message') {
+          const chatId = normalizedItem.chatId;
+          const text = normalizedItem.text;
+          const replyToMessageId = normalizedItem.replyToMessageId;
+          const resolvedConversation = resolveTelegramConversationForOutbound(state, chatId, {
+            replyToMessageId,
+          });
+          state = resolvedConversation.state;
+          const delivery = await sendTelegramOutboxMessage(chatId, text, replyToMessageId);
+          const sent = delivery.sent;
+          state = appendChatTranscriptMessage(
+            state,
+            chatId,
+            'assistant',
+            text,
+            {
+              maxHistoryMessages: env.maxHistoryMessages,
+              conversationId: resolvedConversation.conversationId,
+              telegramMessageId: Number(sent?.message_id ?? 0) || 0,
+            },
+          );
+          state = setTelegramOutboxCheckpoint(
+            state,
+            Math.max(state.telegramOutboxOffset, sequenceNumber),
+            { maxHistoryMessages: env.maxHistoryMessages },
+          );
+          state = recordTelegramOutboxDeliveryReceipt(state, {
+            sequenceNumber,
+            chatId,
+            replyToMessageId: delivery.requestedReplyToMessageId,
+            deliveryMode: delivery.deliveryMode === 'no_reply' ? 'fallback_no_reply' : delivery.deliveryMode,
+            telegramMessageId: Number(sent?.message_id ?? 0) || 0,
+            deliveredAtMs: Date.now(),
+          }, { maxHistoryMessages: env.maxHistoryMessages });
           await persistState();
+          log('delivered Telegram follow-up message', {
+            chatId,
+            conversationId: resolvedConversation.conversationId,
+            sequenceNumber,
+            replyToMessageId,
+            deliveryMode: delivery.deliveryMode,
+            telegramMessageId: Number(sent?.message_id ?? 0) || 0,
+            fallbackError: delivery.fallbackError || undefined,
+          });
           continue;
         }
 
-        const chatId = String(item?.chat_scope ?? '').trim();
-        const question = String(item?.question ?? '').trim();
-        const options = Array.isArray(item?.options)
-          ? item.options.map((value) => String(value ?? '').trim()).filter(Boolean)
-          : [];
-        if (!chatId || !question || options.length < 2) {
-          throw new Error('runtime telegram outbox ask_with_options item was incomplete');
-        }
-
+        const chatId = normalizedItem.chatId;
+        const question = normalizedItem.question;
+        const options = normalizedItem.options;
         const promptId = `o${sequenceNumber.toString(36)}`;
-        const result = await sendTelegramMessage(chatId, question, {
-          reply_markup: {
-            inline_keyboard: options.map((label, index) => ([{
-              text: label,
-              callback_data: buildOptionCallbackData(promptId, index),
-            }])),
-          },
-        });
+        const resolvedConversation = resolveTelegramConversationForOutbound(state, chatId, {});
+        state = resolvedConversation.state;
+        const replyMarkup = {
+          inline_keyboard: options.map((label, index) => ([{
+            text: label,
+            callback_data: buildOptionCallbackData(promptId, index),
+          }])),
+        };
+        const promptDelivery = normalizedItem.kind === 'approval_request'
+          ? await sendTelegramPromptMessage(chatId, question, replyMarkup, normalizedItem.replyToMessageId)
+          : { sent: await sendTelegramMessage(chatId, question, { reply_markup: replyMarkup }) };
+        const result = promptDelivery.sent;
 
         state = appendChatTranscriptMessage(
           state,
           chatId,
           'assistant',
           question,
-          { maxHistoryMessages: env.maxHistoryMessages },
+          {
+            maxHistoryMessages: env.maxHistoryMessages,
+            conversationId: resolvedConversation.conversationId,
+            telegramMessageId: Number(result?.message_id ?? 0) || 0,
+          },
         );
         state = setPendingOptionPrompt(state, promptId, {
+          kind: normalizedItem.kind,
+          approvalId: normalizedItem.kind === 'approval_request' ? normalizedItem.approvalId : '',
           chatId,
           question,
           options,
+          conversationId: resolvedConversation.conversationId,
           telegramMessageId: Number(result?.message_id ?? 0) || 0,
           createdAtMs: Date.now(),
         }, { maxHistoryMessages: env.maxHistoryMessages });
-        state.telegramOutboxOffset = Math.max(state.telegramOutboxOffset, sequenceNumber);
+        state = setTelegramOutboxCheckpoint(
+          state,
+          Math.max(state.telegramOutboxOffset, sequenceNumber),
+          { maxHistoryMessages: env.maxHistoryMessages },
+        );
         await persistState();
-        log('delivered Telegram ask-with-options prompt', {
+        log(
+          normalizedItem.kind === 'approval_request'
+            ? 'delivered Telegram approval prompt'
+            : 'delivered Telegram ask-with-options prompt',
+          {
           chatId,
+          conversationId: resolvedConversation.conversationId,
           promptId,
+          approvalId: normalizedItem.kind === 'approval_request' ? normalizedItem.approvalId : undefined,
           optionCount: options.length,
+          replyToMessageId: normalizedItem.replyToMessageId ?? 0,
+          deliveryMode: promptDelivery.deliveryMode ?? 'no_reply',
+          telegramMessageId: Number(result?.message_id ?? 0) || 0,
+          fallbackError: promptDelivery.fallbackError || undefined,
         });
       }
     } catch (error) {
@@ -775,6 +1131,7 @@ async function main() {
   log(`bridge transcript settings history=${env.maxHistoryMessages} max_tokens=${env.maxTokens < 0 ? 'unlimited' : env.maxTokens}`, {
     chatCount: state.chatIds.length,
     sessionCount: Object.keys(state.chatSessions ?? {}).length,
+    replayRetainedOutbox: env.replayRetainedOutbox,
   });
   await Promise.all([
     pollTelegramLoop(),

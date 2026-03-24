@@ -1290,9 +1290,72 @@ extern "C" {
         float bond_strength;
         float recent_user_valence;
         float dissatisfaction;
+        float contact_set_point_hours;
+        float silence_hours;
+        float silence_deficit;
         int32_t user_turn_count;
         int32_t system_turn_count;
         int64_t last_update_monotonic_ms;
+        int64_t last_substantive_contact_monotonic_ms;
+    };
+
+    enum llama_self_disturbance_source_kind {
+        LLAMA_SELF_DISTURBANCE_SOURCE_NONE = 0,
+        LLAMA_SELF_DISTURBANCE_SOURCE_USER_MESSAGE = 1,
+        LLAMA_SELF_DISTURBANCE_SOURCE_HIDDEN_THOUGHT = 2,
+        LLAMA_SELF_DISTURBANCE_SOURCE_TOOL_SELECTION = 3,
+        LLAMA_SELF_DISTURBANCE_SOURCE_TOOL_ARGUMENTS = 4,
+        LLAMA_SELF_DISTURBANCE_SOURCE_TOOL_OBSERVATION = 5,
+        LLAMA_SELF_DISTURBANCE_SOURCE_VISIBLE_OUTPUT = 6,
+        LLAMA_SELF_DISTURBANCE_SOURCE_SOCIAL_SILENCE = 7,
+        LLAMA_SELF_DISTURBANCE_SOURCE_DMN_EMIT = 8,
+    };
+
+    enum llama_self_disturbance_failure_class {
+        LLAMA_SELF_DISTURBANCE_FAILURE_NONE = 0,
+        LLAMA_SELF_DISTURBANCE_FAILURE_MALFORMED_ARGUMENTS = 1,
+        LLAMA_SELF_DISTURBANCE_FAILURE_WRONG_TOOL_OR_METHOD = 2,
+        LLAMA_SELF_DISTURBANCE_FAILURE_LOCAL_DISPATCH = 3,
+        LLAMA_SELF_DISTURBANCE_FAILURE_DOWNSTREAM_SERVICE = 4,
+        LLAMA_SELF_DISTURBANCE_FAILURE_UPSTREAM_DEPENDENCY = 5,
+    };
+
+    struct llama_self_appraisal_vector {
+        float novelty;
+        float goal_relevance;
+        float progress_error;
+        float progress_velocity_error;
+        float expectation_violation;
+        float controllability_deficit;
+        float failure_severity;
+        float social_deficit;
+        float reciprocity_deficit;
+        float unresolved_commitment;
+        float effort_cost;
+    };
+
+    struct llama_self_disturbance_delta {
+        float total_disturbance;
+        float contradiction_delta;
+        float uncertainty_delta;
+        float goal_pressure_delta;
+        float recovery_urgency_delta;
+        float followup_continuation_delta;
+        float social_relevance_delta;
+        float loop_inefficiency_delta;
+        float satisfaction_risk_delta;
+        uint32_t reason_mask;
+        bool requires_emotive_recompute;
+    };
+
+    struct llama_self_disturbance_state_info {
+        bool valid;
+        int32_t source_kind;
+        int32_t failure_class;
+        float source_reliability;
+        int64_t admitted_monotonic_ms;
+        struct llama_self_appraisal_vector appraisal;
+        struct llama_self_disturbance_delta delta;
     };
 
     enum llama_self_profile_id {
@@ -1851,7 +1914,7 @@ extern "C" {
         LLAMA_BASH_TOOL_CWD_MAX_CHARS = 256,
         LLAMA_BASH_TOOL_COMMAND_MAX_CHARS = 512,
         LLAMA_BASH_TOOL_INTENT_MAX_CHARS = 512,
-        LLAMA_BASH_TOOL_STDOUT_MAX_CHARS = 4096,
+        LLAMA_BASH_TOOL_STDOUT_MAX_CHARS = 819200,
         LLAMA_BASH_TOOL_STDERR_MAX_CHARS = 4096,
         LLAMA_BASH_TOOL_ERROR_MAX_CHARS = 256,
         LLAMA_CODEX_TOOL_PATH_MAX_CHARS = 256,
@@ -1875,7 +1938,7 @@ extern "C" {
         LLAMA_TELEGRAM_ASK_OPTION_LABEL_MAX_CHARS = 96,
         LLAMA_TELEGRAM_ASK_MAX_OPTIONS = 6,
         LLAMA_SELF_STATE_MAX_DELTA_DIMS = 8,
-        LLAMA_COGNITIVE_MAX_TOOL_SPECS = 16,
+        LLAMA_COGNITIVE_MAX_TOOL_SPECS = 64,
         LLAMA_COGNITIVE_TOOL_NAME_MAX_CHARS = 48,
         LLAMA_COGNITIVE_TOOL_DESCRIPTION_MAX_CHARS = 160,
         LLAMA_COGNITIVE_MAX_PENDING_COMMANDS = 16,
@@ -3393,6 +3456,9 @@ extern "C" {
     LLAMA_API int32_t llama_self_state_get_emotive_moment_revision(
             const struct llama_context * ctx,
             struct llama_emotive_moment_revision * out_info);
+    LLAMA_API int32_t llama_self_state_get_last_disturbance(
+            const struct llama_context * ctx,
+            struct llama_self_disturbance_state_info * out_info);
     LLAMA_API struct llama_self_model_extension_update llama_self_model_extension_default_update(void);
     LLAMA_API int32_t llama_self_state_model_extension_count(const struct llama_context * ctx);
     LLAMA_API int32_t llama_self_state_get_model_extension(

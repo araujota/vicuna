@@ -38,15 +38,70 @@ enum server_openclaw_xml_arg_type_mask : uint32_t {
 struct server_openclaw_xml_arg_requirement {
     std::string name;
     std::string description;
+    std::vector<std::string> allowed_string_values;
     uint32_t allowed_types = 0;
     bool required = false;
 };
 
-struct server_openclaw_xml_tool_contract {
-    std::string tool_name;
+struct server_openclaw_tool_family_contract {
+    std::string tool_family_id;
+    std::string tool_family_name;
+    std::string description;
+};
+
+struct server_openclaw_tool_method_contract {
+    std::string tool_family_id;
+    std::string tool_family_name;
+    std::string method_name;
     std::string capability_id;
+    std::string tool_name;
     std::string description;
     std::vector<server_openclaw_xml_arg_requirement> args;
+};
+
+struct server_openclaw_xml_tool_contract {
+    std::string tool_family_id;
+    std::string tool_family_name;
+    std::string method_name;
+    std::string capability_id;
+    std::string tool_name;
+    std::string description;
+    std::vector<server_openclaw_xml_arg_requirement> args;
+};
+
+struct server_openclaw_tool_argument_contract {
+    std::string tool_family_id;
+    std::string tool_family_name;
+    std::string method_name;
+    std::string capability_id;
+    std::string tool_name;
+    std::string description;
+    nlohmann::json input_schema = nlohmann::json::object();
+    nlohmann::json fixed_arguments = nlohmann::json::object();
+    std::vector<server_openclaw_xml_arg_requirement> args;
+};
+
+struct server_openclaw_parsed_tool_selection {
+    common_chat_msg message;
+    std::string visible_prefix;
+    std::string xml_block;
+    std::string captured_planner_reasoning;
+    std::string tool_family_id;
+    std::string tool_family_name;
+    std::string captured_payload;
+};
+
+struct server_openclaw_parsed_tool_method_selection {
+    common_chat_msg message;
+    std::string visible_prefix;
+    std::string xml_block;
+    std::string captured_planner_reasoning;
+    std::string tool_family_id;
+    std::string tool_family_name;
+    std::string method_name;
+    std::string capability_id;
+    std::string tool_name;
+    std::string captured_payload;
 };
 
 struct server_openclaw_parsed_tool_call {
@@ -55,6 +110,15 @@ struct server_openclaw_parsed_tool_call {
     std::string xml_block;
     std::string captured_planner_reasoning;
     std::string captured_tool_xml;
+    std::string captured_payload;
+};
+
+struct server_openclaw_parsed_tool_arguments {
+    common_chat_msg message;
+    std::string visible_payload;
+    std::string captured_planner_reasoning;
+    std::string captured_arguments_json;
+    nlohmann::json arguments = nlohmann::json::object();
     std::string captured_payload;
 };
 
@@ -71,27 +135,95 @@ public:
     bool build_chat_tools(
             std::vector<common_chat_tool> * out_tools,
             const std::vector<int32_t> * spec_indexes = nullptr) const;
+    bool build_tool_family_contracts(
+            std::vector<server_openclaw_tool_family_contract> * out_families,
+            const std::vector<int32_t> * spec_indexes = nullptr,
+            std::string * out_error = nullptr) const;
+    bool build_tool_method_contracts(
+            const std::string & tool_family_id,
+            std::vector<server_openclaw_tool_method_contract> * out_methods,
+            const std::vector<int32_t> * spec_indexes = nullptr,
+            std::string * out_error = nullptr) const;
     bool build_xml_tool_contracts(
             std::vector<server_openclaw_xml_tool_contract> * out_contracts,
             const std::vector<int32_t> * spec_indexes = nullptr,
             std::string * out_error = nullptr) const;
+    bool render_tool_family_selection_guidance(
+            std::string * out_guidance,
+            const std::vector<int32_t> * spec_indexes = nullptr,
+            std::string * out_error = nullptr) const;
+    bool render_tool_method_selection_guidance(
+            const std::string & tool_family_id,
+            std::string * out_guidance,
+            const std::vector<int32_t> * spec_indexes = nullptr,
+            std::string * out_error = nullptr) const;
+    bool build_tool_argument_contract(
+            const std::string & tool_family_id,
+            const std::string & method_name,
+            server_openclaw_tool_argument_contract * out_contract,
+            const std::vector<int32_t> * spec_indexes = nullptr,
+            std::string * out_error = nullptr) const;
+    bool render_tool_argument_json_guidance(
+            const std::string & tool_family_id,
+            const std::string & method_name,
+            std::string * out_guidance,
+            const std::vector<int32_t> * spec_indexes = nullptr,
+            std::string * out_error = nullptr) const;
     bool render_tool_call_xml_guidance(
             std::string * out_guidance,
+            const std::string * tool_family_id = nullptr,
+            const std::string * method_name = nullptr,
+            const std::vector<int32_t> * spec_indexes = nullptr,
+            std::string * out_error = nullptr) const;
+    bool parse_tool_selection_json(
+            const std::string & text,
+            server_openclaw_parsed_tool_selection * out_parsed,
+            const std::vector<int32_t> * spec_indexes = nullptr,
+            std::string * out_error = nullptr) const;
+    bool parse_tool_method_selection_json(
+            const std::string & text,
+            const std::string & tool_family_id,
+            server_openclaw_parsed_tool_method_selection * out_parsed,
+            const std::vector<int32_t> * spec_indexes = nullptr,
+            std::string * out_error = nullptr) const;
+    bool parse_tool_arguments_json(
+            const std::string & text,
+            const std::string & tool_family_id,
+            const std::string & method_name,
+            server_openclaw_parsed_tool_arguments * out_parsed,
+            const std::vector<int32_t> * spec_indexes = nullptr,
+            std::string * out_error = nullptr) const;
+    bool parse_tool_selection_xml(
+            const std::string & text,
+            server_openclaw_parsed_tool_selection * out_parsed,
+            const std::vector<int32_t> * spec_indexes = nullptr,
+            std::string * out_error = nullptr) const;
+    bool parse_tool_method_selection_xml(
+            const std::string & text,
+            const std::string & tool_family_id,
+            server_openclaw_parsed_tool_method_selection * out_parsed,
             const std::vector<int32_t> * spec_indexes = nullptr,
             std::string * out_error = nullptr) const;
     bool parse_tool_call_xml(
             const std::string & text,
             server_openclaw_parsed_tool_call * out_parsed,
+            const std::string * tool_family_id = nullptr,
+            const std::string * method_name = nullptr,
             const std::vector<int32_t> * spec_indexes = nullptr,
             std::string * out_error = nullptr) const;
     bool recover_tool_call_xml(
             const std::string & text,
             server_openclaw_parsed_tool_call * out_parsed,
+            const std::string * tool_family_id = nullptr,
+            const std::string * method_name = nullptr,
             const std::vector<int32_t> * spec_indexes = nullptr,
             std::string * out_error = nullptr) const;
     std::string strip_tool_call_xml_markup(const std::string & text) const;
     const server_openclaw_capability_runtime * capability_by_spec_index(int32_t spec_index) const;
     const server_openclaw_capability_runtime * capability_by_tool_name(const std::string & tool_name) const;
+    const server_openclaw_capability_runtime * capability_by_family_and_method(
+            const std::string & tool_family_id,
+            const std::string & method_name) const;
 
     const server_openclaw_capability_runtime * resolve_command(
             const llama_cognitive_command & command,

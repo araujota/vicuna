@@ -274,6 +274,7 @@ static bool verify_runtime_persistence_surfaces(
 
     if (llama_self_state_set_updater_program(ctx, persisted_program) != 0 ||
         llama_self_state_upsert_model_extension(ctx, persisted_extension) != 0 ||
+        llama_self_state_upsert_tool_job(ctx, 77, LLAMA_SELF_TOOL_JOB_COMPLETED, 0.9f) != 0 ||
         llama_bash_tool_configure(ctx, &persisted_bash) != 0 ||
         llama_hard_memory_configure(ctx, persisted_hard_memory) != 0) {
         std::fprintf(stderr, "failed to seed runtime persistence surfaces\n");
@@ -309,11 +310,13 @@ static bool verify_runtime_persistence_surfaces(
     llama_bash_tool_config restored_bash = {};
     llama_hard_memory_config restored_hard_memory = {};
     llama_self_model_extension_info restored_extension = {};
+    llama_self_tool_state_info restored_tool_state = {};
     const int32_t expected_restored_extension_count = llama_self_state_model_extension_count(ctx);
     const bool restored_ok =
             llama_self_state_get_updater_program(restored_ctx, &restored_program) == 0 &&
             llama_bash_tool_get_config(restored_ctx, &restored_bash) == 0 &&
             llama_hard_memory_get_config(restored_ctx, &restored_hard_memory) == 0 &&
+            llama_self_state_get_tool_state(restored_ctx, &restored_tool_state) == 0 &&
             llama_self_state_model_extension_count(restored_ctx) == expected_restored_extension_count &&
             find_model_extension_by_key(restored_ctx, "persistence.discovered_register", &restored_extension) &&
             restored_program.repair_emit_threshold == persisted_program.repair_emit_threshold &&
@@ -326,6 +329,11 @@ static bool verify_runtime_persistence_surfaces(
             restored_hard_memory.timeout_ms == persisted_hard_memory.timeout_ms &&
             restored_hard_memory.max_results == persisted_hard_memory.max_results &&
             std::string(restored_hard_memory.container_tag) == "persist-container" &&
+            restored_tool_state.completed_jobs == 1 &&
+            restored_tool_state.failed_jobs == 0 &&
+            restored_tool_state.pending_jobs == 0 &&
+            restored_tool_state.running_jobs == 0 &&
+            restored_tool_state.readiness >= 0.90f &&
             std::string(restored_extension.key) == "persistence.discovered_register" &&
             (restored_extension.flags & LLAMA_SELF_MODEL_EXTENSION_FLAG_DISCOVERED) != 0 &&
             restored_extension.lifecycle_stage == LLAMA_SELF_MODEL_EXTENSION_STAGE_ALLOSTATIC &&
@@ -767,6 +775,103 @@ int main(int argc, char ** argv) {
         social_state.user_turn_count < 2 ||
         social_state.system_turn_count < 1) {
         std::fprintf(stderr, "social relationship state was not maintained as persistent scalars\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    llama_self_disturbance_state_info user_disturbance = {};
+    if (llama_self_state_get_last_disturbance(ctx, &user_disturbance) != 0 ||
+        !user_disturbance.valid ||
+        user_disturbance.source_kind != LLAMA_SELF_DISTURBANCE_SOURCE_USER_MESSAGE ||
+        user_disturbance.source_reliability < 0.99f ||
+        user_disturbance.delta.total_disturbance <= 0.0f) {
+        std::fprintf(stderr, "user disturbance state was not surfaced correctly\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    const std::vector<llama_token> hidden_tokens = tokenize_or_die(
+            vocab,
+            "I may have selected the wrong recovery path and should reassess the evidence.");
+    llama_self_state_event hidden_event = {
+        /*.tokens =*/ hidden_tokens.data(),
+        /*.n_tokens =*/ hidden_tokens.size(),
+        /*.role =*/ LLAMA_SELF_STATE_EVENT_SYSTEM,
+        /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+        /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED | LLAMA_SELF_STATE_EVENT_INTERNAL_ARTIFACT,
+        /*.decoder_entropy =*/ 1.4f,
+        /*.decoder_top_margin =*/ 0.16f,
+    };
+    llama_self_state_feature_vector hidden_prewrite = {};
+    llama_self_state_feature_vector hidden_postwrite = {};
+    if (llama_self_state_build_prewrite_features(ctx, &hidden_event, &hidden_prewrite) != 0 ||
+        llama_self_state_apply_prewrite(ctx, &hidden_event, &hidden_prewrite) != 0 ||
+        llama_self_state_build_postwrite_features(ctx, &hidden_event, &hidden_postwrite) != 0 ||
+        llama_self_state_apply_postwrite(ctx, &hidden_event, &hidden_postwrite) != 0) {
+        std::fprintf(stderr, "failed to apply hidden-thought disturbance event\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    llama_self_disturbance_state_info hidden_disturbance = {};
+    if (llama_self_state_get_last_disturbance(ctx, &hidden_disturbance) != 0 ||
+        !hidden_disturbance.valid ||
+        hidden_disturbance.source_kind != LLAMA_SELF_DISTURBANCE_SOURCE_HIDDEN_THOUGHT ||
+        hidden_disturbance.source_reliability >= user_disturbance.source_reliability ||
+        hidden_disturbance.delta.total_disturbance <= 0.0f) {
+        std::fprintf(stderr, "hidden-thought disturbance reliability was not surfaced correctly\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    llama_self_state_datetime current_time = {};
+    if (llama_self_state_get_datetime(ctx, &current_time) != 0) {
+        std::fprintf(stderr, "failed to fetch self-state time surface\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+    llama_self_state_time_point shifted_time = {
+        /*.wall_clock_ms =*/ current_time.wall_clock_ms + 7ll * 24ll * 60ll * 60ll * 1000ll,
+        /*.monotonic_ms =*/ current_time.monotonic_ms + 7ll * 24ll * 60ll * 60ll * 1000ll,
+        /*.timezone_offset_minutes =*/ current_time.timezone_offset_minutes,
+    };
+    if (llama_self_state_set_time(ctx, shifted_time) != 0 ||
+        llama_self_state_get_social_state(ctx, &social_state) != 0 ||
+        social_state.contact_set_point_hours <= 0.0f ||
+        social_state.silence_hours <= 0.0f ||
+        social_state.silence_deficit <= 0.0f) {
+        std::fprintf(stderr, "social silence did not accumulate after elapsed time\n");
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+
+    const std::vector<llama_token> reconnect_tokens = tokenize_or_die(
+            vocab,
+            "Thanks, please keep going and tell me what you find next.");
+    llama_self_state_event reconnect_event = {
+        /*.tokens =*/ reconnect_tokens.data(),
+        /*.n_tokens =*/ reconnect_tokens.size(),
+        /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+        /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+        /*.flags =*/ LLAMA_SELF_STATE_EVENT_ADMITTED,
+        /*.decoder_entropy =*/ 0.2f,
+        /*.decoder_top_margin =*/ 0.85f,
+    };
+    llama_self_state_feature_vector reconnect_prewrite = {};
+    llama_self_state_feature_vector reconnect_postwrite = {};
+    if (llama_self_state_build_prewrite_features(ctx, &reconnect_event, &reconnect_prewrite) != 0 ||
+        llama_self_state_apply_prewrite(ctx, &reconnect_event, &reconnect_prewrite) != 0 ||
+        llama_self_state_build_postwrite_features(ctx, &reconnect_event, &reconnect_postwrite) != 0 ||
+        llama_self_state_apply_postwrite(ctx, &reconnect_event, &reconnect_postwrite) != 0 ||
+        llama_self_state_get_social_state(ctx, &social_state) != 0 ||
+        social_state.silence_deficit > 0.001f) {
+        std::fprintf(stderr, "substantive interaction did not restore social silence deficit\n");
         llama_free(ctx);
         llama_model_free(model);
         return 1;

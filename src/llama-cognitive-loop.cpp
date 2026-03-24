@@ -22,7 +22,7 @@
 
 namespace {
 
-constexpr float LLAMA_DMN_PRESSURE_THRESHOLD = 0.24f;
+constexpr float LLAMA_DMN_PRESSURE_THRESHOLD = 0.18f;
 constexpr float LLAMA_TEMPORAL_SELF_TRIGGER_THRESHOLD = 0.58f;
 constexpr uint64_t LLAMA_TEMPORAL_SELF_TRIGGER_COOLDOWN_US = 2ULL * 60ULL * 1000000ULL;
 constexpr int32_t LLAMA_COG_LOOP_UNBOUNDED_MAX_STEPS = std::numeric_limits<int32_t>::max();
@@ -176,8 +176,24 @@ bool pressure_crossed(const llama_dmn_pressure_vector & pressure) {
     return pressure.total >= LLAMA_DMN_PRESSURE_THRESHOLD;
 }
 
+bool tool_state_has_lifecycle_signal(const llama_self_tool_state_info & tool_state) {
+    return tool_state.pending_jobs > 0 ||
+            tool_state.running_jobs > 0 ||
+            tool_state.completed_jobs > 0 ||
+            tool_state.failed_jobs > 0 ||
+            tool_state.last_update_monotonic_ms >= 0;
+}
+
+float tool_pressure_from_tool_state(const llama_self_tool_state_info & tool_state) {
+    const float completion_signal = tool_state.completed_jobs > 0 ? 0.80f : 0.0f;
+    const float failure_signal = tool_state.failed_jobs > 0 ? 0.55f : 0.0f;
+    const float baseline_surface = clamp_unit(0.35f * (1.0f - tool_state.readiness));
+    return clamp_unit(std::max(completion_signal, failure_signal) + baseline_surface);
+}
+
 struct repair_signal_state {
     float dissatisfaction = 0.0f;
+    float silence_deficit = 0.0f;
     float recent_user_valence = 0.0f;
     float trust_deficit = 0.0f;
     float reciprocity_deficit = 0.0f;
@@ -200,14 +216,16 @@ repair_signal_state compute_repair_signal(
         const llama_self_tool_state_info & tool_state,
         bool has_tool_state) {
     repair_signal_state signal = {};
-    signal.dissatisfaction = clamp_unit(social.dissatisfaction);
+    signal.dissatisfaction = clamp_unit(std::max(social.dissatisfaction, social.silence_deficit));
+    signal.silence_deficit = clamp_unit(social.silence_deficit);
     signal.recent_user_valence = clamp_unit(social.recent_user_valence);
     signal.trust_deficit = clamp_unit(1.0f - social.trust);
     signal.reciprocity_deficit = clamp_unit(1.0f - social.reciprocity);
     signal.failure_signal = has_tool_state && tool_state.failed_jobs > 0 ? 1.0f : 0.0f;
     signal.social_relevance = clamp_unit(get_scalar_register(ctx, LLAMA_SELF_REGISTER_SOCIAL_RELEVANCE));
     signal.evidence = clamp_unit(
-            0.35f * signal.dissatisfaction +
+            0.28f * signal.dissatisfaction +
+            0.10f * signal.silence_deficit +
             0.25f * signal.recent_user_valence +
             0.15f * signal.trust_deficit +
             0.10f * signal.reciprocity_deficit +
@@ -2644,7 +2662,7 @@ public:
                 0.45f * std::min(1.0f, (float) tool_state.pending_jobs) +
                 0.35f * std::min(1.0f, (float) tool_state.running_jobs) +
                 0.20f * std::min(1.0f, (float) tool_state.failed_jobs));
-        const float dissatisfaction = clamp_unit(std::max(social.dissatisfaction, satisfaction_risk));
+        const float dissatisfaction = clamp_unit(std::max({social.dissatisfaction, social.silence_deficit, satisfaction_risk}));
         const float reactivation = top_reactivation_priority();
         const llama_self_model_horizon_info & instant = model_state.horizons[LLAMA_SELF_HORIZON_INSTANT];
         const float epistemic_divergence = clamp_unit(std::max(
@@ -3290,17 +3308,15 @@ public:
 
         llama_self_tool_state_info tool_state = {};
         const bool has_tool_state = ctx.self_state_get_tool_state(&tool_state);
-        if (has_tool_state) {
-            const float completion_signal = tool_state.completed_jobs > 0 ? 0.80f : 0.0f;
-            const float failure_signal = tool_state.failed_jobs > 0 ? 0.55f : 0.0f;
-            pressure.tool_delta = clamp_unit(std::max(completion_signal, failure_signal) + 0.35f * (1.0f - tool_state.readiness));
-        } else {
-            pressure.tool_delta = get_scalar_register(ctx, LLAMA_SELF_REGISTER_TOOL_SALIENCE);
-        }
+        const bool has_tool_lifecycle_signal = has_tool_state && tool_state_has_lifecycle_signal(tool_state);
+        const float recent_tool_salience = get_scalar_register(ctx, LLAMA_SELF_REGISTER_TOOL_SALIENCE);
+        pressure.tool_delta = has_tool_lifecycle_signal ?
+                tool_pressure_from_tool_state(tool_state) :
+                std::max(tool_pressure_from_tool_state(tool_state), recent_tool_salience);
 
         llama_self_social_state_info social = {};
         (void) ctx.self_state_get_social_state(&social);
-        const repair_signal_state repair_signal = compute_repair_signal(ctx, social, tool_state, has_tool_state);
+        const repair_signal_state repair_signal = compute_repair_signal(ctx, social, tool_state, has_tool_lifecycle_signal);
         const float repair_admission_floor = clamp_unit(updater_program.repair_admission_floor);
         const float repair_admission_weight = clamp_unit(updater_program.repair_admission_weight);
         pressure.repair = repair_signal.evidence >= repair_admission_floor ? repair_signal.evidence : 0.0f;
@@ -3314,7 +3330,8 @@ public:
                 0.10f * pressure.goals +
                 0.22f * pressure.tool_delta +
                 0.10f * pressure.counterfactual +
-                0.14f * pressure.continuation +
+                0.10f * pressure.continuation +
+                0.04f * clamp_unit(social.silence_deficit) +
                 repair_admission_weight * pressure.repair);
         return pressure;
     }
@@ -5095,7 +5112,8 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
             0.14f * trace.favorable_divergence +
             0.12f * model_state.belief_summary.residual_allostatic_pressure +
             0.12f * std::fabs(model_state.extension_summary.gain_signal) +
-            0.10f * social_state.dissatisfaction) : 0.0f;
+            0.06f * social_state.dissatisfaction +
+            0.04f * social_state.silence_deficit) : 0.0f;
 
     current_self_model_revision.valid = true;
     current_self_model_revision.input_hash = dmn_input_hash;
@@ -5111,6 +5129,7 @@ bool llama_cognitive_loop::dmn_tick(uint64_t now_us, llama_dmn_tick_trace * out_
             0.34f * social_relevance +
             0.22f * continuation +
             0.22f * social_state.dissatisfaction +
+            0.10f * social_state.silence_deficit +
             0.12f * trace.pressure.goals +
             (last_governance_trace.outcome == LLAMA_GOVERNANCE_OUTCOME_EMIT_REPAIR ? 0.20f : 0.0f));
     const float relay_tool_affinity = clamp_unit(

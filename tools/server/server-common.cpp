@@ -109,9 +109,14 @@ int32_t classify_foreground_role(const json & body) {
     }
 
     const json & messages = body.at("messages");
+    bool saw_system = false;
     for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
         const std::string role = json_value(*it, "role", std::string());
-        if (role == "assistant" || role == "system" || role.empty()) {
+        if (role == "assistant" || role.empty()) {
+            continue;
+        }
+        if (role == "system") {
+            saw_system = true;
             continue;
         }
         if (role == "tool" || role == "function") {
@@ -120,7 +125,7 @@ int32_t classify_foreground_role(const json & body) {
         return LLAMA_SELF_STATE_EVENT_USER;
     }
 
-    return LLAMA_SELF_STATE_EVENT_USER;
+    return saw_system ? LLAMA_SELF_STATE_EVENT_SYSTEM : LLAMA_SELF_STATE_EVENT_USER;
 }
 
 std::string extract_foreground_message_text(const json & body) {
@@ -225,6 +230,12 @@ bool foreground_request_requires_fresh_tool_grounding(const std::string & text) 
                 "service status",
                 "journalctl",
                 "logs",
+                "sonarr",
+                "radarr",
+                "chaptarr",
+                "download queue",
+                "queue status",
+                "library state",
             })) {
         return true;
     }
@@ -244,6 +255,60 @@ bool foreground_request_requires_fresh_tool_grounding(const std::string & text) 
                 "this week",
                 "next week",
                 "as of ",
+            })) {
+        return true;
+    }
+
+    return false;
+}
+
+bool foreground_request_requires_external_action(const std::string & text) {
+    const std::string lowered = lowercase_ascii_copy(trim_copy(text));
+    if (lowered.empty()) {
+        return false;
+    }
+
+    if (contains_any_phrase(lowered, {
+                "download ",
+                "download\"",
+                "download'",
+                "via radarr",
+                "via sonarr",
+                "via chaptarr",
+                "using radarr",
+                "using sonarr",
+                "using chaptarr",
+                "add it",
+                "add them",
+                "install ",
+                "create ",
+                "write ",
+                "edit ",
+                "modify ",
+                "remove ",
+                "delete ",
+                "restart ",
+                "stop ",
+                "start ",
+                "send ",
+                "message ",
+                "notify ",
+                "run ",
+                "execute ",
+                "deploy ",
+                "commit ",
+                "pull ",
+                "push ",
+            })) {
+        return true;
+    }
+
+    if (contains_any_phrase(lowered, {
+                "could you download",
+                "can you download",
+                "please download",
+                "download this",
+                "download that",
             })) {
         return true;
     }
@@ -276,6 +341,10 @@ bool authoritative_reply_is_procedural_non_answer(const std::string & text) {
                 "recommend checking",
                 "please check",
                 "you should check",
+                "you can access the web interface",
+                "use the command line",
+                "open your web browser and navigate",
+                "log in, go to the",
             })) {
         return true;
     }
@@ -285,6 +354,16 @@ bool authoritative_reply_is_procedural_non_answer(const std::string & text) {
                 "i do not have access",
                 "i can't access",
                 "i cannot access",
+                "i don't have direct access",
+                "i do not have direct access",
+                "i can't directly access",
+                "i cannot directly access",
+                "i can't interact with external surfaces",
+                "i cannot interact with external surfaces",
+                "i can't interact with external systems",
+                "i cannot interact with external systems",
+                "i can't interact with those systems",
+                "i cannot interact with those systems",
                 "i don't have real-time access",
                 "i do not have real-time access",
                 "i can't provide live",
@@ -302,6 +381,123 @@ bool authoritative_retry_requires_tool_escalation(const std::string & text, int3
     }
 
     return foreground_request_requires_fresh_tool_grounding(text);
+}
+
+bool authoritative_visible_reply_looks_like_question(const std::string & text) {
+    const std::string trimmed = trim_copy(text);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    if (trimmed.find('?') != std::string::npos) {
+        return true;
+    }
+
+    const std::string lowered = lowercase_ascii_copy(trimmed);
+    return contains_any_phrase(lowered, {
+            "can you ",
+            "could you ",
+            "would you ",
+            "will you ",
+            "which ",
+            "what ",
+            "where ",
+            "when ",
+            "who ",
+            "whom ",
+            "whose ",
+            "why ",
+            "how ",
+            "do you ",
+            "did you ",
+            "are you ",
+            "is it ",
+            "should i ",
+            "should we ",
+            "would you like ",
+            "do i ",
+        });
+}
+
+int32_t infer_authoritative_action_from_visible_surface(
+        bool dmn_origin,
+        const std::string & visible_text,
+        bool resuming_from_tool_result,
+        int32_t foreground_role) {
+    const std::string trimmed = trim_copy(visible_text);
+
+    if (dmn_origin) {
+        return trimmed.empty() ?
+                LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT :
+                LLAMA_AUTHORITATIVE_REACT_ACTION_INTERNAL_WRITE;
+    }
+
+    if (!trimmed.empty()) {
+        return authoritative_visible_reply_looks_like_question(trimmed) ?
+                LLAMA_AUTHORITATIVE_REACT_ACTION_ASK :
+                LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER;
+    }
+
+    if (resuming_from_tool_result || foreground_role == LLAMA_SELF_STATE_EVENT_TOOL) {
+        return LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT;
+    }
+
+    return LLAMA_AUTHORITATIVE_REACT_ACTION_NONE;
+}
+
+std::string truncate_text_to_token_budget(
+        const llama_vocab * vocab,
+        const std::string & text,
+        size_t max_tokens,
+        size_t * out_token_count,
+        size_t * out_original_token_count,
+        bool * out_truncated) {
+    if (out_token_count) {
+        *out_token_count = 0;
+    }
+    if (out_original_token_count) {
+        *out_original_token_count = 0;
+    }
+    if (out_truncated) {
+        *out_truncated = false;
+    }
+
+    const std::string trimmed = trim_copy(text);
+    if (trimmed.empty()) {
+        return std::string();
+    }
+
+    if (!vocab) {
+        return trimmed;
+    }
+
+    llama_tokens tokens = common_tokenize(vocab, trimmed, true, true);
+    if (out_original_token_count) {
+        *out_original_token_count = tokens.size();
+    }
+    if (tokens.empty()) {
+        return std::string();
+    }
+
+    if (max_tokens > 0 && tokens.size() > max_tokens) {
+        tokens.resize(max_tokens);
+        if (out_truncated) {
+            *out_truncated = true;
+        }
+    }
+
+    if (out_token_count) {
+        *out_token_count = tokens.size();
+    }
+    if (tokens.empty()) {
+        return std::string();
+    }
+
+    const llama_token bos = llama_vocab_bos(vocab);
+    if (bos != LLAMA_TOKEN_NULL && tokens.front() == bos) {
+        tokens.erase(tokens.begin());
+    }
+    return trim_copy(common_detokenize(vocab, tokens, true));
 }
 
 bool user_facing_text_violates_plain_prose_policy(const std::string & text) {
@@ -354,6 +550,22 @@ bool user_facing_text_violates_plain_prose_policy(const std::string & text) {
     }
 
     return false;
+}
+
+std::string bounded_runtime_log_excerpt(const std::string & text, size_t max_chars) {
+    const std::string trimmed = trim_copy(text);
+    if (trimmed.size() <= max_chars) {
+        return trimmed;
+    }
+    return trimmed.substr(0, max_chars) + "\n...[truncated]";
+}
+
+std::string synthesize_deferred_terminal_failure_text(const std::string & request_text) {
+    const std::string trimmed = trim_copy(request_text);
+    if (trimmed.empty()) {
+        return "I ran into a problem while finishing that request and could not produce a complete final status message.";
+    }
+    return "I ran into a problem while finishing that request and could not produce a complete final status message. Please try the request again if needed.";
 }
 
 common_chat_params build_chat_completion_params(

@@ -231,6 +231,7 @@ struct llama_context {
     bool self_state_get_model_state(llama_self_model_state_info * out_info) const;
     bool self_state_get_self_model_revision(llama_self_model_revision * out_info) const;
     bool self_state_get_emotive_moment_revision(llama_emotive_moment_revision * out_info) const;
+    bool self_state_get_last_disturbance(llama_self_disturbance_state_info * out_info) const;
     int32_t self_state_model_extension_count() const;
     bool self_state_get_model_extension(int32_t index, llama_self_model_extension_info * out_info) const;
     bool self_state_upsert_model_extension(const llama_self_model_extension_update & update);

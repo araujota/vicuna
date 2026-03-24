@@ -85,7 +85,7 @@ Execution remains intentionally bounded and host-visible:
 - `VICUNA_BASH_TOOL_PATH`: absolute bash-compatible executable path
 - `VICUNA_BASH_TOOL_WORKDIR`: working directory for launched commands
 - `VICUNA_BASH_TOOL_TIMEOUT_MS`: per-command timeout budget
-- `VICUNA_BASH_TOOL_MAX_STDOUT_BYTES`: bounded stdout capture budget
+- `VICUNA_BASH_TOOL_MAX_STDOUT_BYTES`: bounded stdout capture budget for raw tool bodies and provenance
 - `VICUNA_BASH_TOOL_MAX_STDERR_BYTES`: bounded stderr capture budget
 - `VICUNA_BASH_TOOL_LOGIN_SHELL`: use `bash -lc` instead of `bash -c`
 - `VICUNA_BASH_TOOL_INHERIT_ENV`: inherit the server environment or launch with an empty one
@@ -94,6 +94,9 @@ Execution remains intentionally bounded and host-visible:
 The managed runtime launcher defaults `VICUNA_BASH_TOOL_LOGIN_SHELL` to `0` so
 bounded tool commands avoid host login-shell startup scripts unless an operator
 explicitly opts back into them.
+It defaults `VICUNA_BASH_TOOL_MAX_STDOUT_BYTES` to `819200` so large API-backed
+tool bodies can be retained for provenance without immediately truncating at
+small shell-style limits.
 It also defaults `VICUNA_BASH_TOOL_MAX_CHILD_PROCESSES` to `4096`, because
 Linux counts `RLIMIT_NPROC` against the whole user account; values that are too
 small can make even simple tool commands fail to fork on an otherwise healthy
@@ -103,7 +106,16 @@ host.
 host, submits typed results back into the runtime, and only then lets the
 active-loop or DMN runner continue. Unsupported hosts, disabled execution,
 timeouts, and launch failures are surfaced through typed result fields instead
-of silent shell fallbacks.
+of silent shell fallbacks. On successful executions, the model-facing
+observation now prefers the tool response body itself instead of shell-wrapper
+metadata like `status=` and `exit_code=`.
+
+Runtime snapshots may still persist historical `bash_tool_config` state for
+compatibility, but that snapshot data is not the authority for the live host.
+On startup, `server_context` now reapplies the current env-derived bash and
+hard-memory policy after snapshot restore so stale runtime state cannot silently
+disable host-visible external tools such as Radarr, Sonarr, Chaptarr, or
+Tavily.
 
 ### Core System Prompt
 
@@ -229,9 +241,40 @@ prompts. The directive steers tone, stance, social posture, and verbosity for
 natural-language generation while explicitly leaving tool XML, tool arguments,
 JSON, and other structured output untouched.
 
+The emotive layer is now fed by a typed disturbance pipeline rather than by
+ad hoc controller-side mood nudges. Every admitted artifact can update the
+self-model through one inspectable path: event -> appraisal vector ->
+disturbance deltas -> self-state registers -> emotive-moment recompute. The
+current disturbance state records source kind, reliability, failure class, and
+low-dimensional appraisal magnitudes such as expectation violation, progress
+error, controllability deficit, and social deficit. Hidden-thought artifacts,
+user messages, tool observations, tool failures, and time-decayed silence are
+all handled through that same pipeline instead of through tool-family-specific
+ prompt heuristics.
+
+Time-decayed social silence is also now explicit state, not an implicit
+side-effect of dissatisfaction alone. The runtime tracks the last substantive
+contact time, derives a social contact set point from bond strength,
+reciprocity, follow-up continuation, and inhibition, and turns excess silence
+past that set point into a bounded `silence_deficit`. That deficit perturbs the
+self-model, the emotive moment, and DMN repair pressure so idle-but-socially-
+relevant states can eventually admit autonomous outreach or follow-up work.
+
+Every prompt-construction path now refreshes self-state time before prompt
+assembly and injects the current emotive context through the same shared
+helper. This includes plain system-origin completions, active authoritative
+ReAct turns, DMN authoritative ReAct turns, and lightweight inference paths
+such as Telegram acknowledgements. There is no separate prompt family that is
+allowed to skip the current emotive moment.
+
 The `/health` payload now also exposes the current self-model revision, current
 emotive-moment revision, and current shared-context-window state so operators
 can verify what the ReAct loop is being seeded with on a live runtime.
+
+`/health` additionally exposes the current social-contact registers and the
+last disturbance summary so operators can inspect the live set point, current
+silence deficit, disturbance source, and recent appraisal magnitudes that are
+currently perturbing the self-model.
 
 Temporal Active LoRA writes are not part of live self-state admission. They are
 only triggered when context spans are evicted into temporal memory.
@@ -256,22 +299,41 @@ window into runtime-owned dialogue history before preparing the next
 authoritative ReAct step. That keeps runtime-side Telegram dialogue continuity
 alive across active replies, DMN emits, and runtime snapshot restore.
 
+The Telegram bridge system prompt now also treats exposed media tools as real
+current-turn capabilities. If Sonarr, Radarr, or Chaptarr is available and the
+user asks about media-library or queue state, the model is instructed to use
+the relevant tool instead of inheriting an older "I can't access that" refusal
+from transcript continuity.
+
+Telegram-origin active turns now go straight into the real deferred background
+work path. The bridge no longer emits a preliminary acknowledgement before the
+authoritative turn starts, and the runtime-owned Telegram outbox follow-up is
+therefore the first bridge-authored reply for that turn.
+
 The Tavily-backed `web_search` tool is now also explicitly source-first. The
 wrapper no longer treats Tavily's generated `answer` field as authoritative by
 default; it retrieves bounded multi-source evidence instead and expects the
 authoritative ReAct loop to synthesize from returned URLs, scores, and excerpts.
 
-The OpenClaw external runtime catalog now also carries two Servarr tools:
+The OpenClaw external runtime catalog now also carries planner-facing media
+capability aliases instead of only one overloaded tool per service. The runtime
+still dispatches through the same Radarr, Sonarr, and Chaptarr wrappers, but
+the planner now sees narrower selectable tools such as:
 
-- `radarr` for movie-library status, queue, calendar, folders, quality
-  profiles, lookup, and add flows
-- `sonarr` for series-library status, queue, calendar, folders, quality
-  profiles, lookup, and add flows
+- `radarr_inspect`, `radarr_queue`, `radarr_search`,
+  `radarr_download_movie`, `radarr_delete_movie`
+- `sonarr_inspect`, `sonarr_queue`, `sonarr_search`,
+  `sonarr_download_series`, `sonarr_delete_series`
+- `chaptarr_inspect`, `chaptarr_queue`, `chaptarr_search`,
+  `chaptarr_author_lookup`, `chaptarr_book_lookup`,
+  `chaptarr_download_author`, `chaptarr_download_book`,
+  `chaptarr_delete_book`
 
 These are not server-local special cases masquerading as tools. Their
 descriptors come from the same external catalog contract as `web_search`, and
-`server_context` only provides explicit dispatch construction to launch the
-wrapper binaries under the existing `legacy_bash` path.
+`server_context` only provides explicit dispatch construction plus fixed runtime
+argument merge so the wrapper binaries still run under the existing
+`legacy_bash` path with the correct downstream action.
 
 Runtime snapshot restore now accepts snapshot schema version `6`, which is the
 first version that persists the Telegram dialogue object. That keeps bounded
@@ -302,16 +364,21 @@ division of responsibility between the CPU loop and model generation:
   tool availability, and safety constraints
 - CPU-side policy no longer gets to authoritatively enqueue the final
   `answer` / `ask` / `act` / `wait` decision or choose the concrete tool
-- instead, the server requests one hidden ReAct control step with explicit
-  `Thought:` and `Action:` lines plus a canonical XML tool call when the
-  action is `act`
+- instead, the server requests one hidden ReAct control step and, for tool
+  work, walks the model through explicit JSON stages: select the tool family,
+  select the method, then emit only the selected method's arguments as JSON
 - every active and DMN tool exposed to that loop comes from the same
   `server_openclaw_fabric` capability registry; there is no parallel
   user-facing tool descriptor path outside the fabric
+- admitted DMN ticks queued for authoritative follow-up must retain
+  `SERVER_REACT_ORIGIN_DMN` and their DMN trace identity through queued
+  execution; the generic active preparation path must not overwrite them just
+  because a completion task still has default foreground fields
 - the hidden ReAct step is validated against the exposed tool registry and
   safety policy; invalid control output is critiqued and regenerated instead
   of being silently replaced by a fallback CPU tool choice
-- only after validation does host code bind the selected tool request and
+- only after validation does host code bind the selected tool request,
+  synthesize the final invocation from the selected family and method, and
   dispatch it
 
 When an active turn is resuming from a completed tool observation, the server
@@ -319,6 +386,12 @@ marks that state explicitly and tightens the planner prompt so the next control
 step chooses `act`, `answer`, or `ask` from the observation. A post-tool
 `wait` is treated as malformed control and retried; the CPU still does not pick
 an alternative action on the model's behalf.
+
+Post-tool and mid-protocol continuations also carry an explicit pinned
+turn-state bundle into the prompt: the original request, the last completed
+controller step, that step's result, and the latest completed tool observation
+when one exists. That means later stages do not have to recover grounding from
+an arbitrary rolling slice of recent hidden thoughts and visible outputs.
 
 Active authoritative ReAct now also has an explicit continuation policy beyond
 basic parse validity:
@@ -333,17 +406,31 @@ basic parse validity:
 - a visible reply that only narrates intended work or lack of access, such as
   “I will use historical data” or “I do not have real-time access,” is not
   accepted as a terminal answer
+- active turns also reject false claims that the runtime cannot interact with
+  external systems when a relevant live tool is available for the request
 - unsupported terminal answers are retried within the same authoritative turn
   with explicit feedback instead of returning hidden-thought-adjacent
   procedural text to the user
+- for non-staged turns, the runtime still prefers an explicit hidden
+  `Action:` line, but if that label is missing it now has one bounded fallback
+  policy instead of immediately returning `500`: recover a valid tool call from
+  visible tool XML, otherwise infer `answer`, `ask`, `internal_write`, or a
+  state-permitted `wait` from the visible surface, then re-apply the same
+  grounding and retry gates
+- each extracted hidden `<think>...</think>` block is tokenized with the live
+  model vocabulary and capped at `1024` tokens before the runtime stores it as
+  planner reasoning or admits it as a hidden-thought artifact; visible reply
+  text outside the think block is left unchanged
 - after repeated rejected non-tool retries on a mutable active turn, the server
   escalates that turn to `tool_choice=required` so the loop converges onto a
   fresh observation instead of spinning indefinitely
 - user-facing text is plain prose only: visible answers, asks, Telegram relay
   text, and ask-with-options prompts/options are rejected if they contain “as
   an AI” disclaimers, markdown emphasis, or bullet/numbered list formatting
-- the continuation budget is effectively unbounded by default; the turn keeps
-  cycling until it reaches a valid terminal condition or is externally stopped
+- both the overall continuation budget and the per-stage retry budget are now
+  explicit and bounded; stage failures retry locally first and can rewind from
+  argument emission back to method selection or from method selection back to
+  tool selection instead of looping indefinitely
 
 This is why active and DMN runners now stop in `LLAMA_COG_LOOP_PHASE_PROPOSE`
 with no pending command when authoritative mode is enabled: the cognitive loop
@@ -353,31 +440,58 @@ and observation integration. The validated step is then admitted into the
 canonical shared context as hidden thought, tool call, tool observation, or
 visible output instead of surviving only as task-local transcript state.
 
+The DMN handoff invariant is now explicit in the server layer:
+
+- `enqueue_dmn_react_task(...)` creates an internal completion task carrying the
+  retained DMN tick trace
+- the generic active authoritative preparation path must skip any task that is
+  already DMN-origin or already has a DMN trace
+- DMN-origin Bash, hard-memory, and Codex dispatch now call the same
+  `llama_cognitive_command_begin_external_wait(...)` transition used by active
+  turns, so the host/runtime boundary preserves one shared external-wait
+  contract even though later terminal-policy rules still differ by origin
+- the idle DMN scheduler must treat queued authoritative tasks and live active
+  or DMN runners as a single shared “ReAct loop live” gate; DMN ticks resume
+  only after that gate is clear
+- the queue thread must keep calling `update_slots()` while idle; otherwise a
+  deferred high-pressure DMN state can never re-enter until unrelated queue
+  work or a restart wakes the runtime
+- any tool capability whose `execution_safety_class` is not `read_only` is
+  fail-closed behind a runtime-owned Telegram approval object; the blocked
+  command stays parked until `/v1/telegram/approval` resolves it
+- DMN-owned approval waits stay DMN-owned in runtime health, and a fresh
+  Telegram user message can supersede them through
+  `/v1/telegram/interruption` without counting that DMN wait as a foreground
+  engagement turn
+
+System-origin requests can still explicitly disable authoritative ReAct through
+the existing request header and request body flag, but the Telegram bridge no
+longer uses that path for preliminary acknowledgements.
+
 ### ReAct Tool-Call XML Contract
 
 For active-loop ReAct tool steps, host code now enforces one canonical tool
 surface for model output:
 
-- emit at most one short visible sentence before the tool call
-- then emit exactly one `<vicuna_tool_call>` block with no trailing assistant
-  content after the closing tag
-- encode each argument as `<arg name="..." type="...">...</arg>`
-- restrict argument `type` to `string`, `integer`, `number`, `boolean`, `null`,
-  or `json`
-- reject undeclared arguments, duplicate arguments, missing required arguments,
-  malformed XML, and schema/type mismatches
+- emit typed JSON at each controller stage instead of free-form tool markup
+- `select_tool_family` emits only `{"action":"select_tool","tool_family_id":"..."}`
+- `select_method` emits only `{"action":"select_method","method_name":"..."}`
+- `emit_arguments` emits only `{"action":"act", ...selected method args...}`
+- after a tool result, `decide_after_tool` emits only `{"action":"decide","decision":"answer|ask|select_tool|wait"}`
+- if the controller decides to answer or ask, `emit_response` emits only `{"action":"answer|ask","assistant_text":"..."}`
+- reject undeclared fields, malformed JSON, unlisted tool families, unlisted methods, and schema/type mismatches at the stage where they occur
 
-For `tool="exec"`, the planner-visible contract is now stricter: `command`
-means one bounded invocation only, not shell scripting. `server_context`
-preserves the preflight-safe command if planner XML tries to replace it with a
-metacharacter-heavy shell pipeline, and `server-bash-tool` still rejects
-chaining, redirection, and command substitution at execution time.
+Hidden reasoning is still preserved for provenance and self-state processing,
+but for staged tool phases it is no longer the authoritative source of the
+controller action. The explicit visible `action` field is the source of truth
+for stage control, which prevents valid staged turns from failing only because
+the hidden `<think>` text omitted a literal `Action:` line.
 
 `server-openclaw-fabric.cpp` derives these contracts from the registered tool
-schema, injects the contract into the tool-step system prompt, parses only the
-canonical XML form back into typed `common_chat_tool_call` state, and strips any
-rejected tool-call markup from assistant text before it can leak to user-facing
-surfaces such as Telegram.
+schema, injects the family, method, and argument contracts into the staged
+system prompts, parses only the canonical JSON stage outputs back into typed
+controller state, and rejects malformed stage payloads before they can leak to
+user-facing surfaces such as Telegram.
 
 Functional tool LoRAs are only loaded while generating this XML-bearing tool
 step. Once the host begins external execution, the runtime unloads the
@@ -492,6 +606,11 @@ Hidden-thought capture and exact tool-call capture now follow this policy:
 - DMN hidden reasoning is also admitted as a cognitive artifact in the
   counterfactual channel so later runtime context can reuse it without routing
   it to user-visible outputs
+- when context compaction triggers, the runtime discards half of the non-kept
+  span by default (`n_discard = n_left / 2`), so host validation for the
+  hidden-thought cap should confirm that this discard span remains larger than
+  the fixed `1024`-token think-block budget under the live `n_ctx` and `n_keep`
+  configuration
 - tool requests are captured at dispatch time in `tool_call` events with exact
   structured payloads, then later paired with `tool_result` events via
   `command_id` and `tool_job_id`
@@ -517,6 +636,16 @@ Health and `/metrics` expose the same repository state online:
 - observed increases in discovered / permanent / allostatic self-state counts
 - latest self-state progress gauges such as allostatic divergence and promotion
   readiness
+- foreground delivery state via `waiting_active_tasks` plus
+  `foreground_runtime.waiting_on_tool_result`,
+  `foreground_runtime.waiting_on_deferred_delivery`,
+  `foreground_runtime.waiting_emit_response`, and
+  `foreground_runtime.waiting_post_tool_decision`
+
+Current runtime journald breadcrumbs also include bounded authoritative ReAct
+reasoning excerpts, repeated-failure loop aborts, and idle-loop summaries that
+name pending foreground/tool/outbox counts. Provenance remains the full-fidelity
+surface; journald is for live operator diagnosis.
 
 ### User-Model Capture Guidance
 
@@ -581,15 +710,15 @@ Authoring rules:
 
 The first-class tool surface now includes:
 
-- the bash CLI wrapper for bounded host execution
+- the internal bash CLI transport used by typed wrappers such as Servarr and Tavily
 - `hard_memory_query` for retrieval
 - `hard_memory_write` for explicit durable Supermemory writes
 - the Codex CLI wrapper for bounded self-modification work
 
-The `exec` tool descriptor is intentionally explicit. It tells the ReAct loop
-that `exec` is the bounded shell tool for host-local observation and action,
-including filesystem state, current working directory, repository state,
-environment state, running processes, and direct command output.
+The raw `exec` tool is no longer exposed as a planner-visible OpenClaw
+capability. Host-local bash execution remains available only as an internal
+transport behind typed wrappers, so active and DMN turns must route through
+structured tool families instead of free-form shell commands.
 
 Every OpenClaw tool schema is also expected to be self-describing. Parameter
 descriptions are required throughout the exposed schema, including nested

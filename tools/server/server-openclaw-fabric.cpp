@@ -14,7 +14,11 @@
 namespace {
 
 constexpr const char * SERVER_OPENCLAW_XML_ROOT = "vicuna_tool_call";
+constexpr const char * SERVER_OPENCLAW_XML_TOOL_SELECTION_ROOT = "vicuna_tool_selection";
+constexpr const char * SERVER_OPENCLAW_XML_TOOL_METHOD_ROOT = "vicuna_tool_method";
 constexpr const char * SERVER_OPENCLAW_XML_ARG = "arg";
+constexpr const char * SERVER_OPENCLAW_TOOL_SELECTION_PREFIX = "SelectedToolFamily:";
+constexpr const char * SERVER_OPENCLAW_TOOL_METHOD_PREFIX = "SelectedMethod:";
 
 struct builtin_capability_registration {
     const char * tool_id;
@@ -67,7 +71,7 @@ bool builtin_tool_enabled_for_env(const char * tool_id) {
         return true;
     }
     // Compatibility: older host-local env files often pin the builtin allowlist
-    // to exec + hard_memory_query. Treat that legacy hard-memory entry as the
+    // to hard_memory_query alone. Treat that legacy hard-memory entry as the
     // whole hard-memory tool layer so explicit durable writes are not silently
     // removed from the live OpenClaw surface.
     if (std::strcmp(tool_id, "hard_memory_write") == 0 &&
@@ -75,7 +79,7 @@ bool builtin_tool_enabled_for_env(const char * tool_id) {
         return true;
     }
     // Compatibility: preserve the DMN user-contact relay when older host-local
-    // allowlists pin the builtin surface to exec + hard_memory_query.
+    // allowlists pin the builtin surface to hard_memory_query alone.
     if (std::strcmp(tool_id, "telegram_relay") == 0 &&
             env_list_contains("VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS", "hard_memory_query", false)) {
         return true;
@@ -94,6 +98,43 @@ constexpr uint32_t SERVER_OPENCLAW_REQUIRED_REACT_ELIGIBILITY_MASK =
 
 bool descriptor_has_react_eligibility(const openclaw_tool_capability_descriptor & descriptor) {
     return (descriptor.tool_flags & SERVER_OPENCLAW_REQUIRED_REACT_ELIGIBILITY_MASK) != 0;
+}
+
+bool descriptor_is_disabled_builtin(const openclaw_tool_capability_descriptor & descriptor) {
+    return descriptor.capability_id == "openclaw.exec.command" ||
+           descriptor.tool_surface_id == "vicuna.exec.main" ||
+           descriptor.tool_name == "exec" ||
+           descriptor.tool_family_id == "exec";
+}
+
+std::string descriptor_tool_family_id(const openclaw_tool_capability_descriptor & descriptor) {
+    return !descriptor.tool_family_id.empty() ? descriptor.tool_family_id : descriptor.tool_name;
+}
+
+std::string descriptor_tool_family_name(const openclaw_tool_capability_descriptor & descriptor) {
+    if (!descriptor.tool_family_name.empty()) {
+        return descriptor.tool_family_name;
+    }
+    const std::string family_id = descriptor_tool_family_id(descriptor);
+    return family_id.empty() ? descriptor.tool_name : family_id;
+}
+
+std::string descriptor_tool_family_description(const openclaw_tool_capability_descriptor & descriptor) {
+    if (!descriptor.tool_family_description.empty()) {
+        return descriptor.tool_family_description;
+    }
+    return descriptor.description;
+}
+
+std::string descriptor_method_name(const openclaw_tool_capability_descriptor & descriptor) {
+    return !descriptor.method_name.empty() ? descriptor.method_name : descriptor.tool_name;
+}
+
+std::string descriptor_method_description(const openclaw_tool_capability_descriptor & descriptor) {
+    if (!descriptor.method_description.empty()) {
+        return descriptor.method_description;
+    }
+    return descriptor.description;
 }
 
 void set_bounded(char * dst, size_t dst_size, const std::string & src) {
@@ -372,6 +413,24 @@ uint32_t xml_type_mask_from_schema_type(const nlohmann::json & type_json) {
     return mask;
 }
 
+std::vector<std::string> schema_string_enum_values(const nlohmann::json & property_schema) {
+    std::vector<std::string> values;
+    if (!property_schema.is_object() || !property_schema.contains("enum") || !property_schema.at("enum").is_array()) {
+        return values;
+    }
+    for (const auto & entry : property_schema.at("enum")) {
+        if (entry.is_string()) {
+            values.push_back(entry.get<std::string>());
+        }
+    }
+    return values;
+}
+
+bool validate_parsed_arg_value(
+        const server_openclaw_xml_arg_requirement & requirement,
+        const nlohmann::json & parsed_value,
+        std::string * out_error);
+
 std::string xml_type_label(uint32_t mask) {
     std::vector<std::string> labels;
     if ((mask & SERVER_OPENCLAW_XML_ARG_STRING) != 0) {
@@ -445,9 +504,12 @@ bool build_xml_tool_contract_from_capability(
         return false;
     }
 
-    out_contract->tool_name = capability.descriptor.tool_name;
+    out_contract->tool_family_id = descriptor_tool_family_id(capability.descriptor);
+    out_contract->tool_family_name = descriptor_tool_family_name(capability.descriptor);
+    out_contract->method_name = descriptor_method_name(capability.descriptor);
     out_contract->capability_id = capability.descriptor.capability_id;
-    out_contract->description = capability.descriptor.description;
+    out_contract->tool_name = capability.descriptor.tool_name;
+    out_contract->description = descriptor_method_description(capability.descriptor);
     out_contract->args.clear();
 
     std::set<std::string> required_args;
@@ -469,6 +531,7 @@ bool build_xml_tool_contract_from_capability(
         server_openclaw_xml_arg_requirement arg;
         arg.name = it.key();
         arg.description = trim_ascii_copy_local(it.value().value("description", std::string()));
+        arg.allowed_string_values = schema_string_enum_values(it.value());
         arg.required = required_args.count(arg.name) > 0;
         arg.allowed_types = xml_type_mask_from_schema_type(it.value().value("type", nlohmann::json()));
         if (arg.allowed_types == 0) {
@@ -478,6 +541,53 @@ bool build_xml_tool_contract_from_capability(
         out_contract->args.push_back(std::move(arg));
     }
 
+    return true;
+}
+
+bool build_tool_argument_contract_from_capability(
+        const server_openclaw_capability_runtime & capability,
+        server_openclaw_tool_argument_contract * out_contract,
+        std::string * out_error) {
+    if (!out_contract) {
+        set_error(out_error, "tool argument contract output is required");
+        return false;
+    }
+
+    server_openclaw_xml_tool_contract xml_contract;
+    if (!build_xml_tool_contract_from_capability(capability, &xml_contract, out_error)) {
+        return false;
+    }
+
+    nlohmann::json input_schema = nlohmann::json::object();
+    nlohmann::json fixed_arguments = nlohmann::json::object();
+    try {
+        input_schema = nlohmann::json::parse(capability.descriptor.input_schema_json);
+    } catch (const std::exception & err) {
+        set_error(out_error, std::string("failed to parse method input schema: ") + err.what());
+        return false;
+    }
+    if (!capability.descriptor.fixed_arguments_json.empty()) {
+        try {
+            fixed_arguments = nlohmann::json::parse(capability.descriptor.fixed_arguments_json);
+        } catch (const std::exception & err) {
+            set_error(out_error, std::string("failed to parse method fixed arguments: ") + err.what());
+            return false;
+        }
+        if (!fixed_arguments.is_object()) {
+            set_error(out_error, "method fixed arguments must be a JSON object");
+            return false;
+        }
+    }
+
+    out_contract->tool_family_id = xml_contract.tool_family_id;
+    out_contract->tool_family_name = xml_contract.tool_family_name;
+    out_contract->method_name = xml_contract.method_name;
+    out_contract->capability_id = xml_contract.capability_id;
+    out_contract->tool_name = xml_contract.tool_name;
+    out_contract->description = xml_contract.description;
+    out_contract->input_schema = std::move(input_schema);
+    out_contract->fixed_arguments = std::move(fixed_arguments);
+    out_contract->args = xml_contract.args;
     return true;
 }
 
@@ -522,6 +632,140 @@ bool append_contracts_for_indexes(
         }
     }
     return true;
+}
+
+bool json_value_matches_allowed_types(uint32_t allowed_types, const nlohmann::json & value) {
+    if (value.is_string()) {
+        return (allowed_types & SERVER_OPENCLAW_XML_ARG_STRING) != 0;
+    }
+    if (value.is_boolean()) {
+        return (allowed_types & SERVER_OPENCLAW_XML_ARG_BOOLEAN) != 0;
+    }
+    if (value.is_number_integer() || value.is_number_unsigned()) {
+        return (allowed_types & SERVER_OPENCLAW_XML_ARG_INTEGER) != 0 ||
+               (allowed_types & SERVER_OPENCLAW_XML_ARG_NUMBER) != 0;
+    }
+    if (value.is_number_float()) {
+        return (allowed_types & SERVER_OPENCLAW_XML_ARG_NUMBER) != 0;
+    }
+    if (value.is_null()) {
+        return (allowed_types & SERVER_OPENCLAW_XML_ARG_NULL) != 0;
+    }
+    if (value.is_object() || value.is_array()) {
+        return (allowed_types & SERVER_OPENCLAW_XML_ARG_JSON) != 0;
+    }
+    return false;
+}
+
+bool parse_visible_json_payload(
+        const std::string & full_text,
+        std::string * out_reasoning,
+        std::string * out_visible_payload,
+        nlohmann::json * out_payload,
+        std::string * out_error) {
+    if (!out_reasoning || !out_visible_payload || !out_payload) {
+        set_error(out_error, "json payload parse requires output storage");
+        return false;
+    }
+
+    std::string planner_reasoning;
+    std::string visible_text;
+    extract_hidden_reasoning_and_visible_text(full_text, &planner_reasoning, &visible_text);
+    const std::string trimmed_visible = trim_ascii_copy_local(visible_text);
+    if (trimmed_visible.empty()) {
+        set_error(out_error, "stage output did not include a visible JSON object");
+        return false;
+    }
+
+    try {
+        *out_payload = nlohmann::json::parse(trimmed_visible);
+    } catch (const std::exception & err) {
+        set_error(out_error, std::string("stage output did not contain valid JSON: ") + err.what());
+        return false;
+    }
+    if (!out_payload->is_object()) {
+        set_error(out_error, "stage output must be a single JSON object");
+        return false;
+    }
+
+    *out_reasoning = std::move(planner_reasoning);
+    *out_visible_payload = trimmed_visible;
+    return true;
+}
+
+bool validate_tool_argument_payload(
+        const server_openclaw_tool_argument_contract & contract,
+        nlohmann::json * io_arguments,
+        std::string * out_error) {
+    if (!io_arguments || !io_arguments->is_object()) {
+        set_error(out_error, "method arguments must be a JSON object");
+        return false;
+    }
+
+    std::set<std::string> required_args;
+    if (contract.input_schema.contains("required") && contract.input_schema.at("required").is_array()) {
+        for (const auto & entry : contract.input_schema.at("required")) {
+            if (entry.is_string()) {
+                required_args.insert(entry.get<std::string>());
+            }
+        }
+    }
+
+    std::map<std::string, server_openclaw_xml_arg_requirement> requirements;
+    for (const auto & arg : contract.args) {
+        requirements[arg.name] = arg;
+    }
+
+    for (auto it = io_arguments->begin(); it != io_arguments->end(); ++it) {
+        const auto requirement_it = requirements.find(it.key());
+        if (requirement_it == requirements.end()) {
+            set_error(out_error, "method arguments used an undeclared field: " + it.key());
+            return false;
+        }
+        if (!json_value_matches_allowed_types(requirement_it->second.allowed_types, it.value())) {
+            set_error(out_error, "method arguments used an unsupported type for field: " + it.key());
+            return false;
+        }
+        if (!validate_parsed_arg_value(requirement_it->second, it.value(), out_error)) {
+            return false;
+        }
+        required_args.erase(it.key());
+    }
+
+    if (!required_args.empty()) {
+        set_error(out_error, "method arguments are missing required field: " + *required_args.begin());
+        return false;
+    }
+
+    for (auto it = contract.fixed_arguments.begin(); it != contract.fixed_arguments.end(); ++it) {
+        const auto existing = io_arguments->find(it.key());
+        if (existing != io_arguments->end() && *existing != it.value()) {
+            set_error(out_error, "method arguments conflicted with fixed runtime argument: " + it.key());
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool validate_parsed_arg_value(
+        const server_openclaw_xml_arg_requirement & requirement,
+        const nlohmann::json & parsed_value,
+        std::string * out_error) {
+    if ((requirement.allowed_types & SERVER_OPENCLAW_XML_ARG_STRING) == 0 || requirement.allowed_string_values.empty()) {
+        return true;
+    }
+    if (!parsed_value.is_string()) {
+        return true;
+    }
+    const std::string value = parsed_value.get<std::string>();
+    for (const auto & allowed : requirement.allowed_string_values) {
+        if (value == allowed) {
+            return true;
+        }
+    }
+    set_error(out_error, "tool-call XML used an unsupported value for argument \"" + requirement.name + "\": " + value);
+    return false;
 }
 
 bool parse_integer_exact(const std::string & value, int64_t * out_value) {
@@ -636,19 +880,21 @@ std::string join_payload(const std::string & prefix, const std::string & xml_blo
     return trimmed_prefix + "\n" + xml_block;
 }
 
-const server_openclaw_xml_tool_contract * find_contract_by_tool_name(
+const server_openclaw_xml_tool_contract * find_contract_by_family_and_method(
         const std::vector<server_openclaw_xml_tool_contract> & contracts,
-        const std::string & tool_name) {
+        const std::string & tool_family_id,
+        const std::string & method_name) {
     for (const auto & contract : contracts) {
-        if (contract.tool_name == tool_name) {
+        if (contract.tool_family_id == tool_family_id && contract.method_name == method_name) {
             return &contract;
         }
     }
     return nullptr;
 }
 
-bool extract_tool_call_xml_region(
+bool extract_xml_region(
         const std::string & text,
+        const std::string & root_name,
         size_t * out_root_start,
         size_t * out_root_end,
         bool * out_has_closing_tag,
@@ -658,13 +904,13 @@ bool extract_tool_call_xml_region(
         return false;
     }
 
-    const size_t root_start = text.find(std::string("<") + SERVER_OPENCLAW_XML_ROOT);
+    const size_t root_start = text.find(std::string("<") + root_name);
     if (root_start == std::string::npos) {
-        set_error(out_error, "tool-call XML root was not found");
+        set_error(out_error, "XML root was not found");
         return false;
     }
 
-    const std::string root_close = std::string("</") + SERVER_OPENCLAW_XML_ROOT + ">";
+    const std::string root_close = std::string("</") + root_name + ">";
     const size_t root_end = text.find(root_close, root_start);
     *out_root_start = root_start;
     if (root_end == std::string::npos) {
@@ -675,6 +921,192 @@ bool extract_tool_call_xml_region(
 
     *out_root_end = root_end + root_close.size();
     *out_has_closing_tag = true;
+    return true;
+}
+
+bool extract_last_complete_xml_region(
+        const std::string & text,
+        const std::string & root_name,
+        size_t * out_root_start,
+        size_t * out_root_end,
+        std::string * out_error) {
+    if (!out_root_start || !out_root_end) {
+        set_error(out_error, "XML recovery requires output storage");
+        return false;
+    }
+
+    const std::string root_open = std::string("<") + root_name;
+    const std::string root_close = std::string("</") + root_name + ">";
+
+    bool found = false;
+    size_t search_pos = 0;
+    size_t best_start = 0;
+    size_t best_end = 0;
+    while (true) {
+        const size_t root_start = text.find(root_open, search_pos);
+        if (root_start == std::string::npos) {
+            break;
+        }
+        const size_t root_end = text.find(root_close, root_start);
+        if (root_end != std::string::npos) {
+            found = true;
+            best_start = root_start;
+            best_end = root_end + root_close.size();
+        }
+        search_pos = root_start + 1;
+    }
+
+    if (!found) {
+        set_error(out_error, "XML root with a closing tag was not found");
+        return false;
+    }
+
+    *out_root_start = best_start;
+    *out_root_end = best_end;
+    return true;
+}
+
+bool parse_tool_selection_message(
+        const std::string & full_text,
+        const std::vector<server_openclaw_tool_family_contract> & families,
+        server_openclaw_parsed_tool_selection * out_parsed,
+        std::string * out_error) {
+    if (!out_parsed) {
+        set_error(out_error, "tool-selection XML parse requires output storage");
+        return false;
+    }
+
+    std::string planner_reasoning;
+    std::string visible_text;
+    extract_hidden_reasoning_and_visible_text(full_text, &planner_reasoning, &visible_text);
+    const std::string trimmed_visible = trim_ascii_copy_local(visible_text);
+    if (trimmed_visible.empty()) {
+        set_error(out_error, "tool-selection output is empty");
+        return false;
+    }
+
+    std::vector<std::string> selector_lines;
+    std::istringstream line_stream(trimmed_visible);
+    for (std::string line; std::getline(line_stream, line); ) {
+        const std::string trimmed_line = trim_ascii_copy_local(line);
+        if (!trimmed_line.empty()) {
+            selector_lines.push_back(trimmed_line);
+        }
+    }
+    if (selector_lines.size() != 1) {
+        set_error(out_error, "tool-selection output must contain exactly one visible selector line");
+        return false;
+    }
+
+    std::string tool_family_id = selector_lines.front();
+    if (tool_family_id.rfind(SERVER_OPENCLAW_TOOL_SELECTION_PREFIX, 0) == 0) {
+        tool_family_id = trim_ascii_copy_local(tool_family_id.substr(std::strlen(SERVER_OPENCLAW_TOOL_SELECTION_PREFIX)));
+    }
+    if (tool_family_id.empty()) {
+        set_error(out_error, "tool-selection output did not include a tool family id");
+        return false;
+    }
+    if (tool_family_id.find_first_of(" \t\r\n") != std::string::npos) {
+        set_error(out_error, "tool-selection output must contain only the selected tool family id");
+        return false;
+    }
+
+    auto family_it = std::find_if(
+            families.begin(),
+            families.end(),
+            [&](const server_openclaw_tool_family_contract & family) {
+                return family.tool_family_id == tool_family_id;
+            });
+    if (family_it == families.end()) {
+        set_error(out_error, "tool-selection XML selected an unknown or disallowed tool family: " + tool_family_id);
+        return false;
+    }
+
+    out_parsed->message = {};
+    out_parsed->message.role = "assistant";
+    out_parsed->message.content = "";
+    out_parsed->message.reasoning_content = planner_reasoning;
+    out_parsed->visible_prefix = "";
+    out_parsed->xml_block = selector_lines.front();
+    out_parsed->captured_planner_reasoning = planner_reasoning;
+    out_parsed->tool_family_id = family_it->tool_family_id;
+    out_parsed->tool_family_name = family_it->tool_family_name;
+    out_parsed->captured_payload = trim_ascii_copy_local(full_text);
+    return true;
+}
+
+bool parse_tool_method_selection_message(
+        const std::string & full_text,
+        const std::string & tool_family_id,
+        const std::vector<server_openclaw_tool_method_contract> & methods,
+        server_openclaw_parsed_tool_method_selection * out_parsed,
+        std::string * out_error) {
+    if (!out_parsed) {
+        set_error(out_error, "tool-method XML parse requires output storage");
+        return false;
+    }
+
+    std::string planner_reasoning;
+    std::string visible_text;
+    extract_hidden_reasoning_and_visible_text(full_text, &planner_reasoning, &visible_text);
+    const std::string trimmed_visible = trim_ascii_copy_local(visible_text);
+    if (trimmed_visible.empty()) {
+        set_error(out_error, "tool-method output is empty");
+        return false;
+    }
+
+    std::vector<std::string> selector_lines;
+    std::istringstream line_stream(trimmed_visible);
+    for (std::string line; std::getline(line_stream, line); ) {
+        const std::string trimmed_line = trim_ascii_copy_local(line);
+        if (!trimmed_line.empty()) {
+            selector_lines.push_back(trimmed_line);
+        }
+    }
+    if (selector_lines.size() != 1) {
+        set_error(out_error, "tool-method output must contain exactly one visible selector line");
+        return false;
+    }
+
+    std::string selected_method_name = selector_lines.front();
+    if (selected_method_name.rfind(SERVER_OPENCLAW_TOOL_METHOD_PREFIX, 0) == 0) {
+        selected_method_name = trim_ascii_copy_local(selected_method_name.substr(std::strlen(SERVER_OPENCLAW_TOOL_METHOD_PREFIX)));
+    }
+    if (selected_method_name.empty()) {
+        set_error(out_error, "tool-method output did not include a method id");
+        return false;
+    }
+    if (selected_method_name.find_first_of(" \t\r\n") != std::string::npos) {
+        set_error(out_error, "tool-method output must contain only the selected method id");
+        return false;
+    }
+
+    const std::string selected_family_id = trim_ascii_copy_local(tool_family_id);
+    auto method_match = std::find_if(
+            methods.begin(),
+            methods.end(),
+            [&](const server_openclaw_tool_method_contract & method) {
+                return method.tool_family_id == selected_family_id &&
+                       method.method_name == selected_method_name;
+            });
+    if (method_match == methods.end()) {
+        set_error(out_error, "tool-method XML selected an unknown or disallowed method: " + selected_method_name);
+        return false;
+    }
+
+    out_parsed->message = {};
+    out_parsed->message.role = "assistant";
+    out_parsed->message.content = "";
+    out_parsed->message.reasoning_content = planner_reasoning;
+    out_parsed->visible_prefix = "";
+    out_parsed->xml_block = selector_lines.front();
+    out_parsed->captured_planner_reasoning = planner_reasoning;
+    out_parsed->tool_family_id = method_match->tool_family_id;
+    out_parsed->tool_family_name = method_match->tool_family_name;
+    out_parsed->method_name = method_match->method_name;
+    out_parsed->capability_id = method_match->capability_id;
+    out_parsed->tool_name = method_match->tool_name;
+    out_parsed->captured_payload = trim_ascii_copy_local(full_text);
     return true;
 }
 
@@ -698,15 +1130,18 @@ bool recover_partial_tool_call_message(
     }
 
     const auto root_tool_it = root_attrs.find("tool");
-    if (root_tool_it == root_attrs.end()) {
-        set_error(out_error, "partial tool-call XML recovery requires a quoted tool attribute");
+    const auto root_method_it = root_attrs.find("method");
+    if (root_tool_it == root_attrs.end() || root_method_it == root_attrs.end()) {
+        set_error(out_error, "partial tool-call XML recovery requires quoted tool and method attributes");
         return false;
     }
 
-    const std::string tool_name = trim_ascii_copy_local(root_tool_it->second);
-    const server_openclaw_xml_tool_contract * contract = find_contract_by_tool_name(contracts, tool_name);
+    const std::string tool_family_id = trim_ascii_copy_local(root_tool_it->second);
+    const std::string method_name = trim_ascii_copy_local(root_method_it->second);
+    const server_openclaw_xml_tool_contract * contract =
+            find_contract_by_family_and_method(contracts, tool_family_id, method_name);
     if (!contract) {
-        set_error(out_error, "partial tool-call XML selected an unknown or disallowed tool: " + tool_name);
+        set_error(out_error, "partial tool-call XML selected an unknown or disallowed tool/method");
         return false;
     }
 
@@ -765,7 +1200,8 @@ bool recover_partial_tool_call_message(
 
         nlohmann::json parsed_value;
         std::string ignored_error;
-        if (parse_arg_value_json(xml_block.substr(value_start, value_end - value_start), declared_type, &parsed_value, &ignored_error)) {
+        if (parse_arg_value_json(xml_block.substr(value_start, value_end - value_start), declared_type, &parsed_value, &ignored_error) &&
+                validate_parsed_arg_value(requirement_it->second, parsed_value, nullptr)) {
             arguments[arg_name] = std::move(parsed_value);
             seen_args.insert(arg_name);
         }
@@ -779,7 +1215,7 @@ bool recover_partial_tool_call_message(
     extract_hidden_reasoning_and_visible_text(raw_prefix, &planner_reasoning, &visible_prefix);
     out_parsed->message.content = visible_prefix;
     out_parsed->message.reasoning_content = planner_reasoning;
-    out_parsed->message.tool_calls = { common_chat_tool_call { tool_name, arguments.dump(), "" } };
+    out_parsed->message.tool_calls = { common_chat_tool_call { contract->tool_name, arguments.dump(), "" } };
     out_parsed->visible_prefix = visible_prefix;
     out_parsed->xml_block = xml_block;
     out_parsed->captured_planner_reasoning = planner_reasoning;
@@ -838,10 +1274,6 @@ bool dispatch_backend_from_string(
     return false;
 }
 
-bool exec_available(bool bash_enabled, bool /*hard_memory_enabled*/, bool /*codex_enabled*/) {
-    return bash_enabled;
-}
-
 bool hard_memory_available(bool /*bash_enabled*/, bool hard_memory_enabled, bool /*codex_enabled*/) {
     return hard_memory_enabled;
 }
@@ -854,45 +1286,6 @@ bool telegram_available(bool /*bash_enabled*/, bool /*hard_memory_enabled*/, boo
     return true;
 }
 
-openclaw_tool_capability_descriptor build_exec_descriptor() {
-    openclaw_tool_capability_descriptor exec = {};
-    exec.capability_id = "openclaw.exec.command";
-    exec.tool_surface_id = "vicuna.exec.main";
-    exec.capability_kind = "tool";
-    exec.owner_plugin_id = "openclaw-core";
-    exec.tool_name = "exec";
-    exec.description = "Inspect or act on host-local state by running one bounded shell command through the execution policy. Use this for filesystem state, the current working directory, repository state, environment variables, running processes, or command output. Keep the command narrow and direct, and do not use shell chaining or redirection.";
-    exec.input_schema_json = R"({
-        "type":"object",
-        "required":["command"],
-        "properties":{
-            "command":{
-                "type":"string",
-                "description":"A single bounded shell command to execute for direct host-local observation or action. Prefer precise commands such as pwd, ls, git status, or cat path."
-            },
-            "workdir":{
-                "type":"string",
-                "description":"Optional working directory for the command when the observation or action should run in a specific repository or path."
-            }
-        }
-    })";
-    exec.output_contract = "pending_then_result";
-    exec.side_effect_class = "system_exec";
-    exec.approval_mode = "policy_driven";
-    exec.execution_modes = {"sync", "background", "approval_gated"};
-    exec.provenance_namespace = "openclaw/openclaw-core/tool/exec";
-    exec.tool_kind = LLAMA_TOOL_KIND_BASH_CLI;
-    exec.tool_flags =
-            LLAMA_COG_TOOL_ACTIVE_ELIGIBLE |
-            LLAMA_COG_TOOL_DMN_ELIGIBLE |
-            LLAMA_COG_TOOL_REMEDIATION_SAFE |
-            LLAMA_COG_TOOL_EXTERNAL_SIDE_EFFECT;
-    exec.latency_class = LLAMA_COG_TOOL_LATENCY_MEDIUM;
-    exec.max_steps_reserved = 2;
-    exec.dispatch_backend = "legacy_bash";
-    return exec;
-}
-
 openclaw_tool_capability_descriptor build_hard_memory_descriptor() {
     openclaw_tool_capability_descriptor memory = {};
     memory.capability_id = "openclaw.vicuna.hard_memory_query";
@@ -900,6 +1293,11 @@ openclaw_tool_capability_descriptor build_hard_memory_descriptor() {
     memory.capability_kind = "memory_adapter";
     memory.owner_plugin_id = "vicuna-memory";
     memory.tool_name = "hard_memory_query";
+    memory.tool_family_id = "hard_memory";
+    memory.tool_family_name = "Hard Memory";
+    memory.tool_family_description = "Read from or write durable memory primitives in Vicuña hard memory.";
+    memory.method_name = "query";
+    memory.method_description = "Query Vicuña hard memory with a retrieval string.";
     memory.description = "Query Vicuña hard memory and return typed retrieval results";
     memory.input_schema_json = R"({
         "type":"object",
@@ -913,6 +1311,7 @@ openclaw_tool_capability_descriptor build_hard_memory_descriptor() {
     })";
     memory.output_contract = "completed_result";
     memory.side_effect_class = "memory_read";
+    memory.execution_safety_class = "read_only";
     memory.approval_mode = "none";
     memory.execution_modes = {"sync"};
     memory.provenance_namespace = "openclaw/vicuna-memory/memory_adapter/hard_memory_query";
@@ -935,6 +1334,11 @@ openclaw_tool_capability_descriptor build_hard_memory_write_descriptor() {
     memory.capability_kind = "memory_adapter";
     memory.owner_plugin_id = "vicuna-memory";
     memory.tool_name = "hard_memory_write";
+    memory.tool_family_id = "hard_memory";
+    memory.tool_family_name = "Hard Memory";
+    memory.tool_family_description = "Read from or write durable memory primitives in Vicuña hard memory.";
+    memory.method_name = "write";
+    memory.method_description = "Archive a batch of durable memory primitives.";
     memory.description = "Archive explicit durable memories to Vicuña hard memory and Supermemory";
     memory.input_schema_json = R"({
         "type":"object",
@@ -972,6 +1376,7 @@ openclaw_tool_capability_descriptor build_hard_memory_write_descriptor() {
     })";
     memory.output_contract = "completed_result";
     memory.side_effect_class = "memory_write";
+    memory.execution_safety_class = "approval_required";
     memory.approval_mode = "none";
     memory.execution_modes = {"sync"};
     memory.provenance_namespace = "openclaw/vicuna-memory/memory_adapter/hard_memory_write";
@@ -994,6 +1399,11 @@ openclaw_tool_capability_descriptor build_codex_descriptor() {
     codex.capability_kind = "tool";
     codex.owner_plugin_id = "vicuna-runtime";
     codex.tool_name = "codex";
+    codex.tool_family_id = "codex";
+    codex.tool_family_name = "Codex";
+    codex.tool_family_description = "Use the local Codex CLI to make repository changes in this checkout.";
+    codex.method_name = "run_task";
+    codex.method_description = "Run one local Codex task against the repository checkout.";
     codex.description = "Use the local Codex CLI to implement a repository change and rebuild the runtime";
     codex.input_schema_json = R"({
         "type":"object",
@@ -1007,6 +1417,7 @@ openclaw_tool_capability_descriptor build_codex_descriptor() {
     })";
     codex.output_contract = "pending_then_result";
     codex.side_effect_class = "self_modification";
+    codex.execution_safety_class = "approval_required";
     codex.approval_mode = "none";
     codex.execution_modes = {"background"};
     codex.provenance_namespace = "openclaw/vicuna-runtime/tool/codex";
@@ -1029,6 +1440,11 @@ openclaw_tool_capability_descriptor build_telegram_relay_descriptor() {
     relay.capability_kind = "tool";
     relay.owner_plugin_id = "vicuna-runtime";
     relay.tool_name = "telegram_relay";
+    relay.tool_family_id = "telegram";
+    relay.tool_family_name = "Telegram";
+    relay.tool_family_description = "Send direct user-facing messages or questions through the Telegram bridge.";
+    relay.method_name = "relay";
+    relay.method_description = "Relay one plain-prose message to the Telegram user.";
     relay.description = "Send a DMN-origin question, comment, or conclusion through the Telegram bridge";
     relay.input_schema_json =
             R"({
@@ -1043,6 +1459,7 @@ openclaw_tool_capability_descriptor build_telegram_relay_descriptor() {
             })";
     relay.output_contract = "completed_result";
     relay.side_effect_class = "user_contact";
+    relay.execution_safety_class = "approval_required";
     relay.approval_mode = "none";
     relay.execution_modes = {"sync"};
     relay.provenance_namespace = "openclaw/vicuna-runtime/tool/telegram_relay";
@@ -1063,6 +1480,11 @@ openclaw_tool_capability_descriptor build_telegram_ask_options_descriptor() {
     ask.capability_kind = "tool";
     ask.owner_plugin_id = "vicuna-runtime";
     ask.tool_name = "ask_with_options";
+    ask.tool_family_id = "telegram";
+    ask.tool_family_name = "Telegram";
+    ask.tool_family_description = "Send direct user-facing messages or questions through the Telegram bridge.";
+    ask.method_name = "ask_with_options";
+    ask.method_description = "Ask the Telegram user a question with a bounded option list.";
     ask.description = "Ask the Telegram user a question with inline reply options and continue once they choose one";
     ask.input_schema_json =
             R"({
@@ -1083,6 +1505,7 @@ openclaw_tool_capability_descriptor build_telegram_ask_options_descriptor() {
             })";
     ask.output_contract = "completed_result";
     ask.side_effect_class = "user_contact";
+    ask.execution_safety_class = "read_only";
     ask.approval_mode = "none";
     ask.execution_modes = {"sync"};
     ask.provenance_namespace = "openclaw/vicuna-runtime/tool/ask_with_options";
@@ -1099,12 +1522,6 @@ openclaw_tool_capability_descriptor build_telegram_ask_options_descriptor() {
 
 const builtin_capability_registration * builtin_capability_registrations(size_t * out_count) {
     static const builtin_capability_registration registrations[] = {
-        {
-            "exec",
-            SERVER_OPENCLAW_DISPATCH_LEGACY_BASH,
-            exec_available,
-            build_exec_descriptor,
-        },
         {
             "hard_memory_query",
             SERVER_OPENCLAW_DISPATCH_LEGACY_HARD_MEMORY,
@@ -1283,6 +1700,105 @@ bool server_openclaw_fabric::build_chat_tools(
     return true;
 }
 
+bool server_openclaw_fabric::build_tool_family_contracts(
+        std::vector<server_openclaw_tool_family_contract> * out_families,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_families) {
+        set_error(out_error, "tool family output is required");
+        return false;
+    }
+    out_families->clear();
+
+    std::set<std::string> seen_family_ids;
+    auto append_family = [&](const server_openclaw_capability_runtime & capability) {
+        server_openclaw_tool_family_contract family;
+        family.tool_family_id = descriptor_tool_family_id(capability.descriptor);
+        if (family.tool_family_id.empty() || seen_family_ids.count(family.tool_family_id) > 0) {
+            return;
+        }
+        family.tool_family_name = descriptor_tool_family_name(capability.descriptor);
+        family.description = descriptor_tool_family_description(capability.descriptor);
+        seen_family_ids.insert(family.tool_family_id);
+        out_families->push_back(std::move(family));
+    };
+
+    if (!spec_indexes || spec_indexes->empty()) {
+        for (const auto & capability : capability_state) {
+            append_family(capability);
+        }
+        return true;
+    }
+
+    for (int32_t spec_index : *spec_indexes) {
+        const server_openclaw_capability_runtime * capability = capability_by_spec_index(spec_index);
+        if (!capability) {
+            set_error(out_error, "tool spec index is out of range for tool family contract");
+            return false;
+        }
+        append_family(*capability);
+    }
+    return true;
+}
+
+bool server_openclaw_fabric::build_tool_method_contracts(
+        const std::string & tool_family_id,
+        std::vector<server_openclaw_tool_method_contract> * out_methods,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_methods) {
+        set_error(out_error, "tool method output is required");
+        return false;
+    }
+    out_methods->clear();
+
+    const std::string normalized_family_id = trim_ascii_copy_local(tool_family_id);
+    if (normalized_family_id.empty()) {
+        set_error(out_error, "tool family id is required for tool method contracts");
+        return false;
+    }
+
+    std::vector<server_openclaw_xml_tool_contract> contracts;
+    if (!build_xml_tool_contracts(&contracts, spec_indexes, out_error)) {
+        return false;
+    }
+    for (const auto & contract : contracts) {
+        if (contract.tool_family_id != normalized_family_id) {
+            continue;
+        }
+        server_openclaw_tool_method_contract method;
+        method.tool_family_id = contract.tool_family_id;
+        method.tool_family_name = contract.tool_family_name;
+        method.method_name = contract.method_name;
+        method.capability_id = contract.capability_id;
+        method.tool_name = contract.tool_name;
+        method.description = contract.description;
+        method.args = contract.args;
+        out_methods->push_back(std::move(method));
+    }
+    const bool have_specific_method = std::any_of(
+            out_methods->begin(),
+            out_methods->end(),
+            [](const server_openclaw_tool_method_contract & method) {
+                return method.method_name != "generic";
+            });
+    if (have_specific_method) {
+        out_methods->erase(
+                std::remove_if(
+                        out_methods->begin(),
+                        out_methods->end(),
+                        [](const server_openclaw_tool_method_contract & method) {
+                            return method.method_name == "generic";
+                        }),
+                out_methods->end());
+    }
+    if (out_methods->empty()) {
+        set_error(out_error, "no tool methods were available for family: " + normalized_family_id);
+        return false;
+    }
+    return true;
+}
+
 bool server_openclaw_fabric::build_xml_tool_contracts(
         std::vector<server_openclaw_xml_tool_contract> * out_contracts,
         const std::vector<int32_t> * spec_indexes,
@@ -1290,8 +1806,178 @@ bool server_openclaw_fabric::build_xml_tool_contracts(
     return append_contracts_for_indexes(capability_state, spec_indexes, out_contracts, out_error);
 }
 
+bool server_openclaw_fabric::render_tool_family_selection_guidance(
+        std::string * out_guidance,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_guidance) {
+        set_error(out_error, "tool-family guidance output is required");
+        return false;
+    }
+
+    std::vector<server_openclaw_tool_family_contract> families;
+    if (!build_tool_family_contracts(&families, spec_indexes, out_error)) {
+        return false;
+    }
+    if (families.empty()) {
+        set_error(out_error, "tool-family guidance requires at least one available family");
+        return false;
+    }
+
+    std::ostringstream out;
+    out << "Tool-selection contract for this step:\n";
+    out << "- Emit exactly one JSON object immediately after </think> in the form "
+        << R"({"tool_family_id":"<family_id>"})" << ".\n";
+    out << "- Do not emit method names, arguments, markdown, XML, or extra prose outside the hidden reasoning block.\n";
+    out << "Available tool families:\n";
+    for (const auto & family : families) {
+        out << "- tool=\"" << family.tool_family_id << "\"";
+        if (!family.tool_family_name.empty()) {
+            out << " name=\"" << family.tool_family_name << "\"";
+        }
+        if (!family.description.empty()) {
+            out << " description=\"" << family.description << "\"";
+        }
+        out << "\n";
+    }
+    out << "Canonical example:\n";
+    out << "{\"tool_family_id\":\"" << families.front().tool_family_id << "\"}";
+    *out_guidance = out.str();
+    return true;
+}
+
+bool server_openclaw_fabric::render_tool_method_selection_guidance(
+        const std::string & tool_family_id,
+        std::string * out_guidance,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_guidance) {
+        set_error(out_error, "tool-method guidance output is required");
+        return false;
+    }
+
+    std::vector<server_openclaw_tool_method_contract> methods;
+    if (!build_tool_method_contracts(tool_family_id, &methods, spec_indexes, out_error)) {
+        return false;
+    }
+
+    std::ostringstream out;
+    out << "Tool-method selection contract for this step:\n";
+    out << "- The selected tool family is \"" << trim_ascii_copy_local(tool_family_id) << "\".\n";
+    out << "- Emit exactly one JSON object immediately after </think> in the form "
+        << R"({"method_name":"<method_id>"})" << ".\n";
+    out << "- Do not emit arguments, markdown, XML, or extra visible prose outside the hidden reasoning block.\n";
+    out << "Available methods:\n";
+    for (const auto & method : methods) {
+        out << "- tool=\"" << method.tool_family_id << "\" method=\"" << method.method_name << "\"";
+        if (!method.description.empty()) {
+            out << " description=\"" << method.description << "\"";
+        }
+        out << "\n";
+    }
+    out << "Canonical example:\n";
+    out << "{\"method_name\":\"" << methods.front().method_name << "\"}";
+    *out_guidance = out.str();
+    return true;
+}
+
+bool server_openclaw_fabric::build_tool_argument_contract(
+        const std::string & tool_family_id,
+        const std::string & method_name,
+        server_openclaw_tool_argument_contract * out_contract,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_contract) {
+        set_error(out_error, "tool argument contract output is required");
+        return false;
+    }
+
+    const std::string normalized_family_id = trim_ascii_copy_local(tool_family_id);
+    const std::string normalized_method_name = trim_ascii_copy_local(method_name);
+    if (normalized_family_id.empty() || normalized_method_name.empty()) {
+        set_error(out_error, "tool family id and method name are required for method argument contracts");
+        return false;
+    }
+
+    auto matches_spec_indexes = [&](int32_t index) {
+        return !spec_indexes || spec_indexes->empty() ||
+               std::find(spec_indexes->begin(), spec_indexes->end(), index) != spec_indexes->end();
+    };
+
+    for (size_t i = 0; i < capability_state.size(); ++i) {
+        if (!matches_spec_indexes((int32_t) i)) {
+            continue;
+        }
+        const auto & capability = capability_state[i];
+        if (descriptor_tool_family_id(capability.descriptor) != normalized_family_id ||
+                descriptor_method_name(capability.descriptor) != normalized_method_name) {
+            continue;
+        }
+        return build_tool_argument_contract_from_capability(capability, out_contract, out_error);
+    }
+
+    set_error(out_error, "no tool argument contract was available for family/method: " +
+            normalized_family_id + "/" + normalized_method_name);
+    return false;
+}
+
+bool server_openclaw_fabric::render_tool_argument_json_guidance(
+        const std::string & tool_family_id,
+        const std::string & method_name,
+        std::string * out_guidance,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_guidance) {
+        set_error(out_error, "tool argument guidance output is required");
+        return false;
+    }
+
+    server_openclaw_tool_argument_contract contract;
+    if (!build_tool_argument_contract(tool_family_id, method_name, &contract, spec_indexes, out_error)) {
+        return false;
+    }
+
+    std::ostringstream out;
+    out << "Method-argument contract for this step:\n";
+    out << "- The selected tool family is \"" << contract.tool_family_id << "\".\n";
+    out << "- The selected method is \"" << contract.method_name << "\".\n";
+    out << "- Emit exactly one JSON object immediately after </think> and nothing else.\n";
+    out << "- Do not restate the tool family or method in the visible JSON.\n";
+    out << "- Do not emit markdown, XML, code fences, or extra prose outside the hidden reasoning block.\n";
+    out << "Allowed argument fields:\n";
+    for (const auto & arg : contract.args) {
+        out << "- " << arg.name << ": " << xml_type_label(arg.allowed_types);
+        if (arg.required) {
+            out << " (required)";
+        }
+        if (!arg.description.empty()) {
+            out << " - " << arg.description;
+        }
+        if (!arg.allowed_string_values.empty()) {
+            out << " Allowed values: ";
+            for (size_t i = 0; i < arg.allowed_string_values.size(); ++i) {
+                if (i > 0) {
+                    out << ", ";
+                }
+                out << arg.allowed_string_values[i];
+            }
+            out << ".";
+        }
+        out << "\n";
+    }
+    if (!contract.fixed_arguments.empty()) {
+        out << "Fixed runtime arguments that will be merged by the controller:\n";
+        out << contract.fixed_arguments.dump(2) << "\n";
+    }
+    out << "Method argument JSON schema:\n" << contract.input_schema.dump(2);
+    *out_guidance = out.str();
+    return true;
+}
+
 bool server_openclaw_fabric::render_tool_call_xml_guidance(
         std::string * out_guidance,
+        const std::string * tool_family_id,
+        const std::string * method_name,
         const std::vector<int32_t> * spec_indexes,
         std::string * out_error) const {
     if (!out_guidance) {
@@ -1308,19 +1994,46 @@ bool server_openclaw_fabric::render_tool_call_xml_guidance(
         return false;
     }
 
+    if (tool_family_id && !tool_family_id->empty()) {
+        const std::string normalized_family_id = trim_ascii_copy_local(*tool_family_id);
+        contracts.erase(
+                std::remove_if(
+                        contracts.begin(),
+                        contracts.end(),
+                        [&](const server_openclaw_xml_tool_contract & contract) {
+                            return contract.tool_family_id != normalized_family_id;
+                        }),
+                contracts.end());
+    }
+    if (method_name && !method_name->empty()) {
+        const std::string normalized_method_name = trim_ascii_copy_local(*method_name);
+        contracts.erase(
+                std::remove_if(
+                        contracts.begin(),
+                        contracts.end(),
+                        [&](const server_openclaw_xml_tool_contract & contract) {
+                            return contract.method_name != normalized_method_name;
+                        }),
+                contracts.end());
+    }
+    if (contracts.empty()) {
+        set_error(out_error, "tool-call XML guidance could not resolve the selected tool family and method");
+        return false;
+    }
+
     std::ostringstream out;
     out << "Tool-call output contract for this step:\n";
-    out << "- Emit at most one short visible sentence before the XML block.\n";
-    out << "- Then emit exactly one <" << SERVER_OPENCLAW_XML_ROOT << "> block and nothing after it.\n";
+    out << "- Emit exactly one <" << SERVER_OPENCLAW_XML_ROOT << "> block immediately after </think> and nothing after it.\n";
     out << "- Do not use JSON tool calls, markdown code fences, or alternate tool markup.\n";
+    out << "- The root tag must include quoted tool and method attributes.\n";
     out << "- Each argument must be an <" << SERVER_OPENCLAW_XML_ARG << "> tag with quoted name and type attributes.\n";
     out << "- Allowed argument types are string, integer, number, boolean, null, and json.\n";
     out << "- String arguments must XML-escape special characters.\n";
     out << "- json arguments must contain valid JSON object or array text.\n";
-    out << "Allowed tools for this step:\n";
+    out << "Allowed tool methods for this step:\n";
 
     for (const auto & contract : contracts) {
-        out << "- tool=\"" << contract.tool_name << "\"";
+        out << "- tool=\"" << contract.tool_family_id << "\" method=\"" << contract.method_name << "\"";
         if (!contract.capability_id.empty()) {
             out << " capability=\"" << contract.capability_id << "\"";
         }
@@ -1329,23 +2042,35 @@ bool server_openclaw_fabric::render_tool_call_xml_guidance(
         }
         out << "\n";
         for (const auto & arg : contract.args) {
-        out << "  - " << arg.name << ": " << xml_type_label(arg.allowed_types);
-        if (arg.required) {
-            out << " (required)";
-        }
-        if (contract.tool_name == "exec" && arg.name == "command") {
-            out << " [single command only; no pipes, redirects, chaining, or substitution]";
-        }
-        if (!arg.description.empty()) {
-            out << " - " << arg.description;
-        }
-        out << "\n";
+            out << "  - " << arg.name << ": " << xml_type_label(arg.allowed_types);
+            if (arg.required) {
+                out << " (required)";
+            }
+            if (contract.tool_name == "exec" && arg.name == "command") {
+                out << " [single command only; no pipes, redirects, chaining, or substitution]";
+            }
+            if (!arg.description.empty()) {
+                out << " - " << arg.description;
+            }
+            if (!arg.allowed_string_values.empty()) {
+                out << " Allowed values: ";
+                for (size_t i = 0; i < arg.allowed_string_values.size(); ++i) {
+                    if (i > 0) {
+                        out << ", ";
+                    }
+                    out << arg.allowed_string_values[i];
+                }
+                out << ".";
+            }
+            out << "\n";
         }
     }
 
     const auto & example = contracts.front();
     out << "Canonical example:\n";
-    out << "<" << SERVER_OPENCLAW_XML_ROOT << " tool=\"" << example.tool_name << "\">\n";
+    out << "<" << SERVER_OPENCLAW_XML_ROOT
+        << " tool=\"" << example.tool_family_id
+        << "\" method=\"" << example.method_name << "\">\n";
     for (const auto & arg : example.args) {
         out << "  <" << SERVER_OPENCLAW_XML_ARG << " name=\"" << arg.name << "\" type=\"";
         if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_STRING) != 0) {
@@ -1362,7 +2087,9 @@ bool server_openclaw_fabric::render_tool_call_xml_guidance(
             out << "null";
         }
         out << "\">";
-        if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_STRING) != 0) {
+        if (!arg.allowed_string_values.empty()) {
+            out << arg.allowed_string_values.front();
+        } else if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_STRING) != 0) {
             out << "example";
         } else if ((arg.allowed_types & SERVER_OPENCLAW_XML_ARG_INTEGER) != 0) {
             out << "1";
@@ -1383,9 +2110,365 @@ bool server_openclaw_fabric::render_tool_call_xml_guidance(
     return true;
 }
 
+bool server_openclaw_fabric::parse_tool_selection_json(
+        const std::string & text,
+        server_openclaw_parsed_tool_selection * out_parsed,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_parsed) {
+        set_error(out_error, "tool-selection JSON parse requires output storage");
+        return false;
+    }
+
+    std::vector<server_openclaw_tool_family_contract> families;
+    if (!build_tool_family_contracts(&families, spec_indexes, out_error)) {
+        return false;
+    }
+    if (families.empty()) {
+        set_error(out_error, "tool-selection JSON parse requires at least one available tool family");
+        return false;
+    }
+
+    std::string planner_reasoning;
+    std::string visible_payload;
+    nlohmann::json payload = nlohmann::json::object();
+    if (!parse_visible_json_payload(text, &planner_reasoning, &visible_payload, &payload, out_error)) {
+        return false;
+    }
+    const std::string action = trim_ascii_copy_local(payload.value("action", std::string()));
+    if (action != "select_tool") {
+        set_error(out_error, "tool-selection JSON must include action=\"select_tool\"");
+        return false;
+    }
+    const std::string tool_family_id = trim_ascii_copy_local(payload.value("tool_family_id", std::string()));
+    if (tool_family_id.empty()) {
+        set_error(out_error, "tool-selection JSON must include tool_family_id");
+        return false;
+    }
+    if (payload.size() != 2) {
+        set_error(out_error, "tool-selection JSON must contain only action and tool_family_id");
+        return false;
+    }
+
+    auto family_it = std::find_if(
+            families.begin(),
+            families.end(),
+            [&](const server_openclaw_tool_family_contract & family) {
+                return family.tool_family_id == tool_family_id;
+            });
+    if (family_it == families.end()) {
+        set_error(out_error, "tool-selection JSON selected an unknown or disallowed tool family: " + tool_family_id);
+        return false;
+    }
+
+    out_parsed->message = {};
+    out_parsed->message.role = "assistant";
+    out_parsed->message.reasoning_content = planner_reasoning;
+    out_parsed->visible_prefix.clear();
+    out_parsed->xml_block = visible_payload;
+    out_parsed->captured_planner_reasoning = planner_reasoning;
+    out_parsed->tool_family_id = family_it->tool_family_id;
+    out_parsed->tool_family_name = family_it->tool_family_name;
+    out_parsed->captured_payload = trim_ascii_copy_local(text);
+    return true;
+}
+
+bool server_openclaw_fabric::parse_tool_method_selection_json(
+        const std::string & text,
+        const std::string & tool_family_id,
+        server_openclaw_parsed_tool_method_selection * out_parsed,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_parsed) {
+        set_error(out_error, "tool-method JSON parse requires output storage");
+        return false;
+    }
+
+    std::vector<server_openclaw_tool_method_contract> methods;
+    if (!build_tool_method_contracts(tool_family_id, &methods, spec_indexes, out_error)) {
+        return false;
+    }
+
+    std::string planner_reasoning;
+    std::string visible_payload;
+    nlohmann::json payload = nlohmann::json::object();
+    if (!parse_visible_json_payload(text, &planner_reasoning, &visible_payload, &payload, out_error)) {
+        return false;
+    }
+    const std::string action = trim_ascii_copy_local(payload.value("action", std::string()));
+    if (action != "select_method") {
+        set_error(out_error, "tool-method JSON must include action=\"select_method\"");
+        return false;
+    }
+    const std::string selected_method_name = trim_ascii_copy_local(payload.value("method_name", std::string()));
+    if (selected_method_name.empty()) {
+        set_error(out_error, "tool-method JSON must include method_name");
+        return false;
+    }
+    if (payload.size() != 2) {
+        set_error(out_error, "tool-method JSON must contain only action and method_name");
+        return false;
+    }
+
+    auto method_match = std::find_if(
+            methods.begin(),
+            methods.end(),
+            [&](const server_openclaw_tool_method_contract & method) {
+                return method.method_name == selected_method_name;
+            });
+    if (method_match == methods.end()) {
+        set_error(out_error, "tool-method JSON selected an unknown or disallowed method: " + selected_method_name);
+        return false;
+    }
+
+    out_parsed->message = {};
+    out_parsed->message.role = "assistant";
+    out_parsed->message.reasoning_content = planner_reasoning;
+    out_parsed->visible_prefix.clear();
+    out_parsed->xml_block = visible_payload;
+    out_parsed->captured_planner_reasoning = planner_reasoning;
+    out_parsed->tool_family_id = method_match->tool_family_id;
+    out_parsed->tool_family_name = method_match->tool_family_name;
+    out_parsed->method_name = method_match->method_name;
+    out_parsed->capability_id = method_match->capability_id;
+    out_parsed->tool_name = method_match->tool_name;
+    out_parsed->captured_payload = trim_ascii_copy_local(text);
+    return true;
+}
+
+bool server_openclaw_fabric::parse_tool_arguments_json(
+        const std::string & text,
+        const std::string & tool_family_id,
+        const std::string & method_name,
+        server_openclaw_parsed_tool_arguments * out_parsed,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_parsed) {
+        set_error(out_error, "tool-arguments JSON parse requires output storage");
+        return false;
+    }
+
+    server_openclaw_tool_argument_contract contract;
+    if (!build_tool_argument_contract(tool_family_id, method_name, &contract, spec_indexes, out_error)) {
+        return false;
+    }
+
+    std::string planner_reasoning;
+    std::string visible_payload;
+    nlohmann::json payload = nlohmann::json::object();
+    if (!parse_visible_json_payload(text, &planner_reasoning, &visible_payload, &payload, out_error)) {
+        return false;
+    }
+    const std::string action = trim_ascii_copy_local(payload.value("action", std::string()));
+    if (action != "act") {
+        set_error(out_error, "method arguments JSON must include action=\"act\"");
+        return false;
+    }
+    payload.erase("action");
+    if (!validate_tool_argument_payload(contract, &payload, out_error)) {
+        return false;
+    }
+
+    out_parsed->message = {};
+    out_parsed->message.role = "assistant";
+    out_parsed->message.reasoning_content = planner_reasoning;
+    out_parsed->message.tool_calls = { common_chat_tool_call { contract.tool_name, payload.dump(), "" } };
+    out_parsed->visible_payload = visible_payload;
+    out_parsed->captured_planner_reasoning = planner_reasoning;
+    out_parsed->captured_arguments_json = payload.dump();
+    out_parsed->arguments = payload;
+    out_parsed->captured_payload = trim_ascii_copy_local(text);
+    return true;
+}
+
+bool server_openclaw_fabric::parse_tool_selection_xml(
+        const std::string & text,
+        server_openclaw_parsed_tool_selection * out_parsed,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_parsed) {
+        set_error(out_error, "tool-selection XML parse requires output storage");
+        return false;
+    }
+
+    std::vector<server_openclaw_tool_family_contract> families;
+    if (!build_tool_family_contracts(&families, spec_indexes, out_error)) {
+        return false;
+    }
+    if (families.empty()) {
+        set_error(out_error, "tool-selection XML parse requires at least one available tool family");
+        return false;
+    }
+
+    std::string selector_error;
+    if (parse_tool_selection_message(text, families, out_parsed, &selector_error)) {
+        return true;
+    }
+
+    std::string strict_error;
+    size_t root_start = 0;
+    size_t root_close_end = 0;
+    bool has_closing_tag = false;
+    if (!extract_xml_region(
+                text,
+                SERVER_OPENCLAW_XML_TOOL_SELECTION_ROOT,
+                &root_start,
+                &root_close_end,
+                &has_closing_tag,
+                &strict_error)) {
+        strict_error.clear();
+    } else if (!has_closing_tag) {
+        strict_error = "tool-selection XML closing tag was not found";
+    } else {
+        const std::string recovered_text = trim_ascii_copy_local(text.substr(0, root_close_end));
+        if (trim_ascii_copy_local(text.substr(root_close_end)).empty() &&
+                parse_tool_selection_message(recovered_text, families, out_parsed, &strict_error)) {
+            return true;
+        }
+        if (trim_ascii_copy_local(text.substr(root_close_end)).empty() && strict_error.empty()) {
+            strict_error = "tool-selection parse failed";
+        } else if (!trim_ascii_copy_local(text.substr(root_close_end)).empty()) {
+            strict_error = "tool-selection XML must not have trailing content after the closing tag";
+        }
+    }
+
+    size_t recovered_start = 0;
+    size_t recovered_end = 0;
+    if (!extract_last_complete_xml_region(
+                text,
+                SERVER_OPENCLAW_XML_TOOL_SELECTION_ROOT,
+                &recovered_start,
+                &recovered_end,
+                out_error)) {
+        if (!selector_error.empty()) {
+            set_error(out_error, selector_error);
+        } else if (!strict_error.empty()) {
+            set_error(out_error, strict_error);
+        }
+        return false;
+    }
+    if (recovered_start == root_start && recovered_end == root_close_end && !strict_error.empty()) {
+        set_error(out_error, strict_error);
+        return false;
+    }
+
+    const std::string recovered_text = trim_ascii_copy_local(text.substr(0, recovered_end));
+    if (!trim_ascii_copy_local(text.substr(recovered_end)).empty()) {
+        if (!selector_error.empty()) {
+            set_error(out_error, selector_error);
+        } else if (!strict_error.empty()) {
+            set_error(out_error, strict_error);
+        } else {
+            set_error(out_error, "tool-selection XML must not have trailing content after the closing tag");
+        }
+        return false;
+    }
+    if (!parse_tool_selection_message(recovered_text, families, out_parsed, out_error)) {
+        if (!selector_error.empty() && out_error && out_error->empty()) {
+            *out_error = selector_error;
+        } else if (!strict_error.empty() && out_error && out_error->empty()) {
+            *out_error = strict_error;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool server_openclaw_fabric::parse_tool_method_selection_xml(
+        const std::string & text,
+        const std::string & tool_family_id,
+        server_openclaw_parsed_tool_method_selection * out_parsed,
+        const std::vector<int32_t> * spec_indexes,
+        std::string * out_error) const {
+    if (!out_parsed) {
+        set_error(out_error, "tool-method XML parse requires output storage");
+        return false;
+    }
+
+    std::vector<server_openclaw_tool_method_contract> methods;
+    if (!build_tool_method_contracts(tool_family_id, &methods, spec_indexes, out_error)) {
+        return false;
+    }
+
+    std::string selector_error;
+    if (parse_tool_method_selection_message(text, tool_family_id, methods, out_parsed, &selector_error)) {
+        return true;
+    }
+
+    std::string strict_error;
+    size_t root_start = 0;
+    size_t root_close_end = 0;
+    bool has_closing_tag = false;
+    if (!extract_xml_region(
+                text,
+                SERVER_OPENCLAW_XML_TOOL_METHOD_ROOT,
+                &root_start,
+                &root_close_end,
+                &has_closing_tag,
+                &strict_error)) {
+        strict_error.clear();
+    } else if (!has_closing_tag) {
+        strict_error = "tool-method XML closing tag was not found";
+    } else {
+        const std::string recovered_text = trim_ascii_copy_local(text.substr(0, root_close_end));
+        if (trim_ascii_copy_local(text.substr(root_close_end)).empty() &&
+                parse_tool_method_selection_message(recovered_text, tool_family_id, methods, out_parsed, &strict_error)) {
+            return true;
+        }
+        if (trim_ascii_copy_local(text.substr(root_close_end)).empty() && strict_error.empty()) {
+            strict_error = "tool-method parse failed";
+        } else if (!trim_ascii_copy_local(text.substr(root_close_end)).empty()) {
+            strict_error = "tool-method XML must not have trailing content after the closing tag";
+        }
+    }
+
+    size_t recovered_start = 0;
+    size_t recovered_end = 0;
+    if (!extract_last_complete_xml_region(
+                text,
+                SERVER_OPENCLAW_XML_TOOL_METHOD_ROOT,
+                &recovered_start,
+                &recovered_end,
+                out_error)) {
+        if (!selector_error.empty()) {
+            set_error(out_error, selector_error);
+        } else if (!strict_error.empty()) {
+            set_error(out_error, strict_error);
+        }
+        return false;
+    }
+    if (recovered_start == root_start && recovered_end == root_close_end && !strict_error.empty()) {
+        set_error(out_error, strict_error);
+        return false;
+    }
+
+    const std::string recovered_text = trim_ascii_copy_local(text.substr(0, recovered_end));
+    if (!trim_ascii_copy_local(text.substr(recovered_end)).empty()) {
+        if (!selector_error.empty()) {
+            set_error(out_error, selector_error);
+        } else if (!strict_error.empty()) {
+            set_error(out_error, strict_error);
+        } else {
+            set_error(out_error, "tool-method XML must not have trailing content after the closing tag");
+        }
+        return false;
+    }
+    if (!parse_tool_method_selection_message(recovered_text, tool_family_id, methods, out_parsed, out_error)) {
+        if (!selector_error.empty() && out_error && out_error->empty()) {
+            *out_error = selector_error;
+        } else if (!strict_error.empty() && out_error && out_error->empty()) {
+            *out_error = strict_error;
+        }
+        return false;
+    }
+    return true;
+}
+
 bool server_openclaw_fabric::parse_tool_call_xml(
         const std::string & text,
         server_openclaw_parsed_tool_call * out_parsed,
+        const std::string * tool_family_id,
+        const std::string * method_name,
         const std::vector<int32_t> * spec_indexes,
         std::string * out_error) const {
     if (!out_parsed) {
@@ -1405,7 +2488,7 @@ bool server_openclaw_fabric::parse_tool_call_xml(
     size_t root_start = 0;
     size_t root_close_end = 0;
     bool has_closing_tag = false;
-    if (!extract_tool_call_xml_region(text, &root_start, &root_close_end, &has_closing_tag, out_error)) {
+    if (!extract_xml_region(text, SERVER_OPENCLAW_XML_ROOT, &root_start, &root_close_end, &has_closing_tag, out_error)) {
         return false;
     }
     if (!has_closing_tag) {
@@ -1427,15 +2510,32 @@ bool server_openclaw_fabric::parse_tool_call_xml(
         return false;
     }
     const auto root_tool_it = attrs.find("tool");
-    if (root_tool_it == attrs.end() || trim_ascii_copy_local(root_tool_it->second).empty()) {
-        set_error(out_error, "tool-call XML root is missing a quoted tool attribute");
+    const auto root_method_it = attrs.find("method");
+    if (root_tool_it == attrs.end() || root_method_it == attrs.end()) {
+        set_error(out_error, "tool-call XML root requires quoted tool and method attributes");
         return false;
     }
-    const std::string tool_name = trim_ascii_copy_local(root_tool_it->second);
+    const std::string selected_tool_family_id = trim_ascii_copy_local(root_tool_it->second);
+    const std::string selected_method_name = trim_ascii_copy_local(root_method_it->second);
+    if (selected_tool_family_id.empty() || selected_method_name.empty()) {
+        set_error(out_error, "tool-call XML root tool and method attributes must not be empty");
+        return false;
+    }
+    if (tool_family_id && !trim_ascii_copy_local(*tool_family_id).empty() &&
+            selected_tool_family_id != trim_ascii_copy_local(*tool_family_id)) {
+        set_error(out_error, "tool-call XML changed the selected tool family");
+        return false;
+    }
+    if (method_name && !trim_ascii_copy_local(*method_name).empty() &&
+            selected_method_name != trim_ascii_copy_local(*method_name)) {
+        set_error(out_error, "tool-call XML changed the selected method");
+        return false;
+    }
 
-    const server_openclaw_xml_tool_contract * contract = find_contract_by_tool_name(contracts, tool_name);
+    const server_openclaw_xml_tool_contract * contract =
+            find_contract_by_family_and_method(contracts, selected_tool_family_id, selected_method_name);
     if (!contract) {
-        set_error(out_error, "tool-call XML selected an unknown or disallowed tool: " + tool_name);
+        set_error(out_error, "tool-call XML selected an unknown or disallowed tool/method");
         return false;
     }
 
@@ -1517,6 +2617,9 @@ bool server_openclaw_fabric::parse_tool_call_xml(
         if (!parse_arg_value_json(raw_value, declared_type, &parsed_value, out_error)) {
             return false;
         }
+        if (!validate_parsed_arg_value(requirement_it->second, parsed_value, out_error)) {
+            return false;
+        }
         arguments[arg_name] = std::move(parsed_value);
         seen_args.insert(arg_name);
     }
@@ -1545,7 +2648,7 @@ bool server_openclaw_fabric::parse_tool_call_xml(
     extract_hidden_reasoning_and_visible_text(raw_prefix, &planner_reasoning, &visible_prefix);
     out_parsed->message.content = visible_prefix;
     out_parsed->message.reasoning_content = planner_reasoning;
-    out_parsed->message.tool_calls = { common_chat_tool_call { tool_name, arguments.dump(), "" } };
+    out_parsed->message.tool_calls = { common_chat_tool_call { contract->tool_name, arguments.dump(), "" } };
     out_parsed->visible_prefix = visible_prefix;
     out_parsed->xml_block = xml_block;
     out_parsed->captured_planner_reasoning = planner_reasoning;
@@ -1557,6 +2660,8 @@ bool server_openclaw_fabric::parse_tool_call_xml(
 bool server_openclaw_fabric::recover_tool_call_xml(
         const std::string & text,
         server_openclaw_parsed_tool_call * out_parsed,
+        const std::string * tool_family_id,
+        const std::string * method_name,
         const std::vector<int32_t> * spec_indexes,
         std::string * out_error) const {
     if (!out_parsed) {
@@ -1576,7 +2681,7 @@ bool server_openclaw_fabric::recover_tool_call_xml(
     size_t root_start = 0;
     size_t root_close_end = 0;
     bool has_closing_tag = false;
-    if (!extract_tool_call_xml_region(text, &root_start, &root_close_end, &has_closing_tag, out_error)) {
+    if (!extract_xml_region(text, SERVER_OPENCLAW_XML_ROOT, &root_start, &root_close_end, &has_closing_tag, out_error)) {
         return false;
     }
 
@@ -1590,7 +2695,13 @@ bool server_openclaw_fabric::recover_tool_call_xml(
     if (has_closing_tag) {
         server_openclaw_parsed_tool_call strict = {};
         std::string strict_error;
-        if (parse_tool_call_xml(join_payload(raw_prefix, xml_block), &strict, spec_indexes, &strict_error)) {
+        if (parse_tool_call_xml(
+                    join_payload(raw_prefix, xml_block),
+                    &strict,
+                    tool_family_id,
+                    method_name,
+                    spec_indexes,
+                    &strict_error)) {
             *out_parsed = std::move(strict);
             return true;
         }
@@ -1604,17 +2715,34 @@ bool server_openclaw_fabric::recover_tool_call_xml(
 }
 
 std::string server_openclaw_fabric::strip_tool_call_xml_markup(const std::string & text) const {
-    const std::string root_open = std::string("<") + SERVER_OPENCLAW_XML_ROOT;
-    const std::string root_close = std::string("</") + SERVER_OPENCLAW_XML_ROOT + ">";
-    size_t start = text.find(root_open);
+    size_t start = std::string::npos;
+    size_t end = std::string::npos;
+    const std::vector<std::string> root_names = {
+        SERVER_OPENCLAW_XML_ROOT,
+        SERVER_OPENCLAW_XML_TOOL_SELECTION_ROOT,
+        SERVER_OPENCLAW_XML_TOOL_METHOD_ROOT,
+    };
+    for (const auto & root_name : root_names) {
+        const std::string root_open = std::string("<") + root_name;
+        const size_t candidate_start = text.find(root_open);
+        if (candidate_start == std::string::npos && root_name != SERVER_OPENCLAW_XML_ROOT) {
+            continue;
+        }
+        if (candidate_start == std::string::npos) {
+            continue;
+        }
+        const std::string root_close = std::string("</") + root_name + ">";
+        const size_t candidate_end = text.find(root_close, candidate_start);
+        start = candidate_start;
+        end = candidate_end == std::string::npos ? std::string::npos : candidate_end + root_close.size();
+        break;
+    }
     if (start == std::string::npos) {
         return strip_hidden_reasoning_markup_preserve_text(text);
     }
-    size_t end = text.find(root_close, start);
     if (end == std::string::npos) {
         return strip_hidden_reasoning_markup_preserve_text(text.substr(0, start));
     }
-    end += root_close.size();
     const std::string prefix = strip_hidden_reasoning_markup_preserve_text(text.substr(0, start));
     const std::string suffix = strip_hidden_reasoning_markup_preserve_text(text.substr(end));
     if (prefix.empty()) {
@@ -1639,6 +2767,23 @@ const server_openclaw_capability_runtime * server_openclaw_fabric::capability_by
     }
     for (const auto & capability : capability_state) {
         if (capability.descriptor.tool_name == tool_name) {
+            return &capability;
+        }
+    }
+    return nullptr;
+}
+
+const server_openclaw_capability_runtime * server_openclaw_fabric::capability_by_family_and_method(
+        const std::string & tool_family_id,
+        const std::string & method_name) const {
+    const std::string normalized_family_id = trim_ascii_copy_local(tool_family_id);
+    const std::string normalized_method_name = trim_ascii_copy_local(method_name);
+    if (normalized_family_id.empty() || normalized_method_name.empty()) {
+        return nullptr;
+    }
+    for (const auto & capability : capability_state) {
+        if (descriptor_tool_family_id(capability.descriptor) == normalized_family_id &&
+                descriptor_method_name(capability.descriptor) == normalized_method_name) {
             return &capability;
         }
     }
@@ -1730,6 +2875,9 @@ bool server_openclaw_fabric::load_external_catalog(
         }
 
         for (const auto & descriptor : external_catalog.capabilities) {
+            if (descriptor_is_disabled_builtin(descriptor)) {
+                continue;
+            }
             if (!descriptor_has_react_eligibility(descriptor)) {
                 set_error(
                         out_error,

@@ -59,9 +59,6 @@ Current built-ins are registered in
 and mirrored in
 [`tools/openclaw-harness/src/catalog.ts`](../../tools/openclaw-harness/src/catalog.ts):
 
-- `exec`
-  `tool_surface_id=vicuna.exec.main`
-  `capability_id=openclaw.exec.command`
 - `hard_memory_query`
   `tool_surface_id=vicuna.memory.hard_query`
   `capability_id=openclaw.vicuna.hard_memory_query`
@@ -76,7 +73,7 @@ and mirrored in
 
 - `VICUNA_OPENCLAW_TOOL_FABRIC_ENABLED=1`
   Enables catalog installation and strict dispatch resolution.
-- `VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS=exec,hard_memory_query,hard_memory_write`
+- `VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS=hard_memory_query,hard_memory_write,codex`
   Optional comma-separated allowlist of registered built-ins.
 - `VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH=/path/to/openclaw-catalog.json`
   Optional external catalog file merged with the built-ins.
@@ -84,17 +81,17 @@ and mirrored in
 If the fabric is enabled but no routable capabilities survive policy and local
 tool availability checks, startup refuses to install the catalog.
 
-If a host still carries the older builtin allowlist
-`exec,hard_memory_query`, the runtime now compatibility-upgrades that setting
-so `hard_memory_write` remains available as part of the hard-memory tool layer
-instead of being silently dropped.
+If a host still carries the older builtin allowlist `hard_memory_query`, the
+runtime now compatibility-upgrades that setting so `hard_memory_write` remains
+available as part of the hard-memory tool layer instead of being silently
+dropped.
 
 At runtime, `llama-server` now logs the effective prerequisite state and the
 installed capability set, for example:
 
 - `bash=1 hard_memory=1 codex=1`
 - `catalog_path=/var/cache/vicuna/openclaw-catalog.json catalog_exists=1`
-- `OpenClaw capability set: exec=..., hard_memory_query=..., ...`
+- `OpenClaw capability set: hard_memory_query=..., hard_memory_write=..., ...`
 
 ## Live Catalog Reload
 
@@ -132,6 +129,13 @@ That lets key edits happen without restarting inference. The runtime only sees
 the installed tool descriptor; the wrapper command reads the key from the
 OpenClaw secrets file at execution time.
 
+The live host execution policy for those wrappers still comes from the runtime
+env, not from persisted runtime snapshots. `server_context` may restore
+historical tool-config fields for compatibility, but it now reapplies the
+current env-derived bash and hard-memory policy after restore so stale snapshot
+state cannot silently disable Radarr, Sonarr, Chaptarr, or Tavily dispatch on
+restart.
+
 ## Adding Another External Tool
 
 For a tool that can route through an existing backend such as `legacy_bash`:
@@ -166,6 +170,39 @@ lets the running runtime pick up the new capability on the next idle reload
 cycle. When selected, the runtime dispatches the bounded wrapper command
 `tools/openclaw-harness/bin/tavily-web-search`.
 
+The same install path now applies to the LAN media tools. For example:
+
+```bash
+cd tools/openclaw-harness
+npm run build
+node dist/index.js install-radarr "$RADARR_API_KEY" "http://10.0.0.218:7878"
+node dist/index.js install-sonarr "$SONARR_API_KEY" "http://10.0.0.218:8989"
+node dist/index.js install-chaptarr "$CHAPTARR_API_KEY" "http://10.0.0.218:8789"
+```
+
+The runtime catalog keeps the Radarr, Sonarr, and Chaptarr media aliases
+visible even when their API keys are not yet present. Wrapper execution then
+fails with typed configuration or authorization errors instead of silently
+removing those tools from the OpenClaw surface.
+
+On the current LAN deployment, Chaptarr's broader discovery surface depends on
+Hardcover being configured inside the container. Once the bearer token is
+installed through `/api/v1/config/hardcover`, the exposed `chaptarr_search`
+and `chaptarr_book_lookup` aliases can successfully drive `/api/v1/search` and
+`/api/v1/book/lookup` in addition to `chaptarr_author_lookup`.
+
+On Telegram-origin turns, the bridge prompt now explicitly tells the model to
+use those exposed media tools when the user asks about managed media state.
+Older assistant refusals in transcript history are treated as stale rather than
+as a reason to avoid the currently available tool.
+
+Telegram-origin active requests can also acknowledge immediately now. The
+bridge first runs a lightweight acknowledgement-only inference request, emits
+that model-generated acknowledgement right away, then starts the full staged
+ReAct turn in the background. `server_context` later publishes a chat-scoped
+Telegram outbox message when the final completion or terminal failure follow-up
+is ready.
+
 For system-service deployments, `tools/ops/install-vicuna-system-service.sh`
 and `tools/ops/rebuild-vicuna-runtime.sh` now sync the runtime catalog to the
 configured `VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH` before service startup or
@@ -179,6 +216,11 @@ investigation or fresh current information. The foreground transcript becomes:
 
 - user turn
 - assistant first-move planning step
+- assistant typed `select_tool_family`
+- assistant typed `select_method`
+- assistant typed `emit_arguments`
+- after each tool result, assistant typed `decide_after_tool`
+- if answering or asking, assistant typed `emit_response`
 - assistant tool call
 - tool observation
 - assistant follow-up planning or final answer
@@ -191,6 +233,57 @@ The planner phase now sees the full currently installed tool surface instead of
 an internally preselected singleton. Tool preference should emerge from the
 canonical shared-context prompt reconstruction and learned LoRA state, not from server-side hardcoded
 tool-specific routing.
+
+When authoritative ReAct is active, tool use is now a staged runtime protocol
+rather than a single freeform jump directly to tool arguments.
+
+Stage 1 is tool-family selection. The model receives the visible tool families
+for that turn and must emit only:
+
+- `Action: select_tool`
+- `{"tool_family_id":"..."}`
+
+Stage 2 is method selection. The runtime looks up the selected family and feeds
+back only the methods and descriptors for that family. The model must then
+emit only:
+
+- `Action: select_method`
+- `{"method_name":"..."}`
+
+Stage 3 is final argument emission. The runtime looks up the exact typed
+contract for the selected tool family plus method and feeds back only that
+method contract. The model must then emit only:
+
+- `Action: act`
+- one JSON object containing only the selected method arguments
+
+The runtime, not the model, synthesizes the executable invocation from the
+selected family, selected method, and validated argument JSON. Method-local
+contracts preserve top-level field descriptions plus enum-constrained allowed
+values for string arguments, and the server rejects payloads that use
+unsupported enum values, undeclared fields, or mismatch the already selected
+tool family and method before dispatch. For media aliases, the planner no
+longer needs to emit a broad Servarr `action` selector; the runtime merges the
+fixed downstream action for that alias before wrapper dispatch.
+
+This same staged protocol now applies to every OpenClaw-backed tool, not only
+Radarr, Sonarr, and Chaptarr. The runtime only dispatches after stage 3 has
+resolved to a registered capability and the resulting command is installed as an
+async tool job.
+
+Every stage is also traceable in provenance:
+
+- `react_stage_parse_failure` when staged JSON cannot be parsed or is rejected
+- `react_stage_parsed` when the stage output is accepted
+- `react_stage_transition` when the runtime advances from tool to method or
+  method to final call
+- `tool_call` and `tool_result` for the actual command lifecycle
+
+Those `react_stage` events include the captured hidden reasoning, raw stage
+payload, selected tool family, selected method, and the final accepted
+argument JSON. The `tool_call` event then records the controller-synthesized
+invocation payload that was actually dispatched. They are for operator
+inspection only; user-visible outputs still exclude hidden reasoning.
 
 If a selected tool path already has a learned functional/process-functional
 adapter, that adapter is now scoped only to tool-call generation and argument
@@ -227,10 +320,23 @@ If an external catalog entry omits both active and DMN eligibility, the runtime
 now rejects the catalog instead of silently installing a tool that the model
 can never see.
 
-## Exec Policy
+## Provenance Retention
 
-`exec` remains intentionally narrower than a shell script surface. Planner XML
-for `exec.command` must describe a single bounded invocation only. The server
-still rejects shell metacharacters such as pipes, redirects, chaining, and
-substitution, and it now preserves the preflight-safe command if planner XML
-tries to override that request with unsafe shell syntax.
+Structured provenance now rotates by hour and prunes old segments
+automatically.
+
+- the configured `VICUNA_PROVENANCE_LOG_PATH` is treated as the base path
+- writes go to hourly segment files such as `runtime-provenance.20260323T17.jsonl`
+- `VICUNA_PROVENANCE_RETENTION_HOURS` controls retention and defaults to `48`
+- `/health` exposes both the configured base `path` and the current
+  `active_path`, plus `retention_ms` and `prune_total`
+
+This keeps the expanded staged-tool and hidden-reasoning trace surface bounded
+without requiring external logrotate rules.
+
+## Raw Exec Removal
+
+The raw `exec` tool family is no longer part of the exposed OpenClaw surface.
+Host-local bash execution still exists internally for typed wrappers such as
+Servarr and Tavily, but planner-visible tool selection must now route through
+those structured families instead of a free-form shell-command capability.

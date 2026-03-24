@@ -17,6 +17,7 @@ unset VICUNA_RUNTIME_MODEL_URL
 unset VICUNA_RUNTIME_MODEL_ALIAS
 unset VICUNA_RUNTIME_MODEL_CHAT_TEMPLATE_FILE
 unset VICUNA_RUNTIME_MODEL_REASONING_FORMAT
+unset VICUNA_RUNTIME_CTX_SIZE
 unset TELEGRAM_BRIDGE_MODEL
 
 # shellcheck disable=SC1091
@@ -80,6 +81,16 @@ EXPECTED_TEMPLATE_PATH="$REPO_ROOT/models/templates/deepseek-ai-DeepSeek-R1-Dist
 
 [[ "$VICUNA_RUNTIME_MODEL_REASONING_FORMAT" == "deepseek" ]] || {
     printf 'expected runtime model reasoning format deepseek, got %s\n' "$VICUNA_RUNTIME_MODEL_REASONING_FORMAT" >&2
+    exit 1
+}
+
+[[ "$VICUNA_RUNTIME_CTX_SIZE" == "16384" ]] || {
+    printf 'expected runtime context size 16384 by default, got %s\n' "$VICUNA_RUNTIME_CTX_SIZE" >&2
+    exit 1
+}
+
+[[ "$VICUNA_BASH_TOOL_MAX_STDOUT_BYTES" == "819200" ]] || {
+    printf 'expected bash tool stdout budget 819200 by default, got %s\n' "$VICUNA_BASH_TOOL_MAX_STDOUT_BYTES" >&2
     exit 1
 }
 

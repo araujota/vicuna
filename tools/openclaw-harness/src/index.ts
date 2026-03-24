@@ -3,6 +3,7 @@ import {
   defaultPaths,
   loadToolSecrets,
   saveToolSecrets,
+  upsertApiToolConfig,
   upsertServarrConfig,
   upsertTavilyApiKey
 } from "./config.js";
@@ -67,15 +68,23 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         2
       )}\n`
     );
-  } else if (command === "install-radarr" || command === "install-sonarr") {
+  } else if (command === "install-radarr" || command === "install-sonarr" || command === "install-chaptarr") {
     const apiKey = process.argv[3];
     if (!apiKey) {
       throw new Error(`${command} requires an api key argument`);
     }
     const optionalBaseUrl = process.argv[4];
     const paths = defaultCliPaths();
-    const toolId = command === "install-radarr" ? "radarr" : "sonarr";
-    const secrets = upsertServarrConfig(loadToolSecrets(paths.secretsPath), toolId, apiKey, optionalBaseUrl);
+    const toolId =
+      command === "install-radarr"
+        ? "radarr"
+        : command === "install-sonarr"
+          ? "sonarr"
+          : "chaptarr";
+    const secrets =
+      toolId === "chaptarr"
+        ? upsertApiToolConfig(loadToolSecrets(paths.secretsPath), toolId, apiKey, optionalBaseUrl)
+        : upsertServarrConfig(loadToolSecrets(paths.secretsPath), toolId, apiKey, optionalBaseUrl);
     saveToolSecrets(paths.secretsPath, secrets);
     writeRuntimeCatalog(paths.runtimeCatalogPath, paths.secretsPath);
     process.stdout.write(

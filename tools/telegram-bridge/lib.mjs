@@ -3,17 +3,28 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 export const DEFAULT_STATE = {
+  schemaVersion: 2,
   telegramOffset: 0,
   telegramOutboxOffset: 0,
+  telegramOutboxCheckpointInitialized: false,
+  telegramOutboxDeliveryReceipt: null,
   chatIds: [],
   proactiveResponseIds: [],
+  nextConversationOrdinal: 1,
   chatSessions: {},
+  chatConversationState: {},
   pendingOptionPrompts: {},
 };
 
 export const DEFAULT_MAX_HISTORY_MESSAGES = 12;
 export const DEFAULT_MAX_DOCUMENT_CHARS = 12000;
 export const DEFAULT_MAX_PENDING_OPTION_PROMPTS = 32;
+export const DEFAULT_MAX_CONVERSATION_MESSAGE_LINKS = 64;
+export const TELEGRAM_BRIDGE_STATE_SCHEMA_VERSION = 2;
+
+export function buildTelegramRelaySystemPrompt() {
+  return 'You are replying to a Telegram user through middleware. Keep responses clear and concise unless the user asks for depth. Maintain continuity across the provided transcript. When the user explicitly asks to search the web or needs fresh current information, prefer the web search tool if the runtime makes it available. Use direct command-execution tools only when appropriate instead of pretending a command ran. If the runtime exposes Sonarr, Radarr, Chaptarr, or another relevant live tool for this turn, use the relevant tool instead of claiming you lack access or cannot interact with external systems. If earlier transcript messages said you could not access those systems, treat that as stale and use the currently available tool on this turn.';
+}
 
 const PDF_MIME_TYPES = new Set([
   'application/pdf',
@@ -319,7 +330,14 @@ function normalizeTranscriptMessage(raw) {
   if (!role || !content) {
     return null;
   }
-  return { role, content };
+  const conversationId = typeof raw.conversationId === 'string' ? raw.conversationId.trim() : '';
+  const telegramMessageId = Math.max(0, Number(raw.telegramMessageId ?? 0) || 0);
+  return {
+    role,
+    content,
+    ...(conversationId ? { conversationId } : {}),
+    ...(telegramMessageId > 0 ? { telegramMessageId } : {}),
+  };
 }
 
 export function retainCoherentTranscriptWindow(messages, options = {}) {
@@ -355,12 +373,44 @@ function normalizeChatSessions(raw, maxHistoryMessages) {
   return chatSessions;
 }
 
+function normalizeChatConversationState(raw, maxMessageLinks) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {};
+  }
+  const chatConversationState = {};
+  for (const [chatId, entry] of Object.entries(raw)) {
+    const latestConversationId = typeof entry?.latestConversationId === 'string'
+      ? entry.latestConversationId.trim()
+      : '';
+    const messageEntries = [];
+    if (entry?.messageToConversation && typeof entry.messageToConversation === 'object' && !Array.isArray(entry.messageToConversation)) {
+      for (const [messageId, conversationIdRaw] of Object.entries(entry.messageToConversation)) {
+        const telegramMessageId = Math.max(0, Number(messageId) || 0);
+        const conversationId = typeof conversationIdRaw === 'string' ? conversationIdRaw.trim() : '';
+        if (telegramMessageId > 0 && conversationId) {
+          messageEntries.push([String(telegramMessageId), conversationId]);
+        }
+      }
+    }
+    messageEntries.sort((lhs, rhs) => Number(lhs[0]) - Number(rhs[0]));
+    if (latestConversationId || messageEntries.length > 0) {
+      chatConversationState[String(chatId)] = {
+        latestConversationId,
+        messageToConversation: Object.fromEntries(messageEntries.slice(-maxMessageLinks)),
+      };
+    }
+  }
+  return chatConversationState;
+}
+
 function normalizePendingOptionPrompts(raw, maxPendingPrompts) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return {};
   }
   const entries = [];
   for (const [promptId, prompt] of Object.entries(raw)) {
+    const kind = prompt?.kind === 'approval_request' ? 'approval_request' : 'ask_with_options';
+    const approvalId = typeof prompt?.approvalId === 'string' ? prompt.approvalId.trim() : '';
     const question = typeof prompt?.question === 'string' ? prompt.question.trim() : '';
     const options = Array.isArray(prompt?.options)
       ? prompt.options
@@ -372,12 +422,18 @@ function normalizePendingOptionPrompts(raw, maxPendingPrompts) {
     if (!promptId || !question || options.length < 2 || !chatId) {
       continue;
     }
+    if (kind === 'approval_request' && !approvalId) {
+      continue;
+    }
     entries.push([
       String(promptId),
       {
+        kind,
+        approvalId,
         chatId,
         question,
         options,
+        conversationId: typeof prompt?.conversationId === 'string' ? prompt.conversationId.trim() : '',
         telegramMessageId: Math.max(0, Number(prompt?.telegramMessageId ?? 0) || 0),
         createdAtMs: Math.max(0, Number(prompt?.createdAtMs ?? 0) || 0),
       },
@@ -387,18 +443,173 @@ function normalizePendingOptionPrompts(raw, maxPendingPrompts) {
   return Object.fromEntries(entries.slice(-maxPendingPrompts));
 }
 
+function normalizeTelegramOutboxDeliveryReceipt(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+
+  const sequenceNumber = Math.max(0, Number(raw.sequenceNumber ?? 0) || 0);
+  const chatId = String(raw.chatId ?? '').trim();
+  const replyToMessageId = Math.max(0, Number(raw.replyToMessageId ?? 0) || 0);
+  const telegramMessageId = Math.max(0, Number(raw.telegramMessageId ?? 0) || 0);
+  const deliveredAtMs = Math.max(0, Number(raw.deliveredAtMs ?? 0) || 0);
+  const deliveryModeRaw = String(raw.deliveryMode ?? '').trim().toLowerCase();
+  const deliveryMode = deliveryModeRaw === 'fallback_no_reply'
+    ? 'fallback_no_reply'
+    : deliveryModeRaw === 'reply'
+      ? 'reply'
+      : '';
+  if (sequenceNumber <= 0 || !chatId || telegramMessageId <= 0 || !deliveryMode) {
+    return null;
+  }
+  return {
+    sequenceNumber,
+    chatId,
+    replyToMessageId,
+    deliveryMode,
+    telegramMessageId,
+    deliveredAtMs,
+  };
+}
+
 export function normalizeState(raw, options = {}) {
   const state = raw && typeof raw === 'object' ? raw : {};
   const maxHistoryMessages = Math.max(1, parseInteger(options.maxHistoryMessages, DEFAULT_MAX_HISTORY_MESSAGES));
   const maxPendingPrompts = Math.max(1, parseInteger(options.maxPendingOptionPrompts, DEFAULT_MAX_PENDING_OPTION_PROMPTS));
+  const maxConversationMessageLinks = Math.max(1, parseInteger(options.maxConversationMessageLinks, DEFAULT_MAX_CONVERSATION_MESSAGE_LINKS));
   const chatSessions = normalizeChatSessions(state.chatSessions, maxHistoryMessages);
+  const telegramOutboxDeliveryReceipt = normalizeTelegramOutboxDeliveryReceipt(state.telegramOutboxDeliveryReceipt);
+  const telegramOutboxOffset = Math.max(0, parseInteger(state.telegramOutboxOffset, 0));
+  const checkpointInitialized = typeof state.telegramOutboxCheckpointInitialized === 'boolean'
+    ? state.telegramOutboxCheckpointInitialized
+    : telegramOutboxOffset > 0 || Boolean(telegramOutboxDeliveryReceipt);
   return {
+    schemaVersion: Math.max(1, parseInteger(state.schemaVersion, TELEGRAM_BRIDGE_STATE_SCHEMA_VERSION)),
     telegramOffset: Math.max(0, parseInteger(state.telegramOffset, 0)),
-    telegramOutboxOffset: Math.max(0, parseInteger(state.telegramOutboxOffset, 0)),
+    telegramOutboxOffset,
+    telegramOutboxCheckpointInitialized: checkpointInitialized,
+    telegramOutboxDeliveryReceipt,
     chatIds: uniqueStrings([...(state.chatIds ?? []), ...Object.keys(chatSessions)]),
     proactiveResponseIds: uniqueStrings(state.proactiveResponseIds).slice(-256),
+    nextConversationOrdinal: Math.max(1, parseInteger(state.nextConversationOrdinal, 1)),
     chatSessions,
+    chatConversationState: normalizeChatConversationState(state.chatConversationState, maxConversationMessageLinks),
     pendingOptionPrompts: normalizePendingOptionPrompts(state.pendingOptionPrompts, maxPendingPrompts),
+  };
+}
+
+export function reconcileTelegramOutboxOffset(currentOffset, outboxState) {
+  const offset = Math.max(0, parseInteger(currentOffset, 0));
+  const storedItems = Math.max(0, parseInteger(outboxState?.stored_items, 0));
+  const newestSequence = Math.max(0, parseInteger(outboxState?.newest_sequence, 0));
+  const oldestSequence = Math.max(0, parseInteger(outboxState?.oldest_sequence, 0));
+
+  if (storedItems <= 0) {
+    return 0;
+  }
+
+  if (storedItems > 0 && newestSequence > 0 && offset > newestSequence) {
+    return Math.max(0, oldestSequence > 0 ? oldestSequence - 1 : 0);
+  }
+
+  if (oldestSequence > 0 && offset + 1 < oldestSequence) {
+    return Math.max(0, oldestSequence - 1);
+  }
+
+  return offset;
+}
+
+export function normalizeTelegramOutboxItem(item) {
+  const sequenceNumber = Math.max(0, parseInteger(item?.sequence_number, 0));
+  const kind = String(item?.kind ?? '').trim();
+  const base = {
+    ok: false,
+    skippable: sequenceNumber > 0,
+    sequenceNumber,
+    kind,
+  };
+
+  if (!kind) {
+    return {
+      ...base,
+      error: 'runtime telegram outbox item was missing kind',
+    };
+  }
+
+  if (kind === 'message') {
+    const chatId = String(item?.chat_scope ?? '').trim();
+    const text = String(item?.text ?? '').trim();
+    const replyToMessageId = Number(item?.reply_to_message_id ?? 0) || 0;
+    if (!chatId || !text) {
+      return {
+        ...base,
+        error: 'runtime telegram outbox message item was incomplete',
+      };
+    }
+    return {
+      ok: true,
+      skippable: true,
+      sequenceNumber,
+      kind,
+      chatId,
+      text,
+      replyToMessageId,
+    };
+  }
+
+  if (kind === 'ask_with_options') {
+    const chatId = String(item?.chat_scope ?? '').trim();
+    const question = String(item?.question ?? '').trim();
+    const options = Array.isArray(item?.options)
+      ? item.options.map((value) => String(value ?? '').trim()).filter(Boolean)
+      : [];
+    if (!chatId || !question || options.length < 2) {
+      return {
+        ...base,
+        error: 'runtime telegram outbox ask_with_options item was incomplete',
+      };
+    }
+    return {
+      ok: true,
+      skippable: true,
+      sequenceNumber,
+      kind,
+      chatId,
+      question,
+      options,
+    };
+  }
+
+  if (kind === 'approval_request') {
+    const approvalId = String(item?.approval_id ?? '').trim();
+    const chatId = String(item?.chat_scope ?? '').trim();
+    const question = String(item?.question ?? '').trim();
+    const options = Array.isArray(item?.options)
+      ? item.options.map((value) => String(value ?? '').trim()).filter(Boolean)
+      : [];
+    const replyToMessageId = Number(item?.reply_to_message_id ?? 0) || 0;
+    if (!approvalId || !chatId || !question || options.length < 2 || !options.includes('disallow')) {
+      return {
+        ...base,
+        error: 'runtime telegram outbox approval_request item was incomplete',
+      };
+    }
+    return {
+      ok: true,
+      skippable: true,
+      sequenceNumber,
+      kind,
+      approvalId,
+      chatId,
+      question,
+      options,
+      replyToMessageId,
+    };
+  }
+
+  return {
+    ...base,
+    error: `runtime telegram outbox item kind '${kind}' is unsupported`,
   };
 }
 
@@ -417,6 +628,60 @@ export async function loadState(statePath, options = {}) {
 export async function saveState(statePath, state, options = {}) {
   await mkdir(path.dirname(statePath), { recursive: true });
   await writeFile(statePath, `${JSON.stringify(normalizeState(state, options), null, 2)}\n`, 'utf8');
+}
+
+export function setTelegramOutboxCheckpoint(state, nextOffset, options = {}) {
+  const normalizedState = normalizeState(state, options);
+  return {
+    ...normalizedState,
+    telegramOutboxOffset: Math.max(0, Number(nextOffset ?? 0) || 0),
+    telegramOutboxCheckpointInitialized: true,
+  };
+}
+
+export function recordTelegramOutboxDeliveryReceipt(state, receipt, options = {}) {
+  const normalizedState = normalizeState(state, options);
+  const normalizedReceipt = normalizeTelegramOutboxDeliveryReceipt(receipt);
+  if (!normalizedReceipt) {
+    return normalizedState;
+  }
+  return {
+    ...normalizedState,
+    telegramOutboxCheckpointInitialized: true,
+    telegramOutboxDeliveryReceipt: normalizedReceipt,
+  };
+}
+
+export function shouldBootstrapTelegramOutboxOffset(state, outboxState, options = {}) {
+  const normalizedState = normalizeState(state, options);
+  if (normalizedState.telegramOutboxCheckpointInitialized) {
+    return false;
+  }
+  const storedItems = Math.max(0, parseInteger(outboxState?.stored_items, 0));
+  const newestSequence = Math.max(0, parseInteger(outboxState?.newest_sequence, 0));
+  return storedItems > 0 && newestSequence > 0;
+}
+
+export function bootstrapTelegramOutboxOffset(state, outboxState, options = {}) {
+  const normalizedState = normalizeState(state, options);
+  const newestSequence = Math.max(0, parseInteger(outboxState?.newest_sequence, 0));
+  return {
+    ...normalizedState,
+    telegramOutboxOffset: newestSequence,
+    telegramOutboxCheckpointInitialized: true,
+  };
+}
+
+export function isTelegramReplyTargetErrorMessage(message) {
+  const normalized = String(message ?? '').trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return normalized.includes('reply message not found') ||
+    normalized.includes('message to be replied not found') ||
+    normalized.includes('message_id_invalid') ||
+    normalized.includes('message thread not found') ||
+    normalized.includes('replied message not found');
 }
 
 export function appendProactiveId(state, responseId) {
@@ -446,32 +711,89 @@ export function updateTelegramOffset(state, updateId) {
   };
 }
 
-export function getChatTranscript(state, chatId) {
+function withLatestConversationId(state, chatId, conversationId) {
+  const chatKey = String(chatId).trim();
+  const trimmedConversationId = String(conversationId ?? '').trim();
+  if (!chatKey || !trimmedConversationId) {
+    return state;
+  }
+  return {
+    ...state,
+    chatConversationState: {
+      ...(state.chatConversationState ?? {}),
+      [chatKey]: {
+        latestConversationId: trimmedConversationId,
+        messageToConversation: {
+          ...(state?.chatConversationState?.[chatKey]?.messageToConversation ?? {}),
+        },
+      },
+    },
+  };
+}
+
+export function getChatTranscript(state, chatId, options = {}) {
   const chatKey = String(chatId);
-  return Array.isArray(state?.chatSessions?.[chatKey]?.messages)
+  const messages = Array.isArray(state?.chatSessions?.[chatKey]?.messages)
     ? state.chatSessions[chatKey].messages
     : [];
+  const conversationId = typeof options.conversationId === 'string'
+    ? options.conversationId.trim()
+    : '';
+  if (!conversationId) {
+    return messages;
+  }
+  return messages.filter((entry) => String(entry?.conversationId ?? '').trim() === conversationId);
 }
 
 export function appendChatTranscriptMessage(state, chatId, role, content, options = {}) {
-  const normalized = normalizeTranscriptMessage({ role, content });
+  const conversationId = typeof options.conversationId === 'string' ? options.conversationId.trim() : '';
+  const telegramMessageId = Math.max(0, Number(options.telegramMessageId ?? 0) || 0);
+  const normalized = normalizeTranscriptMessage({
+    role,
+    content,
+    ...(conversationId ? { conversationId } : {}),
+    ...(telegramMessageId > 0 ? { telegramMessageId } : {}),
+  });
   if (!normalized) {
     return state;
   }
   const chatKey = String(chatId);
   const maxHistoryMessages = Math.max(1, parseInteger(options.maxHistoryMessages, DEFAULT_MAX_HISTORY_MESSAGES));
+  const maxConversationMessageLinks = Math.max(1, parseInteger(options.maxConversationMessageLinks, DEFAULT_MAX_CONVERSATION_MESSAGE_LINKS));
+  const normalizedState = normalizeState(state, options);
   const nextMessages = retainCoherentTranscriptWindow([
-    ...getChatTranscript(state, chatKey),
+    ...getChatTranscript(normalizedState, chatKey),
     normalized,
   ], { maxHistoryMessages });
 
+  const chatConversationEntry = {
+    latestConversationId: String(normalizedState?.chatConversationState?.[chatKey]?.latestConversationId ?? '').trim(),
+    messageToConversation: {
+      ...(normalizedState?.chatConversationState?.[chatKey]?.messageToConversation ?? {}),
+    },
+  };
+  if (conversationId) {
+    chatConversationEntry.latestConversationId = conversationId;
+  }
+  if (conversationId && telegramMessageId > 0) {
+    chatConversationEntry.messageToConversation[String(telegramMessageId)] = conversationId;
+    const messageEntries = Object.entries(chatConversationEntry.messageToConversation)
+      .filter(([messageId, value]) => (Number(messageId) || 0) > 0 && String(value ?? '').trim())
+      .sort((lhs, rhs) => Number(lhs[0]) - Number(rhs[0]));
+    chatConversationEntry.messageToConversation = Object.fromEntries(messageEntries.slice(-maxConversationMessageLinks));
+  }
+
   return {
-    ...registerChat(state, chatKey),
+    ...registerChat(normalizedState, chatKey),
     chatSessions: {
-      ...(state.chatSessions ?? {}),
+      ...(normalizedState.chatSessions ?? {}),
       [chatKey]: {
         messages: nextMessages,
       },
+    },
+    chatConversationState: {
+      ...(normalizedState.chatConversationState ?? {}),
+      [chatKey]: chatConversationEntry,
     },
   };
 }
@@ -482,9 +804,12 @@ export function setPendingOptionPrompt(state, promptId, prompt, options = {}) {
   const nextPrompts = {
     ...(normalizedState.pendingOptionPrompts ?? {}),
     [String(promptId)]: {
+      kind: prompt?.kind === 'approval_request' ? 'approval_request' : 'ask_with_options',
+      approvalId: String(prompt?.approvalId ?? '').trim(),
       chatId: String(prompt?.chatId ?? '').trim(),
       question: String(prompt?.question ?? '').trim(),
       options: Array.isArray(prompt?.options) ? prompt.options.map((value) => String(value ?? '').trim()).filter(Boolean).slice(0, 6) : [],
+      conversationId: String(prompt?.conversationId ?? '').trim(),
       telegramMessageId: Math.max(0, Number(prompt?.telegramMessageId ?? 0) || 0),
       createdAtMs: Math.max(0, Number(prompt?.createdAtMs ?? Date.now()) || Date.now()),
     },
@@ -507,6 +832,119 @@ export function deletePendingOptionPrompt(state, promptId, options = {}) {
     ...normalizedState,
     pendingOptionPrompts: nextPrompts,
   };
+}
+
+export function getLatestConversationId(state, chatId) {
+  return String(state?.chatConversationState?.[String(chatId)]?.latestConversationId ?? '').trim();
+}
+
+export function getConversationForTelegramMessage(state, chatId, telegramMessageId) {
+  const messageId = Math.max(0, Number(telegramMessageId ?? 0) || 0);
+  if (messageId <= 0) {
+    return '';
+  }
+  return String(
+    state?.chatConversationState?.[String(chatId)]?.messageToConversation?.[String(messageId)] ?? '',
+  ).trim();
+}
+
+export function createTelegramConversation(state, chatId, options = {}) {
+  const chatKey = String(chatId);
+  const normalizedState = normalizeState(state, options);
+  const ordinal = Math.max(1, Number(normalizedState.nextConversationOrdinal) || 1);
+  const conversationId = `tc${ordinal.toString(36)}`;
+  return {
+    state: {
+      ...registerChat(normalizedState, chatKey),
+      nextConversationOrdinal: ordinal + 1,
+      chatConversationState: {
+        ...(normalizedState.chatConversationState ?? {}),
+        [chatKey]: {
+          latestConversationId: conversationId,
+          messageToConversation: {
+            ...(normalizedState?.chatConversationState?.[chatKey]?.messageToConversation ?? {}),
+          },
+        },
+      },
+    },
+    conversationId,
+    reason: 'created',
+  };
+}
+
+export function resolveTelegramConversationForMessage(state, message, options = {}) {
+  const chatId = String(message?.chat?.id ?? '').trim();
+  if (!chatId) {
+    return { state, conversationId: '', reason: 'missing_chat' };
+  }
+
+  const normalizedState = normalizeState(state, options);
+  const explicitReplyConversationId = getConversationForTelegramMessage(
+    normalizedState,
+    chatId,
+    Number(message?.reply_to_message?.message_id ?? 0) || 0,
+  );
+  if (explicitReplyConversationId) {
+    return {
+      state: withLatestConversationId(normalizedState, chatId, explicitReplyConversationId),
+      conversationId: explicitReplyConversationId,
+      reason: 'reply_to_message',
+    };
+  }
+
+  const latestConversationId = getLatestConversationId(normalizedState, chatId);
+  if (latestConversationId) {
+    return {
+      state: withLatestConversationId(normalizedState, chatId, latestConversationId),
+      conversationId: latestConversationId,
+      reason: 'latest',
+    };
+  }
+
+  return createTelegramConversation(normalizedState, chatId, options);
+}
+
+export function resolveTelegramConversationForOutbound(state, chatId, options = {}) {
+  const chatKey = String(chatId).trim();
+  if (!chatKey) {
+    return { state, conversationId: '', reason: 'missing_chat' };
+  }
+
+  const normalizedState = normalizeState(state, options);
+  const preferredConversationId = typeof options.preferredConversationId === 'string'
+    ? options.preferredConversationId.trim()
+    : '';
+  if (preferredConversationId) {
+    return {
+      state: withLatestConversationId(normalizedState, chatKey, preferredConversationId),
+      conversationId: preferredConversationId,
+      reason: 'preferred',
+    };
+  }
+
+  const replyConversationId = getConversationForTelegramMessage(
+    normalizedState,
+    chatKey,
+    Number(options.replyToMessageId ?? 0) || 0,
+  );
+  if (replyConversationId) {
+    return {
+      state: withLatestConversationId(normalizedState, chatKey, replyConversationId),
+      conversationId: replyConversationId,
+      reason: 'reply_to_message',
+    };
+  }
+
+  const latestConversationId = getLatestConversationId(normalizedState, chatKey);
+  if (latestConversationId) {
+    return {
+      state: normalizedState,
+      conversationId: latestConversationId,
+      reason: 'latest',
+    };
+  }
+
+  return createTelegramConversation(normalizedState, chatKey, options);
 }
 
 export function sanitizeAssistantRelayText(text) {

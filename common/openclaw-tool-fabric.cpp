@@ -106,6 +106,19 @@ bool openclaw_tool_capability_descriptor_validate(
             return false;
         }
     }
+    if (!descriptor.fixed_arguments_json.empty()) {
+        json fixed_arguments;
+        try {
+            fixed_arguments = json::parse(descriptor.fixed_arguments_json);
+        } catch (const std::exception & e) {
+            set_error(out_error, std::string("fixed_arguments_json must be valid JSON: ") + e.what());
+            return false;
+        }
+        if (!fixed_arguments.is_object()) {
+            set_error(out_error, "fixed_arguments_json must be a JSON object");
+            return false;
+        }
+    }
     return true;
 }
 
@@ -150,10 +163,17 @@ json openclaw_tool_capability_descriptor_to_json(
         {"capability_kind", descriptor.capability_kind},
         {"owner_plugin_id", descriptor.owner_plugin_id},
         {"tool_name", descriptor.tool_name},
+        {"tool_family_id", descriptor.tool_family_id},
+        {"tool_family_name", descriptor.tool_family_name},
+        {"tool_family_description", descriptor.tool_family_description},
+        {"method_name", descriptor.method_name},
+        {"method_description", descriptor.method_description},
         {"description", descriptor.description},
         {"input_schema_json", descriptor.input_schema_json.empty() ? json::object() : json::parse(descriptor.input_schema_json)},
+        {"fixed_arguments_json", descriptor.fixed_arguments_json.empty() ? json::object() : json::parse(descriptor.fixed_arguments_json)},
         {"output_contract", descriptor.output_contract},
         {"side_effect_class", descriptor.side_effect_class},
+        {"execution_safety_class", descriptor.execution_safety_class},
         {"approval_mode", descriptor.approval_mode},
         {"execution_modes", descriptor.execution_modes},
         {"provenance_namespace", descriptor.provenance_namespace},
@@ -180,12 +200,21 @@ bool openclaw_tool_capability_descriptor_from_json(
     descriptor.capability_kind = data.value("capability_kind", "tool");
     descriptor.owner_plugin_id = data.value("owner_plugin_id", "");
     descriptor.tool_name = data.value("tool_name", "");
+    descriptor.tool_family_id = data.value("tool_family_id", "");
+    descriptor.tool_family_name = data.value("tool_family_name", "");
+    descriptor.tool_family_description = data.value("tool_family_description", "");
+    descriptor.method_name = data.value("method_name", "");
+    descriptor.method_description = data.value("method_description", "");
     descriptor.description = data.value("description", "");
     if (data.contains("input_schema_json")) {
         descriptor.input_schema_json = data.at("input_schema_json").dump();
     }
+    if (data.contains("fixed_arguments_json")) {
+        descriptor.fixed_arguments_json = data.at("fixed_arguments_json").dump();
+    }
     descriptor.output_contract = data.value("output_contract", "");
     descriptor.side_effect_class = data.value("side_effect_class", "");
+    descriptor.execution_safety_class = data.value("execution_safety_class", "");
     descriptor.approval_mode = data.value("approval_mode", "");
     descriptor.provenance_namespace = data.value("provenance_namespace", "");
     descriptor.tool_kind = data.value("tool_kind", 0);

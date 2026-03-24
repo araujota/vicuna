@@ -48,13 +48,13 @@ As of 2026-03-20, this workstation reports:
 - hostname: `tyler-araujo-MS-7E12`
 - primary LAN IPv4: `10.0.0.20`
 - Tailscale IPv4: `100.83.122.99`
-- Tailscale DNS name: `tyler-araujo-ms-7e12.tail4f73bf.ts.net`
+- Tailscale DNS name: `vicuna-host`
 - repo path: `/home/tyler-araujo/Projects/vicuna`
 - default user: `tyler-araujo`
 
 Preferred remote admin path:
 - `tailscale ssh tyler-araujo@100.83.122.99`
-- `tailscale ssh tyler-araujo@tyler-araujo-ms-7e12.tail4f73bf.ts.net`
+- `tailscale ssh tyler-araujo@vicuna-host`
 
 Requirements:
 - the client device must also be enrolled in the same Tailscale tailnet
@@ -73,6 +73,10 @@ Runtime verification after rebuild:
 ## Active Technologies
 - C++17 with the existing `llama.cpp`/Vicuña runtime and C API surfaces + Existing Active LoRA manager, cognitive loop runtime, self-state and server serialization surfaces (044-process-functional-lora)
 - In-memory runtime bank plus existing server export/import and typed state surfaces (044-process-functional-lora)
+- C++17 for runtime and server code, existing TypeScript/Node.js support surfaces where already presen + Existing `llama.cpp`/Vicuña runtime, self-state runtime, Active LoRA manager, functional LoRA stack, HTTP server/OpenClaw tool fabric, existing telemetry/provenance surfaces (070-truth-runtime-refactor)
+- In-memory runtime state with existing snapshot/export/import surfaces for self-state, provenance, and LoRA archives (070-truth-runtime-refactor)
+- C++17 and TypeScript/Node.js + `server_context`, `server_task`, OpenClaw fabric, common OpenClaw catalog types, Telegram bridge middleware, TypeScript OpenClaw harness, existing media wrappers (083-async-ack-react)
+- Runtime snapshot JSON, proactive mailbox state, Telegram dialogue state, OpenClaw catalog JSON, OpenClaw tool secrets JSON (083-async-ack-react)
 
 ## Recent Changes
 - 044-process-functional-lora: Added C++17 with the existing `llama.cpp`/Vicuña runtime and C API surfaces + Existing Active LoRA manager, cognitive loop runtime, self-state and server serialization surfaces

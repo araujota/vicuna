@@ -651,7 +651,7 @@ function chaptarrCapability(): CapabilityDescriptor {
             "delete_book",
           ],
           description:
-            `The Chaptarr operation to perform. Read actions inspect or look up authors and books without starting downloads; inspect is a generic alias for listing current authors; search uses Chaptarr's mixed discovery endpoint; add_author and add_book are legacy add paths; download_author and download_book start ebook acquisition using the fixed NAS Books root at ${FIXED_CHAPTARR_ROOT_FOLDER_PATH}; delete_book removes one tracked ebook and deletes its files by default.`
+            `The Chaptarr operation to perform. Read actions inspect or look up authors and books without starting downloads; inspect is a generic alias for listing current authors; search uses Chaptarr's mixed discovery endpoint; add_author, add_book, download_author, and download_book all start ebook acquisition using the fixed NAS Books root at ${FIXED_CHAPTARR_ROOT_FOLDER_PATH}; delete_book removes one tracked ebook and deletes its files by default.`
         },
         term: {
           type: "string",

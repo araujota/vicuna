@@ -147,6 +147,10 @@ Both loops share state, but they do not share identical triggers or output polic
   ReAct turn contract. CPU policy may validate, reject, expose tools, dispatch,
   and integrate observations, but it must not substitute its own action or tool
   choice for an invalid turn.
+- Admitted DMN ticks that enter authoritative mode must hand off into a
+  DMN-origin staged `server_task` without being reclassified as active work.
+  The server-side completion path must treat DMN origin as explicit typed
+  policy, not infer loop identity from default foreground request fields.
 - Host-side prompt assembly must rebuild each ReAct turn from the canonical
   shared cognitive context and current emotive moment instead of maintaining a
   parallel transcript authority in server memory.
@@ -191,6 +195,25 @@ Both loops share state, but they do not share identical triggers or output polic
   falling back to CPU-side action selection or discarding the tool intent.
 - Both loops now also assign explicit functional microphases and route the
   functional LoRA bank through the same public activation substrate.
+- When active or DMN tool work leaves the model and enters host execution, the
+  server must transition that command through the same explicit external-wait
+  bookkeeping surface so later observation integration resumes the correct
+  authoritative turn.
+- DMN idle ticks are only admissible when the authoritative ReAct fabric is
+  actually quiescent. Queued active/DMN follow-up tasks and live active/DMN
+  runners both count as loop activity and must defer the next DMN tick.
+- Queue idle time is still part of runtime control. The queue thread must keep
+  calling `update_slots()` on timeout so a deferred high-pressure DMN state can
+  re-admit without unrelated queue traffic or a restart.
+- Tool safety is explicit host policy. Capability descriptors carry an
+  `execution_safety_class`; `read_only` capabilities dispatch autonomously,
+  while every other capability is fail-closed behind a runtime-owned Telegram
+  approval object delivered through the outbox as `approval_request`.
+- Approval decisions are structured runtime events, not transcript heuristics.
+  The bridge submits callback selections to `/v1/telegram/approval`, the
+  runtime resumes or rejects the exact blocked command payload, and fresh
+  Telegram user messages can supersede DMN-owned approval waits through
+  `/v1/telegram/interruption`.
 
 The self-model-to-language path is also explicit:
 

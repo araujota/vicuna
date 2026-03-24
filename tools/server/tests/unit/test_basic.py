@@ -2,6 +2,7 @@ import pytest
 import requests
 import time
 import json
+from pathlib import Path
 from utils import ServerPreset, match_regex
 
 server = ServerPreset.tinyllama2()
@@ -32,6 +33,10 @@ def test_server_health_exposes_runtime_observability():
     res = server.make_request("GET", "/health")
     assert res.status_code == 200
     assert res.body["waiting_active_tasks"] == 0
+    assert res.body["foreground_runtime"]["waiting_on_tool_result"] == 0
+    assert res.body["foreground_runtime"]["waiting_on_deferred_delivery"] == 0
+    assert res.body["foreground_runtime"]["waiting_emit_response"] == 0
+    assert res.body["foreground_runtime"]["waiting_post_tool_decision"] == 0
     assert res.body["external_bash_pending"] == 0
     assert res.body["external_hard_memory_pending"] == 0
     assert res.body["runtime_persistence"]["enabled"] is False
@@ -143,6 +148,50 @@ def test_runtime_snapshot_migrates_legacy_bash_allowlist(tmp_path):
     assert migrated_snapshot["bash_tool_config"]["allowed_commands"] == ""
 
 
+def test_runtime_snapshot_keeps_env_bash_policy_authoritative(tmp_path):
+    global server
+    snapshot_path = tmp_path / "runtime-state.json"
+    server.extra_env = {
+        "VICUNA_RUNTIME_STATE_PATH": str(snapshot_path),
+        "VICUNA_SELF_EMIT_STARTUP_TEXT": "seed runtime snapshot",
+    }
+    server.start()
+
+    for _ in range(20):
+        if snapshot_path.exists():
+            break
+        time.sleep(0.25)
+    assert snapshot_path.exists()
+    server.stop()
+
+    snapshot = json.loads(snapshot_path.read_text())
+    snapshot["bash_tool_config"]["enabled"] = False
+    snapshot["bash_tool_config"]["allowed_commands"] = "stale-command"
+    snapshot["bash_tool_config"]["working_directory"] = "/tmp/stale-bash-workdir"
+    snapshot_path.write_text(json.dumps(snapshot))
+
+    repo_root = Path(__file__).resolve().parents[4]
+    server = ServerPreset.tinyllama2()
+    server.extra_env = {
+        "VICUNA_RUNTIME_STATE_PATH": str(snapshot_path),
+        "VICUNA_SELF_EMIT_STARTUP_TEXT": "reapply env policy",
+        "VICUNA_BASH_TOOL_ENABLED": "1",
+        "VICUNA_BASH_TOOL_ALLOWED_COMMANDS": "pwd",
+        "VICUNA_BASH_TOOL_WORKDIR": str(repo_root),
+    }
+    server.start()
+    health = server.make_request("GET", "/health")
+    assert health.status_code == 200
+    assert health.body["runtime_persistence"]["restore_attempted"] is True
+    assert health.body["runtime_persistence"]["healthy"] is True
+    server.stop()
+
+    restored_snapshot = json.loads(snapshot_path.read_text())
+    assert restored_snapshot["bash_tool_config"]["enabled"] is True
+    assert restored_snapshot["bash_tool_config"]["allowed_commands"] == "pwd"
+    assert restored_snapshot["bash_tool_config"]["working_directory"] == str(repo_root)
+
+
 def test_unified_provenance_repository_records_self_improvement_events(tmp_path):
     global server
     snapshot_path = tmp_path / "runtime-state.json"
@@ -167,10 +216,17 @@ def test_unified_provenance_repository_records_self_improvement_events(tmp_path)
 
     lines = []
     for _ in range(20):
-        if provenance_path.exists() and provenance_path.read_text().strip():
-            lines = [line for line in provenance_path.read_text().splitlines() if line.strip()]
-            if lines:
-                break
+        segment_paths = sorted(tmp_path.glob("runtime-provenance*.jsonl"))
+        if not segment_paths:
+            time.sleep(0.25)
+            continue
+        lines = []
+        for segment_path in segment_paths:
+            lines.extend(
+                line for line in segment_path.read_text().splitlines() if line.strip()
+            )
+        if lines:
+            break
         time.sleep(0.25)
 
     assert lines
@@ -207,6 +263,8 @@ def test_unified_provenance_repository_records_self_improvement_events(tmp_path)
     assert health.body["provenance_repository"]["enabled"] is True
     assert health.body["provenance_repository"]["healthy"] is True
     assert health.body["provenance_repository"]["path"] == str(provenance_path)
+    assert health.body["provenance_repository"]["active_path"].startswith(str(tmp_path))
+    assert health.body["provenance_repository"]["retention_ms"] == 48 * 60 * 60 * 1000
     assert health.body["provenance_repository"]["append_total"] >= 1
 
     metrics = server.make_request("GET", "/metrics")

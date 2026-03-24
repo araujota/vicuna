@@ -107,6 +107,8 @@ struct server_routes {
     server_http_context::handler_t get_response_oai;
     server_http_context::handler_t get_self_emit_stream_oai;
     server_http_context::handler_t get_telegram_outbox;
+    server_http_context::handler_t post_telegram_approval;
+    server_http_context::handler_t post_telegram_interruption;
     server_http_context::handler_t post_anthropic_messages;
     server_http_context::handler_t post_anthropic_count_tokens;
     server_http_context::handler_t post_apply_template;

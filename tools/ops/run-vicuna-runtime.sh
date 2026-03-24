@@ -24,6 +24,6 @@ exec "$REPO_ROOT/build-host-cuda-128/bin/llama-server" \
   --reasoning-format "$VICUNA_RUNTIME_MODEL_REASONING_FORMAT" \
   --reasoning-budget -1 \
   --port 8080 \
-  --ctx-size 4096 \
+  --ctx-size "$VICUNA_RUNTIME_CTX_SIZE" \
   --api-surface openai \
   -ngl 999

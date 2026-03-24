@@ -860,6 +860,120 @@ int main(int argc, char ** argv) {
     }
 
     {
+        g_contradiction_score = 0.18f;
+        g_uncertainty_score = 0.14f;
+        g_broadcast_score = 0.82f;
+
+        llama_context * ctx = create_context(model);
+        if (!ctx) {
+            std::fprintf(stderr, "failed to create authoritative DMN external-wait context\n");
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_tool_spec tavily_spec = {};
+        tavily_spec.tool_kind = LLAMA_TOOL_KIND_BASH_CLI;
+        tavily_spec.flags = LLAMA_COG_TOOL_ACTIVE_ELIGIBLE | LLAMA_COG_TOOL_DMN_ELIGIBLE;
+        tavily_spec.latency_class = LLAMA_COG_TOOL_LATENCY_MEDIUM;
+        tavily_spec.max_steps_reserved = 2;
+        std::snprintf(tavily_spec.name, sizeof(tavily_spec.name), "%s", "web_search");
+        std::snprintf(tavily_spec.description, sizeof(tavily_spec.description), "%s", "Search the live web through Tavily");
+        std::snprintf(tavily_spec.capability_id, sizeof(tavily_spec.capability_id), "%s", "openclaw.tavily.web_search");
+        std::snprintf(tavily_spec.owner_plugin_id, sizeof(tavily_spec.owner_plugin_id), "%s", "openclaw-tavily");
+        std::snprintf(tavily_spec.provenance_namespace, sizeof(tavily_spec.provenance_namespace), "%s", "openclaw/openclaw-tavily/tool/web_search");
+        if (llama_cognitive_tool_spec_set(ctx, &tavily_spec, 1) != 0 ||
+            llama_cognitive_authoritative_react_set_enabled(ctx, true) != 0) {
+            std::fprintf(stderr, "failed to configure authoritative DMN external-wait context\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const std::vector<llama_token> goal_tokens = tokenize_or_die(vocab, "Check live external state before deciding what to do next.");
+        const std::vector<llama_token> handle_tokens = tokenize_or_die(vocab, "live external state follow up");
+        const std::vector<llama_token> tokens = tokenize_or_die(vocab, "Please follow up with current external information.");
+        if (llama_self_state_upsert_goal(ctx, 52, goal_tokens.data(), goal_tokens.size(), 1.0f) != 0 ||
+            llama_self_state_upsert_memory_handle(ctx, 53, LLAMA_SELF_MEMORY_HANDLE_WORKING_MEMORY_CLUSTER, handle_tokens.data(), handle_tokens.size(), 1.0f) != 0) {
+            std::fprintf(stderr, "failed to seed authoritative DMN external-wait state\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        const llama_self_state_event event = {
+            /*.tokens =*/ tokens.data(),
+            /*.n_tokens =*/ tokens.size(),
+            /*.role =*/ LLAMA_SELF_STATE_EVENT_USER,
+            /*.channel =*/ LLAMA_SELF_STATE_EVENT_CHANNEL_PRIMARY,
+            /*.flags =*/ 0,
+            /*.decoder_entropy =*/ 0.0f,
+            /*.decoder_top_margin =*/ 1.0f,
+        };
+        if (!ingest_event_without_runner("seed-authoritative-dmn-external-wait", ctx, event)) {
+            std::fprintf(stderr, "failed to ingest authoritative DMN external-wait seed event\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_dmn_tick_trace trace = {};
+        if (llama_dmn_tick(ctx, 9100, &trace) != 0 ||
+            !trace.admitted ||
+            !trace.authoritative_turn.valid ||
+            trace.tick_id <= 0) {
+            std::fprintf(stderr, "failed to initialize authoritative DMN external-wait trace\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        int32_t command_id = -1;
+        int32_t tool_job_id = -1;
+        if (llama_cognitive_dmn_authoritative_begin_tool(
+                    ctx,
+                    trace.tick_id,
+                    0,
+                    0.85f,
+                    &command_id,
+                    &tool_job_id) != 0 ||
+            command_id <= 0 ||
+            tool_job_id <= 0 ||
+            llama_cognitive_command_rebind_tool(ctx, command_id, 0) != 0) {
+            std::fprintf(stderr, "failed to begin authoritative DMN tool command for external wait\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        if (llama_cognitive_command_begin_external_wait(ctx, command_id) != 0) {
+            std::fprintf(stderr, "failed to begin DMN external wait\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_cognitive_dmn_runner_status runner = {};
+        llama_process_functional_signature signature = {};
+        if (llama_cognitive_dmn_runner_get(ctx, &runner) != 0 ||
+            !runner.active ||
+            !runner.waiting_on_tool ||
+            runner.pending_command_id != command_id ||
+            runner.pending_tool_spec_index != 0 ||
+            runner.functional_microphase != LLAMA_FUNCTIONAL_MICROPHASE_NONE ||
+            !expect_functional_family_state("dmn-external-wait-tool-functional-ablated", ctx, LLAMA_FUNCTIONAL_LORA_TOOL_SELECTION, false) ||
+            !expect_functional_family_state("dmn-external-wait-planner-functional-ablated", ctx, LLAMA_FUNCTIONAL_LORA_PLANNING_COMPOSITION, false) ||
+            llama_process_functional_get_current_signature(ctx, &signature) != 0 ||
+            signature.valid) {
+            std::fprintf(stderr, "DMN external wait did not preserve waiting state while unloading staged functional state\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(ctx);
+    }
+
+    {
         g_contradiction_score = 0.10f;
         g_uncertainty_score = 0.10f;
         g_broadcast_score = 0.05f;
@@ -1706,6 +1820,54 @@ int main(int argc, char ** argv) {
         if (trace.functional_activation.microphase != LLAMA_FUNCTIONAL_MICROPHASE_NONE ||
             !expect_functional_family_state("low-pressure-dmn-functional", ctx, LLAMA_FUNCTIONAL_LORA_SELF_OBSERVATION, false)) {
             std::fprintf(stderr, "low-pressure DMN did not clear functional state\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_free(ctx);
+    }
+
+    {
+        g_contradiction_score = 0.0f;
+        g_uncertainty_score = 0.0f;
+        g_broadcast_score = 0.0f;
+
+        llama_context * ctx = create_context(model);
+        if (!ctx) {
+            std::fprintf(stderr, "failed to create DMN tool-salience fallback context\n");
+            llama_model_free(model);
+            return 1;
+        }
+
+        if (llama_self_state_note_tool_event(ctx) != 0) {
+            std::fprintf(stderr, "failed to seed recent tool salience\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_self_register_info tool_salience = {};
+        if (llama_self_state_get_register(ctx, LLAMA_SELF_REGISTER_TOOL_SALIENCE, &tool_salience) != 0 ||
+            tool_salience.scalar_value < 0.99f) {
+            std::fprintf(stderr, "failed to raise tool-salience register before DMN tick\n");
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+
+        llama_dmn_tick_trace trace = {};
+        if (llama_dmn_tick(ctx, 5001, &trace) != 0 ||
+            trace.pressure.tool_delta < 0.99f ||
+            !trace.admitted ||
+            trace.winner_action == LLAMA_DMN_ACTION_SILENT) {
+            std::fprintf(stderr,
+                    "DMN did not admit from recent tool salience without tool jobs "
+                    "(tool_delta=%.3f admitted=%d total=%.3f winner=%d)\n",
+                    trace.pressure.tool_delta,
+                    trace.admitted ? 1 : 0,
+                    trace.pressure.total,
+                    trace.winner_action);
             llama_free(ctx);
             llama_model_free(model);
             return 1;

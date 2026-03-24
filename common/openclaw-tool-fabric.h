@@ -12,10 +12,17 @@ struct openclaw_tool_capability_descriptor {
     std::string capability_kind;
     std::string owner_plugin_id;
     std::string tool_name;
+    std::string tool_family_id;
+    std::string tool_family_name;
+    std::string tool_family_description;
+    std::string method_name;
+    std::string method_description;
     std::string description;
     std::string input_schema_json;
+    std::string fixed_arguments_json;
     std::string output_contract;
     std::string side_effect_class;
+    std::string execution_safety_class;
     std::string approval_mode;
     std::vector<std::string> execution_modes;
     std::string provenance_namespace;

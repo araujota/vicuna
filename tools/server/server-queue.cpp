@@ -202,7 +202,11 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 if (res) {
                     break; // new task arrived or terminate
                 }
-                // otherwise, loop again to check sleeping condition
+                // No new task arrived, but the server still needs periodic idle
+                // scheduler work such as DMN admission re-evaluation.
+                lock.unlock();
+                callback_update_slots();
+                lock.lock();
             }
         }
     }

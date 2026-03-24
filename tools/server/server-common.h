@@ -91,9 +91,26 @@ std::string extract_foreground_message_text(const json & body);
 int32_t classify_foreground_role_for_request(const std::string & raw_body, const json & parsed_body);
 std::string extract_foreground_message_text_for_request(const std::string & raw_body, const json & parsed_body);
 bool foreground_request_requires_fresh_tool_grounding(const std::string & text);
+bool foreground_request_requires_external_action(const std::string & text);
 bool authoritative_reply_is_procedural_non_answer(const std::string & text);
 bool authoritative_retry_requires_tool_escalation(const std::string & text, int32_t retry_count);
+bool authoritative_visible_reply_looks_like_question(const std::string & text);
+int32_t infer_authoritative_action_from_visible_surface(
+        bool dmn_origin,
+        const std::string & visible_text,
+        bool resuming_from_tool_result,
+        int32_t foreground_role);
+inline constexpr size_t SERVER_THINK_BLOCK_TOKEN_CAP = 1024;
+std::string truncate_text_to_token_budget(
+        const llama_vocab * vocab,
+        const std::string & text,
+        size_t max_tokens,
+        size_t * out_token_count = nullptr,
+        size_t * out_original_token_count = nullptr,
+        bool * out_truncated = nullptr);
 bool user_facing_text_violates_plain_prose_policy(const std::string & text);
+std::string bounded_runtime_log_excerpt(const std::string & text, size_t max_chars = 1600);
+std::string synthesize_deferred_terminal_failure_text(const std::string & request_text);
 common_chat_params build_chat_completion_params(
         const server_chat_params & opt,
         const std::vector<common_chat_msg> & messages,

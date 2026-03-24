@@ -133,6 +133,7 @@ public:
     bool get_model_state(llama_self_model_state_info * out_info) const;
     bool get_self_model_revision(llama_self_model_revision * out_info) const;
     bool get_emotive_moment_revision(llama_emotive_moment_revision * out_info) const;
+    bool get_last_disturbance(llama_self_disturbance_state_info * out_info) const;
     int32_t model_extension_count() const;
     bool get_model_extension(int32_t index, llama_self_model_extension_info * out_info) const;
     bool upsert_model_extension(const llama_self_model_extension_update & update);
@@ -187,7 +188,9 @@ private:
     void reset_dynamic_state_preserve_static();
     void append_trace(const llama_self_state_event & event);
     void bridge_working_memory_to_handles(const std::array<float, 32> & sketch, float salience);
+    void recompute_social_contact_state();
     void update_social_state(const llama_self_state_event & event, const llama_self_state_feature_vector & features);
+    void update_disturbance_state(const llama_self_state_event & event, const llama_self_state_feature_vector & features, uint32_t source_mask);
     void initialize_model_state();
     void refresh_model_extension_summary();
     void refresh_model_extension_lifecycle();
@@ -200,6 +203,10 @@ private:
     void update_expanded_model(const llama_self_state_event & event, const llama_self_state_feature_vector & features, uint32_t source_mask);
     void update_summary_registers(uint32_t source_mask);
     void update_evolution_uncertainty(uint32_t source_mask, float signed_progress, float efficiency_advantage);
+    bool event_is_substantive_social_contact(const llama_self_state_event & event, const llama_self_state_feature_vector & features) const;
+    static float disturbance_source_reliability(const llama_self_state_event & event);
+    static int32_t disturbance_source_kind(const llama_self_state_event & event);
+    static int32_t disturbance_failure_class(const llama_self_state_event & event);
 
     void recompute_time_surface(uint32_t source_mask);
     void update_scalar_register(int32_t register_id, float value, uint32_t source_mask);
@@ -244,6 +251,10 @@ private:
     float social_reciprocity = 0.5f;
     float social_recent_user_valence = 0.0f;
     float social_dissatisfaction = 0.0f;
+    float social_contact_set_point_hours = 72.0f;
+    float social_silence_hours = 0.0f;
+    float social_silence_deficit = 0.0f;
+    int64_t social_last_substantive_contact_monotonic_ms = -1;
     llama_self_user_preference_profile user_preference = {};
     std::array<llama_self_model_horizon_info, LLAMA_SELF_HORIZON_COUNT> model_horizons = {};
     llama_self_forecast_trace model_forecast = {};
@@ -271,6 +282,7 @@ private:
 
     mutable llama_self_model_revision cached_self_model_revision = {};
     mutable llama_emotive_moment_revision cached_emotive_moment_revision = {};
+    mutable llama_self_disturbance_state_info last_disturbance_state = {};
     mutable uint64_t cached_self_model_source_hash = 0;
     mutable uint64_t cached_emotive_source_hash = 0;
     mutable int32_t next_self_model_revision_id = 1;
