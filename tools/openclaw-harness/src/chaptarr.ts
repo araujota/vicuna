@@ -22,8 +22,17 @@ const DEFAULT_MONITOR_NEW_ITEMS = "all";
 const DEFAULT_CHAPTARR_SEARCH_PROVIDER = "hardcover";
 const DEFAULT_CHAPTARR_EBOOK_QUALITY_PROFILE_ID = 1;
 const DEFAULT_CHAPTARR_EBOOK_METADATA_PROFILE_ID = 2;
+const EBOOK_FILE_EXTENSIONS = new Set(["epub", "mobi", "azw", "azw3", "kfx", "pdf", "fb2", "djvu", "djv"]);
+const AUDIOBOOK_FILE_EXTENSIONS = new Set(["mp3", "m4b", "m4a", "aac", "aax", "flac", "ogg", "opus", "wav", "wma"]);
 
 type ChaptarrRecord = Record<string, unknown>;
+type BookMediaAnalysis = {
+  eligible: boolean;
+  ebookEditions: ChaptarrRecord[];
+  ebookFiles: ChaptarrRecord[];
+  ebookFormats: string[];
+  ebookFileExtensions: string[];
+};
 
 function cloneRecord(value: unknown): ChaptarrRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -53,6 +62,11 @@ function recordIntegerLike(record: ChaptarrRecord, key: string): number | undefi
   return undefined;
 }
 
+function recordBoolean(record: ChaptarrRecord, key: string): boolean | undefined {
+  const value = record[key];
+  return typeof value === "boolean" ? value : undefined;
+}
+
 function resolveTrackedAuthorId(record: ChaptarrRecord): number | undefined {
   return (
     recordIntegerLike(record, "id") ??
@@ -77,11 +91,130 @@ function recordObject(record: ChaptarrRecord, key: string): ChaptarrRecord | und
   return cloneRecord(value);
 }
 
+function cloneRecordArray(value: unknown): ChaptarrRecord[] {
+  if (Array.isArray(value)) {
+    return value
+      .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+      .map((entry) => cloneRecord(entry));
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const nestedValue = (value as ChaptarrRecord).value;
+    if (Array.isArray(nestedValue)) {
+      return nestedValue
+        .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+        .map((entry) => cloneRecord(entry));
+    }
+  }
+  return [];
+}
+
+function recordArray(record: ChaptarrRecord, key: string): ChaptarrRecord[] {
+  return cloneRecordArray(record[key]);
+}
+
 function sortStrings(values: string[]): string[] {
-  return values
+  return [...new Set(values
     .map((value) => value.trim())
     .filter((value) => value.length > 0)
-    .sort((left, right) => left.localeCompare(right));
+  )].sort((left, right) => left.localeCompare(right));
+}
+
+function recordPathExtension(record: ChaptarrRecord): string | undefined {
+  const explicitExtension = recordString(record, "extension");
+  if (explicitExtension) {
+    return explicitExtension.toLowerCase().replace(/^\./, "");
+  }
+  const path = recordString(record, "path");
+  if (!path) {
+    return undefined;
+  }
+  const match = /\.([A-Za-z0-9]+)$/.exec(path);
+  return match ? match[1].toLowerCase() : undefined;
+}
+
+function matchesFormatPattern(value: string | undefined, extensions: Set<string>): boolean {
+  if (!value) {
+    return false;
+  }
+  const normalized = value.toLowerCase();
+  return [...extensions].some((extension) => normalized.includes(extension));
+}
+
+function isEbookEdition(edition: ChaptarrRecord): boolean {
+  return (
+    edition.isEbook === true ||
+    recordString(edition, "mediaType") === FIXED_CHAPTARR_MEDIA_TYPE ||
+    matchesFormatPattern(recordString(edition, "format"), EBOOK_FILE_EXTENSIONS)
+  );
+}
+
+function isAudiobookEdition(edition: ChaptarrRecord): boolean {
+  return (
+    edition.isEbook === false ||
+    recordString(edition, "mediaType") === "audiobook" ||
+    matchesFormatPattern(recordString(edition, "format"), AUDIOBOOK_FILE_EXTENSIONS)
+  );
+}
+
+function isEbookFile(file: ChaptarrRecord): boolean {
+  const extension = recordPathExtension(file);
+  return (
+    recordBoolean(file, "isEbook") === true ||
+    recordString(file, "mediaType") === FIXED_CHAPTARR_MEDIA_TYPE ||
+    (extension !== undefined && EBOOK_FILE_EXTENSIONS.has(extension)) ||
+    matchesFormatPattern(recordString(file, "format"), EBOOK_FILE_EXTENSIONS)
+  );
+}
+
+function isAudiobookFile(file: ChaptarrRecord): boolean {
+  const extension = recordPathExtension(file);
+  return (
+    recordBoolean(file, "isEbook") === false ||
+    recordString(file, "mediaType") === "audiobook" ||
+    (extension !== undefined && AUDIOBOOK_FILE_EXTENSIONS.has(extension)) ||
+    matchesFormatPattern(recordString(file, "format"), AUDIOBOOK_FILE_EXTENSIONS)
+  );
+}
+
+function analyzeBookMedia(book: ChaptarrRecord): BookMediaAnalysis {
+  const editions = recordArray(book, "editions");
+  const files = [
+    ...recordArray(book, "bookFiles"),
+    ...recordArray(book, "files"),
+  ];
+  const ebookEditions = editions.filter(isEbookEdition);
+  const audiobookEditions = editions.filter(isAudiobookEdition);
+  const ebookFiles = files.filter(isEbookFile);
+  const audiobookFiles = files.filter(isAudiobookFile);
+  const mediaType = recordString(book, "mediaType");
+  const lastSelectedMediaType = recordString(book, "lastSelectedMediaType");
+  const explicitEbook =
+    mediaType === FIXED_CHAPTARR_MEDIA_TYPE ||
+    lastSelectedMediaType === FIXED_CHAPTARR_MEDIA_TYPE ||
+    book.ebookMonitored === true ||
+    ebookEditions.length > 0 ||
+    ebookFiles.length > 0;
+  const explicitAudiobook =
+    mediaType === "audiobook" ||
+    lastSelectedMediaType === "audiobook" ||
+    book.audiobookMonitored === true ||
+    (editions.length > 0 && ebookEditions.length === 0 && audiobookEditions.length > 0) ||
+    (files.length > 0 && ebookFiles.length === 0 && audiobookFiles.length > 0);
+  const eligible = explicitEbook || (!explicitAudiobook && editions.length === 0 && files.length === 0);
+
+  return {
+    eligible,
+    ebookEditions,
+    ebookFiles,
+    ebookFormats: sortStrings(ebookEditions.flatMap((edition) => {
+      const format = recordString(edition, "format");
+      return format ? [format] : [];
+    })),
+    ebookFileExtensions: sortStrings(ebookFiles.flatMap((file) => {
+      const extension = recordPathExtension(file);
+      return extension ? [extension] : [];
+    })),
+  };
 }
 
 function summarizeChaptarrCommandResult(data: unknown): unknown {
@@ -124,7 +257,8 @@ function summarizeChaptarrBookRecord(data: unknown): unknown {
   }
 
   const author = recordObject(record, "author");
-  const editions = Array.isArray(record.editions) ? record.editions.filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry)) as ChaptarrRecord[] : [];
+  const editions = recordArray(record, "editions");
+  const media = analyzeBookMedia(record);
   return {
     id: recordIntegerLike(record, "id") ?? recordIntegerLike(record, "bookId") ?? recordIntegerLike(record, "localBookId"),
     title: recordString(record, "title"),
@@ -139,6 +273,11 @@ function summarizeChaptarrBookRecord(data: unknown): unknown {
     has_files: record.hasFiles === true,
     edition_count: editions.length > 0 ? editions.length : undefined,
     ebook_edition_count: editions.filter((edition) => edition.isEbook === true).length || undefined,
+    ...(media.ebookFormats.length > 0 ? { ebook_formats: media.ebookFormats } : {}),
+    ...(media.ebookFileExtensions.length > 0 ? { ebook_file_extensions: media.ebookFileExtensions } : {}),
+    ...((media.ebookEditions.length + media.ebookFiles.length) > 0
+      ? { ebook_option_count: media.ebookEditions.length + media.ebookFiles.length }
+      : {}),
   };
 }
 
@@ -175,19 +314,34 @@ function summarizeChaptarrAuthorList(data: unknown): unknown {
   };
 }
 
-function summarizeChaptarrBookList(data: unknown): unknown {
+function summarizeChaptarrBookList(
+  data: unknown,
+  options?: { signalNoEbookMatch?: boolean; message?: string }
+): unknown {
   if (!Array.isArray(data)) {
     return data;
   }
 
+  const rawBookCount = data.filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry)).length;
   const items: ChaptarrRecord[] = data.flatMap((entry) => {
-    const summary = summarizeChaptarrBookRecord(entry);
+    const record = entry && typeof entry === "object" && !Array.isArray(entry) ? cloneRecord(entry) : undefined;
+    if (!record || !analyzeBookMedia(record).eligible) {
+      return [];
+    }
+    const summary = summarizeChaptarrBookRecord(record);
     return summary && typeof summary === "object" && !Array.isArray(summary) ? [summary as ChaptarrRecord] : [];
   });
 
   return {
+    ...(rawBookCount !== items.length ? { raw_book_count: rawBookCount } : {}),
     total_books: items.length,
     titles: sortStrings(items.flatMap((item) => typeof item.title === "string" ? [item.title] : [])),
+    ...(options?.signalNoEbookMatch && rawBookCount > 0 && items.length === 0
+      ? {
+          no_ebook_match: true,
+          message: options.message ?? "No ebook-capable book matches were found.",
+        }
+      : {}),
     items,
   };
 }
@@ -209,13 +363,17 @@ function summarizeChaptarrSeriesList(data: unknown): unknown {
   };
 }
 
-function summarizeChaptarrSearchResults(data: unknown): unknown {
+function summarizeChaptarrSearchResults(
+  data: unknown,
+  options?: { signalNoEbookMatch?: boolean; message?: string }
+): unknown {
   if (!Array.isArray(data)) {
     return data;
   }
 
   const bookItems: ChaptarrRecord[] = [];
   const authorItems: ChaptarrRecord[] = [];
+  let rawBookCount = 0;
 
   for (const entry of data) {
     const record = entry && typeof entry === "object" && !Array.isArray(entry) ? cloneRecord(entry) : undefined;
@@ -223,17 +381,30 @@ function summarizeChaptarrSearchResults(data: unknown): unknown {
       continue;
     }
     if (record.book && typeof record.book === "object" && !Array.isArray(record.book)) {
-      bookItems.push(summarizeChaptarrBookRecord(record.book) as ChaptarrRecord);
+      rawBookCount += 1;
+      const bookRecord = cloneRecord(record.book);
+      if (analyzeBookMedia(bookRecord).eligible) {
+        bookItems.push(summarizeChaptarrBookRecord(bookRecord) as ChaptarrRecord);
+      }
     }
     if (record.author && typeof record.author === "object" && !Array.isArray(record.author)) {
       authorItems.push(summarizeChaptarrAuthorRecord(record.author) as ChaptarrRecord);
     }
   }
 
+  const resultCount = authorItems.length + bookItems.length;
   return {
-    result_count: data.length,
+    ...(data.length !== resultCount ? { raw_result_count: data.length } : {}),
+    ...(rawBookCount !== bookItems.length ? { raw_book_result_count: rawBookCount } : {}),
+    result_count: resultCount,
     author_result_count: authorItems.length,
     book_result_count: bookItems.length,
+    ...(options?.signalNoEbookMatch && rawBookCount > 0 && bookItems.length === 0
+      ? {
+          no_ebook_match: true,
+          message: options.message ?? "No ebook-capable book matches were found.",
+        }
+      : {}),
     authors: authorItems,
     books: bookItems,
   };
@@ -387,9 +558,18 @@ function selectSearchBookCandidate(
     return [{
       searchEntry: cloneRecord(record),
       book: cloneRecord(record.book),
+      media: analyzeBookMedia(cloneRecord(record.book)),
     }];
   });
-  const selected = chooseLookupCandidate(candidates, [
+  const ebookCandidates = candidates.filter((candidate) => candidate.media.eligible);
+  if (ebookCandidates.length === 0 && candidates.length > 0) {
+    throw new ChaptarrToolError(
+      "no_ebook_match",
+      "search result did not include an ebook-capable book match",
+      { term, foreign_book_id: foreignBookId, foreign_edition_id: foreignEditionId }
+    );
+  }
+  const selected = chooseLookupCandidate(ebookCandidates, [
     (candidate) =>
       foreignBookId !== undefined &&
       (recordString(candidate.book, "foreignBookId") === foreignBookId ||
@@ -397,20 +577,11 @@ function selectSearchBookCandidate(
         recordString(candidate.searchEntry, "foreignId") === foreignBookId),
     (candidate) =>
       foreignEditionId !== undefined &&
-      Array.isArray(candidate.book.editions) &&
-      candidate.book.editions.some((edition) =>
-        edition &&
-        typeof edition === "object" &&
-        !Array.isArray(edition) &&
-        (recordString(edition as ChaptarrRecord, "foreignEditionId") === foreignEditionId ||
-          recordString(edition as ChaptarrRecord, "titleSlug") === foreignEditionId)),
+      candidate.media.ebookEditions.some((edition) =>
+        recordString(edition, "foreignEditionId") === foreignEditionId ||
+        recordString(edition, "titleSlug") === foreignEditionId),
     (candidate) =>
-      Array.isArray(candidate.book.editions) &&
-      candidate.book.editions.some((edition) =>
-        edition &&
-        typeof edition === "object" &&
-        !Array.isArray(edition) &&
-        (edition as ChaptarrRecord).isEbook === true),
+      candidate.media.ebookEditions.length > 0 || candidate.media.ebookFiles.length > 0,
     (candidate) =>
       queryMatchesText(
         term,
@@ -428,12 +599,8 @@ function selectSearchBookCandidate(
 }
 
 function pickPreferredBookEditions(book: ChaptarrRecord, foreignEditionId: string | undefined, monitored: boolean): ChaptarrRecord[] {
-  const allEditions = Array.isArray(book.editions)
-    ? book.editions
-        .filter((edition) => edition && typeof edition === "object" && !Array.isArray(edition))
-        .map((edition) => cloneRecord(edition))
-    : [];
-  const ebookEditions = allEditions.filter((edition) => edition.isEbook === true);
+  const allEditions = recordArray(book, "editions");
+  const ebookEditions = allEditions.filter(isEbookEdition);
   const source = ebookEditions.length > 0 ? ebookEditions : allEditions;
   if (source.length === 0) {
     return [];
@@ -735,7 +902,14 @@ export async function handleChaptarr(context: ChaptarrCliContext) {
     const provider = optionalString(payload, "provider");
     const query = provider ? { term, provider } : { term };
     const data = await chaptarrRequestJson(config, "GET", "/api/v1/search", query);
-    return successEnvelope(action, config.baseUrl, "GET", "/api/v1/search", query, summarizeChaptarrSearchResults(data));
+    return successEnvelope(
+      action,
+      config.baseUrl,
+      "GET",
+      "/api/v1/search",
+      query,
+      summarizeChaptarrSearchResults(data, { signalNoEbookMatch: true })
+    );
   }
   if (resolvedAction === "author_lookup") {
     const term = requireString(payload, "term", "term is required for author_lookup");
@@ -747,7 +921,14 @@ export async function handleChaptarr(context: ChaptarrCliContext) {
     const term = requireString(payload, "term", "term is required for book_lookup");
     const query = { term };
     const data = await chaptarrRequestJson(config, "GET", "/api/v1/book/lookup", query);
-    return successEnvelope(action, config.baseUrl, "GET", "/api/v1/book/lookup", query, summarizeChaptarrBookList(data));
+    return successEnvelope(
+      action,
+      config.baseUrl,
+      "GET",
+      "/api/v1/book/lookup",
+      query,
+      summarizeChaptarrBookList(data, { signalNoEbookMatch: true })
+    );
   }
   if (resolvedAction === "list_books") {
     const query = authorScopedQuery(payload);

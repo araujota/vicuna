@@ -651,12 +651,12 @@ function chaptarrCapability(): CapabilityDescriptor {
             "delete_book",
           ],
           description:
-            `The Chaptarr operation to perform. Read actions inspect or look up authors and books without starting downloads; inspect is a generic alias for listing current authors; search uses Chaptarr's mixed discovery endpoint; add_author, add_book, download_author, and download_book all start ebook acquisition using the fixed NAS Books root at ${FIXED_CHAPTARR_ROOT_FOLDER_PATH}; delete_book removes one tracked ebook and deletes its files by default.`
+            `The Chaptarr operation to perform. Read actions inspect or look up authors and books without starting downloads; inspect is a generic alias for listing current authors; search and book_lookup only surface ebook-capable book options while preserving author discovery; add_author, add_book, download_author, and download_book all start ebook acquisition using the fixed NAS Books root at ${FIXED_CHAPTARR_ROOT_FOLDER_PATH}; download_book resolves the ebook candidate and starts acquisition in the same tool call; delete_book removes one tracked ebook and deletes its files by default.`
         },
         term: {
           type: "string",
           description:
-            "Search term for search, author_lookup, book_lookup, add_author, add_book, download_book, or delete_book. Use a precise author name, book title, or other lookup phrase."
+            "Search term for search, author_lookup, book_lookup, add_author, add_book, download_book, or delete_book. Book-searching actions only surface ebook-capable book options for the supplied phrase."
         },
         provider: {
           type: "string",
@@ -1123,8 +1123,8 @@ function mediaRuntimeCapabilities(): CapabilityDescriptor[] {
       toolSurfaceId: "vicuna.media.chaptarr.search",
       toolName: "chaptarr_search",
       methodName: "search",
-      methodDescription: "Run Chaptarr's mixed discovery search for an author or book query without starting any download.",
-      description: "Run Chaptarr's mixed discovery search for an author or book query. This is discovery only and does not add media or start a download.",
+      methodDescription: "Run Chaptarr's mixed discovery search while exposing only ebook-capable book options.",
+      description: "Run Chaptarr's mixed discovery search for an author or book query. This is discovery only and does not add media or start a download, and any returned book options are restricted to ebook-capable matches.",
       fixedArguments: { action: "search" },
       includeProperties: ["term", "provider"],
       requiredProperties: ["term"],
@@ -1149,8 +1149,8 @@ function mediaRuntimeCapabilities(): CapabilityDescriptor[] {
       toolSurfaceId: "vicuna.media.chaptarr.book_lookup",
       toolName: "chaptarr_book_lookup",
       methodName: "book_lookup",
-      methodDescription: "Look up books in Chaptarr by title or identifier without starting any download.",
-      description: "Look up books in Chaptarr by title or identifier. This is discovery only and does not start any download.",
+      methodDescription: "Look up books in Chaptarr by title or identifier while exposing only ebook-capable options.",
+      description: "Look up books in Chaptarr by title or identifier. This is discovery only and does not start any download, and any returned book options are restricted to ebook-capable matches.",
       fixedArguments: { action: "book_lookup" },
       includeProperties: ["term"],
       requiredProperties: ["term"],
@@ -1175,8 +1175,8 @@ function mediaRuntimeCapabilities(): CapabilityDescriptor[] {
       toolSurfaceId: "vicuna.media.chaptarr.download_book",
       toolName: "chaptarr_download_book",
       methodName: "download_book",
-      methodDescription: "Start ebook-only Chaptarr acquisition for a specific title.",
-      description: `Start ebook-only Chaptarr acquisition for a specific title. If the book is not yet tracked, this method adds it using Hardcover-backed search results, the fixed NAS Books folder at ${FIXED_CHAPTARR_ROOT_FOLDER_PATH}, and the deployment-fixed Ebook quality and Ebook Default metadata profiles with immediate search enabled. If the book is already tracked, this method repairs the existing author and book into ebook acquisition state, enables monitoring on the tracked book, and then triggers Chaptarr's native Book Search command. This starts acquisition/search; it does not guarantee a completed download/import.`,
+      methodDescription: "Start ebook-only Chaptarr acquisition for a specific title in one tool call.",
+      description: `Start ebook-only Chaptarr acquisition for a specific title. If the book is not yet tracked, this method resolves an ebook-capable candidate, adds it using Hardcover-backed search results, the fixed NAS Books folder at ${FIXED_CHAPTARR_ROOT_FOLDER_PATH}, and the deployment-fixed Ebook quality and Ebook Default metadata profiles with immediate search enabled. If the book is already tracked, this method repairs the existing author and book into ebook acquisition state, enables monitoring on the tracked book, and then triggers Chaptarr's native Book Search command. The ebook candidate resolution and acquisition start happen in this same tool call; this starts acquisition/search and does not guarantee a completed download/import.`,
       fixedArguments: { action: "download_book" },
       includeProperties: ["term", "foreign_book_id", "foreign_edition_id"],
       requiredProperties: ["term"],

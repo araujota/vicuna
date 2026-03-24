@@ -85,7 +85,7 @@ test("handleChaptarr maps inspect to author listing", async () => {
   }
 });
 
-test("handleChaptarr shapes generic search requests with an optional provider", async () => {
+test("handleChaptarr filters generic search results down to ebook-capable book options", async () => {
   const originalFetch = globalThis.fetch;
   const fetchCalls: Array<{ url: string; method: string }> = [];
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -105,11 +105,42 @@ test("handleChaptarr shapes generic search requests with an optional provider", 
       },
       {
         book: {
+          id: 77,
+          title: "The Hobbit (Audio)",
+          foreignBookId: "hc:41",
+          hardcoverBookId: "hc:41",
+          mediaType: "audiobook",
+          monitored: false,
+          author: {
+            id: 12,
+            authorName: "J.R.R. Tolkien"
+          },
+          bookFiles: [
+            {
+              path: "/books/the-hobbit.m4b"
+            }
+          ]
+        }
+      },
+      {
+        book: {
           id: 91,
           title: "The Hobbit",
           foreignBookId: "hc:42",
           hardcoverBookId: "hc:42",
           monitored: true,
+          editions: [
+            {
+              foreignEditionId: "edition-epub",
+              isEbook: true,
+              format: "EPUB"
+            }
+          ],
+          bookFiles: [
+            {
+              path: "/books/the-hobbit.epub"
+            }
+          ],
           author: {
             id: 12,
             authorName: "J.R.R. Tolkien"
@@ -137,6 +168,8 @@ test("handleChaptarr shapes generic search requests with an optional provider", 
     assert.equal(response.request?.path, "/api/v1/search");
     assert.deepEqual(response.request?.query, { term: "Tolkien", provider: "hardcover" });
     assert.deepEqual(response.data, {
+      raw_result_count: 3,
+      raw_book_result_count: 2,
       result_count: 2,
       author_result_count: 1,
       book_result_count: 1,
@@ -164,8 +197,11 @@ test("handleChaptarr shapes generic search requests with an optional provider", 
           media_type: undefined,
           path: undefined,
           has_files: false,
-          edition_count: undefined,
-          ebook_edition_count: undefined,
+          edition_count: 1,
+          ebook_edition_count: 1,
+          ebook_formats: ["EPUB"],
+          ebook_file_extensions: ["epub"],
+          ebook_option_count: 2,
         }
       ],
     });
@@ -206,6 +242,54 @@ test("handleChaptarr shapes book lookup requests", async () => {
     assert.deepEqual(response.request?.query, { term: "The Hobbit" });
     assert.equal(fetchCalls.length, 1);
     assert.match(fetchCalls[0].url, /\/api\/v1\/book\/lookup\?term=The\+Hobbit$/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleChaptarr signals when book lookup finds only audiobook matches", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify([
+      {
+        id: 88,
+        title: "The Hobbit (Audio)",
+        foreignBookId: "hc:41",
+        mediaType: "audiobook",
+        bookFiles: [
+          {
+            path: "/books/the-hobbit.m4b"
+          }
+        ],
+        author: {
+          authorName: "J.R.R. Tolkien"
+        }
+      }
+    ]), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    })) as typeof fetch;
+
+  try {
+    const response = await handleChaptarr({
+      service: "chaptarr",
+      config: {
+        service: "chaptarr",
+        baseUrl: DEFAULT_CHAPTARR_BASE_URL,
+        apiKey: "test-key"
+      },
+      payload: { action: "book_lookup", term: "The Hobbit" }
+    });
+
+    assert.equal(response.ok, true);
+    assert.deepEqual(response.data, {
+      raw_book_count: 1,
+      total_books: 0,
+      titles: [],
+      no_ebook_match: true,
+      message: "No ebook-capable book matches were found.",
+      items: [],
+    });
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -791,6 +875,7 @@ test("handleChaptarr triggers BookSearch for an already-tracked add_book target"
         has_files: false,
         edition_count: 1,
         ebook_edition_count: 1,
+        ebook_option_count: 1,
       },
       monitor_result: {
         total_books: 1,
@@ -841,6 +926,64 @@ test("handleChaptarr triggers BookSearch for an already-tracked add_book target"
     const commandBody = JSON.parse(fetchCalls[6].body ?? "{}") as Record<string, unknown>;
     assert.equal(commandBody.name, "BookSearch");
     assert.deepEqual(commandBody.bookIds, [91]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleChaptarr rejects audiobook-only download candidates", async () => {
+  const originalFetch = globalThis.fetch;
+  const fetchCalls: Array<{ url: string; method: string }> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    fetchCalls.push({
+      url: String(input),
+      method: init?.method ?? "GET"
+    });
+    return new Response(JSON.stringify([
+      {
+        foreignId: "hc:41",
+        book: {
+          title: "The Hobbit (Audio)",
+          foreignBookId: "hc:41",
+          mediaType: "audiobook",
+          author: {
+            authorName: "J.R.R. Tolkien",
+            foreignAuthorId: "hc:656983",
+            titleSlug: "jrr-tolkien",
+          },
+          bookFiles: [
+            {
+              path: "/books/the-hobbit.m4b"
+            }
+          ]
+        }
+      }
+    ]), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  }) as typeof fetch;
+
+  try {
+    await assert.rejects(
+      handleChaptarr({
+        service: "chaptarr",
+        config: {
+          service: "chaptarr",
+          baseUrl: DEFAULT_CHAPTARR_BASE_URL,
+          apiKey: "test-key"
+        },
+        payload: {
+          action: "download_book",
+          term: "The Hobbit",
+        }
+      }),
+      (error: unknown) =>
+        error instanceof ChaptarrToolError &&
+        error.kind === "no_ebook_match"
+    );
+    assert.equal(fetchCalls.length, 1);
+    assert.match(fetchCalls[0].url, /\/api\/v1\/search\?term=The\+Hobbit&provider=hardcover$/);
   } finally {
     globalThis.fetch = originalFetch;
   }

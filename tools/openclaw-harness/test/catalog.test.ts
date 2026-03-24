@@ -225,6 +225,9 @@ test("runtime catalog exposes fully described Radarr, Sonarr, and Chaptarr schem
   const chaptarrSearchCapability = catalog.capabilities.find(
     (capability) => capability.capability_id === "openclaw.servarr.chaptarr.search"
   );
+  const chaptarrBookLookupCapability = catalog.capabilities.find(
+    (capability) => capability.capability_id === "openclaw.servarr.chaptarr.book-lookup"
+  );
   const radarrDeleteCapability = catalog.capabilities.find(
     (capability) => capability.capability_id === "openclaw.servarr.radarr.delete-movie"
   );
@@ -249,6 +252,7 @@ test("runtime catalog exposes fully described Radarr, Sonarr, and Chaptarr schem
   assert.ok(chaptarrCapability);
   assert.ok(chaptarrAddBookCapability);
   assert.ok(chaptarrSearchCapability);
+  assert.ok(chaptarrBookLookupCapability);
   assert.ok(radarrDeleteCapability);
   assert.ok(sonarrDeleteCapability);
   assert.ok(chaptarrDeleteCapability);
@@ -295,6 +299,8 @@ test("runtime catalog exposes fully described Radarr, Sonarr, and Chaptarr schem
   assert.match(sonarrCapability?.description ?? "", /Start Sonarr series acquisition/i);
   assert.match(chaptarrCapability?.description ?? "", /Start ebook-only Chaptarr acquisition for an author's catalog/i);
   assert.match(chaptarrAddBookCapability?.description ?? "", /Start ebook-only Chaptarr acquisition for a specific title/i);
+  assert.match(chaptarrSearchCapability?.description ?? "", /ebook-capable matches/i);
+  assert.match(chaptarrBookLookupCapability?.description ?? "", /ebook-capable matches/i);
   assert.match(radarrDeleteCapability?.description ?? "", /remove its files from `\/movies` by default/i);
   assert.match(sonarrDeleteCapability?.description ?? "", /remove its files from `\/tv` by default/i);
   assert.match(chaptarrDeleteCapability?.description ?? "", /remove its files from `\/books` by default/i);
@@ -341,7 +347,8 @@ test("runtime catalog exposes fully described Radarr, Sonarr, and Chaptarr schem
   assert.ok(!("root_folder_path" in chaptarrSchema.properties));
   assert.ok(!("root_folder_path" in chaptarrAddBookSchema.properties));
   assert.match(chaptarrSearchSchema.properties.provider.description ?? "", /Hardcover/i);
-  assert.match(chaptarrAddBookCapability?.description ?? "", /starts acquisition\/search; it does not guarantee a completed download\/import/i);
+  assert.match(chaptarrAddBookCapability?.description ?? "", /same tool call/i);
+  assert.match(chaptarrAddBookCapability?.description ?? "", /starts acquisition\/search and does not guarantee a completed download\/import/i);
   assert.match(radarrSearchCapability?.description ?? "", /does not add the movie or start a download/i);
   assert.match(sonarrSearchCapability?.description ?? "", /does not add the series or start a download/i);
   assert.match(radarrDeleteSchema.properties.delete_files.description ?? "", /remove the movie files from disk/i);
