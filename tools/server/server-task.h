@@ -132,6 +132,21 @@ enum server_react_origin {
     SERVER_REACT_ORIGIN_DMN = 2,
 };
 
+enum server_react_tool_stage {
+    SERVER_REACT_TOOL_STAGE_NONE = 0,
+    SERVER_REACT_TOOL_STAGE_SELECT_TOOL = 1,
+    SERVER_REACT_TOOL_STAGE_SELECT_METHOD = 2,
+    SERVER_REACT_TOOL_STAGE_EMIT_TOOL_CALL = 3,
+    SERVER_REACT_TOOL_STAGE_DECIDE_AFTER_TOOL = 4,
+    SERVER_REACT_TOOL_STAGE_EMIT_RESPONSE = 5,
+};
+
+struct server_react_history_entry {
+    std::string phase;
+    std::string kind;
+    std::string text;
+};
+
 struct server_task {
     int id = -1; // to be filled by server_queue
 
@@ -155,20 +170,44 @@ struct server_task {
     std::string foreground_text;
     int32_t foreground_role = LLAMA_SELF_STATE_EVENT_USER;
     uint32_t foreground_flags = 0;
+    bool disable_authoritative_react = false;
     llama_active_loop_trace active_trace = {};
     bool has_active_trace = false;
     int32_t react_iteration = 0;
     int32_t react_origin = SERVER_REACT_ORIGIN_NONE;
     int32_t react_retry_count = 0;
-    int32_t react_retry_limit = std::numeric_limits<int32_t>::max();
+    int32_t react_retry_limit = 12;
+    int32_t react_stage_retry_count = 0;
+    int32_t react_stage_retry_limit = 3;
+    int32_t react_tool_stage = SERVER_REACT_TOOL_STAGE_NONE;
     std::string react_retry_feedback;
     std::string react_assistant_prefill;
+    std::string react_selected_tool_family_id;
+    std::string react_selected_method_name;
+    std::string react_selected_capability_id;
+    int32_t react_pending_terminal_action = LLAMA_AUTHORITATIVE_REACT_ACTION_NONE;
+    std::string react_last_step_name;
+    std::string react_last_step_output;
+    std::string react_last_step_result;
+    std::string react_last_tool_family_id;
+    std::string react_last_tool_method_name;
+    std::string react_last_tool_capability_id;
+    std::string react_last_tool_observation;
+    std::vector<server_react_history_entry> react_history;
+    std::string react_last_failure_class;
+    std::string react_last_failure_detail;
+    int32_t react_same_failure_count = 0;
     std::vector<common_chat_tool> react_tools;
     bool react_resuming_from_tool_result = false;
     bool telegram_dialogue_active = false;
+    bool telegram_deferred_delivery = false;
     std::string telegram_chat_scope;
     int64_t telegram_message_id = 0;
     int32_t telegram_history_turn_limit = 0;
+    bool foreground_consent_requested = false;
+    bool foreground_consent_active = false;
+    int32_t foreground_consent_episode_id = 0;
+    std::string foreground_consent_scope_id;
     llama_dmn_tick_trace dmn_trace = {};
     bool has_dmn_trace = false;
 
@@ -262,17 +301,41 @@ struct server_task {
         copy.foreground_text = foreground_text;
         copy.foreground_role = foreground_role;
         copy.foreground_flags = foreground_flags;
+        copy.disable_authoritative_react = disable_authoritative_react;
         copy.react_iteration = react_iteration;
         copy.react_origin = react_origin;
         copy.react_retry_count = react_retry_count;
         copy.react_retry_limit = react_retry_limit;
+        copy.react_stage_retry_count = react_stage_retry_count;
+        copy.react_stage_retry_limit = react_stage_retry_limit;
+        copy.react_tool_stage = react_tool_stage;
         copy.react_retry_feedback = react_retry_feedback;
+        copy.react_selected_tool_family_id = react_selected_tool_family_id;
+        copy.react_selected_method_name = react_selected_method_name;
+        copy.react_selected_capability_id = react_selected_capability_id;
+        copy.react_pending_terminal_action = react_pending_terminal_action;
+        copy.react_last_step_name = react_last_step_name;
+        copy.react_last_step_output = react_last_step_output;
+        copy.react_last_step_result = react_last_step_result;
+        copy.react_last_tool_family_id = react_last_tool_family_id;
+        copy.react_last_tool_method_name = react_last_tool_method_name;
+        copy.react_last_tool_capability_id = react_last_tool_capability_id;
+        copy.react_last_tool_observation = react_last_tool_observation;
+        copy.react_history = react_history;
+        copy.react_last_failure_class = react_last_failure_class;
+        copy.react_last_failure_detail = react_last_failure_detail;
+        copy.react_same_failure_count = react_same_failure_count;
         copy.react_resuming_from_tool_result = react_resuming_from_tool_result;
         copy.react_tools = react_tools;
         copy.telegram_dialogue_active = telegram_dialogue_active;
+        copy.telegram_deferred_delivery = telegram_deferred_delivery;
         copy.telegram_chat_scope = telegram_chat_scope;
         copy.telegram_message_id = telegram_message_id;
         copy.telegram_history_turn_limit = telegram_history_turn_limit;
+        copy.foreground_consent_requested = foreground_consent_requested;
+        copy.foreground_consent_active = foreground_consent_active;
+        copy.foreground_consent_episode_id = foreground_consent_episode_id;
+        copy.foreground_consent_scope_id = foreground_consent_scope_id;
         copy.dmn_trace = dmn_trace;
         copy.has_dmn_trace = has_dmn_trace;
         copy.id_slot   = -1; // child tasks cannot specify slot
@@ -306,7 +369,31 @@ static inline bool server_task_should_prepare_authoritative_react(const server_t
         return false;
     }
 
+    if (task.disable_authoritative_react) {
+        return false;
+    }
+
     return task.has_active_trace || task.has_dmn_trace;
+}
+
+static inline bool server_task_has_dmn_authoritative_identity(const server_task & task) {
+    return task.has_dmn_trace || task.react_origin == SERVER_REACT_ORIGIN_DMN;
+}
+
+static inline bool server_task_should_prepare_active_authoritative(const server_task & task) {
+    if (task.type != SERVER_TASK_TYPE_COMPLETION) {
+        return false;
+    }
+
+    if (task.disable_authoritative_react) {
+        return false;
+    }
+
+    if (server_task_has_dmn_authoritative_identity(task)) {
+        return false;
+    }
+
+    return task.foreground_role != LLAMA_SELF_STATE_EVENT_SYSTEM;
 }
 
 static inline bool server_task_has_authoritative_react_surface(const server_task & task) {

@@ -6,10 +6,17 @@ export type CapabilityDescriptor = {
   capability_kind: string;
   owner_plugin_id: string;
   tool_name: string;
+  tool_family_id?: string;
+  tool_family_name?: string;
+  tool_family_description?: string;
+  method_name?: string;
+  method_description?: string;
   description: string;
   input_schema_json: Record<string, unknown>;
+  fixed_arguments_json?: Record<string, unknown>;
   output_contract: string;
   side_effect_class: string;
+  execution_safety_class: string;
   approval_mode: string;
   execution_modes: CapabilityExecutionMode[];
   provenance_namespace: string;
@@ -109,6 +116,17 @@ export function assertCapabilityDescriptor(descriptor: CapabilityDescriptor): Ca
   }
   if (!descriptor.provenance_namespace) {
     throw new Error("provenance_namespace is required");
+  }
+  if (!descriptor.execution_safety_class) {
+    throw new Error("execution_safety_class is required");
+  }
+  if (
+    descriptor.fixed_arguments_json !== undefined &&
+    (typeof descriptor.fixed_arguments_json !== "object" ||
+      descriptor.fixed_arguments_json === null ||
+      Array.isArray(descriptor.fixed_arguments_json))
+  ) {
+    throw new Error("fixed_arguments_json must be an object when provided");
   }
   assertSchemaDescriptions(descriptor.input_schema_json, "input_schema_json", true);
   return descriptor;

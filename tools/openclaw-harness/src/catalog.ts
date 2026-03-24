@@ -1,12 +1,18 @@
+import { FIXED_CHAPTARR_ROOT_FOLDER_PATH } from "./chaptarr-client.js";
 import type { CapabilityCatalog, CapabilityDescriptor } from "./contracts.js";
 import { assertCapabilityCatalog } from "./contracts.js";
 import type { OpenClawToolSecrets } from "./config.js";
+import {
+  FIXED_RADARR_QUALITY_PROFILE_NAME,
+  FIXED_RADARR_ROOT_FOLDER_PATH,
+  FIXED_SONARR_QUALITY_PROFILE_NAME,
+  FIXED_SONARR_ROOT_FOLDER_PATH,
+} from "./servarr.js";
 
-export type BuiltinToolId = "exec" | "hard_memory_query" | "hard_memory_write" | "codex";
+export type BuiltinToolId = "hard_memory_query" | "hard_memory_write" | "codex";
 
 export type CatalogOptions = {
   enabledTools?: BuiltinToolId[];
-  enableExec?: boolean;
   enableHardMemoryQuery?: boolean;
   enableHardMemoryWrite?: boolean;
   enableCodex?: boolean;
@@ -26,47 +32,15 @@ function combineToolFlags(...flags: number[]): number {
   return flags.reduce((mask, flag) => mask | flag, 0);
 }
 
-function execCapability(): CapabilityDescriptor {
-  return {
-    capability_id: "openclaw.exec.command",
-    tool_surface_id: "vicuna.exec.main",
-    capability_kind: "tool",
-    owner_plugin_id: "openclaw-core",
-    tool_name: "exec",
-    description:
-      "Inspect or act on host-local state by running one bounded shell command through the execution policy. Use this for filesystem state, the current working directory, repository state, environment variables, running processes, or command output. Keep the command narrow and direct, and do not use shell chaining or redirection.",
-    input_schema_json: {
-      type: "object",
-      required: ["command"],
-      properties: {
-        command: {
-          type: "string",
-          description:
-            "A single bounded shell command to execute for direct host-local observation or action. Prefer precise commands such as pwd, ls, git status, or cat path."
-        },
-        workdir: {
-          type: "string",
-          description:
-            "Optional working directory for the command when the observation or action should run in a specific repository or path."
-        }
-      }
-    },
-    output_contract: "pending_then_result",
-    side_effect_class: "system_exec",
-    approval_mode: "policy_driven",
-    execution_modes: ["sync", "background", "approval_gated"],
-    provenance_namespace: "openclaw/openclaw-core/tool/exec",
-    tool_kind: 4,
-    tool_flags: combineToolFlags(
-      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
-      COG_TOOL_FLAG_DMN_ELIGIBLE,
-      COG_TOOL_FLAG_REMEDIATION_SAFE,
-      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
-    ),
-    latency_class: 1,
-    max_steps_reserved: 2,
-    dispatch_backend: "legacy_bash"
-  };
+function executionSafetyClassForSideEffectClass(sideEffectClass: string | undefined): string {
+  switch (sideEffectClass) {
+    case "memory_read":
+    case "network_read":
+    case "service_read":
+      return "read_only";
+    default:
+      return "approval_required";
+  }
 }
 
 function hardMemoryCapability(): CapabilityDescriptor {
@@ -76,6 +50,11 @@ function hardMemoryCapability(): CapabilityDescriptor {
     capability_kind: "memory_adapter",
     owner_plugin_id: "vicuna-memory",
     tool_name: "hard_memory_query",
+    tool_family_id: "hard_memory",
+    tool_family_name: "Hard Memory",
+    tool_family_description: "Read from or write durable memory primitives in Vicuña hard memory.",
+    method_name: "query",
+    method_description: "Query Vicuña hard memory with a retrieval string.",
     description: "Query Vicuña hard memory with typed results",
     input_schema_json: {
       type: "object",
@@ -90,6 +69,7 @@ function hardMemoryCapability(): CapabilityDescriptor {
     },
     output_contract: "completed_result",
     side_effect_class: "memory_read",
+    execution_safety_class: "read_only",
     approval_mode: "none",
     execution_modes: ["sync"],
     provenance_namespace: "openclaw/vicuna-memory/memory_adapter/hard_memory_query",
@@ -113,6 +93,11 @@ function hardMemoryWriteCapability(): CapabilityDescriptor {
     capability_kind: "memory_adapter",
     owner_plugin_id: "vicuna-memory",
     tool_name: "hard_memory_write",
+    tool_family_id: "hard_memory",
+    tool_family_name: "Hard Memory",
+    tool_family_description: "Read from or write durable memory primitives in Vicuña hard memory.",
+    method_name: "write",
+    method_description: "Archive a batch of durable memory primitives.",
     description: "Archive explicit durable memories to Vicuña hard memory and Supermemory",
     input_schema_json: {
       type: "object",
@@ -188,6 +173,7 @@ function hardMemoryWriteCapability(): CapabilityDescriptor {
     },
     output_contract: "completed_result",
     side_effect_class: "memory_write",
+    execution_safety_class: "approval_required",
     approval_mode: "none",
     execution_modes: ["sync"],
     provenance_namespace: "openclaw/vicuna-memory/memory_adapter/hard_memory_write",
@@ -211,6 +197,11 @@ function codexCapability(): CapabilityDescriptor {
     capability_kind: "tool",
     owner_plugin_id: "vicuna-runtime",
     tool_name: "codex",
+    tool_family_id: "codex",
+    tool_family_name: "Codex",
+    tool_family_description: "Use the local Codex CLI to make repository changes in this checkout.",
+    method_name: "run_task",
+    method_description: "Run one local Codex task against the repository checkout.",
     description: "Use the local Codex CLI to implement a repository change and rebuild the runtime",
     input_schema_json: {
       type: "object",
@@ -225,6 +216,7 @@ function codexCapability(): CapabilityDescriptor {
     },
     output_contract: "pending_then_result",
     side_effect_class: "self_modification",
+    execution_safety_class: "approval_required",
     approval_mode: "none",
     execution_modes: ["background"],
     provenance_namespace: "openclaw/vicuna-runtime/tool/codex",
@@ -248,6 +240,11 @@ function tavilyWebSearchCapability(): CapabilityDescriptor {
     capability_kind: "tool",
     owner_plugin_id: "openclaw-tavily",
     tool_name: "web_search",
+    tool_family_id: "web_search",
+    tool_family_name: "Web Search",
+    tool_family_description: "Search the live web and return source-grounded evidence.",
+    method_name: "search",
+    method_description: "Run one Tavily web search query.",
     description: "Search the live web through Tavily and return ranked source evidence with URLs and excerpts; synthesize from the returned sources rather than expecting a provider-generated answer",
     input_schema_json: {
       type: "object",
@@ -303,6 +300,7 @@ function tavilyWebSearchCapability(): CapabilityDescriptor {
     },
     output_contract: "completed_result",
     side_effect_class: "network_read",
+    execution_safety_class: "read_only",
     approval_mode: "policy_driven",
     execution_modes: ["sync"],
     provenance_namespace: "openclaw/openclaw-tavily/tool/web_search",
@@ -326,8 +324,14 @@ function radarrCapability(): CapabilityDescriptor {
     capability_kind: "tool",
     owner_plugin_id: "openclaw-servarr",
     tool_name: "radarr",
+    tool_family_id: "radarr",
+    tool_family_name: "Radarr",
+    tool_family_description:
+      "Inspect and manage the Radarr movie library on the media server.",
+    method_name: "generic",
+    method_description: "Call the generic Radarr wrapper with an explicit action argument.",
     description:
-      "Inspect and manage the Radarr movie library on the LAN-connected media server. Use this for Radarr system status, queue state, calendar, root folders, quality profiles, existing movies, movie lookup, and adding a movie after you have the right folder and quality profile.",
+      `Inspect and manage the Radarr movie library on the LAN-connected media server. Use this for Radarr system status, queue state, calendar, root folders, quality profiles, existing movies, movie lookup, and adding a movie into the fixed destination root ${FIXED_RADARR_ROOT_FOLDER_PATH} with the deployment-fixed quality profile ${FIXED_RADARR_QUALITY_PROFILE_NAME}.`,
     input_schema_json: {
       type: "object",
       required: ["action"],
@@ -340,22 +344,30 @@ function radarrCapability(): CapabilityDescriptor {
             "calendar",
             "root_folders",
             "quality_profiles",
+            "inspect",
             "list_movies",
             "lookup_movie",
             "add_movie",
+            "download_movie",
+            "delete_movie",
           ],
           description:
-            "The Radarr operation to perform. Read actions inspect the movie library; add_movie looks up a movie and then adds it to Radarr."
+            "The Radarr operation to perform. Read actions inspect or look up movies without starting downloads; add_movie is the legacy add path; download_movie starts acquisition by adding the movie if needed and then triggering Radarr's search flow; delete_movie removes one tracked movie and deletes its files by default."
         },
         term: {
           type: "string",
           description:
-            "Search term for lookup_movie or add_movie. Use a precise movie title, year, or other lookup phrase."
+            "Search term for lookup_movie, add_movie, download_movie, or delete_movie. Use a precise movie title and optionally a year."
+        },
+        movie_id: {
+          type: "integer",
+          description:
+            "Optional tracked Radarr movie id to delete directly without title resolution."
         },
         tmdb_id: {
           type: "integer",
           description:
-            "Optional TMDb movie id used to disambiguate the chosen lookup result when add_movie finds multiple candidates."
+            "Optional TMDb movie id used to disambiguate the chosen lookup result when add_movie finds multiple candidates or to select the tracked movie to delete."
         },
         start: {
           type: "string",
@@ -372,16 +384,6 @@ function radarrCapability(): CapabilityDescriptor {
           description:
             "Whether the calendar action should include unmonitored movies."
         },
-        root_folder_path: {
-          type: "string",
-          description:
-            "Destination Radarr root folder path. Required for add_movie."
-        },
-        quality_profile_id: {
-          type: "integer",
-          description:
-            "Radarr quality profile id to assign when adding a movie. Required for add_movie."
-        },
         monitored: {
           type: "boolean",
           description:
@@ -389,7 +391,7 @@ function radarrCapability(): CapabilityDescriptor {
         },
         minimum_availability: {
           type: "string",
-          enum: ["tba", "announced", "inCinemas", "released"],
+          enum: ["tba", "announced", "inCinemas", "released", "deleted"],
           description:
             "Minimum Radarr availability state to wait for when adding a movie."
         },
@@ -412,11 +414,22 @@ function radarrCapability(): CapabilityDescriptor {
             type: "integer",
             description: "One Radarr tag id."
           }
+        },
+        delete_files: {
+          type: "boolean",
+          description:
+            "Whether delete_movie should remove the movie files from disk. Defaults to true."
+        },
+        add_import_exclusion: {
+          type: "boolean",
+          description:
+            "Whether delete_movie should add an import exclusion for the removed movie."
         }
       }
     },
     output_contract: "completed_result",
     side_effect_class: "service_api",
+    execution_safety_class: "approval_required",
     approval_mode: "policy_driven",
     execution_modes: ["sync"],
     provenance_namespace: "openclaw/openclaw-servarr/tool/radarr",
@@ -439,8 +452,14 @@ function sonarrCapability(): CapabilityDescriptor {
     capability_kind: "tool",
     owner_plugin_id: "openclaw-servarr",
     tool_name: "sonarr",
+    tool_family_id: "sonarr",
+    tool_family_name: "Sonarr",
+    tool_family_description:
+      "Inspect and manage the Sonarr television library on the media server.",
+    method_name: "generic",
+    method_description: "Call the generic Sonarr wrapper with an explicit action argument.",
     description:
-      "Inspect and manage the Sonarr series library on the LAN-connected media server. Use this for Sonarr system status, queue state, calendar, root folders, quality profiles, existing series, series lookup, and adding a series after you have the right folder and quality profile.",
+      `Inspect and manage the Sonarr series library on the LAN-connected media server. Use this for Sonarr system status, queue state, calendar, root folders, quality profiles, existing series, series lookup, and adding a series into the fixed destination root ${FIXED_SONARR_ROOT_FOLDER_PATH} with the deployment-fixed quality profile ${FIXED_SONARR_QUALITY_PROFILE_NAME}.`,
     input_schema_json: {
       type: "object",
       required: ["action"],
@@ -453,27 +472,35 @@ function sonarrCapability(): CapabilityDescriptor {
             "calendar",
             "root_folders",
             "quality_profiles",
+            "inspect",
             "list_series",
             "lookup_series",
             "add_series",
+            "download_series",
+            "delete_series",
           ],
           description:
-            "The Sonarr operation to perform. Read actions inspect the series library; add_series looks up a series and then adds it to Sonarr."
+            "The Sonarr operation to perform. Read actions inspect or look up series without starting downloads; add_series is the legacy add path; download_series starts acquisition by adding the series if needed and then triggering Sonarr's search flow; delete_series removes one tracked series and deletes its files by default."
         },
         term: {
           type: "string",
           description:
-            "Search term for lookup_series or add_series. Use a precise series title, year, or other lookup phrase."
+            "Search term for lookup_series, add_series, download_series, or delete_series. Use a precise series title and optionally a year."
+        },
+        series_id: {
+          type: "integer",
+          description:
+            "Optional tracked Sonarr series id to delete directly without title resolution."
         },
         tvdb_id: {
           type: "integer",
           description:
-            "Optional TVDb series id used to disambiguate the chosen lookup result when add_series finds multiple candidates."
+            "Optional TVDb series id used to disambiguate the chosen lookup result when add_series finds multiple candidates or to select the tracked series to delete."
         },
         tmdb_id: {
           type: "integer",
           description:
-            "Optional TMDb series id used to disambiguate the chosen lookup result when add_series finds multiple candidates."
+            "Optional TMDb series id used to disambiguate the chosen lookup result when add_series finds multiple candidates or to select the tracked series to delete."
         },
         start: {
           type: "string",
@@ -489,16 +516,6 @@ function sonarrCapability(): CapabilityDescriptor {
           type: "boolean",
           description:
             "Whether the calendar action should include unmonitored series."
-        },
-        root_folder_path: {
-          type: "string",
-          description:
-            "Destination Sonarr root folder path. Required for add_series."
-        },
-        quality_profile_id: {
-          type: "integer",
-          description:
-            "Sonarr quality profile id to assign when adding a series. Required for add_series."
         },
         monitored: {
           type: "boolean",
@@ -561,11 +578,22 @@ function sonarrCapability(): CapabilityDescriptor {
             type: "integer",
             description: "One Sonarr tag id."
           }
+        },
+        delete_files: {
+          type: "boolean",
+          description:
+            "Whether delete_series should remove the series files from disk. Defaults to true."
+        },
+        add_import_list_exclusion: {
+          type: "boolean",
+          description:
+            "Whether delete_series should add an import-list exclusion for the removed series."
         }
       }
     },
     output_contract: "completed_result",
     side_effect_class: "service_api",
+    execution_safety_class: "approval_required",
     approval_mode: "policy_driven",
     execution_modes: ["sync"],
     provenance_namespace: "openclaw/openclaw-servarr/tool/sonarr",
@@ -581,8 +609,596 @@ function sonarrCapability(): CapabilityDescriptor {
   };
 }
 
+function chaptarrCapability(): CapabilityDescriptor {
+  return {
+    capability_id: "openclaw.servarr.chaptarr",
+    tool_surface_id: "vicuna.media.chaptarr",
+    capability_kind: "tool",
+    owner_plugin_id: "openclaw-servarr",
+    tool_name: "chaptarr",
+    tool_family_id: "chaptarr",
+    tool_family_name: "Chaptarr",
+    tool_family_description:
+      "Inspect and manage the Chaptarr ebook library on the media server.",
+    method_name: "generic",
+    method_description: "Call the generic Chaptarr wrapper with an explicit action argument.",
+    description:
+      "Inspect and manage the Chaptarr ebook library on the LAN-connected media server. Use this for Chaptarr system and health status, queue status, root folders, ebook profile lookup, Hardcover-backed mixed search, author or book lookup, scoped book or series inspection, and starting ebook acquisition flows.",
+    input_schema_json: {
+      type: "object",
+      required: ["action"],
+      properties: {
+        action: {
+          type: "string",
+          enum: [
+            "system_status",
+            "health",
+            "queue_status",
+            "root_folders",
+            "quality_profiles",
+            "metadata_profiles",
+            "inspect",
+            "list_authors",
+            "search",
+            "author_lookup",
+            "book_lookup",
+            "list_books",
+            "list_series",
+            "add_author",
+            "add_book",
+            "download_author",
+            "download_book",
+            "delete_book",
+          ],
+          description:
+            `The Chaptarr operation to perform. Read actions inspect or look up authors and books without starting downloads; inspect is a generic alias for listing current authors; search uses Chaptarr's mixed discovery endpoint; add_author and add_book are legacy add paths; download_author and download_book start ebook acquisition using the fixed NAS Books root at ${FIXED_CHAPTARR_ROOT_FOLDER_PATH}; delete_book removes one tracked ebook and deletes its files by default.`
+        },
+        term: {
+          type: "string",
+          description:
+            "Search term for search, author_lookup, book_lookup, add_author, add_book, download_book, or delete_book. Use a precise author name, book title, or other lookup phrase."
+        },
+        provider: {
+          type: "string",
+          description:
+            "Optional upstream search provider for the generic search action. Omit it to let Chaptarr use its configured default, which is Hardcover on the current deployment."
+        },
+        foreign_author_id: {
+          type: "string",
+          description:
+            "Optional foreign author id used to disambiguate the selected lookup result when add_author finds multiple candidates."
+        },
+        foreign_book_id: {
+          type: "string",
+          description:
+            "Optional foreign book id used to disambiguate the selected lookup result when add_book finds multiple candidates or to select the tracked book to delete."
+        },
+        book_id: {
+          type: "integer",
+          description:
+            "Optional tracked Chaptarr local book id to delete directly without title resolution."
+        },
+        foreign_edition_id: {
+          type: "string",
+          description:
+            "Optional foreign edition id used to disambiguate the selected edition when add_book finds multiple candidates."
+        },
+        author_id: {
+          type: "integer",
+          description:
+            "Optional Chaptarr author id used to scope list_books or list_series to a single author."
+        },
+        media_type: {
+          type: "string",
+          enum: ["ebook"],
+          description:
+            "Media type selector for Chaptarr profile inspection. This deployment only exposes ebook handling."
+        },
+        quality_profile_id: {
+          type: "integer",
+          description:
+            "Chaptarr ebook quality profile id to assign when adding an author or book. Required for add_author and add_book."
+        },
+        metadata_profile_id: {
+          type: "integer",
+          description:
+            "Chaptarr metadata profile id to assign when adding an author or book. Required for add_author and add_book."
+        },
+        monitored: {
+          type: "boolean",
+          description:
+            "Whether the added author or added book should be monitored in Chaptarr."
+        },
+        any_edition_ok: {
+          type: "boolean",
+          description:
+            "Whether add_book may accept any edition instead of requiring one specific monitored edition."
+        },
+        monitor_new_items: {
+          type: "string",
+          enum: ["all", "none", "new"],
+          description:
+            "How Chaptarr should monitor newly discovered items for the added author."
+        },
+        monitor: {
+          type: "string",
+          enum: ["all", "future", "missing", "existing", "latest", "first", "none", "unknown"],
+          description:
+            "Chaptarr author-monitor mode used inside add_author addOptions."
+        },
+        search_for_missing_books: {
+          type: "boolean",
+          description:
+            "Whether Chaptarr should immediately search for missing books after adding the author."
+        },
+        search_for_new_book: {
+          type: "boolean",
+          description:
+            "Whether add_book should immediately search indexers and download clients for the newly added book."
+        },
+        tags: {
+          type: "array",
+          description:
+            "Optional Chaptarr tag ids to assign to the author when adding it.",
+          items: {
+            type: "integer",
+            description: "One Chaptarr tag id."
+          }
+        },
+        delete_files: {
+          type: "boolean",
+          description:
+            "Whether delete_book should remove the ebook files from disk. Defaults to true."
+        },
+        add_import_list_exclusion: {
+          type: "boolean",
+          description:
+            "Whether delete_book should add an import-list exclusion for the removed tracked book."
+        }
+      }
+    },
+    output_contract: "completed_result",
+    side_effect_class: "service_api",
+    execution_safety_class: "approval_required",
+    approval_mode: "policy_driven",
+    execution_modes: ["sync"],
+    provenance_namespace: "openclaw/openclaw-servarr/tool/chaptarr",
+    tool_kind: 4,
+    tool_flags: combineToolFlags(
+      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      COG_TOOL_FLAG_DMN_ELIGIBLE,
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+    ),
+    latency_class: 1,
+    max_steps_reserved: 3,
+    dispatch_backend: "legacy_bash"
+  };
+}
+
+type CapabilitySchema = {
+  type: "object";
+  required?: string[];
+  properties: Record<string, unknown>;
+};
+
+type CapabilityAliasOptions = {
+  capabilityId: string;
+  toolSurfaceId: string;
+  toolName: string;
+  toolFamilyId?: string;
+  toolFamilyName?: string;
+  toolFamilyDescription?: string;
+  methodName: string;
+  methodDescription: string;
+  description: string;
+  fixedArguments: Record<string, unknown>;
+  includeProperties: string[];
+  requiredProperties?: string[];
+  provenanceSuffix?: string;
+  sideEffectClass?: string;
+  executionSafetyClass?: string;
+  toolFlags?: number;
+};
+
+function pickSchemaProperties(schema: CapabilitySchema, keys: string[]): Record<string, unknown> {
+  const picked: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (key in schema.properties) {
+      picked[key] = schema.properties[key];
+    }
+  }
+  return picked;
+}
+
+function makeCapabilityAlias(
+  base: CapabilityDescriptor,
+  options: CapabilityAliasOptions
+): CapabilityDescriptor {
+  const schema = base.input_schema_json as CapabilitySchema;
+  const sideEffectClass = options.sideEffectClass ?? base.side_effect_class;
+  const requiredFromBase = new Set(
+    Array.isArray(schema.required) ? schema.required.filter((entry) => entry !== "action") : []
+  );
+  const requiredProperties =
+    options.requiredProperties ??
+    options.includeProperties.filter((key) => requiredFromBase.has(key));
+  return {
+    ...base,
+    capability_id: options.capabilityId,
+    tool_surface_id: options.toolSurfaceId,
+    tool_name: options.toolName,
+    tool_family_id: options.toolFamilyId ?? base.tool_family_id ?? base.tool_name,
+    tool_family_name: options.toolFamilyName ?? base.tool_family_name ?? base.tool_name,
+    tool_family_description:
+      options.toolFamilyDescription ?? base.tool_family_description ?? base.description,
+    method_name: options.methodName,
+    method_description: options.methodDescription,
+    description: options.description,
+    input_schema_json: {
+      type: "object",
+      ...(requiredProperties.length > 0 ? { required: requiredProperties } : {}),
+      properties: pickSchemaProperties(schema, options.includeProperties)
+    },
+    fixed_arguments_json: options.fixedArguments,
+    side_effect_class: sideEffectClass,
+    execution_safety_class:
+      options.executionSafetyClass ??
+      executionSafetyClassForSideEffectClass(sideEffectClass),
+    tool_flags: options.toolFlags ?? base.tool_flags,
+    provenance_namespace: `${base.provenance_namespace}/${options.provenanceSuffix ?? options.toolName}`
+  };
+}
+
+function mediaRuntimeCapabilities(): CapabilityDescriptor[] {
+  const radarr = radarrCapability();
+  const sonarr = sonarrCapability();
+  const chaptarr = chaptarrCapability();
+  const readOnlyToolFlags = combineToolFlags(
+    COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+    COG_TOOL_FLAG_DMN_ELIGIBLE,
+    COG_TOOL_FLAG_SIMULATION_SAFE,
+    COG_TOOL_FLAG_REMEDIATION_SAFE
+  );
+  const acquisitionToolFlags = combineToolFlags(
+    COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+    COG_TOOL_FLAG_DMN_ELIGIBLE,
+    COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+  );
+
+  return [
+    makeCapabilityAlias(radarr, {
+      capabilityId: "openclaw.servarr.radarr.inspect",
+      toolSurfaceId: "vicuna.media.radarr.inspect",
+      toolName: "radarr_inspect",
+      methodName: "inspect",
+      methodDescription: "List the movies already tracked in Radarr.",
+      description: "Inspect the current Radarr movie library by listing the movies already tracked on the media server.",
+      fixedArguments: { action: "inspect" },
+      includeProperties: [],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(radarr, {
+      capabilityId: "openclaw.servarr.radarr.queue",
+      toolSurfaceId: "vicuna.media.radarr.queue",
+      toolName: "radarr_queue",
+      methodName: "queue",
+      methodDescription: "Inspect the current Radarr download queue.",
+      description: "Inspect the current Radarr download queue on the media server.",
+      fixedArguments: { action: "queue" },
+      includeProperties: [],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(radarr, {
+      capabilityId: "openclaw.servarr.radarr.root-folders",
+      toolSurfaceId: "vicuna.media.radarr.root_folders",
+      toolName: "radarr_root_folders",
+      methodName: "root_folders",
+      methodDescription: "List the configured Radarr root folders.",
+      description: "List the configured Radarr root folders as read-only service state. This does not start any download.",
+      fixedArguments: { action: "root_folders" },
+      includeProperties: [],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(radarr, {
+      capabilityId: "openclaw.servarr.radarr.quality-profiles",
+      toolSurfaceId: "vicuna.media.radarr.quality_profiles",
+      toolName: "radarr_quality_profiles",
+      methodName: "quality_profiles",
+      methodDescription: "List the configured Radarr quality profiles.",
+      description: "List the configured Radarr quality profiles as read-only service state. This does not start any download.",
+      fixedArguments: { action: "quality_profiles" },
+      includeProperties: [],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(radarr, {
+      capabilityId: "openclaw.servarr.radarr.search",
+      toolSurfaceId: "vicuna.media.radarr.search",
+      toolName: "radarr_search",
+      methodName: "lookup_movie",
+      methodDescription: "Look up movie candidates in Radarr by title or identifier without starting any download.",
+      description: "Search Radarr's movie lookup endpoint for a movie title or identifier. This is discovery only and does not add the movie or start a download.",
+      fixedArguments: { action: "lookup_movie" },
+      includeProperties: ["term"],
+      requiredProperties: ["term"],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(radarr, {
+      capabilityId: "openclaw.servarr.radarr.download-movie",
+      toolSurfaceId: "vicuna.media.radarr.download_movie",
+      toolName: "radarr_download_movie",
+      methodName: "download_movie",
+      methodDescription: "Start Radarr movie acquisition for the requested title.",
+      description: `Start Radarr movie acquisition for the requested title. If the movie is not yet tracked, this method adds it into the fixed destination root ${FIXED_RADARR_ROOT_FOLDER_PATH} with the deployment-fixed quality profile ${FIXED_RADARR_QUALITY_PROFILE_NAME} and requests an immediate search. If the movie is already tracked, this method triggers Radarr's native Movies Search command for the existing item.`,
+      fixedArguments: { action: "download_movie" },
+      includeProperties: [
+        "term",
+        "tmdb_id",
+        "monitored",
+        "minimum_availability",
+        "monitor",
+        "search_for_movie",
+        "tags",
+      ],
+      requiredProperties: ["term"],
+      sideEffectClass: "service_acquisition",
+      toolFlags: acquisitionToolFlags,
+    }),
+    makeCapabilityAlias(radarr, {
+      capabilityId: "openclaw.servarr.radarr.delete-movie",
+      toolSurfaceId: "vicuna.media.radarr.delete_movie",
+      toolName: "radarr_delete_movie",
+      methodName: "delete_movie",
+      methodDescription: "Delete one tracked Radarr movie and remove its files from disk.",
+      description: "Delete one tracked Radarr movie from the library and remove its files from `/movies` by default. Resolve the target by tracked movie id, TMDb id, or one precise tracked title match.",
+      fixedArguments: { action: "delete_movie" },
+      includeProperties: ["term", "movie_id", "tmdb_id", "delete_files", "add_import_exclusion"],
+      sideEffectClass: "service_api",
+      toolFlags: acquisitionToolFlags,
+    }),
+    makeCapabilityAlias(sonarr, {
+      capabilityId: "openclaw.servarr.sonarr.inspect",
+      toolSurfaceId: "vicuna.media.sonarr.inspect",
+      toolName: "sonarr_inspect",
+      methodName: "inspect",
+      methodDescription: "List the series already tracked in Sonarr.",
+      description: "Inspect the current Sonarr series library by listing the series already tracked on the media server.",
+      fixedArguments: { action: "inspect" },
+      includeProperties: [],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(sonarr, {
+      capabilityId: "openclaw.servarr.sonarr.queue",
+      toolSurfaceId: "vicuna.media.sonarr.queue",
+      toolName: "sonarr_queue",
+      methodName: "queue",
+      methodDescription: "Inspect the current Sonarr download queue.",
+      description: "Inspect the current Sonarr download queue on the media server.",
+      fixedArguments: { action: "queue" },
+      includeProperties: [],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(sonarr, {
+      capabilityId: "openclaw.servarr.sonarr.root-folders",
+      toolSurfaceId: "vicuna.media.sonarr.root_folders",
+      toolName: "sonarr_root_folders",
+      methodName: "root_folders",
+      methodDescription: "List the configured Sonarr root folders.",
+      description: "List the configured Sonarr root folders as read-only service state. This does not start any download.",
+      fixedArguments: { action: "root_folders" },
+      includeProperties: [],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(sonarr, {
+      capabilityId: "openclaw.servarr.sonarr.quality-profiles",
+      toolSurfaceId: "vicuna.media.sonarr.quality_profiles",
+      toolName: "sonarr_quality_profiles",
+      methodName: "quality_profiles",
+      methodDescription: "List the configured Sonarr quality profiles.",
+      description: "List the configured Sonarr quality profiles as read-only service state. This does not start any download.",
+      fixedArguments: { action: "quality_profiles" },
+      includeProperties: [],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(sonarr, {
+      capabilityId: "openclaw.servarr.sonarr.search",
+      toolSurfaceId: "vicuna.media.sonarr.search",
+      toolName: "sonarr_search",
+      methodName: "lookup_series",
+      methodDescription: "Look up series candidates in Sonarr by title or identifier without starting any download.",
+      description: "Search Sonarr's series lookup endpoint for a series title or identifier. This is discovery only and does not add the series or start a download.",
+      fixedArguments: { action: "lookup_series" },
+      includeProperties: ["term"],
+      requiredProperties: ["term"],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(sonarr, {
+      capabilityId: "openclaw.servarr.sonarr.download-series",
+      toolSurfaceId: "vicuna.media.sonarr.download_series",
+      toolName: "sonarr_download_series",
+      methodName: "download_series",
+      methodDescription: "Start Sonarr series acquisition for the requested title.",
+      description: `Start Sonarr series acquisition for the requested title. If the series is not yet tracked, this method adds it into the fixed destination root ${FIXED_SONARR_ROOT_FOLDER_PATH} with the deployment-fixed quality profile ${FIXED_SONARR_QUALITY_PROFILE_NAME} and requests an immediate missing-episode search. If the series is already tracked, this method triggers Sonarr's native Series Search command for the existing item.`,
+      fixedArguments: { action: "download_series" },
+      includeProperties: [
+        "term",
+        "tvdb_id",
+        "tmdb_id",
+        "monitored",
+        "season_folder",
+        "series_type",
+        "monitor_new_items",
+        "monitor",
+        "search_for_missing_episodes",
+        "search_for_cutoff_unmet_episodes",
+        "tags",
+      ],
+      requiredProperties: ["term"],
+      sideEffectClass: "service_acquisition",
+      toolFlags: acquisitionToolFlags,
+    }),
+    makeCapabilityAlias(sonarr, {
+      capabilityId: "openclaw.servarr.sonarr.delete-series",
+      toolSurfaceId: "vicuna.media.sonarr.delete_series",
+      toolName: "sonarr_delete_series",
+      methodName: "delete_series",
+      methodDescription: "Delete one tracked Sonarr series and remove its files from disk.",
+      description: "Delete one tracked Sonarr series from the library and remove its files from `/tv` by default. Resolve the target by tracked series id, TVDb id, TMDb id, or one precise tracked title match.",
+      fixedArguments: { action: "delete_series" },
+      includeProperties: ["term", "series_id", "tvdb_id", "tmdb_id", "delete_files", "add_import_list_exclusion"],
+      sideEffectClass: "service_api",
+      toolFlags: acquisitionToolFlags,
+    }),
+    makeCapabilityAlias(chaptarr, {
+      capabilityId: "openclaw.servarr.chaptarr.inspect",
+      toolSurfaceId: "vicuna.media.chaptarr.inspect",
+      toolName: "chaptarr_inspect",
+      methodName: "inspect",
+      methodDescription: "List the authors already tracked in Chaptarr.",
+      description: "Inspect the current Chaptarr library by listing the authors already tracked on the media server.",
+      fixedArguments: { action: "inspect" },
+      includeProperties: [],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(chaptarr, {
+      capabilityId: "openclaw.servarr.chaptarr.queue",
+      toolSurfaceId: "vicuna.media.chaptarr.queue",
+      toolName: "chaptarr_queue",
+      methodName: "queue_status",
+      methodDescription: "Inspect the current Chaptarr queue status.",
+      description: "Inspect the current Chaptarr queue status on the media server.",
+      fixedArguments: { action: "queue_status" },
+      includeProperties: [],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(chaptarr, {
+      capabilityId: "openclaw.servarr.chaptarr.root-folders",
+      toolSurfaceId: "vicuna.media.chaptarr.root_folders",
+      toolName: "chaptarr_root_folders",
+      methodName: "root_folders",
+      methodDescription: "List the configured Chaptarr root folders.",
+      description: "List the configured Chaptarr root folders as read-only service state. This does not start any download.",
+      fixedArguments: { action: "root_folders" },
+      includeProperties: [],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(chaptarr, {
+      capabilityId: "openclaw.servarr.chaptarr.quality-profiles",
+      toolSurfaceId: "vicuna.media.chaptarr.quality_profiles",
+      toolName: "chaptarr_quality_profiles",
+      methodName: "quality_profiles",
+      methodDescription: "List the configured Chaptarr quality profiles.",
+      description: "List the configured Chaptarr ebook quality profiles as read-only service state. This does not start any download.",
+      fixedArguments: { action: "quality_profiles" },
+      includeProperties: [],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(chaptarr, {
+      capabilityId: "openclaw.servarr.chaptarr.metadata-profiles",
+      toolSurfaceId: "vicuna.media.chaptarr.metadata_profiles",
+      toolName: "chaptarr_metadata_profiles",
+      methodName: "metadata_profiles",
+      methodDescription: "List the configured Chaptarr metadata profiles.",
+      description: "List the configured Chaptarr ebook metadata profiles as read-only service state. This does not start any download.",
+      fixedArguments: { action: "metadata_profiles" },
+      includeProperties: [],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(chaptarr, {
+      capabilityId: "openclaw.servarr.chaptarr.search",
+      toolSurfaceId: "vicuna.media.chaptarr.search",
+      toolName: "chaptarr_search",
+      methodName: "search",
+      methodDescription: "Run Chaptarr's mixed discovery search for an author or book query without starting any download.",
+      description: "Run Chaptarr's mixed discovery search for an author or book query. This is discovery only and does not add media or start a download.",
+      fixedArguments: { action: "search" },
+      includeProperties: ["term", "provider"],
+      requiredProperties: ["term"],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(chaptarr, {
+      capabilityId: "openclaw.servarr.chaptarr.author-lookup",
+      toolSurfaceId: "vicuna.media.chaptarr.author_lookup",
+      toolName: "chaptarr_author_lookup",
+      methodName: "author_lookup",
+      methodDescription: "Look up authors in Chaptarr by name or identifier without starting any download.",
+      description: "Look up authors in Chaptarr by name or identifier. This is discovery only and does not start any download.",
+      fixedArguments: { action: "author_lookup" },
+      includeProperties: ["term"],
+      requiredProperties: ["term"],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(chaptarr, {
+      capabilityId: "openclaw.servarr.chaptarr.book-lookup",
+      toolSurfaceId: "vicuna.media.chaptarr.book_lookup",
+      toolName: "chaptarr_book_lookup",
+      methodName: "book_lookup",
+      methodDescription: "Look up books in Chaptarr by title or identifier without starting any download.",
+      description: "Look up books in Chaptarr by title or identifier. This is discovery only and does not start any download.",
+      fixedArguments: { action: "book_lookup" },
+      includeProperties: ["term"],
+      requiredProperties: ["term"],
+      sideEffectClass: "service_read",
+      toolFlags: readOnlyToolFlags,
+    }),
+    makeCapabilityAlias(chaptarr, {
+      capabilityId: "openclaw.servarr.chaptarr.download-author",
+      toolSurfaceId: "vicuna.media.chaptarr.download_author",
+      toolName: "chaptarr_download_author",
+      methodName: "download_author",
+      methodDescription: "Start ebook-only Chaptarr acquisition for an author's catalog.",
+      description: `Start ebook-only Chaptarr acquisition for an author's catalog. If the author is not yet tracked, this method adds the author into the fixed NAS Books folder at ${FIXED_CHAPTARR_ROOT_FOLDER_PATH} with the deployment-fixed Ebook quality and Ebook Default metadata profiles and immediate search enabled. If the author is already tracked, this method repairs the existing author into ebook defaults and then triggers Chaptarr's native Author Search command. This starts acquisition/search; it does not guarantee a completed download/import.`,
+      fixedArguments: { action: "download_author" },
+      includeProperties: ["term", "foreign_author_id"],
+      requiredProperties: ["term"],
+      sideEffectClass: "service_acquisition",
+      toolFlags: acquisitionToolFlags,
+    }),
+    makeCapabilityAlias(chaptarr, {
+      capabilityId: "openclaw.servarr.chaptarr.download-book",
+      toolSurfaceId: "vicuna.media.chaptarr.download_book",
+      toolName: "chaptarr_download_book",
+      methodName: "download_book",
+      methodDescription: "Start ebook-only Chaptarr acquisition for a specific title.",
+      description: `Start ebook-only Chaptarr acquisition for a specific title. If the book is not yet tracked, this method adds it using Hardcover-backed search results, the fixed NAS Books folder at ${FIXED_CHAPTARR_ROOT_FOLDER_PATH}, and the deployment-fixed Ebook quality and Ebook Default metadata profiles with immediate search enabled. If the book is already tracked, this method repairs the existing author and book into ebook acquisition state, enables monitoring on the tracked book, and then triggers Chaptarr's native Book Search command. This starts acquisition/search; it does not guarantee a completed download/import.`,
+      fixedArguments: { action: "download_book" },
+      includeProperties: ["term", "foreign_book_id", "foreign_edition_id"],
+      requiredProperties: ["term"],
+      sideEffectClass: "service_acquisition",
+      toolFlags: acquisitionToolFlags,
+    }),
+    makeCapabilityAlias(chaptarr, {
+      capabilityId: "openclaw.servarr.chaptarr.delete-book",
+      toolSurfaceId: "vicuna.media.chaptarr.delete_book",
+      toolName: "chaptarr_delete_book",
+      methodName: "delete_book",
+      methodDescription: "Delete one tracked Chaptarr book and remove its files from disk.",
+      description: "Delete one tracked Chaptarr ebook from the library and remove its files from `/books` by default. Resolve the target by tracked local book id, foreign book id, or one precise tracked title match.",
+      fixedArguments: { action: "delete_book" },
+      includeProperties: ["term", "book_id", "foreign_book_id", "delete_files", "add_import_list_exclusion"],
+      sideEffectClass: "service_api",
+      toolFlags: acquisitionToolFlags,
+    }),
+  ];
+}
+
 const BUILTIN_CAPABILITIES: Record<BuiltinToolId, () => CapabilityDescriptor> = {
-  exec: execCapability,
   hard_memory_query: hardMemoryCapability,
   hard_memory_write: hardMemoryWriteCapability,
   codex: codexCapability
@@ -592,9 +1208,6 @@ export function buildCatalog(options: CatalogOptions = {}): CapabilityCatalog {
   const enabledTools = new Set<BuiltinToolId>(
     options.enabledTools ??
       (Object.keys(BUILTIN_CAPABILITIES) as BuiltinToolId[]).filter((toolId) => {
-        if (toolId === "exec") {
-          return options.enableExec !== false;
-        }
         if (toolId === "hard_memory_query") {
           return options.enableHardMemoryQuery !== false;
         }
@@ -621,7 +1234,7 @@ export function buildCatalog(options: CatalogOptions = {}): CapabilityCatalog {
 }
 
 export function buildRuntimeCatalog(options: RuntimeCatalogOptions = {}): CapabilityCatalog {
-  const capabilities: CapabilityDescriptor[] = [radarrCapability(), sonarrCapability()];
+  const capabilities: CapabilityDescriptor[] = mediaRuntimeCapabilities();
   const tavilyApiKey = options.secrets?.tools?.tavily?.api_key?.trim();
   if (tavilyApiKey) {
     capabilities.push(tavilyWebSearchCapability());
