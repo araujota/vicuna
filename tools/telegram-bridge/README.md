@@ -200,6 +200,9 @@ even simple allowed commands from forking on a busy workstation.
 - fresh or transcript-reset bridge state does not replay the retained runtime
   outbox backlog by default; explicit replay requires
   `TELEGRAM_BRIDGE_REPLAY_RETAINED_OUTBOX=1`
+- runtime outbox items that fail with terminal Telegram delivery errors such as
+  `chat not found` or `bot was blocked by the user` are now logged and skipped,
+  so one dead chat cannot pin every later follow-up behind it forever
 - if the bridge appears to answer an older Telegram topic, inspect the bridge
   state file and journal together: if `telegramOffset` is still increasing and
   new `appended Telegram user turn` entries appear, the defect is in transcript
@@ -227,6 +230,11 @@ For a clean transcript reset without replaying old runtime follow-ups:
 
 Do not clear the outbox checkpoint fields unless you explicitly intend to
 replay retained runtime outbox items.
+
+If a stale retained outbox item is already blocking current delivery, the safe
+operator repair is to preserve `telegramOffset`, inspect the newest retained
+runtime outbox sequence, and fast-forward `telegramOutboxOffset` only to that
+known safe frontier before restarting the bridge.
 
 ## Test
 

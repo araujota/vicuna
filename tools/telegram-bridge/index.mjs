@@ -21,6 +21,7 @@ import {
   getChatTranscript,
   ingestTelegramDocumentMessage,
   isTelegramReplyTargetErrorMessage,
+  isTelegramTerminalDeliveryErrorMessage,
   loadState,
   normalizeTelegramOutboxItem,
   parseInteger,
@@ -810,112 +811,134 @@ async function pollTelegramAskOutboxLoop() {
         }
 
         const sequenceNumber = normalizedItem.sequenceNumber;
-        if (normalizedItem.kind === 'message') {
+        try {
+          if (normalizedItem.kind === 'message') {
+            const chatId = normalizedItem.chatId;
+            const text = normalizedItem.text;
+            const replyToMessageId = normalizedItem.replyToMessageId;
+            const resolvedConversation = resolveTelegramConversationForOutbound(state, chatId, {
+              replyToMessageId,
+            });
+            state = resolvedConversation.state;
+            const delivery = await sendTelegramOutboxMessage(chatId, text, replyToMessageId);
+            const sent = delivery.sent;
+            state = appendChatTranscriptMessage(
+              state,
+              chatId,
+              'assistant',
+              text,
+              {
+                maxHistoryMessages: env.maxHistoryMessages,
+                conversationId: resolvedConversation.conversationId,
+                telegramMessageId: Number(sent?.message_id ?? 0) || 0,
+              },
+            );
+            state = setTelegramOutboxCheckpoint(
+              state,
+              Math.max(state.telegramOutboxOffset, sequenceNumber),
+              { maxHistoryMessages: env.maxHistoryMessages },
+            );
+            state = recordTelegramOutboxDeliveryReceipt(state, {
+              sequenceNumber,
+              chatId,
+              replyToMessageId: delivery.requestedReplyToMessageId,
+              deliveryMode: delivery.deliveryMode === 'no_reply' ? 'fallback_no_reply' : delivery.deliveryMode,
+              telegramMessageId: Number(sent?.message_id ?? 0) || 0,
+              deliveredAtMs: Date.now(),
+            }, { maxHistoryMessages: env.maxHistoryMessages });
+            await persistState();
+            log('delivered Telegram follow-up message', {
+              chatId,
+              conversationId: resolvedConversation.conversationId,
+              sequenceNumber,
+              replyToMessageId,
+              deliveryMode: delivery.deliveryMode,
+              telegramMessageId: Number(sent?.message_id ?? 0) || 0,
+              fallbackError: delivery.fallbackError || undefined,
+            });
+            continue;
+          }
+
           const chatId = normalizedItem.chatId;
-          const text = normalizedItem.text;
-          const replyToMessageId = normalizedItem.replyToMessageId;
-          const resolvedConversation = resolveTelegramConversationForOutbound(state, chatId, {
-            replyToMessageId,
-          });
+          const question = normalizedItem.question;
+          const options = normalizedItem.options;
+          const promptId = `o${sequenceNumber.toString(36)}`;
+          const resolvedConversation = resolveTelegramConversationForOutbound(state, chatId, {});
           state = resolvedConversation.state;
-          const delivery = await sendTelegramOutboxMessage(chatId, text, replyToMessageId);
-          const sent = delivery.sent;
+          const replyMarkup = {
+            inline_keyboard: options.map((label, index) => ([{
+              text: label,
+              callback_data: buildOptionCallbackData(promptId, index),
+            }])),
+          };
+          const promptDelivery = normalizedItem.kind === 'approval_request'
+            ? await sendTelegramPromptMessage(chatId, question, replyMarkup, normalizedItem.replyToMessageId)
+            : { sent: await sendTelegramMessage(chatId, question, { reply_markup: replyMarkup }) };
+          const result = promptDelivery.sent;
+
           state = appendChatTranscriptMessage(
             state,
             chatId,
             'assistant',
-            text,
+            question,
             {
               maxHistoryMessages: env.maxHistoryMessages,
               conversationId: resolvedConversation.conversationId,
-              telegramMessageId: Number(sent?.message_id ?? 0) || 0,
+              telegramMessageId: Number(result?.message_id ?? 0) || 0,
             },
           );
+          state = setPendingOptionPrompt(state, promptId, {
+            kind: normalizedItem.kind,
+            approvalId: normalizedItem.kind === 'approval_request' ? normalizedItem.approvalId : '',
+            chatId,
+            question,
+            options,
+            conversationId: resolvedConversation.conversationId,
+            telegramMessageId: Number(result?.message_id ?? 0) || 0,
+            createdAtMs: Date.now(),
+          }, { maxHistoryMessages: env.maxHistoryMessages });
           state = setTelegramOutboxCheckpoint(
             state,
             Math.max(state.telegramOutboxOffset, sequenceNumber),
             { maxHistoryMessages: env.maxHistoryMessages },
           );
-          state = recordTelegramOutboxDeliveryReceipt(state, {
-            sequenceNumber,
-            chatId,
-            replyToMessageId: delivery.requestedReplyToMessageId,
-            deliveryMode: delivery.deliveryMode === 'no_reply' ? 'fallback_no_reply' : delivery.deliveryMode,
-            telegramMessageId: Number(sent?.message_id ?? 0) || 0,
-            deliveredAtMs: Date.now(),
-          }, { maxHistoryMessages: env.maxHistoryMessages });
           await persistState();
-          log('delivered Telegram follow-up message', {
-            chatId,
-            conversationId: resolvedConversation.conversationId,
-            sequenceNumber,
-            replyToMessageId,
-            deliveryMode: delivery.deliveryMode,
-            telegramMessageId: Number(sent?.message_id ?? 0) || 0,
-            fallbackError: delivery.fallbackError || undefined,
-          });
-          continue;
+          log(
+            normalizedItem.kind === 'approval_request'
+              ? 'delivered Telegram approval prompt'
+              : 'delivered Telegram ask-with-options prompt',
+            {
+              chatId,
+              conversationId: resolvedConversation.conversationId,
+              promptId,
+              approvalId: normalizedItem.kind === 'approval_request' ? normalizedItem.approvalId : undefined,
+              optionCount: options.length,
+              replyToMessageId: normalizedItem.replyToMessageId ?? 0,
+              deliveryMode: promptDelivery.deliveryMode ?? 'no_reply',
+              telegramMessageId: Number(result?.message_id ?? 0) || 0,
+              fallbackError: promptDelivery.fallbackError || undefined,
+            },
+          );
+        } catch (error) {
+          if (normalizedItem.skippable && isTelegramTerminalDeliveryErrorMessage(error?.message)) {
+            state = setTelegramOutboxCheckpoint(
+              state,
+              Math.max(state.telegramOutboxOffset, sequenceNumber),
+              { maxHistoryMessages: env.maxHistoryMessages },
+            );
+            await persistState();
+            log('skipped terminally undeliverable Telegram outbox item', {
+              sequenceNumber,
+              kind: normalizedItem.kind,
+              chatId: normalizedItem.chatId,
+              replyToMessageId: normalizedItem.replyToMessageId ?? 0,
+              approvalId: normalizedItem.kind === 'approval_request' ? normalizedItem.approvalId : undefined,
+              error: error.message,
+            });
+            continue;
+          }
+          throw error;
         }
-
-        const chatId = normalizedItem.chatId;
-        const question = normalizedItem.question;
-        const options = normalizedItem.options;
-        const promptId = `o${sequenceNumber.toString(36)}`;
-        const resolvedConversation = resolveTelegramConversationForOutbound(state, chatId, {});
-        state = resolvedConversation.state;
-        const replyMarkup = {
-          inline_keyboard: options.map((label, index) => ([{
-            text: label,
-            callback_data: buildOptionCallbackData(promptId, index),
-          }])),
-        };
-        const promptDelivery = normalizedItem.kind === 'approval_request'
-          ? await sendTelegramPromptMessage(chatId, question, replyMarkup, normalizedItem.replyToMessageId)
-          : { sent: await sendTelegramMessage(chatId, question, { reply_markup: replyMarkup }) };
-        const result = promptDelivery.sent;
-
-        state = appendChatTranscriptMessage(
-          state,
-          chatId,
-          'assistant',
-          question,
-          {
-            maxHistoryMessages: env.maxHistoryMessages,
-            conversationId: resolvedConversation.conversationId,
-            telegramMessageId: Number(result?.message_id ?? 0) || 0,
-          },
-        );
-        state = setPendingOptionPrompt(state, promptId, {
-          kind: normalizedItem.kind,
-          approvalId: normalizedItem.kind === 'approval_request' ? normalizedItem.approvalId : '',
-          chatId,
-          question,
-          options,
-          conversationId: resolvedConversation.conversationId,
-          telegramMessageId: Number(result?.message_id ?? 0) || 0,
-          createdAtMs: Date.now(),
-        }, { maxHistoryMessages: env.maxHistoryMessages });
-        state = setTelegramOutboxCheckpoint(
-          state,
-          Math.max(state.telegramOutboxOffset, sequenceNumber),
-          { maxHistoryMessages: env.maxHistoryMessages },
-        );
-        await persistState();
-        log(
-          normalizedItem.kind === 'approval_request'
-            ? 'delivered Telegram approval prompt'
-            : 'delivered Telegram ask-with-options prompt',
-          {
-          chatId,
-          conversationId: resolvedConversation.conversationId,
-          promptId,
-          approvalId: normalizedItem.kind === 'approval_request' ? normalizedItem.approvalId : undefined,
-          optionCount: options.length,
-          replyToMessageId: normalizedItem.replyToMessageId ?? 0,
-          deliveryMode: promptDelivery.deliveryMode ?? 'no_reply',
-          telegramMessageId: Number(result?.message_id ?? 0) || 0,
-          fallbackError: promptDelivery.fallbackError || undefined,
-        });
       }
     } catch (error) {
       log(`Telegram ask-with-options outbox polling error: ${error.message}`);

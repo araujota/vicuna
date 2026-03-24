@@ -684,6 +684,20 @@ export function isTelegramReplyTargetErrorMessage(message) {
     normalized.includes('replied message not found');
 }
 
+export function isTelegramTerminalDeliveryErrorMessage(message) {
+  const normalized = String(message ?? '').trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return normalized.includes('chat not found') ||
+    normalized.includes('bot was blocked by the user') ||
+    normalized.includes('user is deactivated') ||
+    normalized.includes('bot was kicked from the group chat') ||
+    normalized.includes('bot was kicked from the supergroup chat') ||
+    normalized.includes('group chat was deleted') ||
+    normalized.includes('bot is not a member of the channel chat');
+}
+
 export function appendProactiveId(state, responseId) {
   const proactiveResponseIds = uniqueStrings([
     ...state.proactiveResponseIds,

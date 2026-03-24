@@ -21,6 +21,7 @@ import {
   getLatestConversationId,
   ingestTelegramDocumentMessage,
   isTelegramReplyTargetErrorMessage,
+  isTelegramTerminalDeliveryErrorMessage,
   loadState,
   normalizeDocumentPlainText,
   normalizeTelegramOutboxItem,
@@ -751,6 +752,14 @@ test('setTelegramOutboxCheckpoint preserves explicit resume progress', () => {
 test('isTelegramReplyTargetErrorMessage identifies reply-target failures', () => {
   assert.equal(isTelegramReplyTargetErrorMessage('telegram sendMessage failed: 400 {"ok":false,"description":"Bad Request: reply message not found"}'), true);
   assert.equal(isTelegramReplyTargetErrorMessage('telegram sendMessage failed: 403 {"ok":false,"description":"Forbidden: bot was blocked by the user"}'), false);
+});
+
+test('isTelegramTerminalDeliveryErrorMessage identifies terminal chat delivery failures', () => {
+  assert.equal(isTelegramTerminalDeliveryErrorMessage('telegram sendMessage failed: 400 {"ok":false,"description":"Bad Request: chat not found"}'), true);
+  assert.equal(isTelegramTerminalDeliveryErrorMessage('telegram sendMessage failed: 403 {"ok":false,"description":"Forbidden: bot was blocked by the user"}'), true);
+  assert.equal(isTelegramTerminalDeliveryErrorMessage('telegram sendMessage failed: 403 {"ok":false,"description":"Forbidden: bot is not a member of the channel chat"}'), true);
+  assert.equal(isTelegramTerminalDeliveryErrorMessage('telegram sendMessage failed: 400 {"ok":false,"description":"Bad Request: reply message not found"}'), false);
+  assert.equal(isTelegramTerminalDeliveryErrorMessage('telegram sendMessage failed: 500 {"ok":false,"description":"Internal Server Error"}'), false);
 });
 
 test('normalizeTelegramOutboxItem validates message follow-ups', () => {
