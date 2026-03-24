@@ -95,6 +95,21 @@ bool foreground_request_requires_external_action(const std::string & text);
 bool authoritative_reply_is_procedural_non_answer(const std::string & text);
 bool authoritative_retry_requires_tool_escalation(const std::string & text, int32_t retry_count);
 bool authoritative_visible_reply_looks_like_question(const std::string & text);
+bool authoritative_visible_reply_looks_like_control_json(const std::string & text);
+bool authoritative_normalize_required_action_json(
+        const std::string & visible_text,
+        const std::string & expected_action,
+        json * out_payload,
+        std::string * out_normalized_visible,
+        bool * out_recovered = nullptr,
+        std::string * out_error = nullptr);
+bool authoritative_normalize_required_action_json(
+        const std::string & visible_text,
+        const std::string & expected_action,
+        nlohmann::json * out_payload,
+        std::string * out_normalized_visible,
+        bool * out_recovered = nullptr,
+        std::string * out_error = nullptr);
 int32_t infer_authoritative_action_from_visible_surface(
         bool dmn_origin,
         const std::string & visible_text,

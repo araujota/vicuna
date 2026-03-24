@@ -1,4 +1,5 @@
 #include "server-openclaw-fabric.h"
+#include "server-common.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -2135,9 +2136,13 @@ bool server_openclaw_fabric::parse_tool_selection_json(
     if (!parse_visible_json_payload(text, &planner_reasoning, &visible_payload, &payload, out_error)) {
         return false;
     }
-    const std::string action = trim_ascii_copy_local(payload.value("action", std::string()));
-    if (action != "select_tool") {
-        set_error(out_error, "tool-selection JSON must include action=\"select_tool\"");
+    if (!authoritative_normalize_required_action_json(
+                visible_payload,
+                "select_tool",
+                &payload,
+                &visible_payload,
+                nullptr,
+                out_error)) {
         return false;
     }
     const std::string tool_family_id = trim_ascii_copy_local(payload.value("tool_family_id", std::string()));
@@ -2195,9 +2200,13 @@ bool server_openclaw_fabric::parse_tool_method_selection_json(
     if (!parse_visible_json_payload(text, &planner_reasoning, &visible_payload, &payload, out_error)) {
         return false;
     }
-    const std::string action = trim_ascii_copy_local(payload.value("action", std::string()));
-    if (action != "select_method") {
-        set_error(out_error, "tool-method JSON must include action=\"select_method\"");
+    if (!authoritative_normalize_required_action_json(
+                visible_payload,
+                "select_method",
+                &payload,
+                &visible_payload,
+                nullptr,
+                out_error)) {
         return false;
     }
     const std::string selected_method_name = trim_ascii_copy_local(payload.value("method_name", std::string()));
@@ -2259,9 +2268,13 @@ bool server_openclaw_fabric::parse_tool_arguments_json(
     if (!parse_visible_json_payload(text, &planner_reasoning, &visible_payload, &payload, out_error)) {
         return false;
     }
-    const std::string action = trim_ascii_copy_local(payload.value("action", std::string()));
-    if (action != "act") {
-        set_error(out_error, "method arguments JSON must include action=\"act\"");
+    if (!authoritative_normalize_required_action_json(
+                visible_payload,
+                "act",
+                &payload,
+                &visible_payload,
+                nullptr,
+                out_error)) {
         return false;
     }
     payload.erase("action");

@@ -419,6 +419,140 @@ bool authoritative_visible_reply_looks_like_question(const std::string & text) {
         });
 }
 
+bool authoritative_visible_reply_looks_like_control_json(const std::string & text) {
+    const std::string trimmed = trim_copy(text);
+    if (trimmed.empty() || trimmed.front() != '{') {
+        return false;
+    }
+
+    json payload;
+    try {
+        payload = json::parse(trimmed);
+    } catch (...) {
+        return false;
+    }
+    if (!payload.is_object()) {
+        return false;
+    }
+
+    if (payload.contains("tool_family_id") ||
+        payload.contains("method_name") ||
+        payload.contains("decision") ||
+        payload.contains("assistant_text")) {
+        return true;
+    }
+
+    if (!payload.contains("action") || !payload["action"].is_string()) {
+        return false;
+    }
+
+    const std::string action = lowercase_ascii_copy(trim_copy(payload["action"].get<std::string>()));
+    return action == "select_tool" ||
+           action == "select_method" ||
+           action == "act" ||
+           action == "decide" ||
+           action == "answer" ||
+           action == "ask" ||
+           action == "wait" ||
+           action == "internal_write" ||
+           action == "internalwrite" ||
+           action == "reflect";
+}
+
+template <typename JsonT>
+static bool authoritative_normalize_required_action_json_impl(
+        const std::string & visible_text,
+        const std::string & expected_action,
+        JsonT * out_payload,
+        std::string * out_normalized_visible,
+        bool * out_recovered,
+        std::string * out_error) {
+    if (!out_payload || !out_normalized_visible) {
+        if (out_error) {
+            *out_error = "missing output storage for required-action json normalization";
+        }
+        return false;
+    }
+
+    const std::string trimmed_visible = trim_copy(visible_text);
+    if (trimmed_visible.empty()) {
+        if (out_error) {
+            *out_error = "controller stage emitted no visible JSON payload";
+        }
+        return false;
+    }
+
+    JsonT payload;
+    try {
+        payload = JsonT::parse(trimmed_visible);
+    } catch (const std::exception & err) {
+        if (out_error) {
+            *out_error = std::string("controller stage emitted invalid JSON: ") + err.what();
+        }
+        return false;
+    }
+    if (!payload.is_object()) {
+        if (out_error) {
+            *out_error = "controller stage must emit a single JSON object";
+        }
+        return false;
+    }
+
+    bool recovered = false;
+    const auto action_it = payload.find("action");
+    if (action_it == payload.end() ||
+        action_it->is_null() ||
+        (action_it->is_string() && trim_copy(action_it->template get<std::string>()).empty())) {
+        payload["action"] = expected_action;
+        recovered = true;
+    } else if (!action_it->is_string() ||
+               trim_copy(action_it->template get<std::string>()) != expected_action) {
+        if (out_error) {
+            *out_error = std::string("controller stage must emit action=\"") + expected_action + "\"";
+        }
+        return false;
+    }
+
+    *out_payload = std::move(payload);
+    *out_normalized_visible = out_payload->dump();
+    if (out_recovered) {
+        *out_recovered = recovered;
+    }
+    return true;
+}
+
+bool authoritative_normalize_required_action_json(
+        const std::string & visible_text,
+        const std::string & expected_action,
+        json * out_payload,
+        std::string * out_normalized_visible,
+        bool * out_recovered,
+        std::string * out_error) {
+    return authoritative_normalize_required_action_json_impl(
+            visible_text,
+            expected_action,
+            out_payload,
+            out_normalized_visible,
+            out_recovered,
+            out_error);
+}
+
+bool authoritative_normalize_required_action_json(
+        const std::string & visible_text,
+        const std::string & expected_action,
+        nlohmann::json * out_payload,
+        std::string * out_normalized_visible,
+        bool * out_recovered,
+        std::string * out_error) {
+    return authoritative_normalize_required_action_json_impl(
+            visible_text,
+            expected_action,
+            out_payload,
+            out_normalized_visible,
+            out_recovered,
+            out_error);
+}
+
 int32_t infer_authoritative_action_from_visible_surface(
         bool dmn_origin,
         const std::string & visible_text,

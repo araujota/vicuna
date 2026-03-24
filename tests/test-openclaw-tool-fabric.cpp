@@ -575,6 +575,20 @@ int main() {
                 "expected staged tool selection JSON to resolve the hard-memory family")) {
         return 1;
     }
+    const std::string recovered_tool_selection_json =
+            "<think>\n"
+            "Thought: I should query hard memory first.\n"
+            "</think>\n"
+            "{\"tool_family_id\":\"hard_memory\"}";
+    if (!expect(fabric.parse_tool_selection_json(recovered_tool_selection_json, &parsed_tool_selection, &hard_memory_query_only, &error), error.c_str())) {
+        return 1;
+    }
+    if (!expect(parsed_tool_selection.tool_family_id == "hard_memory" &&
+                parsed_tool_selection.xml_block.find("\"action\":\"select_tool\"") != std::string::npos &&
+                parsed_tool_selection.xml_block.find("\"tool_family_id\":\"hard_memory\"") != std::string::npos,
+                "expected staged tool selection JSON without an action field to recover the required action")) {
+        return 1;
+    }
     const std::string valid_tool_selection_xml =
             "<think>\n"
             "Thought: I should query hard memory first.\n"
@@ -610,6 +624,21 @@ int main() {
                 parsed_tool_method.method_name == "query" &&
                 parsed_tool_method.xml_block == "{\"action\":\"select_method\",\"method_name\":\"query\"}",
                 "expected staged method selection JSON to resolve the hard-memory query method")) {
+        return 1;
+    }
+    const std::string recovered_tool_method_json =
+            "<think>\n"
+            "Thought: The query method is the only valid path.\n"
+            "</think>\n"
+            "{\"method_name\":\"query\"}";
+    if (!expect(fabric.parse_tool_method_selection_json(recovered_tool_method_json, "hard_memory", &parsed_tool_method, &hard_memory_query_only, &error), error.c_str())) {
+        return 1;
+    }
+    if (!expect(parsed_tool_method.tool_family_id == "hard_memory" &&
+                parsed_tool_method.method_name == "query" &&
+                parsed_tool_method.xml_block.find("\"action\":\"select_method\"") != std::string::npos &&
+                parsed_tool_method.xml_block.find("\"method_name\":\"query\"") != std::string::npos,
+                "expected staged method selection JSON without an action field to recover the required action")) {
         return 1;
     }
     const std::string valid_tool_method_xml =
@@ -650,14 +679,27 @@ int main() {
                 "expected method arguments JSON to produce one hard-memory query tool call")) {
         return 1;
     }
+    const std::string recovered_tool_arguments_json =
+            "<think>\n"
+            "Thought: The query should stay narrow and direct.\n"
+            "</think>\n"
+            "{\"query\":\"recent preferences\"}";
+    if (!expect(fabric.parse_tool_arguments_json(recovered_tool_arguments_json, "hard_memory", "query", &parsed_tool_arguments, &hard_memory_query_only, &error), error.c_str())) {
+        return 1;
+    }
+    if (!expect(parsed_tool_arguments.arguments.value("query", std::string()) == "recent preferences" &&
+                parsed_tool_arguments.message.tool_calls.size() == 1,
+                "expected method arguments JSON without an action field to recover the required act action")) {
+        return 1;
+    }
 
     const std::string invalid_tool_selection_json =
             "<think>\n"
             "Thought: I should query hard memory first.\n"
             "</think>\n"
-            "{\"tool_family_id\":\"hard_memory\"}";
+            "{\"action\":\"ask\",\"tool_family_id\":\"hard_memory\"}";
     if (!expect(!fabric.parse_tool_selection_json(invalid_tool_selection_json, &parsed_tool_selection, &hard_memory_query_only, &error),
-                "expected staged tool selection JSON without an action field to be rejected")) {
+                "expected staged tool selection JSON with the wrong action field to be rejected")) {
         return 1;
     }
     if (!expect(error.find("action=\"select_tool\"") != std::string::npos,

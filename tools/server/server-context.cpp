@@ -4341,57 +4341,20 @@ private:
         return wrapped;
     }
 
-    static bool react_parse_visible_json_object(
-            const std::string & visible_text,
-            json * out_value,
-            std::string * out_error) {
-        if (!out_value) {
-            if (out_error) {
-                *out_error = "missing output json target";
-            }
-            return false;
-        }
-
-        const std::string trimmed = trim_ascii_copy(visible_text);
-        if (trimmed.empty()) {
-            if (out_error) {
-                *out_error = "controller stage emitted no visible JSON payload";
-            }
-            return false;
-        }
-
-        try {
-            *out_value = json::parse(trimmed);
-        } catch (const std::exception & e) {
-            if (out_error) {
-                *out_error = std::string("controller stage emitted invalid JSON: ") + e.what();
-            }
-            return false;
-        }
-
-        if (!out_value->is_object()) {
-            if (out_error) {
-                *out_error = "controller stage must emit a single JSON object";
-            }
-            return false;
-        }
-
-        return true;
-    }
-
     static bool react_parse_post_tool_decision_json(
             const std::string & visible_text,
             int32_t * out_action,
+            std::string * out_normalized_visible,
             std::string * out_error) {
         json payload;
-        if (!react_parse_visible_json_object(visible_text, &payload, out_error)) {
-            return false;
-        }
-        const std::string stage_action = trim_ascii_copy(payload.value("action", std::string()));
-        if (stage_action != "decide") {
-            if (out_error) {
-                *out_error = "post-tool decision stage must emit action=\"decide\"";
-            }
+        std::string normalized_visible;
+        if (!authoritative_normalize_required_action_json(
+                    visible_text,
+                    "decide",
+                    &payload,
+                    &normalized_visible,
+                    nullptr,
+                    out_error)) {
             return false;
         }
         if (payload.size() != 2 || !payload.contains("decision") || !payload["decision"].is_string()) {
@@ -4427,6 +4390,9 @@ private:
         if (out_action) {
             *out_action = action;
         }
+        if (out_normalized_visible) {
+            *out_normalized_visible = normalized_visible;
+        }
         return true;
     }
 
@@ -4434,16 +4400,17 @@ private:
             const std::string & visible_text,
             const std::string & expected_action,
             std::string * out_response_text,
+            std::string * out_normalized_visible,
             std::string * out_error) {
         json payload;
-        if (!react_parse_visible_json_object(visible_text, &payload, out_error)) {
-            return false;
-        }
-        const std::string stage_action = trim_ascii_copy(payload.value("action", std::string()));
-        if (stage_action != expected_action) {
-            if (out_error) {
-                *out_error = std::string("response stage must emit action=\"") + expected_action + "\"";
-            }
+        std::string normalized_visible;
+        if (!authoritative_normalize_required_action_json(
+                    visible_text,
+                    expected_action,
+                    &payload,
+                    &normalized_visible,
+                    nullptr,
+                    out_error)) {
             return false;
         }
         if (payload.size() != 2 || !payload.contains("assistant_text") || !payload["assistant_text"].is_string()) {
@@ -4484,6 +4451,9 @@ private:
 
         if (out_response_text) {
             *out_response_text = assistant_text;
+        }
+        if (out_normalized_visible) {
+            *out_normalized_visible = normalized_visible;
         }
         return true;
     }
@@ -5503,6 +5473,9 @@ private:
                 fallback_msg.content,
                 task.react_resuming_from_tool_result,
                 task.foreground_role);
+        if (authoritative_visible_reply_looks_like_control_json(fallback_msg.content)) {
+            return false;
+        }
         if (inferred_action == LLAMA_AUTHORITATIVE_REACT_ACTION_NONE) {
             return false;
         }
@@ -5550,15 +5523,17 @@ private:
 
         if (task.react_tool_stage == SERVER_REACT_TOOL_STAGE_DECIDE_AFTER_TOOL) {
             int32_t decided_action = LLAMA_AUTHORITATIVE_REACT_ACTION_NONE;
+            std::string normalized_visible;
             if (!react_parse_post_tool_decision_json(
                         raw_visible,
                         &decided_action,
+                        &normalized_visible,
                         &out_step->error)) {
                 return false;
             }
             out_step->action = decided_action;
             out_step->tool_protocol_signal = REACT_TOOL_PROTOCOL_SIGNAL_DECIDE_AFTER_TOOL;
-            out_step->tool_xml = trim_ascii_copy(raw_visible);
+            out_step->tool_xml = trim_ascii_copy(normalized_visible);
             out_step->planner_reasoning = trim_ascii_copy(out_step->assistant_msg.reasoning_content);
             out_step->action_source = "visible_stage_contract";
         } else if (task.react_tool_stage == SERVER_REACT_TOOL_STAGE_EMIT_RESPONSE) {
@@ -5568,17 +5543,19 @@ private:
                 return false;
             }
             std::string assistant_text;
+            std::string normalized_visible;
             if (!react_parse_terminal_response_json(
                         raw_visible,
                         expected_action,
                         &assistant_text,
+                        &normalized_visible,
                         &out_step->error)) {
                 return false;
             }
             out_step->action = task.react_pending_terminal_action;
             out_step->tool_protocol_signal = REACT_TOOL_PROTOCOL_SIGNAL_EMIT_RESPONSE;
             out_step->assistant_msg.content = std::move(assistant_text);
-            out_step->tool_xml = trim_ascii_copy(raw_visible);
+            out_step->tool_xml = trim_ascii_copy(normalized_visible);
             out_step->planner_reasoning = trim_ascii_copy(out_step->assistant_msg.reasoning_content);
             out_step->action_source = "visible_stage_contract";
         } else if (task.react_tool_stage == SERVER_REACT_TOOL_STAGE_SELECT_METHOD) {
@@ -11263,6 +11240,14 @@ static bool telegram_dialogue_history_from_json(
             retry_task.react_stage_retry_count += 1;
             retry_task.react_retry_feedback = failure_detail;
 
+            if (failure_class == "parse_failure" &&
+                    (failure_detail.find("action=\"") != std::string::npos ||
+                     failure_detail.find("control") != std::string::npos)) {
+                retry_task.react_retry_feedback =
+                        "The previous control step omitted or malformed the required authoritative control contract. "
+                        "Retry the same phase and emit only the exact required staged payload for this turn.";
+            }
+
             if (failure_class == "parse_failure" && slot.stop == STOP_TYPE_LIMIT) {
                 const int32_t configured_predict =
                         retry_task.params.n_predict > 0 ?
@@ -11385,7 +11370,7 @@ static bool telegram_dialogue_history_from_json(
             if (retry_staged_react(retry_task, "parse_failure", react_step.error)) {
                 return;
             }
-            send_error(slot, "Invalid authoritative ReAct control: " + react_step.error, ERROR_TYPE_SERVER);
+            send_error(slot, "Failed to continue authoritative ReAct turn after internal controller retries", ERROR_TYPE_SERVER);
             return;
         }
 

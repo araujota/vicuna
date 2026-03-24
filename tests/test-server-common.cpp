@@ -140,6 +140,67 @@ int main() {
     }
 
     {
+        if (!expect(authoritative_visible_reply_looks_like_control_json(
+                            "{\"tool_family_id\":\"web_search\"}"),
+                    "expected bare tool-family JSON to classify as control-shaped")) {
+            return 1;
+        }
+        if (!expect(authoritative_visible_reply_looks_like_control_json(
+                            "{\"assistant_text\":\"hello\"}"),
+                    "expected bare staged response JSON to classify as control-shaped")) {
+            return 1;
+        }
+        if (!expect(authoritative_visible_reply_looks_like_control_json(
+                            "{\"action\":\"select_tool\",\"tool_family_id\":\"web_search\"}"),
+                    "expected staged action JSON to classify as control-shaped")) {
+            return 1;
+        }
+        if (!expect(!authoritative_visible_reply_looks_like_control_json(
+                             "{\"city\":\"Chicago\"}"),
+                    "expected ordinary JSON content to remain outside control-shape detection")) {
+            return 1;
+        }
+    }
+
+    {
+        json normalized_payload = json::object();
+        std::string normalized_visible;
+        bool recovered = false;
+        if (!expect(authoritative_normalize_required_action_json(
+                            "{\"tool_family_id\":\"hard_memory\"}",
+                            "select_tool",
+                            &normalized_payload,
+                            &normalized_visible,
+                            &recovered),
+                    "expected required-action normalization to recover a missing action field")) {
+            return 1;
+        }
+        if (!expect(recovered &&
+                    normalized_payload.value("action", std::string()) == "select_tool" &&
+                    normalized_payload.value("tool_family_id", std::string()) == "hard_memory" &&
+                    normalized_visible == "{\"tool_family_id\":\"hard_memory\",\"action\":\"select_tool\"}",
+                    "expected required-action normalization to inject the fixed action field")) {
+            return 1;
+        }
+
+        std::string error;
+        if (!expect(!authoritative_normalize_required_action_json(
+                             "{\"action\":\"ask\",\"assistant_text\":\"hello\"}",
+                             "answer",
+                             &normalized_payload,
+                             &normalized_visible,
+                             nullptr,
+                             &error),
+                    "expected required-action normalization to reject conflicting action values")) {
+            return 1;
+        }
+        if (!expect(error.find("action=\"answer\"") != std::string::npos,
+                    "expected conflicting required-action normalization error to mention the required action")) {
+            return 1;
+        }
+    }
+
+    {
         if (!expect(infer_authoritative_action_from_visible_surface(
                             false,
                             "Which deployment target should I use?",

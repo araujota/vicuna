@@ -480,6 +480,8 @@ surface for model output:
 - after a tool result, `decide_after_tool` emits only `{"action":"decide","decision":"answer|ask|select_tool|wait"}`
 - if the controller decides to answer or ask, `emit_response` emits only `{"action":"answer|ask","assistant_text":"..."}`
 - reject undeclared fields, malformed JSON, unlisted tool families, unlisted methods, and schema/type mismatches at the stage where they occur
+- when a staged JSON payload omits the required `action` field but otherwise matches the current stage contract, runtime parsing now normalizes the exact required action internally for that phase instead of leaking the malformed payload to the user
+- malformed staged control remains inside the authoritative retry and stage-rewind loop; raw controller JSON and internal action-label errors should not be published to Telegram as user-visible replies
 
 Hidden reasoning is still preserved for provenance and self-state processing,
 but for staged tool phases it is no longer the authoritative source of the
