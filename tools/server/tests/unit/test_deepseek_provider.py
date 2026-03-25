@@ -1268,6 +1268,119 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
             server.stop()
 
 
+def test_provider_mode_allows_bridge_requests_to_receive_non_telegram_tool_calls():
+    global server
+
+    def staged_radarr_response(payload):
+        stage_prompt = payload["messages"][-1]["content"].lower()
+        if "choosing one tool family" in stage_prompt:
+            return {
+                "id": "stage-family-radarr",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"family": "Radarr"}),
+                        "reasoning_content": "Use Radarr.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "choosing a method of the radarr" in stage_prompt:
+            return {
+                "id": "stage-method-radarr",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"method": "list_downloaded_movies"}),
+                        "reasoning_content": "Inspect the downloaded movie list.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "constructing a payload for the list_downloaded_movies method of the radarr tool family" in stage_prompt:
+            return {
+                "id": "stage-payload-radarr",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({
+                            "action": "submit",
+                            "payload": {},
+                        }),
+                        "reasoning_content": "Submit the empty payload.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        raise AssertionError(f"unexpected staged prompt: {payload['messages'][-1]['content']}")
+
+    with run_mock_deepseek(staged_radarr_response) as (base_url, state):
+        server = make_provider_server(base_url)
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-reasoner",
+                "messages": [
+                    {"role": "user", "content": "What movies do we have in Radarr?"},
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "radarr_list_downloaded_movies",
+                        "description": "List only the movies that are already fully downloaded in Radarr.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "description": "List only the movies that are already fully downloaded in Radarr.",
+                        },
+                        "x-vicuna-family-id": "radarr",
+                        "x-vicuna-family-name": "Radarr",
+                        "x-vicuna-family-description": "Inspect and manage the Radarr movie library on the media server.",
+                        "x-vicuna-method-name": "list_downloaded_movies",
+                        "x-vicuna-method-description": "List the movies already fully downloaded in Radarr.",
+                    },
+                }],
+                "stream": False,
+            }, headers={
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "99",
+                "X-Vicuna-Telegram-Conversation-Id": "tc3",
+            })
+
+            assert response.status_code == 200
+            choice = response.body["choices"][0]
+            assert choice["finish_reason"] == "tool_calls"
+            assert choice["message"]["content"] is None
+            assert choice["message"]["reasoning_content"] == "Submit the empty payload."
+            assert choice["message"]["tool_calls"] == [{
+                "id": choice["message"]["tool_calls"][0]["id"],
+                "type": "function",
+                "function": {
+                    "name": "radarr_list_downloaded_movies",
+                    "arguments": "{}",
+                },
+            }]
+            assert "vicuna_telegram_delivery" not in response.body
+            assert len(state["requests"]) == 3
+
+            outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
+            assert outbox.status_code == 200
+            assert outbox.body["items"] == []
+        finally:
+            server.stop()
+
+
 def test_provider_mode_cognitive_replay_admits_negative_episode():
     global server
 

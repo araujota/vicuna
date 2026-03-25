@@ -2294,12 +2294,10 @@ static bool execute_telegram_delivery_for_bridge_request(
         delivery_source = "tool_call";
     } else {
         if (!result->tool_calls.empty()) {
-            if (out_error) {
-                *out_error = format_error_response(
-                        "Telegram bridge request returned unresolved tool calls instead of a Telegram delivery.",
-                        ERROR_TYPE_SERVER);
-            }
-            return false;
+            // Bridge-scoped requests may now continue through direct runtime tool calls.
+            // Only intercept the bridge-local telegram_relay tool here; leave other tool calls
+            // intact so the bridge can execute them and continue the loop client-side.
+            return true;
         }
         const std::string text = trim_copy(result->content);
         if (text.empty()) {
