@@ -28,9 +28,27 @@ item surfaces. The harness and the server fabric share the same capability
 contract so ReAct sees one authoritative tool system rather than competing
 descriptor registries.
 
+The current server-side staged tool controller also expects every exposed
+capability to support three metadata layers:
+
+- family metadata:
+  - `tool_family_id`
+  - `tool_family_name`
+  - `tool_family_description`
+- method metadata:
+  - `method_name`
+  - `method_description`
+- contract metadata:
+  - `input_schema_json` with descriptions on every nested field and array item
+
+If a capability omits those layers, it can still exist in the catalog, but it
+is a poor fit for staged family -> method -> payload prompting and may be
+excluded from that higher-level controller.
+
 For provider-backed execution, that contract primarily reaches the model as
-chat-tool JSON schema. The harness keeps the argument surface narrow so the
-provider can select the right tool without the older staged local controller.
+chat-tool JSON schema plus the staged family/method/contract surfaces used by
+the retained provider server. The harness keeps the argument surface narrow so
+the provider can select the right tool without hidden tool-selection policy.
 
 Example:
 
@@ -188,13 +206,20 @@ user-facing follow-up messages.
 
 - it writes one retained outbox item into the current provider server
 - the server exposes that item through `GET /v1/telegram/outbox` for the bridge
+- plain text is still accepted for simple follow-up messages
+- richer calls can send one structured Telegram Bot API request with:
+  - `method`
+  - `payload`
+- the relay keeps `chat_scope` and reply anchoring outside that structured
+  payload so routing policy remains explicit in local code
 - the wrapper returns only:
   - `sequence_number`
   - `chat_scope`
   - `deduplicated`
 
 The current tool surface intentionally does not include `ask_with_options` or
-`codex`.
+`codex`, and it still uses an explicit allowlist of outbound Telegram send
+methods instead of exposing arbitrary Bot API calls.
 
 ## Parsed Documents
 

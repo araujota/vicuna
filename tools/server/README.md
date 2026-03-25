@@ -5,12 +5,113 @@
 It is a DeepSeek-backed HTTP server with an optional local
 `Qwen3-Embedding-0.6B-GGUF` backend for emotive-trace enrichment.
 
+## Interleaved tool continuations
+
+When a request resumes an active DeepSeek tool loop, the server now:
+
+- preserves the assistant tool-call step's `reasoning_content` for replay
+- reconstructs the current emotive/VAD state from the replayed request history
+- injects one additive VAD guidance `system` message after the newest tool-result span
+- runs bounded heuristic retrieval in parallel against persisted bad-path memory
+- injects at most one brief critical-guidance heuristic when the current trace matches a stored bad path
+- keeps the original tool payload unchanged
+
+If you send a provider-native `thinking` object, the server forwards it
+unchanged to DeepSeek.
+
+## Staged tool loop
+
+When an incoming OpenAI-compatible request includes `tools` with automatic tool
+selection, the server no longer exposes the flat tool list directly to the
+provider. Instead it runs an explicit staged loop:
+
+- family selection: the provider sees only high-level tool families and must
+  return `{"family":"..."}` in JSON
+- method selection: the provider sees only methods for the chosen family and
+  must return `{"method":"..."}`, `{"method":"back"}`, or
+  `{"method":"complete"}`
+- payload construction: the provider sees the chosen method's typed contract
+  and must return `{"action":"submit","payload":{...}}` or
+  `{"action":"back"}`
+
+After a valid payload is produced, the server emits one normal OpenAI tool call
+back to the caller. After the caller returns a real tool result on the next
+request, the staged loop begins again from family selection.
+
+The staged prompts are additive and keep:
+
+- replayed assistant `reasoning_content` unchanged
+- request-scoped VAD guidance unchanged
+- heuristic guidance unchanged
+
+Tool metadata policy:
+
+- every staged-exposed tool should provide a clear family, method, and contract
+  layer
+- request tools may optionally provide:
+  - `x-vicuna-family-id`
+  - `x-vicuna-family-name`
+  - `x-vicuna-family-description`
+  - `x-vicuna-method-name`
+  - `x-vicuna-method-description`
+- if those fields are absent, the server derives family/method names from the
+  function name, but explicit metadata is preferred
+
+## Cognitive replay
+
+When a foreground trace produces a significant negative emotive delta, the
+runtime stores one bounded cognitive replay entry. After the server has been
+idle long enough, a background worker replays the stored episode through the
+same provider/emotive path with a fixed replay prompt.
+
+Replay resolution is explicit:
+
+- replay-mode traces are marked `cognitive_replay` and cannot admit new replay entries
+- replay success is scored from assistant-generated replay blocks only
+- seeded replay prompts and trailing runtime bookkeeping do not count toward resolve/defer validation
+- each resolved replay runs one follow-up compression pass that receives labeled `Bad Path` and `Better Path`
+- successful compression persists one hard-memory record containing the full bad path, full better path, and one structured heuristic
+
+Inspect replay state with `GET /v1/emotive/cognitive-replay`.
+
+## Heuristic memory
+
+Resolved replay episodes are compressed into one reusable heuristic object and
+stored in bounded hard memory. Live request assembly then:
+
+- embeds the latest thought/request trace
+- scores it against stored bad-path objects
+- reranks with structural and emotive similarity
+- injects only the matching heuristic as brief critical guidance when the
+  bounded threshold is met
+
+Inspect persisted heuristic records and the latest retrieval decision with
+`GET /v1/emotive/heuristics`.
+
+## Pre-idle ongoing tasks
+
+After the replay queue is exhausted for the current idle cycle, the same
+background worker runs one explicit ongoing-task stage before true idle:
+
+- polls the hard-memory-backed ongoing-task registry and current system time
+- runs one due-decision pass that considers both cadence fields and original task wording
+- launches at most one selected task by sending the exact stored `task_text`
+  through the normal provider/emotive path
+- advances the task's `last_done_at` timestamp only after that background run succeeds
+- suppresses new cognitive replay admissions during ongoing-task decision and execution traces
+
+Inspect worker state with `GET /v1/emotive/ongoing-tasks` or under
+`/health -> emotive_runtime -> ongoing_tasks`.
+
 ## Supported routes
 
 - `GET /health`
 - `GET /v1/health`
 - `GET /v1/models`
 - `GET /v1/emotive/trace/latest`
+- `GET /v1/emotive/cognitive-replay`
+- `GET /v1/emotive/heuristics`
+- `GET /v1/emotive/ongoing-tasks`
 - `POST /v1/completions`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
@@ -26,12 +127,24 @@ Default-surface aliases remain for `/models`, `/completions`,
 ## Removed
 
 - local chat inference as the main serving path
-- server-side tool runtimes and OpenClaw catalogs
+- hidden provider-side tool-selection policy
 - legacy WebUI variants, themes, and benchmark helpers
 - slot/router/KV orchestration as product features
 
 The Telegram bridge endpoints are intentionally retained as a narrow transport
 surface for external dialogue delivery.
+
+## Telegram outbox contract
+
+`POST /v1/telegram/outbox` still accepts retained `kind=message` writes, but
+message items may now carry either:
+
+- plain text only, which the server normalizes to `telegram_method=sendMessage`
+- an explicit `telegram_method` plus `telegram_payload` for richer Bot API
+  sends such as formatted text, media, and `reply_markup`
+
+The server keeps a normalized summary `text` field on each queued item so the
+bridge can preserve transcript continuity and readable delivery logs.
 
 ## Build
 
@@ -48,6 +161,48 @@ export VICUNA_DEEPSEEK_MODEL="deepseek-reasoner"
 export VICUNA_DEEPSEEK_BASE_URL="https://api.deepseek.com"
 export VICUNA_EMOTIVE_EMBED_MODEL="/absolute/path/to/Qwen3-Embedding-0.6B-Q8_0.gguf"
 export VICUNA_EMOTIVE_EMBED_POOLING="last"
+export VICUNA_ONGOING_TASKS_ENABLED="true"
+export VICUNA_ONGOING_TASKS_BASE_URL="https://api.supermemory.ai"
+export VICUNA_ONGOING_TASKS_AUTH_TOKEN="your-supermemory-key"
 
 ./build/bin/llama-server --host 127.0.0.1 --port 8080 --api-surface openai --no-webui
+```
+
+Ongoing-task env vars:
+
+- `VICUNA_ONGOING_TASKS_ENABLED`
+- `VICUNA_ONGOING_TASKS_BASE_URL`
+- `VICUNA_ONGOING_TASKS_AUTH_TOKEN`
+- `VICUNA_ONGOING_TASKS_CONTAINER_TAG`
+- `VICUNA_ONGOING_TASKS_RUNTIME_IDENTITY`
+- `VICUNA_ONGOING_TASKS_REGISTRY_KEY`
+- `VICUNA_ONGOING_TASKS_REGISTRY_TITLE`
+- `VICUNA_ONGOING_TASKS_QUERY_THRESHOLD`
+- `VICUNA_ONGOING_TASKS_POLL_MS`
+- `VICUNA_ONGOING_TASKS_TIMEOUT_MS`
+
+## Validate staged tool-loop and VAD guidance
+
+Run the focused provider tests:
+
+```bash
+LLAMA_SERVER_BIN_PATH=./build/bin/llama-server pytest tools/server/tests/unit/test_deepseek_provider.py -q -k "tool or interleaved or staged"
+```
+
+Run the cognitive replay coverage:
+
+```bash
+LLAMA_SERVER_BIN_PATH=./build/bin/llama-server pytest tools/server/tests/unit/test_deepseek_provider.py -q -k "cognitive_replay"
+```
+
+Run the heuristic-memory coverage:
+
+```bash
+LLAMA_SERVER_BIN_PATH=./build/bin/llama-server pytest tools/server/tests/unit/test_deepseek_provider.py -q -k "heuristic"
+```
+
+Run the ongoing-task idle-stage coverage:
+
+```bash
+LLAMA_SERVER_BIN_PATH=./build/bin/llama-server pytest tools/server/tests/unit/test_deepseek_provider.py -q -k "ongoing_task"
 ```

@@ -41,3 +41,14 @@ Work should remove or avoid reintroducing:
 - [ARCHITECTURE.md](/Users/tyleraraujo/vicuna/ARCHITECTURE.md)
 - [docs/build.md](/Users/tyleraraujo/vicuna/docs/build.md)
 - [tools/server/README-dev.md](/Users/tyleraraujo/vicuna/tools/server/README-dev.md)
+
+## Active Technologies
+- C++17 native server/runtime code plus existing Python provider integration tests + existing `cpp-httplib` client/server stack, `nlohmann::json`, existing server-local emotive runtime and VAD projector (114-tool-vad-interleaving)
+- In-memory per-request state plus existing bounded latest-trace history only (114-tool-vad-interleaving)
+- C++17 native server/runtime code plus existing Python provider integration tests + existing `cpp-httplib`, `nlohmann::json`, current DeepSeek provider flow, current emotive runtime, shared HTTP helpers in `common/http.h` (118-idle-ongoing-tasks)
+- hard-memory-backed ongoing-task registry read over HTTP plus existing in-memory worker state and emotive trace history (118-idle-ongoing-tasks)
+- C++17 native server/runtime code plus Python provider integration tests + existing `nlohmann::json`, current provider request assembly, current emotive runtime, existing tool catalog metadata in `tools/openclaw-harness` (119-staged-tool-loop)
+- existing in-memory request/controller state plus existing hard-memory/replay persistence (119-staged-tool-loop)
+
+## Recent Changes
+- 114-tool-vad-interleaving: Added C++17 native server/runtime code plus existing Python provider integration tests + existing `cpp-httplib` client/server stack, `nlohmann::json`, existing server-local emotive runtime and VAD projector

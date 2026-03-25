@@ -143,6 +143,12 @@ static json deepseek_build_provider_messages(const json & body) {
             if (item.contains("tool_calls")) {
                 provider_message["tool_calls"] = deepseek_normalize_outbound_tool_calls(item.at("tool_calls"));
             }
+            if (role == "assistant" && item.contains("tool_calls")) {
+                const auto reasoning_it = item.find("reasoning_content");
+                if (reasoning_it != item.end() && reasoning_it->is_string()) {
+                    provider_message["reasoning_content"] = reasoning_it->get<std::string>();
+                }
+            }
             const std::string tool_call_id = json_value(item, "tool_call_id", std::string());
             if (!tool_call_id.empty()) {
                 provider_message["tool_call_id"] = tool_call_id;
@@ -207,6 +213,12 @@ static json deepseek_build_provider_body(const deepseek_runtime_config & config,
     }
     if (body.contains("parallel_tool_calls")) {
         provider_body["parallel_tool_calls"] = body.at("parallel_tool_calls");
+    }
+    if (body.contains("response_format")) {
+        provider_body["response_format"] = body.at("response_format");
+    }
+    if (body.contains("thinking")) {
+        provider_body["thinking"] = body.at("thinking");
     }
 
     return provider_body;
