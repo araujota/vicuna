@@ -93,6 +93,7 @@ std::string extract_foreground_message_text_for_request(const std::string & raw_
 bool foreground_request_requires_fresh_tool_grounding(const std::string & text);
 bool foreground_request_requires_external_action(const std::string & text);
 bool authoritative_reply_is_procedural_non_answer(const std::string & text);
+bool authoritative_reply_is_future_intent_status(const std::string & text);
 bool authoritative_retry_requires_tool_escalation(const std::string & text, int32_t retry_count);
 bool authoritative_visible_reply_looks_like_question(const std::string & text);
 bool authoritative_visible_reply_looks_like_control_json(const std::string & text);

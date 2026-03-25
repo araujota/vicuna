@@ -4741,6 +4741,8 @@ private:
                                     "The assistant_text value must contain only the final plain-prose user-facing reply for this step. "
                                     "If the latest admitted tool observation shows a successful external action or queued external command, state that the action has already been started, queued, sent, or completed as appropriate. "
                                     "Do not describe a successfully performed tool action as something the user can do later or with some separate command. "
+                                    "Do not narrate the requested operation in future tense such as 'I will ...' when the admitted observation already shows the current result. "
+                                    "If the admitted observation is still insufficient to complete the request, that means decide_after_tool should have chosen select_tool instead of emitting a final reply. "
                                     "Do not emit markdown, bullets, numbered lists, or extra prose outside the JSON object.\n") :
                     first_tool_call_required ?
                             std::string(
@@ -5212,6 +5214,8 @@ private:
             {"phase", phase_name},
             {"retry_count", task.react_retry_count},
             {"stage_retry_count", task.react_stage_retry_count},
+            {"post_tool_terminal_repair_count", task.react_post_tool_terminal_repair_count},
+            {"post_tool_terminal_repair_limit", task.react_post_tool_terminal_repair_limit},
             {"resuming_from_tool_result", task.react_resuming_from_tool_result},
             {"selected_tool_family_id", task.react_selected_tool_family_id},
             {"selected_method_name", task.react_selected_method_name},
@@ -5281,7 +5285,27 @@ private:
         REACT_TOOL_PROTOCOL_SIGNAL_EMIT_RESPONSE = 5,
     };
 
-    std::string validate_authoritative_react_terminal_policy(
+    enum react_terminal_policy_reject_kind {
+        REACT_TERMINAL_POLICY_REJECT_NONE = 0,
+        REACT_TERMINAL_POLICY_REJECT_PROCEDURAL_NON_ANSWER = 1,
+        REACT_TERMINAL_POLICY_REJECT_FUTURE_INTENT_EXTERNAL_ACTION = 2,
+        REACT_TERMINAL_POLICY_REJECT_PLAIN_PROSE_POLICY = 3,
+        REACT_TERMINAL_POLICY_REJECT_FIRST_TOOL_REQUIRED_ANSWER = 4,
+        REACT_TERMINAL_POLICY_REJECT_FIRST_TOOL_REQUIRED_ASK_WAIT = 5,
+        REACT_TERMINAL_POLICY_REJECT_REDUNDANT_TOOL_CALL = 6,
+        REACT_TERMINAL_POLICY_REJECT_READ_ONLY_EXTERNAL_ACTION_CONFLICT = 7,
+    };
+
+    struct react_terminal_policy_validation {
+        react_terminal_policy_reject_kind kind = REACT_TERMINAL_POLICY_REJECT_NONE;
+        std::string error;
+
+        bool accepted() const {
+            return kind == REACT_TERMINAL_POLICY_REJECT_NONE;
+        }
+    };
+
+    react_terminal_policy_validation validate_authoritative_react_terminal_policy(
             const server_task & task,
             const parsed_react_step & step) const {
         if (task.react_origin != SERVER_REACT_ORIGIN_ACTIVE) {
@@ -5291,28 +5315,52 @@ private:
         if (step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER ||
                 step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ASK) {
             const std::string visible = trim_ascii_copy(step.assistant_msg.content);
+            if (task.react_resuming_from_tool_result &&
+                    task.react_tool_stage == SERVER_REACT_TOOL_STAGE_EMIT_RESPONSE &&
+                    foreground_request_requires_external_action(task.foreground_text) &&
+                    authoritative_reply_is_future_intent_status(visible)) {
+                return {
+                    REACT_TERMINAL_POLICY_REJECT_FUTURE_INTENT_EXTERNAL_ACTION,
+                    "visible reply described the requested external action as future work instead of reporting the current admitted result",
+                };
+            }
             if (authoritative_reply_is_procedural_non_answer(visible)) {
-                return "visible reply described intended work or lack of access instead of completing the turn";
+                return {
+                    REACT_TERMINAL_POLICY_REJECT_PROCEDURAL_NON_ANSWER,
+                    "visible reply described intended work or lack of access instead of completing the turn",
+                };
             }
             if (user_facing_text_violates_plain_prose_policy(visible)) {
-                return "visible reply violated the plain-prose policy for user-facing text";
+                return {
+                    REACT_TERMINAL_POLICY_REJECT_PLAIN_PROSE_POLICY,
+                    "visible reply violated the plain-prose policy for user-facing text",
+                };
             }
         }
 
         if (step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER &&
                 react_turn_requires_first_tool_call(task)) {
-            return "latest active user turn requires fresh tool grounding before any direct answer";
+            return {
+                REACT_TERMINAL_POLICY_REJECT_FIRST_TOOL_REQUIRED_ANSWER,
+                "latest active user turn requires fresh tool grounding before any direct answer",
+            };
         }
         if ((step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ASK ||
                 step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_WAIT) &&
                 react_turn_requires_first_tool_call(task)) {
-            return "latest active user turn requires staged tool selection before asking or waiting";
+            return {
+                REACT_TERMINAL_POLICY_REJECT_FIRST_TOOL_REQUIRED_ASK_WAIT,
+                "latest active user turn requires staged tool selection before asking or waiting",
+            };
         }
 
         if (step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ACT &&
                 task.react_resuming_from_tool_result &&
                 canonical_context_has_direct_tool_answer_observation(task)) {
-            return "latest admitted tool observation already contains a direct answer; synthesize it before issuing another tool call";
+            return {
+                REACT_TERMINAL_POLICY_REJECT_REDUNDANT_TOOL_CALL,
+                "latest admitted tool observation already contains a direct answer; synthesize it before issuing another tool call",
+            };
         }
 
         if ((step.action == LLAMA_AUTHORITATIVE_REACT_ACTION_ANSWER ||
@@ -5320,7 +5368,10 @@ private:
                 task.react_resuming_from_tool_result &&
                 foreground_request_requires_external_action(task.foreground_text) &&
                 latest_tool_step_was_read_only(task)) {
-            return "latest completed tool step was read-only, but the original request still requires an external action; continue the staged tool protocol";
+            return {
+                REACT_TERMINAL_POLICY_REJECT_READ_ONLY_EXTERNAL_ACTION_CONFLICT,
+                "latest completed tool step was read-only, but the original request still requires an external action; continue the staged tool protocol",
+            };
         }
 
         return {};
@@ -11219,7 +11270,10 @@ static bool telegram_dialogue_history_from_json(
                 slot.task &&
                 server_task_has_authoritative_react_surface(*slot.task) &&
                 parse_authoritative_react_step(*slot.task, slot.generated_text, &react_step);
-        auto retry_staged_react = [&](server_task & retry_task, const std::string & failure_class, const std::string & failure_detail) -> bool {
+        auto retry_staged_react = [&](server_task & retry_task,
+                                      const std::string & failure_class,
+                                      const std::string & failure_detail,
+                                      react_terminal_policy_reject_kind reject_kind = REACT_TERMINAL_POLICY_REJECT_NONE) -> bool {
             const std::string previous_failure_class = retry_task.react_last_failure_class;
             const std::string previous_failure_detail = retry_task.react_last_failure_detail;
             const bool repeated_same_failure =
@@ -11232,12 +11286,44 @@ static bool telegram_dialogue_history_from_json(
                     repeated_same_failure ?
                             retry_task.react_same_failure_count + 1 :
                             1;
-            if (retry_task.react_retry_count >= retry_task.react_retry_limit) {
+            const bool read_only_external_action_conflict =
+                    failure_class == "terminal_policy_reject" &&
+                    reject_kind == REACT_TERMINAL_POLICY_REJECT_READ_ONLY_EXTERNAL_ACTION_CONFLICT;
+            const bool post_tool_terminal_reject =
+                    failure_class == "terminal_policy_reject" &&
+                    retry_task.react_resuming_from_tool_result &&
+                    retry_task.react_tool_stage == SERVER_REACT_TOOL_STAGE_EMIT_RESPONSE;
+            enum react_post_tool_terminal_repair_action {
+                REACT_POST_TOOL_TERMINAL_REPAIR_NONE = 0,
+                REACT_POST_TOOL_TERMINAL_REPAIR_RETRY_EMIT_RESPONSE = 1,
+                REACT_POST_TOOL_TERMINAL_REPAIR_REWIND_DECIDE = 2,
+                REACT_POST_TOOL_TERMINAL_REPAIR_REWIND_SELECT_TOOL = 3,
+            };
+            react_post_tool_terminal_repair_action post_tool_repair_action =
+                    REACT_POST_TOOL_TERMINAL_REPAIR_NONE;
+            if (post_tool_terminal_reject &&
+                    retry_task.react_post_tool_terminal_repair_count < retry_task.react_post_tool_terminal_repair_limit) {
+                if (read_only_external_action_conflict) {
+                    post_tool_repair_action = REACT_POST_TOOL_TERMINAL_REPAIR_REWIND_SELECT_TOOL;
+                } else if (retry_task.react_post_tool_terminal_repair_count == 0) {
+                    post_tool_repair_action = REACT_POST_TOOL_TERMINAL_REPAIR_RETRY_EMIT_RESPONSE;
+                } else {
+                    post_tool_repair_action = REACT_POST_TOOL_TERMINAL_REPAIR_REWIND_DECIDE;
+                }
+            }
+
+            if (retry_task.react_retry_count >= retry_task.react_retry_limit &&
+                    post_tool_repair_action == REACT_POST_TOOL_TERMINAL_REPAIR_NONE) {
                 return false;
             }
 
-            retry_task.react_retry_count += 1;
+            if (retry_task.react_retry_count < retry_task.react_retry_limit) {
+                retry_task.react_retry_count += 1;
+            }
             retry_task.react_stage_retry_count += 1;
+            if (post_tool_repair_action != REACT_POST_TOOL_TERMINAL_REPAIR_NONE) {
+                retry_task.react_post_tool_terminal_repair_count += 1;
+            }
             retry_task.react_retry_feedback = failure_detail;
 
             if (failure_class == "parse_failure" &&
@@ -11263,10 +11349,13 @@ static bool telegram_dialogue_history_from_json(
                         "Finish the same turn concisely with one Action line and the needed visible reply or tool payload.";
             }
 
-            const bool read_only_external_action_conflict =
-                    failure_class == "terminal_policy_reject" &&
-                    failure_detail == "latest completed tool step was read-only, but the original request still requires an external action; continue the staged tool protocol";
-            if (read_only_external_action_conflict) {
+            if (post_tool_repair_action == REACT_POST_TOOL_TERMINAL_REPAIR_RETRY_EMIT_RESPONSE) {
+                retry_task.react_retry_feedback =
+                        "The previous post-tool final reply did not complete the request from the admitted observation. "
+                        "Rewrite only the final plain-prose status for this step. "
+                        "Report what already happened or the current observed state. "
+                        "Do not narrate future work, and do not tell the user to run a separate command.";
+            } else if (post_tool_repair_action == REACT_POST_TOOL_TERMINAL_REPAIR_REWIND_SELECT_TOOL) {
                 retry_task.react_tool_stage = SERVER_REACT_TOOL_STAGE_SELECT_TOOL;
                 retry_task.react_stage_retry_count = 0;
                 retry_task.react_selected_tool_family_id.clear();
@@ -11277,6 +11366,15 @@ static bool telegram_dialogue_history_from_json(
                         "The previous completed tool step only verified state. "
                         "The original request still requires an external side effect. "
                         "Select the next tool family now instead of answering directly.";
+            } else if (post_tool_repair_action == REACT_POST_TOOL_TERMINAL_REPAIR_REWIND_DECIDE) {
+                retry_task.react_tool_stage = SERVER_REACT_TOOL_STAGE_DECIDE_AFTER_TOOL;
+                retry_task.react_stage_retry_count = 0;
+                retry_task.react_pending_terminal_action = LLAMA_AUTHORITATIVE_REACT_ACTION_NONE;
+                retry_task.react_retry_feedback =
+                        "The previous post-tool final reply was rejected again. "
+                        "Re-evaluate the admitted tool observation and original request now. "
+                        "If another tool step is still needed, choose select_tool. "
+                        "Otherwise choose answer or ask and then produce only the grounded final reply.";
             } else if (failure_class == "terminal_policy_reject") {
                 retry_task.react_retry_feedback = failure_detail + ". Continue the same authoritative ReAct turn. " +
                         std::string(react_turn_requires_retry_tool_escalation(retry_task) ?
@@ -11286,9 +11384,11 @@ static bool telegram_dialogue_history_from_json(
                                 "Do not narrate intended work as the final answer.");
             }
 
-            if (retry_task.react_same_failure_count >= 2 &&
+            if (post_tool_repair_action == REACT_POST_TOOL_TERMINAL_REPAIR_NONE &&
+                    retry_task.react_same_failure_count >= 2 &&
                     failure_class == "terminal_policy_reject" &&
-                    retry_task.react_resuming_from_tool_result) {
+                    retry_task.react_resuming_from_tool_result &&
+                    retry_task.react_tool_stage != SERVER_REACT_TOOL_STAGE_EMIT_RESPONSE) {
                 retry_task.react_tool_stage = SERVER_REACT_TOOL_STAGE_SELECT_TOOL;
                 retry_task.react_stage_retry_count = 0;
                 retry_task.react_selected_tool_family_id.clear();
@@ -11546,30 +11646,31 @@ static bool telegram_dialogue_history_from_json(
                     return;
                 }
             }
-            const std::string continuation_error =
+            const react_terminal_policy_validation continuation_validation =
                     validate_authoritative_react_terminal_policy(resumed_task, react_step);
-            if (!continuation_error.empty()) {
+            if (!continuation_validation.accepted()) {
                 SRV_WRN("authoritative ReAct continuation reject: task=%d origin=%d retry=%d action=%d error=%s\n",
                         resumed_task.id,
                         (int) resumed_task.react_origin,
                         resumed_task.react_retry_count,
                         react_step.action,
-                        continuation_error.c_str());
+                        continuation_validation.error.c_str());
                 capture_react_stage_provenance(
                         resumed_task,
                         "react_stage_reject",
                         "rejected",
                         &react_step,
                         react_parse_input,
-                        continuation_error);
+                        continuation_validation.error);
                 const bool retried = retry_staged_react(
                         resumed_task,
                         "terminal_policy_reject",
-                        continuation_error);
+                        continuation_validation.error,
+                        continuation_validation.kind);
                 if (retried) {
                     return;
                 }
-                send_error(slot, "Failed to continue authoritative ReAct turn after unsupported terminal step", ERROR_TYPE_SERVER);
+                send_error(slot, "Failed to continue authoritative ReAct turn after exhausted terminal-policy repair", ERROR_TYPE_SERVER);
                 return;
             }
             llama_shared_cognitive_context_window context_window = {};
@@ -11719,6 +11820,7 @@ static bool telegram_dialogue_history_from_json(
                         std::lock_guard<std::mutex> lock(runtime_state_mutex);
                         resumed_task.react_resuming_from_tool_result = false;
                         resumed_task.react_stage_retry_count = 0;
+                        resumed_task.react_post_tool_terminal_repair_count = 0;
                         resumed_task.react_tool_stage = SERVER_REACT_TOOL_STAGE_DECIDE_AFTER_TOOL;
                         resumed_task.react_last_tool_family_id = resumed_task.react_selected_tool_family_id;
                         resumed_task.react_last_tool_method_name = resumed_task.react_selected_method_name;
@@ -11884,6 +11986,7 @@ static bool telegram_dialogue_history_from_json(
                         std::lock_guard<std::mutex> lock(runtime_state_mutex);
                         resumed_task.react_resuming_from_tool_result = false;
                         resumed_task.react_stage_retry_count = 0;
+                        resumed_task.react_post_tool_terminal_repair_count = 0;
                         resumed_task.react_tool_stage = SERVER_REACT_TOOL_STAGE_DECIDE_AFTER_TOOL;
                         resumed_task.react_last_tool_family_id = resumed_task.react_selected_tool_family_id;
                         resumed_task.react_last_tool_method_name = resumed_task.react_selected_method_name;

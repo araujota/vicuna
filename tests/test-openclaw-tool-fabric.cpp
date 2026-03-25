@@ -113,8 +113,16 @@ int main() {
                 "expected authoritative ReAct stage retry budget to default to three attempts per stage")) {
         return 1;
     }
+    if (!expect(active_react_task.react_post_tool_terminal_repair_limit == 2,
+                "expected post-tool terminal repair budget to default to two bounded repair steps")) {
+        return 1;
+    }
     if (!expect(active_react_task.react_retry_count == 0,
                 "expected active ReAct retry counter to start at zero")) {
+        return 1;
+    }
+    if (!expect(active_react_task.react_post_tool_terminal_repair_count == 0,
+                "expected post-tool terminal repair counter to start at zero")) {
         return 1;
     }
     if (!expect(active_react_task.react_pending_terminal_action == LLAMA_AUTHORITATIVE_REACT_ACTION_NONE,
@@ -196,6 +204,8 @@ int main() {
     server_task parent_task(SERVER_TASK_TYPE_COMPLETION);
     parent_task.foreground_text = "What is the stock price right now?";
     parent_task.react_retry_limit = 12;
+    parent_task.react_post_tool_terminal_repair_count = 1;
+    parent_task.react_post_tool_terminal_repair_limit = 2;
     parent_task.react_pending_terminal_action = LLAMA_AUTHORITATIVE_REACT_ACTION_ASK;
     parent_task.react_last_step_name = "tool_result";
     parent_task.react_last_step_output = "{\"tool_family_id\":\"weather\"}";
@@ -222,6 +232,11 @@ int main() {
     }
     if (!expect(parent_task.child_tasks[0].react_retry_limit == parent_task.react_retry_limit,
                 "expected child task to preserve bounded continuation budget")) {
+        return 1;
+    }
+    if (!expect(parent_task.child_tasks[0].react_post_tool_terminal_repair_count == parent_task.react_post_tool_terminal_repair_count &&
+                parent_task.child_tasks[0].react_post_tool_terminal_repair_limit == parent_task.react_post_tool_terminal_repair_limit,
+                "expected child task to preserve post-tool terminal repair budget state")) {
         return 1;
     }
     if (!expect(parent_task.child_tasks[0].react_pending_terminal_action == parent_task.react_pending_terminal_action,

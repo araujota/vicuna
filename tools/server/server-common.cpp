@@ -375,6 +375,20 @@ bool authoritative_reply_is_procedural_non_answer(const std::string & text) {
     return false;
 }
 
+bool authoritative_reply_is_future_intent_status(const std::string & text) {
+    const std::string lowered = lowercase_ascii_copy(trim_copy(text));
+    if (lowered.empty()) {
+        return false;
+    }
+
+    return lowered.rfind("i will ", 0) == 0 ||
+            lowered.rfind("i'll ", 0) == 0 ||
+            lowered.rfind("i can ", 0) == 0 ||
+            lowered.rfind("you can ", 0) == 0 ||
+            lowered.rfind("you could ", 0) == 0 ||
+            lowered.rfind("the next step is to ", 0) == 0;
+}
+
 bool authoritative_retry_requires_tool_escalation(const std::string & text, int32_t retry_count) {
     if (retry_count < 2) {
         return false;

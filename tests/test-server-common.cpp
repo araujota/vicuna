@@ -127,6 +127,24 @@ int main() {
     }
 
     {
+        if (!expect(authoritative_reply_is_future_intent_status(
+                            "I will delete the series now."),
+                    "expected future-intent external-action reply to be detected")) {
+            return 1;
+        }
+        if (!expect(authoritative_reply_is_future_intent_status(
+                            "You can run the delete action from Sonarr."),
+                    "expected delegated future-intent reply to be detected")) {
+            return 1;
+        }
+        if (!expect(!authoritative_reply_is_future_intent_status(
+                             "The delete request has already been sent to Sonarr."),
+                    "expected grounded completion status to remain acceptable")) {
+            return 1;
+        }
+    }
+
+    {
         if (!expect(authoritative_visible_reply_looks_like_question(
                             "Which deployment target should I use?"),
                     "expected explicit question text to classify as a question-shaped reply")) {

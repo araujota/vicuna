@@ -179,6 +179,8 @@ struct server_task {
     int32_t react_retry_limit = 12;
     int32_t react_stage_retry_count = 0;
     int32_t react_stage_retry_limit = 3;
+    int32_t react_post_tool_terminal_repair_count = 0;
+    int32_t react_post_tool_terminal_repair_limit = 2;
     int32_t react_tool_stage = SERVER_REACT_TOOL_STAGE_NONE;
     std::string react_retry_feedback;
     std::string react_assistant_prefill;
@@ -308,6 +310,8 @@ struct server_task {
         copy.react_retry_limit = react_retry_limit;
         copy.react_stage_retry_count = react_stage_retry_count;
         copy.react_stage_retry_limit = react_stage_retry_limit;
+        copy.react_post_tool_terminal_repair_count = react_post_tool_terminal_repair_count;
+        copy.react_post_tool_terminal_repair_limit = react_post_tool_terminal_repair_limit;
         copy.react_tool_stage = react_tool_stage;
         copy.react_retry_feedback = react_retry_feedback;
         copy.react_selected_tool_family_id = react_selected_tool_family_id;

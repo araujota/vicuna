@@ -411,6 +411,14 @@ basic parse validity:
 - unsupported terminal answers are retried within the same authoritative turn
   with explicit feedback instead of returning hidden-thought-adjacent
   procedural text to the user
+- a rejected post-tool `emit_response` now has its own small dedicated repair
+  budget in addition to the overall continuation retry budget, so the final
+  grounded reply does not fail immediately just because earlier retries were
+  spent reaching the tool result
+- if the first repaired post-tool final reply is still rejected, the runtime
+  rewinds to `decide_after_tool` so the model can explicitly choose whether to
+  answer, ask, or continue the staged tool protocol instead of looping on the
+  same final-response stage
 - for non-staged turns, the runtime still prefers an explicit hidden
   `Action:` line, but if that label is missing it now has one bounded fallback
   policy instead of immediately returning `500`: recover a valid tool call from
@@ -424,13 +432,18 @@ basic parse validity:
 - after repeated rejected non-tool retries on a mutable active turn, the server
   escalates that turn to `tool_choice=required` so the loop converges onto a
   fresh observation instead of spinning indefinitely
+- on post-tool external-action turns, a final reply is rejected if it narrates
+  future work such as “I will ...” or delegates the already observed action
+  back to the user instead of reporting the current admitted result
 - user-facing text is plain prose only: visible answers, asks, Telegram relay
   text, and ask-with-options prompts/options are rejected if they contain “as
   an AI” disclaimers, markdown emphasis, or bullet/numbered list formatting
 - both the overall continuation budget and the per-stage retry budget are now
   explicit and bounded; stage failures retry locally first and can rewind from
   argument emission back to method selection or from method selection back to
-  tool selection instead of looping indefinitely
+  tool selection instead of looping indefinitely; unrecoverable post-tool
+  failures now surface as exhausted terminal-policy/controller repair rather
+  than an “unsupported terminal step”
 
 This is why active and DMN runners now stop in `LLAMA_COG_LOOP_PHASE_PROPOSE`
 with no pending command when authoritative mode is enabled: the cognitive loop
