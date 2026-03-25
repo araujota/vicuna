@@ -9,11 +9,7 @@ SYSTEMD_DIR="${VICUNA_SYSTEMD_DIR:-/etc/systemd/system}"
 ETC_DIR="${VICUNA_ETC_DIR:-/etc/vicuna}"
 ENV_FILE="${VICUNA_SYSTEM_ENV_FILE:-$ETC_DIR/vicuna.env}"
 STATE_ROOT="${VICUNA_STATE_ROOT:-/var/lib/vicuna}"
-CACHE_ROOT="${VICUNA_CACHE_ROOT:-/var/cache/vicuna}"
 LOG_ROOT="${VICUNA_LOG_ROOT:-/var/log/vicuna}"
-RUNTIME_STATE_PATH="${VICUNA_RUNTIME_STATE_PATH:-$STATE_ROOT/runtime-state.json}"
-RUNTIME_BACKUP_DIR="${VICUNA_RUNTIME_STATE_BACKUP_DIR:-$STATE_ROOT/runtime-state-backups}"
-OPENCLAW_CATALOG_PATH="${VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH:-$CACHE_ROOT/openclaw-catalog.json}"
 TELEGRAM_STATE_PATH="${TELEGRAM_BRIDGE_STATE_PATH:-$STATE_ROOT/telegram-bridge-state.json}"
 DRY_RUN=0
 
@@ -21,32 +17,8 @@ usage() {
     cat <<'EOF'
 Usage: install-vicuna-system-service.sh [--dry-run]
 
-Create or update a dedicated `vicuna` service account, grant it ACL-based
-access to the repository worktree, install system-level runtime and Telegram
-bridge units, and enable them through systemd.
-
-Environment overrides:
-  VICUNA_SERVICE_USER
-  VICUNA_SERVICE_GROUP
-  VICUNA_INTERACTIVE_OWNER
-  VICUNA_SYSTEMD_DIR
-  VICUNA_ETC_DIR
-  VICUNA_SYSTEM_ENV_FILE
-  VICUNA_STATE_ROOT
-  VICUNA_CACHE_ROOT
-  VICUNA_LOG_ROOT
-  VICUNA_RUNTIME_STATE_PATH
-  VICUNA_RUNTIME_STATE_BACKUP_DIR
-  VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH
-  VICUNA_RUNTIME_MODEL_DIR
-  VICUNA_RUNTIME_MODEL_NAME
-  VICUNA_RUNTIME_MODEL_PATH
-  VICUNA_RUNTIME_MODEL_URL
-  VICUNA_RUNTIME_MODEL_ALIAS
-  VICUNA_RUNTIME_MODEL_CHAT_TEMPLATE_FILE
-  VICUNA_RUNTIME_MODEL_REASONING_FORMAT
-  TELEGRAM_BRIDGE_STATE_PATH
-  TELEGRAM_BRIDGE_NODE_BIN
+Install the provider-first Vicuña runtime and retained Telegram bridge as
+systemd services.
 EOF
 }
 
@@ -70,10 +42,7 @@ run_cmd() {
 }
 
 require_root() {
-    if (( DRY_RUN )); then
-        return 0
-    fi
-    if (( EUID != 0 )); then
+    if (( ! DRY_RUN && EUID != 0 )); then
         die "run this script as root"
     fi
 }
@@ -109,69 +78,7 @@ resolve_node_bin() {
         fi
     fi
 
-    local owner_home
-    owner_home="$(getent passwd "$INTERACTIVE_OWNER" | cut -d: -f6)"
-    if [[ -n "$owner_home" && -d "$owner_home/.nvm/versions/node" ]]; then
-        local candidate
-        candidate="$(find "$owner_home/.nvm/versions/node" -mindepth 2 -maxdepth 2 -path '*/bin/node' | sort -V | tail -n 1)"
-        if [[ -n "$candidate" && -x "$candidate" ]] && node_version_ge "$("$candidate" -v)"; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-    fi
-
     die "could not resolve Node.js >= 20.16; set TELEGRAM_BRIDGE_NODE_BIN"
-}
-
-resolve_npm_bin() {
-    local node_bin="$1"
-    local sibling_npm
-    sibling_npm="$(dirname "$node_bin")/npm"
-    if [[ -x "$sibling_npm" ]]; then
-        printf '%s\n' "$sibling_npm"
-        return 0
-    fi
-    if command -v npm >/dev/null 2>&1; then
-        printf '%s\n' "$(command -v npm)"
-        return 0
-    fi
-    die "could not resolve npm for OpenClaw harness build"
-}
-
-resolve_codex_bin() {
-    if [[ -n "${VICUNA_CODEX_TOOL_PATH:-}" && -x "${VICUNA_CODEX_TOOL_PATH:-}" ]]; then
-        printf '%s\n' "$VICUNA_CODEX_TOOL_PATH"
-        return 0
-    fi
-
-    if command -v codex >/dev/null 2>&1; then
-        printf '%s\n' "$(command -v codex)"
-        return 0
-    fi
-
-    local owner_home
-    owner_home="$(getent passwd "$INTERACTIVE_OWNER" | cut -d: -f6)"
-    if [[ -n "$owner_home" ]]; then
-        local candidate=""
-        candidate="$(runuser -u "$INTERACTIVE_OWNER" -- bash -lc 'command -v codex' 2>/dev/null || true)"
-        if [[ -n "$candidate" && -x "$candidate" ]]; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
-
-        for candidate in \
-            "$owner_home/.local/bin/codex" \
-            "$owner_home/.npm-global/bin/codex" \
-            "/usr/local/bin/codex"
-        do
-            if [[ -x "$candidate" ]]; then
-                printf '%s\n' "$candidate"
-                return 0
-            fi
-        done
-    fi
-
-    printf '\n'
 }
 
 ensure_group() {
@@ -212,7 +119,6 @@ grant_repo_access() {
 
 write_env_file() {
     local node_bin="$1"
-    local codex_bin="$2"
     run_cmd install -d -m 0755 "$ETC_DIR"
     if (( DRY_RUN )); then
         cat <<EOF
@@ -223,25 +129,18 @@ VICUNA_SERVICE_GROUP=$SERVICE_GROUP
 VICUNA_RUNTIME_SERVICE_NAME=vicuna-runtime.service
 VICUNA_REPO_ROOT=$REPO_ROOT
 REPO_ROOT=$REPO_ROOT
-VICUNA_RUNTIME_STATE_PATH=$RUNTIME_STATE_PATH
-VICUNA_RUNTIME_STATE_BACKUP_DIR=$RUNTIME_BACKUP_DIR
-VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH=$OPENCLAW_CATALOG_PATH
-VICUNA_RUNTIME_MODEL_DIR=${VICUNA_RUNTIME_MODEL_DIR:-$REPO_ROOT/models/runtime}
-VICUNA_RUNTIME_MODEL_NAME=${VICUNA_RUNTIME_MODEL_NAME:-DeepSeek-R1-Distill-Llama-8B-Q6_K.gguf}
-VICUNA_RUNTIME_MODEL_PATH=${VICUNA_RUNTIME_MODEL_PATH:-$REPO_ROOT/models/runtime/DeepSeek-R1-Distill-Llama-8B-Q6_K.gguf}
-VICUNA_RUNTIME_MODEL_URL=${VICUNA_RUNTIME_MODEL_URL:-https://huggingface.co/bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF/resolve/main/DeepSeek-R1-Distill-Llama-8B-Q6_K.gguf?download=true}
-VICUNA_RUNTIME_MODEL_ALIAS=${VICUNA_RUNTIME_MODEL_ALIAS:-vicuna-runtime}
-VICUNA_RUNTIME_MODEL_CHAT_TEMPLATE_FILE=${VICUNA_RUNTIME_MODEL_CHAT_TEMPLATE_FILE:-$REPO_ROOT/models/templates/deepseek-ai-DeepSeek-R1-Distill-Llama-8B.jinja}
-VICUNA_RUNTIME_MODEL_REASONING_FORMAT=${VICUNA_RUNTIME_MODEL_REASONING_FORMAT:-deepseek}
-VICUNA_BASH_TOOL_WORKDIR=$REPO_ROOT
-VICUNA_BASH_TOOL_MAX_OPEN_FILES=${VICUNA_BASH_TOOL_MAX_OPEN_FILES:-256}
-VICUNA_CODEX_TOOL_PATH=$codex_bin
-VICUNA_CODEX_TOOL_WORKDIR=$REPO_ROOT
+VICUNA_RUNTIME_BUILD_DIR=${VICUNA_RUNTIME_BUILD_DIR:-build-host-cuda-128}
+VICUNA_RUNTIME_PORT=${VICUNA_RUNTIME_PORT:-8080}
+VICUNA_DEEPSEEK_BASE_URL=${VICUNA_DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+VICUNA_DEEPSEEK_MODEL=${VICUNA_DEEPSEEK_MODEL:-deepseek-reasoner}
+VICUNA_DEEPSEEK_TIMEOUT_MS=${VICUNA_DEEPSEEK_TIMEOUT_MS:-60000}
+VICUNA_DEEPSEEK_API_KEY=${VICUNA_DEEPSEEK_API_KEY:-}
 TELEGRAM_BRIDGE_STATE_PATH=$TELEGRAM_STATE_PATH
 TELEGRAM_BRIDGE_NODE_BIN=$node_bin
 EOF
         return 0
     fi
+
     cat >"$ENV_FILE" <<EOF
 VICUNA_SYSTEMD_SCOPE=system
 VICUNA_SYSTEM_ENV_FILE=$ENV_FILE
@@ -250,13 +149,12 @@ VICUNA_SERVICE_GROUP=$SERVICE_GROUP
 VICUNA_RUNTIME_SERVICE_NAME=vicuna-runtime.service
 VICUNA_REPO_ROOT=$REPO_ROOT
 REPO_ROOT=$REPO_ROOT
-VICUNA_RUNTIME_STATE_PATH=$RUNTIME_STATE_PATH
-VICUNA_RUNTIME_STATE_BACKUP_DIR=$RUNTIME_BACKUP_DIR
-VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH=$OPENCLAW_CATALOG_PATH
-VICUNA_BASH_TOOL_WORKDIR=$REPO_ROOT
-VICUNA_BASH_TOOL_MAX_OPEN_FILES=${VICUNA_BASH_TOOL_MAX_OPEN_FILES:-256}
-VICUNA_CODEX_TOOL_PATH=$codex_bin
-VICUNA_CODEX_TOOL_WORKDIR=$REPO_ROOT
+VICUNA_RUNTIME_BUILD_DIR=${VICUNA_RUNTIME_BUILD_DIR:-build-host-cuda-128}
+VICUNA_RUNTIME_PORT=${VICUNA_RUNTIME_PORT:-8080}
+VICUNA_DEEPSEEK_BASE_URL=${VICUNA_DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+VICUNA_DEEPSEEK_MODEL=${VICUNA_DEEPSEEK_MODEL:-deepseek-reasoner}
+VICUNA_DEEPSEEK_TIMEOUT_MS=${VICUNA_DEEPSEEK_TIMEOUT_MS:-60000}
+VICUNA_DEEPSEEK_API_KEY=${VICUNA_DEEPSEEK_API_KEY:-}
 TELEGRAM_BRIDGE_STATE_PATH=$TELEGRAM_STATE_PATH
 TELEGRAM_BRIDGE_NODE_BIN=$node_bin
 EOF
@@ -301,48 +199,6 @@ disable_user_service_if_possible() {
         systemctl --user disable --now "$service_name" >/dev/null 2>&1 || true
 }
 
-sync_runtime_catalog() {
-    local node_bin="$1"
-    local codex_bin="$2"
-
-    run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$(dirname "$OPENCLAW_CATALOG_PATH")"
-
-    local -a sync_env=(
-        env
-        "REPO_ROOT=$REPO_ROOT"
-        "VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH=$OPENCLAW_CATALOG_PATH"
-    )
-    if [[ -n "$codex_bin" ]]; then
-        sync_env+=("VICUNA_CODEX_TOOL_PATH=$codex_bin")
-    fi
-
-    run_cmd "${sync_env[@]}" "$node_bin" "$REPO_ROOT/tools/openclaw-harness/dist/index.js" sync-runtime-catalog
-    if [[ -f "$OPENCLAW_CATALOG_PATH" ]]; then
-        run_cmd chown "$SERVICE_USER:$SERVICE_GROUP" "$OPENCLAW_CATALOG_PATH"
-    fi
-}
-
-build_openclaw_harness_dist() {
-    local node_bin="$1"
-    local npm_bin
-    npm_bin="$(resolve_npm_bin "$node_bin")"
-
-    local -a build_cmd=(
-        "$npm_bin"
-        --prefix
-        "$REPO_ROOT/tools/openclaw-harness"
-        run
-        build
-    )
-
-    if (( DRY_RUN )); then
-        run_cmd "${build_cmd[@]}"
-        return 0
-    fi
-
-    runuser -u "$INTERACTIVE_OWNER" -- "${build_cmd[@]}" >/dev/null
-}
-
 while (($# > 0)); do
     case "$1" in
         --dry-run)
@@ -362,31 +218,24 @@ done
 require_root
 
 NODE_BIN="$(resolve_node_bin)"
-CODEX_BIN="$(resolve_codex_bin)"
 
 log "repo=$REPO_ROOT service_user=$SERVICE_USER interactive_owner=$INTERACTIVE_OWNER"
-log "state_root=$STATE_ROOT cache_root=$CACHE_ROOT log_root=$LOG_ROOT node_bin=$NODE_BIN codex_bin=${CODEX_BIN:-<missing>}"
-
 ensure_group
 ensure_user
-run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_ROOT" "$CACHE_ROOT" "$LOG_ROOT"
-run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$(dirname "$RUNTIME_STATE_PATH")" "$RUNTIME_BACKUP_DIR" "$(dirname "$TELEGRAM_STATE_PATH")"
+run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_ROOT" "$LOG_ROOT"
+run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$(dirname "$TELEGRAM_STATE_PATH")"
 grant_repo_access
-write_env_file "$NODE_BIN" "$CODEX_BIN"
-build_openclaw_harness_dist "$NODE_BIN"
-sync_runtime_catalog "$NODE_BIN" "$CODEX_BIN"
+write_env_file "$NODE_BIN"
 install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-runtime.system.service" "$SYSTEMD_DIR/vicuna-runtime.service"
 install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-telegram-bridge.system.service" "$SYSTEMD_DIR/vicuna-telegram-bridge.service"
-
 disable_user_service_if_possible "vicuna-telegram-bridge.service"
 disable_user_service_if_possible "vicuna-runtime.service"
-
 run_cmd systemctl daemon-reload
 run_cmd systemctl enable vicuna-runtime.service vicuna-telegram-bridge.service
 run_cmd systemctl restart vicuna-runtime.service
 run_cmd systemctl restart vicuna-telegram-bridge.service
 
-log "system-service migration complete"
+log "system-service install complete"
 log "runtime unit: $SYSTEMD_DIR/vicuna-runtime.service"
 log "bridge unit: $SYSTEMD_DIR/vicuna-telegram-bridge.service"
 log "env file: $ENV_FILE"

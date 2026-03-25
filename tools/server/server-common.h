@@ -1,7 +1,8 @@
 #pragma once
 
-#include "common.h"
 #include "log.h"
+
+#include "ggml.h"
 
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>

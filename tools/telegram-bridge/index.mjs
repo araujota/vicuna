@@ -2,10 +2,12 @@ import http from 'node:http';
 import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
+import { access } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import Supermemory, { toFile } from 'supermemory';
 import {
   appendProactiveId,
@@ -42,6 +44,7 @@ import {
 } from './lib.mjs';
 
 const execFileAsync = promisify(execFile);
+const bridgeDir = path.dirname(fileURLToPath(import.meta.url));
 
 const env = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
@@ -59,6 +62,15 @@ const env = {
   replayRetainedOutbox: String(process.env.TELEGRAM_BRIDGE_REPLAY_RETAINED_OUTBOX ?? '').trim() === '1',
   vicunaApiKey: process.env.VICUNA_API_KEY ?? '',
   supermemoryApiKey: process.env.SUPERMEMORY_API_KEY ?? '',
+  supermemoryBaseUrl: (process.env.SUPERMEMORY_BASE_URL ?? 'https://api.supermemory.ai').replace(/\/+$/, ''),
+  hardMemoryRuntimeIdentity: (process.env.VICUNA_HARD_MEMORY_RUNTIME_IDENTITY ?? 'vicuna').trim() || 'vicuna',
+  documentContainerTag: (
+    process.env.TELEGRAM_BRIDGE_DOCUMENT_CONTAINER_TAG ??
+    `${(process.env.VICUNA_HARD_MEMORY_RUNTIME_IDENTITY ?? 'vicuna').trim() || 'vicuna'}-telegram-documents`
+  ).trim() || 'vicuna-telegram-documents',
+  doclingPythonBin: process.env.TELEGRAM_BRIDGE_DOCLING_PYTHON_BIN ?? 'python3',
+  doclingParserScriptPath:
+    process.env.TELEGRAM_BRIDGE_DOCLING_PARSER_SCRIPT_PATH ?? path.join(bridgeDir, 'docling-parse.py'),
 };
 
 if (!env.telegramBotToken) {
@@ -75,7 +87,6 @@ const telegramBaseUrl = `https://api.telegram.org/bot${env.telegramBotToken}`;
 const vicunaUrl = new URL(env.vicunaBaseUrl);
 const sseHttpModule = vicunaUrl.protocol === 'https:' ? https : http;
 let supermemoryClient = null;
-let pdfParseModulePromise = null;
 
 function log(message, extra = undefined) {
   const prefix = '[telegram-bridge]';
@@ -142,6 +153,7 @@ function getSupermemoryClient() {
   if (!supermemoryClient) {
     supermemoryClient = new Supermemory({
       apiKey: env.supermemoryApiKey,
+      baseURL: env.supermemoryBaseUrl,
     });
   }
   return supermemoryClient;
@@ -156,42 +168,70 @@ async function downloadTelegramFile(filePath) {
   return buffer;
 }
 
-async function extractPdfText(fileBuffer) {
-  if (!pdfParseModulePromise) {
-    pdfParseModulePromise = import('pdf-parse');
-  }
-  const { PDFParse } = await pdfParseModulePromise;
-  const parser = new PDFParse({ data: fileBuffer });
+async function parseTelegramDocumentWithDocling(fileBuffer, descriptor) {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vicuna-telegram-doc-'));
+  const safeFileName = path.basename(String(descriptor?.fileName ?? 'telegram-document'));
+  const inputPath = path.join(tempDir, safeFileName);
   try {
-    const result = await parser.getText();
-    return typeof result?.text === 'string' ? result.text : '';
+    await access(env.doclingParserScriptPath);
+    await writeFile(inputPath, fileBuffer);
+    const { stdout, stderr } = await execFileAsync(env.doclingPythonBin, [
+      env.doclingParserScriptPath,
+      inputPath,
+    ], {
+      maxBuffer: 32 * 1024 * 1024,
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: '1',
+      },
+    });
+    try {
+      return JSON.parse(stdout);
+    } catch (error) {
+      throw new Error(
+        `Docling parser returned invalid JSON: ${stderr?.trim() || (error instanceof Error ? error.message : String(error))}`,
+      );
+    }
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      if (error.path === env.doclingParserScriptPath) {
+        throw new Error(`Docling parser helper is missing at ${env.doclingParserScriptPath}.`);
+      }
+      throw new Error(`Docling parsing requires ${env.doclingPythonBin} on the bridge host.`);
+    }
+    const stderr = typeof error?.stderr === 'string' ? error.stderr.trim() : '';
+    const stdout = typeof error?.stdout === 'string' ? error.stdout.trim() : '';
+    throw new Error(stderr || stdout || error.message || 'Docling parsing failed.');
   } finally {
-    await parser.destroy();
+    await rm(tempDir, { recursive: true, force: true });
   }
 }
 
-async function extractWordText(fileBuffer, descriptor) {
-  const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vicuna-telegram-doc-'));
-  const inputPath = path.join(tempDir, descriptor.fileName);
+async function writeSupermemoryMemories(payload) {
+  if (!env.supermemoryApiKey) {
+    throw new Error('SUPERMEMORY_API_KEY is required for parsed chunk persistence.');
+  }
+  const response = await fetch(`${env.supermemoryBaseUrl}/v4/memories`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      Authorization: `Bearer ${env.supermemoryApiKey}`,
+      'x-supermemory-api-key': env.supermemoryApiKey,
+    },
+    body: JSON.stringify(payload),
+  });
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`Supermemory chunk write failed with HTTP ${response.status}: ${body.slice(0, 400)}`);
+  }
+  if (!body.trim()) {
+    return {};
+  }
   try {
-    await writeFile(inputPath, fileBuffer);
-    const { stdout } = await execFileAsync('/usr/bin/textutil', [
-      '-convert',
-      'txt',
-      '-stdout',
-      '-strip',
-      inputPath,
-    ], {
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    return stdout;
-  } catch (error) {
-    if (error && error.code === 'ENOENT') {
-      throw new Error('DOC/DOCX extraction requires /usr/bin/textutil on the bridge host.');
-    }
-    throw error;
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
+    return JSON.parse(body);
+  } catch {
+    return {};
   }
 }
 
@@ -310,8 +350,8 @@ async function interruptDmnApprovalsForChat(chatId, telegramMessageId = 0) {
     telegram_message_id: Math.max(0, Number(telegramMessageId ?? 0) || 0),
     interrupt_kind: 'new_user_message',
   });
-  const cancelledApprovalIds = Array.isArray(response?.cancelled_dmn_approval_ids)
-    ? response.cancelled_dmn_approval_ids.map((value) => String(value ?? '').trim()).filter(Boolean)
+  const cancelledApprovalIds = Array.isArray(response?.cancelled_approval_ids)
+    ? response.cancelled_approval_ids.map((value) => String(value ?? '').trim()).filter(Boolean)
     : [];
   if (cancelledApprovalIds.length === 0) {
     return;
@@ -335,7 +375,7 @@ async function interruptDmnApprovalsForChat(chatId, telegramMessageId = 0) {
     pendingOptionPrompts: Object.fromEntries(nextPromptEntries),
   };
   await persistState();
-  log('cancelled pending DMN approval prompts for new Telegram input', {
+  log('cancelled pending runtime approval prompts for new Telegram input', {
     chatId: String(chatId),
     telegramMessageId: Math.max(0, Number(telegramMessageId ?? 0) || 0),
     cancelledApprovalIds,
@@ -539,6 +579,7 @@ async function handleTelegramMessage(message) {
   }
 
   if (hasDocument) {
+    const captionText = typeof message.caption === 'string' ? message.caption.trim() : '';
     const resolvedConversation = resolveTelegramConversationForMessage(state, message, {
       maxHistoryMessages: env.maxHistoryMessages,
     });
@@ -546,12 +587,15 @@ async function handleTelegramMessage(message) {
     const ingestion = await ingestTelegramDocumentMessage({
       message,
       maxDocumentChars: env.maxDocumentChars,
+      maxDocumentChunks: 128,
       resolveTelegramFile: (fileId) => telegramRequest('getFile', { file_id: fileId }),
       downloadTelegramFile,
-      extractPdfText,
-      extractWordText,
+      parseDocument: ({ fileBuffer, descriptor }) => parseTelegramDocumentWithDocling(fileBuffer, descriptor),
       supermemoryClient: getSupermemoryClient(),
       toFileFactory: (buffer, fileName) => toFile(buffer, fileName),
+      writeChunkMemories: writeSupermemoryMemories,
+      runtimeIdentity: env.hardMemoryRuntimeIdentity,
+      documentContainerTag: env.documentContainerTag,
     });
 
     if (!ingestion.ok) {
@@ -567,7 +611,7 @@ async function handleTelegramMessage(message) {
       state,
       message.chat.id,
       'user',
-      ingestion.transcriptText,
+      captionText ? `${captionText}\n\n${ingestion.transcriptText}` : ingestion.transcriptText,
       {
         maxHistoryMessages: env.maxHistoryMessages,
         conversationId: resolvedConversation.conversationId,
@@ -588,7 +632,7 @@ async function handleTelegramMessage(message) {
   if (!text) {
     await sendTelegramMessage(
       message.chat.id,
-      'Only plain text, PDF, DOC, and DOCX messages are supported right now.',
+      'Only plain text or Docling-supported document uploads such as PDF and DOCX are supported right now.',
       { reply_to_message_id: message.message_id },
     );
     return;

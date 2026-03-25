@@ -1,4 +1,5 @@
 #include "server-emotive-runtime.h"
+#include "server-runtime.h"
 
 #include <algorithm>
 #include <cctype>
@@ -621,12 +622,12 @@ server_emotive_block_record server_emotive_runtime::evaluate_block(
 
     float sim_previous = 0.0f;
     if (have_embedding && !previous_embedding.empty() && previous_embedding.size() == embedding.size()) {
-        sim_previous = clamp_unit((common_embd_similarity_cos(previous_embedding.data(), embedding.data(), (int) embedding.size()) + 1.0f) * 0.5f);
+        sim_previous = clamp_unit((server_embd_similarity_cos(previous_embedding.data(), embedding.data(), (int) embedding.size()) + 1.0f) * 0.5f);
     }
 
     float sim_user = 0.0f;
     if (have_embedding && !user_anchor_embedding.empty() && user_anchor_embedding.size() == embedding.size()) {
-        sim_user = clamp_unit((common_embd_similarity_cos(user_anchor_embedding.data(), embedding.data(), (int) embedding.size()) + 1.0f) * 0.5f);
+        sim_user = clamp_unit((server_embd_similarity_cos(user_anchor_embedding.data(), embedding.data(), (int) embedding.size()) + 1.0f) * 0.5f);
     } else if (kind != SERVER_EMOTIVE_BLOCK_USER_MESSAGE && !user_anchor_embedding.empty()) {
         sim_user = 0.5f;
     }

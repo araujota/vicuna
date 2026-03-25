@@ -18,6 +18,7 @@ export const DEFAULT_STATE = {
 
 export const DEFAULT_MAX_HISTORY_MESSAGES = 12;
 export const DEFAULT_MAX_DOCUMENT_CHARS = 12000;
+export const DEFAULT_MAX_DOCUMENT_CHUNKS = 128;
 export const DEFAULT_MAX_PENDING_OPTION_PROMPTS = 32;
 export const DEFAULT_MAX_CONVERSATION_MESSAGE_LINKS = 64;
 export const TELEGRAM_BRIDGE_STATE_SCHEMA_VERSION = 2;
@@ -48,16 +49,52 @@ const PDF_MIME_TYPES = new Set([
   'application/pdf',
 ]);
 
-const DOC_MIME_TYPES = new Set([
-  'application/msword',
-  'application/doc',
-  'application/vnd.ms-word',
-  'application/x-msword',
-]);
-
 const DOCX_MIME_TYPES = new Set([
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
 ]);
+
+const CSV_MIME_TYPES = new Set([
+  'text/csv',
+  'application/csv',
+  'application/vnd.ms-excel',
+]);
+
+const HTML_MIME_TYPES = new Set([
+  'text/html',
+  'application/xhtml+xml',
+]);
+
+const MARKDOWN_MIME_TYPES = new Set([
+  'text/markdown',
+  'text/x-markdown',
+]);
+
+const PPTX_MIME_TYPES = new Set([
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+]);
+
+const XLSX_MIME_TYPES = new Set([
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+]);
+
+const EXTENSION_TO_LOGICAL_TYPE = new Map([
+  ['pdf', 'pdf'],
+  ['docx', 'docx'],
+  ['pptx', 'pptx'],
+  ['xlsx', 'xlsx'],
+  ['csv', 'csv'],
+  ['md', 'markdown'],
+  ['markdown', 'markdown'],
+  ['html', 'html'],
+  ['htm', 'html'],
+  ['xhtml', 'html'],
+  ['adoc', 'asciidoc'],
+  ['asciidoc', 'asciidoc'],
+  ['tex', 'latex'],
+  ['ltx', 'latex'],
+]);
+
+const DEFAULT_TELEGRAM_DOCUMENT_CONTAINER_TAG = 'vicuna-telegram-documents';
 
 function normalizeMimeType(value) {
   return String(value ?? '').trim().toLowerCase();
@@ -85,14 +122,29 @@ export function detectTelegramDocumentLogicalType(document) {
   const mimeType = normalizeMimeType(document?.mime_type);
   const extension = normalizeFileExtension(document?.file_name);
 
-  if (PDF_MIME_TYPES.has(mimeType) || extension === 'pdf') {
+  if (EXTENSION_TO_LOGICAL_TYPE.has(extension)) {
+    return EXTENSION_TO_LOGICAL_TYPE.get(extension);
+  }
+  if (PDF_MIME_TYPES.has(mimeType)) {
     return 'pdf';
   }
-  if (DOCX_MIME_TYPES.has(mimeType) || extension === 'docx') {
+  if (DOCX_MIME_TYPES.has(mimeType)) {
     return 'docx';
   }
-  if (DOC_MIME_TYPES.has(mimeType) || extension === 'doc') {
-    return 'doc';
+  if (PPTX_MIME_TYPES.has(mimeType)) {
+    return 'pptx';
+  }
+  if (XLSX_MIME_TYPES.has(mimeType)) {
+    return 'xlsx';
+  }
+  if (CSV_MIME_TYPES.has(mimeType)) {
+    return 'csv';
+  }
+  if (HTML_MIME_TYPES.has(mimeType)) {
+    return 'html';
+  }
+  if (MARKDOWN_MIME_TYPES.has(mimeType)) {
+    return 'markdown';
   }
   return 'unsupported';
 }
@@ -146,18 +198,21 @@ export function normalizeDocumentPlainText(text, options = {}) {
 
 export function formatTelegramDocumentTranscript(descriptor, normalizedText) {
   const lines = [
-    `[Document: ${descriptor.fileName}]`,
-    `[Type: ${descriptor.logicalType}]`,
+    `[Uploaded document: ${descriptor.fileName}]`,
+    `Parsed contents of ${descriptor.fileName}`,
   ];
   if (normalizedText.truncated) {
-    lines.push('[Notice: extracted text truncated]');
+    lines.push('[Notice: parsed contents truncated]');
   }
   lines.push('', normalizedText.text);
   return lines.join('\n').trim();
 }
 
-export function buildTelegramDocumentLinkage(descriptor) {
-  const chatPart = sanitizeIdentifierPart(descriptor.chatId);
+export function buildTelegramDocumentLinkage(descriptor, options = {}) {
+  const configuredContainerTag = sanitizeIdentifierPart(
+    String(options.containerTag ?? '').trim(),
+    DEFAULT_TELEGRAM_DOCUMENT_CONTAINER_TAG,
+  );
   const fileUniquePart = sanitizeIdentifierPart(descriptor.fileUniqueId || descriptor.fileId || descriptor.fileName);
   const linkageSeed = [
     descriptor.chatId,
@@ -167,13 +222,15 @@ export function buildTelegramDocumentLinkage(descriptor) {
     descriptor.fileName,
   ].join(':');
   const linkKey = `telegram-doc-${createHash('sha256').update(linkageSeed).digest('hex').slice(0, 24)}`;
-  const containerTag = truncateIdentifier(`telegram-chat-${chatPart}`, 100);
+  const containerTag = truncateIdentifier(configuredContainerTag, 100);
   const rawCustomId = truncateIdentifier(`telegram-file-${linkKey}`, 100);
-  const textCustomId = truncateIdentifier(`telegram-text-${linkKey}`, 100);
+  const parsedCustomId = truncateIdentifier(`telegram-parsed-${linkKey}`, 100);
+  const chunkKeyPrefix = truncateIdentifier(`telegram-chunk-${linkKey}`, 100);
 
   const baseMetadata = {
     source: 'telegram_bridge',
     linkKey,
+    documentTitle: descriptor.fileName,
     telegramChatId: descriptor.chatId,
     telegramMessageId: descriptor.messageId,
     telegramFileId: descriptor.fileId,
@@ -187,14 +244,15 @@ export function buildTelegramDocumentLinkage(descriptor) {
     linkKey,
     containerTag,
     rawCustomId,
-    textCustomId,
+    parsedCustomId,
+    chunkKeyPrefix,
     rawMetadata: {
       ...baseMetadata,
       contentKind: 'source_file',
     },
-    textMetadata: {
+    parsedMetadata: {
       ...baseMetadata,
-      contentKind: 'extracted_text',
+      contentKind: 'parsed_output',
     },
   };
 }
@@ -203,16 +261,144 @@ export function buildTelegramFileUrl(botToken, filePath) {
   return `https://api.telegram.org/file/bot${botToken}/${String(filePath ?? '').replace(/^\/+/, '')}`;
 }
 
+function readFirstNonEmptyString(...values) {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return '';
+}
+
+function parseChunkIndex(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function normalizeParsedChunk(chunk, fallbackIndex) {
+  if (!chunk || typeof chunk !== 'object' || Array.isArray(chunk)) {
+    return null;
+  }
+  const contextualText = readFirstNonEmptyString(
+    chunk.contextual_text,
+    chunk.contextualText,
+    chunk.chunk_text,
+    chunk.chunkText,
+    chunk.content,
+    chunk.text,
+  );
+  if (!contextualText) {
+    return null;
+  }
+  return {
+    chunkIndex: parseChunkIndex(chunk.chunk_index ?? chunk.chunkIndex, fallbackIndex),
+    contextualText,
+    sourceText: readFirstNonEmptyString(
+      chunk.source_text,
+      chunk.sourceText,
+      chunk.text,
+      chunk.content,
+      contextualText,
+    ),
+  };
+}
+
+export function normalizeDoclingParsedDocument(parsedDocument, descriptor, options = {}) {
+  if (!parsedDocument || typeof parsedDocument !== 'object' || Array.isArray(parsedDocument)) {
+    throw new Error('Docling parser returned a non-object payload.');
+  }
+
+  const transcriptSource = readFirstNonEmptyString(
+    parsedDocument.plain_text,
+    parsedDocument.plainText,
+    parsedDocument.parsed_markdown,
+    parsedDocument.parsedMarkdown,
+  );
+  if (!transcriptSource) {
+    throw new Error(`Docling parser returned no parsed contents for ${descriptor.fileName}.`);
+  }
+
+  const parsedMarkdown = readFirstNonEmptyString(
+    parsedDocument.parsed_markdown,
+    parsedDocument.parsedMarkdown,
+    transcriptSource,
+  );
+  const maxChunks = Math.max(1, parseInteger(options.maxChunks, DEFAULT_MAX_DOCUMENT_CHUNKS));
+  const rawChunks = Array.isArray(parsedDocument.chunks) ? parsedDocument.chunks : [];
+  const chunks = rawChunks
+    .map((chunk, index) => normalizeParsedChunk(chunk, index))
+    .filter(Boolean)
+    .sort((lhs, rhs) => lhs.chunkIndex - rhs.chunkIndex)
+    .slice(0, maxChunks);
+
+  return {
+    title: readFirstNonEmptyString(parsedDocument.title, descriptor.fileName),
+    parsedMarkdown,
+    transcript: normalizeDocumentPlainText(transcriptSource, {
+      maxChars: options.maxChars,
+    }),
+    chunks,
+    chunkCount: rawChunks.length,
+    storedChunkCount: chunks.length,
+    doclingVersion: readFirstNonEmptyString(parsedDocument.docling_version, parsedDocument.doclingVersion),
+  };
+}
+
+export function buildTelegramParsedChunkMemories(options = {}) {
+  const {
+    descriptor,
+    linkage,
+    parsedDocument,
+    rawDocumentId = '',
+    parsedDocumentId = '',
+    runtimeIdentity = 'vicuna',
+  } = options;
+
+  return (parsedDocument?.chunks ?? []).map((chunk, index) => ({
+    content: chunk.contextualText,
+    isStatic: true,
+    metadata: {
+      source: 'telegram_bridge',
+      runtimeIdentity,
+      kind: 'tool_observation',
+      domain: 'strategy',
+      key: `${linkage.chunkKeyPrefix}-${String(index).padStart(4, '0')}`,
+      title: `${parsedDocument.title} chunk ${index + 1}`,
+      tags: ['telegram_document', 'parsed_chunk'],
+      importance: 0.6,
+      confidence: 1,
+      gainBias: 0.1,
+      allostaticRelevance: 0,
+      linkKey: linkage.linkKey,
+      contentKind: 'parsed_chunk',
+      documentTitle: parsedDocument.title,
+      telegramChatId: descriptor.chatId,
+      telegramMessageId: descriptor.messageId,
+      telegramFileName: descriptor.fileName,
+      telegramLogicalType: descriptor.logicalType,
+      rawDocumentId,
+      parsedDocumentId,
+      chunkIndex: chunk.chunkIndex,
+      chunkCount: parsedDocument.chunks.length,
+      sourceText: chunk.sourceText,
+      doclingVersion: parsedDocument.doclingVersion || undefined,
+    },
+  }));
+}
+
 export async function ingestTelegramDocumentMessage(options) {
   const {
     message,
     maxDocumentChars = DEFAULT_MAX_DOCUMENT_CHARS,
+    maxDocumentChunks = DEFAULT_MAX_DOCUMENT_CHUNKS,
     resolveTelegramFile,
     downloadTelegramFile,
-    extractPdfText,
-    extractWordText,
+    parseDocument,
     supermemoryClient,
     toFileFactory,
+    writeChunkMemories,
+    runtimeIdentity = 'vicuna',
+    documentContainerTag = DEFAULT_TELEGRAM_DOCUMENT_CONTAINER_TAG,
   } = options ?? {};
 
   const descriptor = buildTelegramDocumentDescriptor(message);
@@ -220,7 +406,7 @@ export async function ingestTelegramDocumentMessage(options) {
     return {
       ok: false,
       descriptor,
-      userError: 'Only plain text, PDF, DOC, and DOCX messages are supported right now.',
+      userError: 'Only Docling-supported document uploads such as PDF and DOCX are supported right now.',
     };
   }
 
@@ -235,10 +421,17 @@ export async function ingestTelegramDocumentMessage(options) {
   if (typeof resolveTelegramFile !== 'function' || typeof downloadTelegramFile !== 'function') {
     throw new Error('Telegram document ingestion requires file resolution and download helpers.');
   }
+  if (typeof parseDocument !== 'function') {
+    throw new Error('Telegram document ingestion requires a Docling parse helper.');
+  }
+  if (typeof writeChunkMemories !== 'function') {
+    throw new Error('Telegram document ingestion requires a chunk-memory writer.');
+  }
 
   let linkage = null;
   let normalized = null;
   let rawDocumentId = '';
+  let parsedDocumentId = '';
   try {
     const fileInfo = await resolveTelegramFile(descriptor.fileId);
     const filePath = String(fileInfo?.file_path ?? '').trim();
@@ -251,22 +444,12 @@ export async function ingestTelegramDocumentMessage(options) {
       throw new Error('Telegram document download returned no bytes.');
     }
 
-    let extractedRawText = '';
-    if (descriptor.logicalType === 'pdf') {
-      if (typeof extractPdfText !== 'function') {
-        throw new Error('PDF extraction helper is not configured.');
-      }
-      extractedRawText = await extractPdfText(fileBuffer, descriptor);
-    } else {
-      if (typeof extractWordText !== 'function') {
-        throw new Error('Word extraction helper is not configured.');
-      }
-      extractedRawText = await extractWordText(fileBuffer, descriptor);
-    }
-
-    normalized = normalizeDocumentPlainText(extractedRawText, {
-      maxChars: maxDocumentChars,
-    });
+    const parsedDocument = normalizeDoclingParsedDocument(
+      await parseDocument({ fileBuffer, descriptor }),
+      descriptor,
+      { maxChars: maxDocumentChars, maxChunks: maxDocumentChunks },
+    );
+    normalized = parsedDocument.transcript;
     if (!normalized.text) {
       return {
         ok: false,
@@ -275,7 +458,9 @@ export async function ingestTelegramDocumentMessage(options) {
       };
     }
 
-    linkage = buildTelegramDocumentLinkage(descriptor);
+    linkage = buildTelegramDocumentLinkage(descriptor, {
+      containerTag: documentContainerTag,
+    });
     const rawUploadFile = await toFileFactory(fileBuffer, descriptor.fileName);
 
     const rawUpload = await supermemoryClient.documents.uploadFile({
@@ -294,16 +479,32 @@ export async function ingestTelegramDocumentMessage(options) {
       metadata: linkage.rawMetadata,
     });
 
-    const textDocument = await supermemoryClient.documents.add({
-      content: normalized.text,
+    const parsedUpload = await supermemoryClient.documents.add({
+      content: parsedDocument.parsedMarkdown,
       containerTag: linkage.containerTag,
-      customId: linkage.textCustomId,
-      metadata: linkage.textMetadata,
+      customId: linkage.parsedCustomId,
+      metadata: linkage.parsedMetadata,
     });
-    const textDocumentId = String(textDocument?.id ?? '').trim();
-    if (!textDocumentId) {
-      throw new Error('Supermemory extracted-text add did not return an id.');
+    parsedDocumentId = String(parsedUpload?.id ?? '').trim();
+    if (!parsedDocumentId) {
+      throw new Error('Supermemory parsed-output add did not return an id.');
     }
+
+    const chunkMemories = buildTelegramParsedChunkMemories({
+      descriptor,
+      linkage,
+      parsedDocument,
+      rawDocumentId,
+      parsedDocumentId,
+      runtimeIdentity,
+    });
+    if (chunkMemories.length === 0) {
+      throw new Error(`Docling produced no searchable chunks for ${descriptor.fileName}.`);
+    }
+    await writeChunkMemories({
+      containerTag: linkage.containerTag,
+      memories: chunkMemories,
+    });
 
     return {
       ok: true,
@@ -312,19 +513,26 @@ export async function ingestTelegramDocumentMessage(options) {
       normalized,
       transcriptText: formatTelegramDocumentTranscript(descriptor, normalized),
       rawDocumentId,
-      textDocumentId,
+      parsedDocumentId,
+      storedChunkCount: chunkMemories.length,
     };
   } catch (error) {
     const messageText = error instanceof Error ? error.message : String(error);
+    const partialStage = parsedDocumentId
+      ? 'parsed output storage'
+      : rawDocumentId
+        ? 'raw file storage'
+        : '';
     return {
       ok: false,
       descriptor,
       linkage,
       normalized,
       rawDocumentId,
-      partialFailure: Boolean(rawDocumentId),
-      userError: rawDocumentId
-        ? `Telegram document ingestion partially failed after raw file storage: ${messageText}`
+      parsedDocumentId,
+      partialFailure: Boolean(rawDocumentId || parsedDocumentId),
+      userError: partialStage
+        ? `Telegram document ingestion partially failed after ${partialStage}: ${messageText}`
         : `Telegram document ingestion failed: ${messageText}`,
     };
   }

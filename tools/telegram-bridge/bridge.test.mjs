@@ -10,6 +10,7 @@ import {
   bootstrapTelegramOutboxOffset,
   buildTelegramDocumentDescriptor,
   buildTelegramDocumentLinkage,
+  buildTelegramParsedChunkMemories,
   buildTelegramFileUrl,
   buildTelegramRelaySystemPrompt,
   createTelegramConversation,
@@ -25,6 +26,7 @@ import {
   isTelegramReplyTargetErrorMessage,
   isTelegramTerminalDeliveryErrorMessage,
   loadState,
+  normalizeDoclingParsedDocument,
   normalizeDocumentPlainText,
   normalizeTelegramOutboxItem,
   normalizeState,
@@ -150,19 +152,23 @@ test('sanitizeAssistantRelayText strips known tool-call xml blocks', () => {
   assert.equal(text, 'prefix\n\nsuffix');
 });
 
-test('detectTelegramDocumentLogicalType supports pdf doc and docx', () => {
+test('detectTelegramDocumentLogicalType supports Docling-backed formats and rejects legacy doc', () => {
   assert.equal(detectTelegramDocumentLogicalType({
     mime_type: 'application/pdf',
     file_name: 'report.bin',
   }), 'pdf');
   assert.equal(detectTelegramDocumentLogicalType({
-    mime_type: 'application/msword',
-    file_name: 'report.doc',
-  }), 'doc');
-  assert.equal(detectTelegramDocumentLogicalType({
     mime_type: 'application/octet-stream',
     file_name: 'report.docx',
   }), 'docx');
+  assert.equal(detectTelegramDocumentLogicalType({
+    mime_type: 'text/markdown',
+    file_name: 'notes.md',
+  }), 'markdown');
+  assert.equal(detectTelegramDocumentLogicalType({
+    mime_type: 'application/msword',
+    file_name: 'report.doc',
+  }), 'unsupported');
   assert.equal(detectTelegramDocumentLogicalType({
     mime_type: 'application/zip',
     file_name: 'report.zip',
@@ -211,13 +217,16 @@ test('buildTelegramDocumentLinkage creates shared metadata for raw and text docu
     fileName: 'memo.docx',
     mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     logicalType: 'docx',
+  }, {
+    containerTag: 'shared-documents',
   });
 
   assert.match(linkage.linkKey, /^telegram-doc-/);
-  assert.equal(linkage.containerTag, 'telegram-chat-1001');
-  assert.equal(linkage.rawMetadata.linkKey, linkage.textMetadata.linkKey);
+  assert.equal(linkage.containerTag, 'shared-documents');
+  assert.equal(linkage.rawMetadata.linkKey, linkage.parsedMetadata.linkKey);
   assert.equal(linkage.rawMetadata.contentKind, 'source_file');
-  assert.equal(linkage.textMetadata.contentKind, 'extracted_text');
+  assert.equal(linkage.parsedMetadata.contentKind, 'parsed_output');
+  assert.match(linkage.chunkKeyPrefix, /^telegram-chunk-/);
 });
 
 test('buildTelegramFileUrl creates telegram file endpoint', () => {
@@ -237,11 +246,83 @@ test('buildTelegramRelaySystemPrompt prefers exposed media tools over stale refu
   assert.match(prompt, /treat that as stale and use the currently available tool on this turn/i);
 });
 
+test('normalizeDoclingParsedDocument keeps parsed markdown and contextualized chunks', () => {
+  const parsed = normalizeDoclingParsedDocument({
+    title: 'report.pdf',
+    parsed_markdown: '# Heading\n\nAlpha',
+    plain_text: 'Heading\n\nAlpha',
+    docling_version: '2.0.0',
+    chunks: [
+      {
+        chunk_index: 1,
+        source_text: 'Alpha',
+        contextual_text: 'Heading\nAlpha',
+      },
+      {
+        chunk_index: 0,
+        source_text: 'Heading',
+        contextual_text: 'Heading',
+      },
+    ],
+  }, {
+    fileName: 'report.pdf',
+  }, {
+    maxChars: 50,
+    maxChunks: 8,
+  });
+
+  assert.equal(parsed.title, 'report.pdf');
+  assert.equal(parsed.parsedMarkdown, '# Heading\n\nAlpha');
+  assert.equal(parsed.transcript.text, 'Heading\n\nAlpha');
+  assert.equal(parsed.chunks.length, 2);
+  assert.equal(parsed.chunks[0].chunkIndex, 0);
+  assert.equal(parsed.chunks[1].contextualText, 'Heading\nAlpha');
+});
+
+test('buildTelegramParsedChunkMemories creates searchable metadata for each stored chunk', () => {
+  const linkage = buildTelegramDocumentLinkage({
+    chatId: '42',
+    messageId: '9',
+    fileId: 'file_1',
+    fileUniqueId: 'uniq_1',
+    fileName: 'memo.docx',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    logicalType: 'docx',
+  });
+  const memories = buildTelegramParsedChunkMemories({
+    descriptor: {
+      chatId: '42',
+      messageId: '9',
+      fileName: 'memo.docx',
+      logicalType: 'docx',
+    },
+    linkage,
+    runtimeIdentity: 'vicuna',
+    rawDocumentId: 'raw_doc_1',
+    parsedDocumentId: 'parsed_doc_1',
+    parsedDocument: {
+      title: 'memo.docx',
+      doclingVersion: '2.0.0',
+      chunks: [
+        { chunkIndex: 0, contextualText: 'Intro chunk', sourceText: 'Intro' },
+      ],
+    },
+  });
+
+  assert.equal(memories.length, 1);
+  assert.equal(memories[0].content, 'Intro chunk');
+  assert.equal(memories[0].metadata.contentKind, 'parsed_chunk');
+  assert.equal(memories[0].metadata.documentTitle, 'memo.docx');
+  assert.equal(memories[0].metadata.rawDocumentId, 'raw_doc_1');
+  assert.equal(memories[0].metadata.parsedDocumentId, 'parsed_doc_1');
+});
+
 test('ingestTelegramDocumentMessage persists raw and extracted documents with shared linkage', async () => {
   const calls = {
     upload: [],
     update: [],
     add: [],
+    writeMemories: [],
   };
   const supermemoryClient = {
     documents: {
@@ -280,28 +361,52 @@ test('ingestTelegramDocumentMessage persists raw and extracted documents with sh
       assert.equal(filePath, 'docs/report.pdf');
       return Buffer.from('pdf bytes');
     },
-    extractPdfText: async () => 'Alpha\n\n\nBeta',
-    extractWordText: async () => {
-      throw new Error('should not be called');
+    parseDocument: async () => ({
+      title: 'report.pdf',
+      parsed_markdown: '# Report\n\nAlpha\n\nBeta',
+      plain_text: 'Alpha\n\nBeta',
+      docling_version: '2.0.0',
+      chunks: [
+        {
+          chunk_index: 0,
+          source_text: 'Alpha',
+          contextual_text: 'Report\nAlpha',
+        },
+        {
+          chunk_index: 1,
+          source_text: 'Beta',
+          contextual_text: 'Report\nBeta',
+        },
+      ],
+    }),
+    writeChunkMemories: async (payload) => {
+      calls.writeMemories.push(payload);
     },
     supermemoryClient,
     toFileFactory: async (buffer, fileName) => ({ buffer: Buffer.from(buffer), fileName }),
+    runtimeIdentity: 'vicuna',
+    documentContainerTag: 'shared-documents',
   });
 
   assert.equal(result.ok, true);
   assert.equal(result.rawDocumentId, 'raw_doc_1');
-  assert.equal(result.textDocumentId, 'text_doc_1');
-  assert.match(result.transcriptText, /\[Document: report\.pdf\]/);
+  assert.equal(result.parsedDocumentId, 'text_doc_1');
+  assert.equal(result.storedChunkCount, 2);
+  assert.match(result.transcriptText, /Parsed contents of report\.pdf/);
   assert.match(result.transcriptText, /Alpha\n\nBeta/);
   assert.equal(calls.upload.length, 1);
   assert.equal(calls.update.length, 1);
   assert.equal(calls.add.length, 1);
+  assert.equal(calls.writeMemories.length, 1);
 
   const rawMetadata = JSON.parse(calls.upload[0].metadata);
   assert.equal(rawMetadata.contentKind, 'source_file');
   assert.equal(calls.update[0].payload.metadata.linkKey, rawMetadata.linkKey);
   assert.equal(calls.add[0].metadata.linkKey, rawMetadata.linkKey);
+  assert.equal(calls.add[0].metadata.contentKind, 'parsed_output');
   assert.equal(calls.add[0].containerTag, calls.update[0].payload.containerTag);
+  assert.equal(calls.writeMemories[0].containerTag, 'shared-documents');
+  assert.equal(calls.writeMemories[0].memories[0].metadata.contentKind, 'parsed_chunk');
 });
 
 test('ingestTelegramDocumentMessage rejects unsupported documents cleanly', async () => {
@@ -319,7 +424,7 @@ test('ingestTelegramDocumentMessage rejects unsupported documents cleanly', asyn
   });
 
   assert.equal(result.ok, false);
-  assert.equal(result.userError, 'Only plain text, PDF, DOC, and DOCX messages are supported right now.');
+  assert.equal(result.userError, 'Only Docling-supported document uploads such as PDF and DOCX are supported right now.');
 });
 
 test('ingestTelegramDocumentMessage requires supermemory for document processing', async () => {
@@ -368,9 +473,14 @@ test('ingestTelegramDocumentMessage surfaces partial failure after raw upload', 
     },
     resolveTelegramFile: async () => ({ file_path: 'docs/report.pdf' }),
     downloadTelegramFile: async () => Buffer.from('pdf bytes'),
-    extractPdfText: async () => 'Alpha',
-    extractWordText: async () => 'unused',
+    parseDocument: async () => ({
+      title: 'report.pdf',
+      parsed_markdown: '# Report\n\nAlpha',
+      plain_text: 'Alpha',
+      chunks: [{ chunk_index: 0, source_text: 'Alpha', contextual_text: 'Report\nAlpha' }],
+    }),
     supermemoryClient,
+    writeChunkMemories: async () => undefined,
     toFileFactory: async () => ({ name: 'report.pdf' }),
   });
 
@@ -379,29 +489,74 @@ test('ingestTelegramDocumentMessage surfaces partial failure after raw upload', 
   assert.match(result.userError, /partially failed after raw file storage/);
 });
 
-test('ingestTelegramDocumentMessage surfaces extraction failures directly', async () => {
+test('ingestTelegramDocumentMessage surfaces Docling parsing failures directly', async () => {
   const result = await ingestTelegramDocumentMessage({
     message: {
       chat: { id: 77 },
       message_id: 10,
       document: {
         file_id: 'file_1',
-        file_name: 'report.doc',
-        mime_type: 'application/msword',
+        file_name: 'report.docx',
+        mime_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
       },
     },
     resolveTelegramFile: async () => ({ file_path: 'docs/report.doc' }),
     downloadTelegramFile: async () => Buffer.from('doc bytes'),
-    extractPdfText: async () => 'unused',
-    extractWordText: async () => {
-      throw new Error('DOC/DOCX extraction requires /usr/bin/textutil on the bridge host.');
+    parseDocument: async () => {
+      throw new Error('Docling is not available in the configured Python environment.');
     },
     supermemoryClient: { documents: {} },
+    writeChunkMemories: async () => undefined,
     toFileFactory: async () => ({ name: 'report.doc' }),
   });
 
   assert.equal(result.ok, false);
-  assert.match(result.userError, /textutil/);
+  assert.match(result.userError, /Docling/);
+});
+
+test('ingestTelegramDocumentMessage surfaces partial failure after parsed output storage when chunks cannot be written', async () => {
+  const result = await ingestTelegramDocumentMessage({
+    message: {
+      chat: { id: 77 },
+      message_id: 10,
+      document: {
+        file_id: 'file_1',
+        file_unique_id: 'uniq_1',
+        file_name: 'report.pdf',
+        mime_type: 'application/pdf',
+      },
+    },
+    resolveTelegramFile: async () => ({ file_path: 'docs/report.pdf' }),
+    downloadTelegramFile: async () => Buffer.from('pdf bytes'),
+    parseDocument: async () => ({
+      title: 'report.pdf',
+      parsed_markdown: '# Report\n\nAlpha',
+      plain_text: 'Alpha',
+      chunks: [{ chunk_index: 0, source_text: 'Alpha', contextual_text: 'Report\nAlpha' }],
+    }),
+    supermemoryClient: {
+      documents: {
+        async uploadFile() {
+          return { id: 'raw_doc_1' };
+        },
+        async update() {
+          return { id: 'raw_doc_1', status: 'done' };
+        },
+        async add() {
+          return { id: 'parsed_doc_1' };
+        },
+      },
+    },
+    writeChunkMemories: async () => {
+      throw new Error('chunk write failed');
+    },
+    toFileFactory: async () => ({ name: 'report.pdf' }),
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.partialFailure, true);
+  assert.equal(result.parsedDocumentId, 'parsed_doc_1');
+  assert.match(result.userError, /parsed output storage/);
 });
 
 test('parseSseChunk parses response events', () => {

@@ -1,4 +1,3 @@
-#include "common.h"
 #include "log.h"
 
 #include <chrono>
@@ -25,6 +24,22 @@ int common_log_verbosity_thold = LOG_DEFAULT_LLAMA;
 
 void common_log_set_verbosity_thold(int verbosity) {
     common_log_verbosity_thold = verbosity;
+}
+
+static bool tty_can_use_colors() {
+    if (const char * no_color = std::getenv("NO_COLOR")) {
+        if (no_color[0] != '\0') {
+            return false;
+        }
+    }
+
+    if (const char * term = std::getenv("TERM")) {
+        if (std::strcmp(term, "dumb") == 0) {
+            return false;
+        }
+    }
+
+    return isatty(fileno(stdout)) || isatty(fileno(stderr));
 }
 
 static int64_t t_us() {

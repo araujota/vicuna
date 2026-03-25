@@ -565,6 +565,6 @@ def test_provider_mode_keeps_bridge_compatibility_endpoints():
             })
             assert interruption.status_code == 200
             assert interruption.body["ok"] is True
-            assert interruption.body["cancelled_dmn_approval_ids"] == []
+            assert interruption.body["cancelled_approval_ids"] == []
         finally:
             server.stop()

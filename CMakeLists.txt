@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
-project("llama.cpp" C CXX)
+project("vicuna" C CXX)
 include(CheckIncludeFileCXX)
 
 #set(CMAKE_WARN_DEPRECATED YES)
@@ -166,7 +166,7 @@ llama_option_depr(WARNING     LLAMA_CANN                GGML_CANN)
 llama_option_depr(WARNING     LLAMA_CURL)
 
 include("cmake/license.cmake")
-license_add_file("llama.cpp" "LICENSE")
+license_add_file("vicuna" "LICENSE")
 
 #
 # 3rd-party
@@ -197,21 +197,14 @@ add_subdirectory(src)
 
 if (LLAMA_BUILD_COMMON)
     add_subdirectory(common)
+endif()
+
+if (LLAMA_BUILD_COMMON OR LLAMA_BUILD_SERVER)
     add_subdirectory(vendor/cpp-httplib)
 endif()
 
-if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
-    include(CTest)
-    add_subdirectory(tests)
-endif()
-
-if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_EXAMPLES)
-    add_subdirectory(examples)
-    add_subdirectory(pocs)
-endif()
-
-if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
-    add_subdirectory(tools)
+if (LLAMA_BUILD_SERVER)
+    add_subdirectory(tools/server)
 endif()
 
 # Automatically add all files from the 'licenses' directory

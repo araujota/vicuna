@@ -931,6 +931,63 @@ function telegramRelayCapability(): CapabilityDescriptor {
   };
 }
 
+function parsedDocumentsSearchCapability(): CapabilityDescriptor {
+  return {
+    capability_id: "openclaw.vicuna.parsed-documents.search-chunks",
+    tool_surface_id: "vicuna.documents.parsed.search_chunks",
+    capability_kind: "tool",
+    owner_plugin_id: "vicuna-parsed-documents",
+    tool_name: "parsed_documents_search_chunks",
+    tool_family_id: "parsed_documents",
+    tool_family_name: "Parsed Documents",
+    tool_family_description:
+      "Search stored parsed-document chunks derived from Telegram-uploaded files and return compact labeled matches.",
+    method_name: "search_chunks",
+    method_description: "Search stored parsed-document chunks by semantic query.",
+    description:
+      "Search the stored parsed-document chunk index and return only the compact matching chunks the system needs, labeled with their source document titles.",
+    input_schema_json: {
+      type: "object",
+      required: ["query"],
+      properties: {
+        query: {
+          type: "string",
+          description: "The semantic retrieval query to run against stored parsed-document chunks."
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 8,
+          description: "Optional maximum number of matching chunks to return."
+        },
+        threshold: {
+          type: "number",
+          minimum: 0,
+          maximum: 1,
+          description:
+            "Optional similarity threshold override in the range [0, 1]. When omitted, the wrapper applies stricter defaults for shorter queries."
+        }
+      }
+    },
+    output_contract: "completed_result",
+    side_effect_class: "memory_read",
+    execution_safety_class: "read_only",
+    approval_mode: "none",
+    execution_modes: ["sync"],
+    provenance_namespace: "openclaw/vicuna-parsed-documents/tool/parsed_documents_search_chunks",
+    tool_kind: 4,
+    tool_flags: combineToolFlags(
+      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      COG_TOOL_FLAG_DMN_ELIGIBLE,
+      COG_TOOL_FLAG_SIMULATION_SAFE,
+      COG_TOOL_FLAG_REMEDIATION_SAFE
+    ),
+    latency_class: 1,
+    max_steps_reserved: 2,
+    dispatch_backend: "legacy_bash"
+  };
+}
+
 type CapabilitySchema = {
   type: "object";
   required?: string[];
@@ -1290,6 +1347,7 @@ export function buildCatalog(options: CatalogOptions = {}): CapabilityCatalog {
 export function buildRuntimeCatalog(options: RuntimeCatalogOptions = {}): CapabilityCatalog {
   const capabilities: CapabilityDescriptor[] = [
     ...mediaRuntimeCapabilities(),
+    parsedDocumentsSearchCapability(),
     telegramRelayCapability(),
     ...ongoingTaskRuntimeCapabilities(),
   ];

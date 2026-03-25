@@ -31,6 +31,15 @@ export type OpenClawToolSecrets = {
       registry_title?: string;
       query_threshold?: number;
     };
+    parsed_documents?: {
+      base_url?: string;
+      auth_token?: string;
+      container_tag?: string;
+      runtime_identity?: string;
+      default_threshold?: number;
+      short_query_threshold?: number;
+      max_results?: number;
+    };
     telegram_relay?: {
       base_url?: string;
       auth_token?: string;
@@ -49,6 +58,7 @@ export type OpenClawPaths = {
   sonarrWrapperPath: string;
   chaptarrWrapperPath: string;
   ongoingTasksWrapperPath: string;
+  parsedDocumentsWrapperPath: string;
   telegramRelayWrapperPath: string;
 };
 
@@ -82,6 +92,7 @@ export function defaultPaths(repoRoot = defaultRepoRoot()): OpenClawPaths {
     sonarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "sonarr-api"),
     chaptarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "chaptarr-api"),
     ongoingTasksWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "ongoing-tasks-api"),
+    parsedDocumentsWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "parsed-documents-search"),
     telegramRelayWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "telegram-relay-api")
   };
 }

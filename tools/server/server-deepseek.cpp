@@ -1,4 +1,5 @@
 #include "server-deepseek.h"
+#include "server-runtime.h"
 
 #include "common/http.h"
 
@@ -566,7 +567,7 @@ bool deepseek_complete_chat(
 
     try {
         const std::string url = deepseek_chat_completions_url(config);
-        auto [client, parts] = common_http_client(url);
+        auto [client, parts] = server_http_client(url);
         client.set_connection_timeout(std::chrono::milliseconds(config.timeout_ms));
         client.set_read_timeout(std::chrono::milliseconds(config.timeout_ms));
         client.set_write_timeout(std::chrono::milliseconds(config.timeout_ms));
@@ -733,7 +734,7 @@ json deepseek_build_health_json(const deepseek_runtime_config & config) {
         {"provider", {
             {"name", "deepseek"},
             {"model", config.model},
-            {"base_url", common_http_show_masked_url(common_http_parse_url(deepseek_chat_completions_url(config)))},
+            {"base_url", server_http_show_masked_url(server_http_parse_url(deepseek_chat_completions_url(config)))},
         }},
     };
 }
@@ -774,7 +775,7 @@ json deepseek_build_models_json(const deepseek_runtime_config & config) {
                 {"owned_by", "deepseek"},
                 {"meta", {
                     {"provider", "deepseek"},
-                    {"endpoint", common_http_show_masked_url(common_http_parse_url(deepseek_chat_completions_url(config)))},
+                    {"endpoint", server_http_show_masked_url(server_http_parse_url(deepseek_chat_completions_url(config)))},
                 }},
             },
         })},
@@ -796,7 +797,7 @@ json deepseek_format_chat_completion_response(
         })},
         {"created", now},
         {"model", config.model},
-        {"system_fingerprint", build_info},
+        {"system_fingerprint", server_runtime_build_info()},
         {"object", "chat.completion"},
         {"usage", {
             {"completion_tokens", result.completion_tokens},
@@ -827,7 +828,7 @@ json deepseek_format_text_completion_response(
         })},
         {"created", now},
         {"model", config.model},
-        {"system_fingerprint", build_info},
+        {"system_fingerprint", server_runtime_build_info()},
         {"object", "text_completion"},
         {"usage", {
             {"completion_tokens", result.completion_tokens},
@@ -930,7 +931,7 @@ std::vector<json> deepseek_format_chat_completion_stream(
             {"created", now},
             {"id", completion_id},
             {"model", config.model},
-            {"system_fingerprint", build_info},
+            {"system_fingerprint", server_runtime_build_info()},
             {"object", "chat.completion.chunk"},
         };
         if (include_trace && !result.emotive_trace.is_null()) {
@@ -982,7 +983,7 @@ std::vector<json> deepseek_format_chat_completion_stream(
             {"created", now},
             {"id", completion_id},
             {"model", config.model},
-            {"system_fingerprint", build_info},
+            {"system_fingerprint", server_runtime_build_info()},
             {"object", "chat.completion.chunk"},
             {"usage", {
                 {"completion_tokens", result.completion_tokens},

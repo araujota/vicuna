@@ -13,6 +13,6 @@ if [[ -z "${VICUNA_DEEPSEEK_API_KEY:-}" ]]; then
 fi
 
 exec "$REPO_ROOT/build-host-cuda-128/bin/llama-server" \
-  --port 8080 \
+  --port "${VICUNA_RUNTIME_PORT:-8080}" \
   --api-surface openai \
   --no-webui

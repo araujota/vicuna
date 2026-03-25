@@ -2,10 +2,7 @@
 #include "server-deepseek.h"
 #include "server-emotive-runtime.h"
 #include "server-http.h"
-
-#include "common.h"
-#include "arg.h"
-#include "log.h"
+#include "server-runtime.h"
 
 #include <algorithm>
 #include <atomic>
@@ -479,23 +476,39 @@ static server_http_res_ptr handle_deepseek_chat(
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
-    common_params params;
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
-        return 1;
+    server_runtime_params params;
+    bool show_help = false;
+    std::string arg_error;
+    if (!server_runtime_params_parse(argc, argv, params, &show_help, &arg_error)) {
+        if (!arg_error.empty()) {
+            LOG_ERR("%s\n", arg_error.c_str());
+        }
+        return arg_error.empty() ? 0 : 1;
+    }
+    if (show_help) {
+        server_runtime_print_usage(argv[0]);
+        return 0;
     }
 
     if (params.n_parallel < 0) {
         params.n_parallel = 4;
     }
 
-    common_init();
+    server_runtime_init(params.verbose);
+
+    if (params.n_threads < 0) {
+        params.n_threads = std::max<int32_t>(1, (int32_t) std::thread::hardware_concurrency() - 1);
+    }
+    if (params.n_threads_batch < 0) {
+        params.n_threads_batch = params.n_threads;
+    }
 
     LOG_INF("system info: n_threads = %d, n_threads_batch = %d, total_threads = %d\n",
-            params.cpuparams.n_threads,
-            params.cpuparams_batch.n_threads,
+            params.n_threads,
+            params.n_threads_batch,
             std::thread::hardware_concurrency());
     LOG_INF("\n");
-    LOG_INF("%s\n", common_params_get_system_info(params).c_str());
+    LOG_INF("%s\n", server_runtime_system_info(params).c_str());
     LOG_INF("\n");
 
     const deepseek_runtime_config deepseek_config = deepseek_runtime_config_from_env();
@@ -601,7 +614,7 @@ int main(int argc, char ** argv) {
     const auto post_telegram_interruption = [](const server_http_req &) {
         return make_json_response({
             {"ok", true},
-            {"cancelled_dmn_approval_ids", json::array()},
+            {"cancelled_approval_ids", json::array()},
         });
     };
 
@@ -618,7 +631,7 @@ int main(int argc, char ** argv) {
     ctx_http.post("/v1/telegram/approval", ex_wrapper(post_telegram_approval));
     ctx_http.post("/v1/telegram/interruption", ex_wrapper(post_telegram_interruption));
 
-    if (params.api_surface != COMMON_SERVER_API_SURFACE_OPENAI) {
+    if (params.api_surface != SERVER_API_SURFACE_OPENAI) {
         ctx_http.post("/chat/completions", ex_wrapper(post_chat_completions));
         ctx_http.post("/completions", ex_wrapper(post_completions));
         ctx_http.post("/responses", ex_wrapper(post_responses));

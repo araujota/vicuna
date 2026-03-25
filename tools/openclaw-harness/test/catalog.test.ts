@@ -39,6 +39,10 @@ const TELEGRAM_CAPABILITY_IDS = [
   "openclaw.vicuna.telegram_relay",
 ] as const;
 
+const PARSED_DOCUMENT_CAPABILITY_IDS = [
+  "openclaw.vicuna.parsed-documents.search-chunks",
+] as const;
+
 test("default catalog exposes only hard-memory builtins", () => {
   const catalog = buildCatalog();
   assert.deepEqual(
@@ -61,6 +65,9 @@ test("runtime catalog exposes only the narrowed media surface plus optional Tavi
     assert.equal(capabilityIds.has(capabilityId), true, `${capabilityId} should be present`);
   }
   for (const capabilityId of TELEGRAM_CAPABILITY_IDS) {
+    assert.equal(capabilityIds.has(capabilityId), true, `${capabilityId} should be present`);
+  }
+  for (const capabilityId of PARSED_DOCUMENT_CAPABILITY_IDS) {
     assert.equal(capabilityIds.has(capabilityId), true, `${capabilityId} should be present`);
   }
 
@@ -178,6 +185,21 @@ test("telegram relay capability stays narrow and does not expose the deleted ask
   assert.equal(capabilities.has("openclaw.vicuna.ask_with_options"), false);
 });
 
+test("parsed-document search capability stays narrow and query-driven", () => {
+  const catalog = buildRuntimeCatalog();
+  const capabilities = new Map(catalog.capabilities.map((capability) => [capability.capability_id, capability]));
+
+  const parsedDocuments = capabilities.get("openclaw.vicuna.parsed-documents.search-chunks");
+  assert.ok(parsedDocuments);
+  assert.equal(parsedDocuments.tool_surface_id, "vicuna.documents.parsed.search_chunks");
+  assert.equal(parsedDocuments.tool_name, "parsed_documents_search_chunks");
+
+  const searchSchema = parsedDocuments.input_schema_json as { properties: Record<string, unknown>; required?: string[] };
+  assert.deepEqual(searchSchema.required, ["query"]);
+  assert.equal("limit" in searchSchema.properties, true);
+  assert.equal("threshold" in searchSchema.properties, true);
+});
+
 test("runtime catalog writing preserves the narrowed tool surface", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vicuna-openclaw-runtime-"));
   const secretsPath = path.join(tempDir, "openclaw-tool-secrets.json");
@@ -198,6 +220,9 @@ test("runtime catalog writing preserves the narrowed tool surface", () => {
     assert.equal(capabilityIds.has(capabilityId), true, `${capabilityId} should be present`);
   }
   for (const capabilityId of TELEGRAM_CAPABILITY_IDS) {
+    assert.equal(capabilityIds.has(capabilityId), true, `${capabilityId} should be present`);
+  }
+  for (const capabilityId of PARSED_DOCUMENT_CAPABILITY_IDS) {
     assert.equal(capabilityIds.has(capabilityId), true, `${capabilityId} should be present`);
   }
   assert.equal(capabilityIds.has("openclaw.tavily.web_search"), true);
@@ -225,6 +250,10 @@ test("OpenClaw secrets still persist media-tool config and configured runtime ca
   assert.equal(
     paths.telegramRelayWrapperPath,
     path.join(tempDir, "tools", "openclaw-harness", "bin", "telegram-relay-api")
+  );
+  assert.equal(
+    paths.parsedDocumentsWrapperPath,
+    path.join(tempDir, "tools", "openclaw-harness", "bin", "parsed-documents-search")
   );
   delete process.env.VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH;
 });

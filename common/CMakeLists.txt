@@ -76,12 +76,6 @@ add_library(${TARGET} STATIC
     ngram-map.h
     ngram-mod.cpp
     ngram-mod.h
-    openclaw-session-binding.cpp
-    openclaw-session-binding.h
-    openclaw-tool-fabric.cpp
-    openclaw-tool-fabric.h
-    openclaw-tool-fabric-events.cpp
-    openclaw-tool-fabric-events.h
     peg-parser.cpp
     peg-parser.h
     preset.cpp

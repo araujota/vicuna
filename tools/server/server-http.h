@@ -6,7 +6,7 @@
 #include <string>
 #include <thread>
 
-struct common_params;
+struct server_runtime_params;
 
 // generator-like API for HTTP response generation
 // this object response with one of the 2 modes:
@@ -64,7 +64,7 @@ struct server_http_context {
     server_http_context();
     ~server_http_context();
 
-    bool init(const common_params & params);
+    bool init(const server_runtime_params & params);
     bool start();
     void stop() const;
 

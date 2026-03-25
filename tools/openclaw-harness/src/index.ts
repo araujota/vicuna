@@ -17,6 +17,18 @@ export * from "./invoke.js";
 export * from "./ongoing-tasks.js";
 export * from "./runtime-catalog.js";
 export {
+  ParsedDocumentsToolError,
+  errorEnvelope as parsedDocumentsErrorEnvelope,
+  handleParsedDocuments,
+  parseCliInvocation as parseParsedDocumentsCliInvocation,
+  resolveParsedDocumentsConfig,
+  runParsedDocumentsCli,
+  type ParsedDocumentsConfig,
+  type ParsedDocumentsInvocation,
+  type ParsedDocumentsResponseEnvelope,
+  type ParsedDocumentSearchResult,
+} from "./parsed-documents.js";
+export {
   TelegramRelayToolError,
   errorEnvelope as telegramRelayErrorEnvelope,
   handleTelegramRelay,

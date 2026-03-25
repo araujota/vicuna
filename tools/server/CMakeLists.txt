@@ -16,6 +16,9 @@ set(TARGET_SRCS
     server-embedding-backend.h
     server-http.cpp
     server-http.h
+    server-runtime.cpp
+    server-runtime.h
+    ../../common/log.cpp
 )
 set(PUBLIC_ASSETS
     index.html.gz
@@ -39,6 +42,9 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(${TARGET} PRIVATE common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/common)
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
+target_link_libraries(${TARGET} PRIVATE cpp-httplib llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_definitions(${TARGET} PRIVATE "VICUNA_SERVER_BUILD_INFO=\"b${LLAMA_BUILD_NUMBER}-${LLAMA_BUILD_COMMIT}\"")
 
 target_compile_features(${TARGET} PRIVATE cxx_std_17)

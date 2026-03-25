@@ -13,6 +13,7 @@ Current scope:
 - Sonarr-backed `sonarr` wrapper command for series-library inspection and explicit download-start flows
 - Chaptarr-backed `chaptarr` wrapper command for ebook-library inspection, Hardcover-backed search, and explicit ebook download-start flows
 - hard-memory-backed `ongoing_tasks` wrapper command for recurring task CRUD and due polling
+- hard-memory-backed `parsed_documents_search_chunks` wrapper command for semantic retrieval over Docling-parsed Telegram uploads
 - provider-backed `telegram_relay` wrapper command for direct user-facing follow-up messages
 - exact selector validation on `tool_surface_id` plus `capability_id`
 - simple CLI entrypoint for emitting the catalog and validating invocations
@@ -195,6 +196,33 @@ user-facing follow-up messages.
 The current tool surface intentionally does not include `ask_with_options` or
 `codex`.
 
+## Parsed Documents
+
+The harness now emits one compact parsed-document retrieval capability:
+
+- `parsed_documents_search_chunks`
+
+This wrapper searches only stored parsed-document chunk memories derived from
+Telegram-uploaded files. The current contract is intentionally narrow:
+
+- required:
+  - `query`
+- optional:
+  - `limit`
+  - `threshold`
+
+The wrapper applies explicit threshold policy in local code:
+
+- short ambiguous queries use a stricter default threshold than longer
+  natural-language queries
+- weak matches are filtered locally even after the backend search returns
+- responses include only:
+  - `document_title`
+  - `chunk_text`
+  - `similarity`
+  - `chunk_index`
+  - `link_key`
+
 Secrets layout:
 
 ```json
@@ -224,6 +252,15 @@ Secrets layout:
       "registry_title": "Ongoing task registry",
       "query_threshold": 0
     },
+    "parsed_documents": {
+      "base_url": "https://api.supermemory.ai",
+      "auth_token": "supermemory-api-key",
+      "container_tag": "vicuna-telegram-documents",
+      "runtime_identity": "vicuna",
+      "default_threshold": 0.58,
+      "short_query_threshold": 0.68,
+      "max_results": 5
+    },
     "telegram_relay": {
       "base_url": "http://127.0.0.1:8080",
       "auth_token": "vicuna-bearer-token",
@@ -247,6 +284,10 @@ instead of silently disappearing from the OpenClaw surface.
 The `ongoing_tasks` wrapper accepts either the secrets values above or the
 standard `SUPERMEMORY_BASE_URL` / `SUPERMEMORY_API_KEY` environment variables
 as a fallback for hard-memory access.
+
+The `parsed_documents` wrapper accepts either the secrets values above or the
+standard `SUPERMEMORY_BASE_URL`, `SUPERMEMORY_API_KEY`, and
+`TELEGRAM_BRIDGE_DOCUMENT_CONTAINER_TAG` environment variables as fallbacks.
 
 The `telegram_relay` wrapper accepts either the secrets values above or the
 standard `TELEGRAM_BRIDGE_VICUNA_BASE_URL`, `VICUNA_API_KEY`, and

@@ -1,6 +1,6 @@
-#include "common.h"
-#include "server-http.h"
 #include "server-common.h"
+#include "server-http.h"
+#include "server-runtime.h"
 
 #include <cpp-httplib/httplib.h>
 
@@ -92,7 +92,7 @@ static void log_server_request(const httplib::Request & req, const httplib::Resp
     SRV_DBG("response: %s\n", res.body.c_str());
 }
 
-bool server_http_context::init(const common_params & params) {
+bool server_http_context::init(const server_runtime_params & params) {
     path_prefix = params.api_prefix;
     port = params.port;
     hostname = params.hostname;
@@ -168,7 +168,7 @@ bool server_http_context::init(const common_params & params) {
     // Middlewares
     //
 
-    const bool openai_surface = params.api_surface == COMMON_SERVER_API_SURFACE_OPENAI;
+    const bool openai_surface = params.api_surface == SERVER_API_SURFACE_OPENAI;
 
     auto middleware_validate_api_key = [api_keys = params.api_keys, openai_surface, api_path_prefix = path_prefix](const httplib::Request & req, httplib::Response & res) {
         const std::unordered_set<std::string> public_endpoints = openai_surface
@@ -255,7 +255,7 @@ bool server_http_context::init(const common_params & params) {
         bool ready = is_ready.load();
         if (!ready) {
             const std::string request_path = strip_path_prefix(req.path, api_path_prefix);
-            auto tmp = string_split<std::string>(request_path, '.');
+            auto tmp = server_string_split(request_path, '.');
             if (request_path == "/" || tmp.back() == "html") {
                 res.status = 503;
                 res.set_content(reinterpret_cast<const char*>(loading_html), loading_html_len, "text/html; charset=utf-8");
@@ -353,7 +353,7 @@ bool server_http_context::start() {
     auto & srv = pimpl->srv;
     bool was_bound = false;
     bool is_sock = false;
-    if (string_ends_with(std::string(hostname), ".sock")) {
+    if (server_string_ends_with(std::string(hostname), ".sock")) {
         is_sock = true;
         LOG_INF("%s: setting address family to AF_UNIX\n", __func__);
         srv->set_address_family(AF_UNIX);
@@ -383,8 +383,8 @@ bool server_http_context::start() {
     thread = std::thread([this]() { pimpl->srv->listen_after_bind(); });
     srv->wait_until_ready();
 
-    listening_address = is_sock ? string_format("unix://%s",    hostname.c_str())
-                                : string_format("http://%s:%d", hostname.c_str(), port);
+    listening_address = is_sock ? server_string_format("unix://%s", hostname.c_str())
+                                : server_string_format("http://%s:%d", hostname.c_str(), port);
     return true;
 }
 

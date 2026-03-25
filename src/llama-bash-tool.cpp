@@ -103,7 +103,7 @@ bool llama_bash_tool::set_request(const llama_bash_tool_request & request) {
         return true;
     }
 
-    if (request_count >= LLAMA_COGNITIVE_MAX_PENDING_COMMANDS) {
+    if (request_count >= LLAMA_BASH_TOOL_MAX_PENDING_REQUESTS) {
         return false;
     }
 
@@ -176,6 +176,10 @@ bool llama_context::bash_tool_set_request(const llama_bash_tool_request & reques
     return bash_tool && bash_tool->set_request(request);
 }
 
+bool llama_context::bash_tool_get_request(int32_t command_id, llama_bash_tool_request * out_request) const {
+    return bash_tool && bash_tool->get_request(command_id, out_request);
+}
+
 bool llama_context::bash_tool_clear_request(int32_t command_id) {
     return bash_tool && bash_tool->clear_request(command_id);
 }
@@ -186,10 +190,6 @@ bool llama_context::bash_tool_submit_result(const llama_bash_tool_result & resul
 
 bool llama_context::bash_tool_get_last_result(llama_bash_tool_result * out_result) const {
     return bash_tool && bash_tool->get_last_result(out_result);
-}
-
-bool llama_context::cognitive_bash_tool_get_request(int32_t command_id, llama_bash_tool_request * out_request) const {
-    return bash_tool && bash_tool->get_request(command_id, out_request);
 }
 
 int32_t llama_bash_tool_configure(
@@ -210,15 +210,21 @@ int32_t llama_bash_tool_get_last_result(
     return ctx && out_result && ctx->bash_tool_get_last_result(out_result) ? 0 : -1;
 }
 
-int32_t llama_cognitive_bash_tool_get_request(
+int32_t llama_bash_tool_get_request(
         const struct llama_context * ctx,
         int32_t command_id,
         struct llama_bash_tool_request * out_request) {
-    return ctx && out_request && ctx->cognitive_bash_tool_get_request(command_id, out_request) ? 0 : -1;
+    return ctx && out_request && ctx->bash_tool_get_request(command_id, out_request) ? 0 : -1;
 }
 
-int32_t llama_cognitive_bash_tool_set_request(
+int32_t llama_bash_tool_set_request(
         struct llama_context * ctx,
         const struct llama_bash_tool_request * request) {
     return ctx && request && ctx->bash_tool_set_request(*request) ? 0 : -1;
+}
+
+int32_t llama_bash_tool_submit_result(
+        struct llama_context * ctx,
+        const struct llama_bash_tool_result * result) {
+    return ctx && result && ctx->bash_tool_submit_result(*result) ? 0 : -1;
 }

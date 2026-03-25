@@ -39,12 +39,16 @@ Optional variables:
 - `TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES` default: `12`
 - `TELEGRAM_BRIDGE_MAX_TOKENS` default: `-1` (unlimited)
 - `TELEGRAM_BRIDGE_MAX_DOCUMENT_CHARS` default: `12000`
+- `TELEGRAM_BRIDGE_DOCLING_PYTHON_BIN` default: `python3`
+- `TELEGRAM_BRIDGE_DOCLING_PARSER_SCRIPT_PATH` default: repo-local `tools/telegram-bridge/docling-parse.py`
+- `TELEGRAM_BRIDGE_DOCUMENT_CONTAINER_TAG` default: `vicuna-telegram-documents`
 - `TELEGRAM_BRIDGE_REPLAY_RETAINED_OUTBOX` default: `0`
   - when `0`, a fresh or reset bridge state fast-forwards to the newest
     retained runtime outbox sequence instead of replaying historical follow-ups
   - set to `1` only for an explicit operator replay of retained outbox items
-- `SUPERMEMORY_API_KEY` required for PDF/DOC/DOCX ingestion and linked
+- `SUPERMEMORY_API_KEY` required for Docling-backed document ingestion and linked
   Supermemory persistence
+- `SUPERMEMORY_BASE_URL` default: `https://api.supermemory.ai`
 - `VICUNA_API_KEY` if the server runs with bearer auth enabled
 
 ## Document Ingestion
@@ -52,27 +56,37 @@ Optional variables:
 Supported inbound Telegram document formats:
 
 - PDF
-- DOC
 - DOCX
+- Markdown
+- HTML/XHTML
+- CSV
+- XLSX
+- PPTX
+- AsciiDoc
+- LaTeX
 
 For each supported Telegram document, the bridge:
 
 1. downloads the raw file through Telegram `getFile`
-2. extracts plain text only
+2. parses the file on the host through Docling
 3. stores the raw file in Supermemory
-4. stores the extracted text in Supermemory as a second linked document
-5. appends the normalized extracted text to the Telegram chat transcript before
+4. stores the parsed full-document output in Supermemory as a second linked artifact
+5. stores context-enriched parsed chunks in Supermemory hard memory for later retrieval
+6. appends the normalized parsed text to the Telegram chat transcript before
    forwarding the turn to Vicuña
 
 Extraction policy:
 
-- PDF uses the local Node dependency `pdf-parse` and loads it lazily only when
-  a PDF message arrives
-- DOC and DOCX use the host's `/usr/bin/textutil` converter
+- parsing runs through the host-side Python helper
+  [docling-parse.py](/Users/tyleraraujo/vicuna/tools/telegram-bridge/docling-parse.py)
+- that helper requires a Python environment on the bridge host with Docling and
+  its chunking dependencies installed
+- the same-turn user transcript now includes the exact label
+  `Parsed contents of <filename>`
 
 If `SUPERMEMORY_API_KEY` is missing, supported document ingestion is rejected.
-If `/usr/bin/textutil` is missing, DOC and DOCX ingestion fails with a direct
-host requirement error.
+If the configured Python interpreter cannot import Docling, document ingestion
+fails with a direct host requirement error.
 
 ## Start
 
@@ -118,7 +132,7 @@ The key runtime variables are:
   `/v1/telegram/approval` as structured approval events instead of rewriting
   them into synthetic transcript text
 - before forwarding a fresh Telegram user message, the bridge calls the runtime
-  interruption surface so pending DMN-owned approval waits for that chat are
+  interruption surface so pending runtime-owned approval waits for that chat are
   superseded cleanly rather than blocking the new foreground turn
 - inline approval clicks still arrive as Telegram `callback_query` updates and
   are resolved through the runtime-owned approval object instead of becoming a
@@ -126,9 +140,9 @@ The key runtime variables are:
 - forwarded chat requests now include Telegram chat metadata headers so the
   runtime can maintain its own bounded last-`N` turn dialogue object instead of
   depending only on bridge-local transcript state
-- supported PDF, DOC, and DOCX messages are converted into plain text before
-  they enter the local transcript and are also persisted to Supermemory as both
-  a raw file record and an extracted-text record linked by shared metadata
+- supported Docling-backed uploads are parsed on the host and are persisted to
+  Supermemory as a raw file artifact, a parsed-output artifact, and searchable
+  parsed chunks linked by shared metadata
 - each Telegram chat keeps its own bounded persisted transcript keyed by
   Telegram `chat_id`, so follow-up turns reuse recent context after restarts
 - pending inline-option prompts are also kept in bounded persisted bridge state
@@ -148,7 +162,7 @@ The key runtime variables are:
   sent to all registered chats while also being recorded into each chat's local
   transcript window
 - those proactive emits are also represented inside the runtime as broadcast
-  Telegram dialogue turns, so DMN-origin or bridge-origin follow-ups can reuse
+  Telegram dialogue turns, so proactive or bridge-origin follow-ups can reuse
   recent user-facing continuity without treating the SSE mailbox as dialogue
   memory
 - the bridge intentionally reconnects the proactive SSE stream when the server

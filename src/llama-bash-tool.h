@@ -18,7 +18,7 @@ public:
 
 private:
     llama_bash_tool_config config = {};
-    llama_bash_tool_request requests[LLAMA_COGNITIVE_MAX_PENDING_COMMANDS] = {};
+    llama_bash_tool_request requests[LLAMA_BASH_TOOL_MAX_PENDING_REQUESTS] = {};
     int32_t request_count = 0;
     llama_bash_tool_result last_result = {};
     bool has_last_result = false;

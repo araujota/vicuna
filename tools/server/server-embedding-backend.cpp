@@ -1,8 +1,9 @@
 #include "server-embedding-backend.h"
 
-#include "common.h"
+#include "server-runtime.h"
 
 #include <algorithm>
+#include <array>
 
 namespace {
 
@@ -27,6 +28,30 @@ static bool env_to_bool(const char * name, bool default_value) {
         }
     }
     return default_value;
+}
+
+static std::string model_metadata_value(const llama_model * model, const char * key) {
+    if (!model || !key) {
+        return {};
+    }
+
+    std::array<char, 128> key_buf = {};
+    std::array<char, 256> val_buf = {};
+    const int32_t count = llama_model_meta_count(model);
+    for (int32_t i = 0; i < count; ++i) {
+        if (llama_model_meta_key_by_index(model, i, key_buf.data(), key_buf.size()) < 0) {
+            continue;
+        }
+        if (std::string(key_buf.data()) != key) {
+            continue;
+        }
+        if (llama_model_meta_val_str_by_index(model, i, val_buf.data(), val_buf.size()) < 0) {
+            return {};
+        }
+        return std::string(val_buf.data());
+    }
+
+    return {};
 }
 
 } // namespace
@@ -88,6 +113,19 @@ bool server_embedding_backend::initialize(std::string * out_error) {
         return false;
     }
 
+    const std::string architecture = model_metadata_value(model_, "general.architecture");
+    if (architecture != "qwen3") {
+        error_message_ = architecture.empty()
+                ? "embedding model is missing general.architecture metadata"
+                : "embedding model architecture must be qwen3";
+        if (out_error) {
+            *out_error = error_message_;
+        }
+        llama_model_free(model_);
+        model_ = nullptr;
+        return false;
+    }
+
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.embeddings = true;
     ctx_params.n_ctx = config_.ctx;
@@ -144,7 +182,7 @@ bool server_embedding_backend::embed_text(const std::string & text, std::vector<
         return false;
     }
 
-    std::vector<llama_token> tokens = common_tokenize(ctx_, text, true, true);
+    std::vector<llama_token> tokens = server_tokenize(ctx_, text, true, true);
     if (tokens.empty()) {
         out_embedding.assign((size_t) std::max(1, n_embd_), 0.0f);
         return true;
@@ -158,7 +196,7 @@ bool server_embedding_backend::embed_text(const std::string & text, std::vector<
 
     llama_batch batch = llama_batch_init((int32_t) tokens.size(), 0, 1);
     for (size_t i = 0; i < tokens.size(); ++i) {
-        common_batch_add(batch, tokens[i], (llama_pos) i, {0}, i + 1 == tokens.size());
+        server_batch_add(batch, tokens[i], (llama_pos) i, {0}, i + 1 == tokens.size());
     }
 
     const int decode_status = llama_decode(ctx_, batch);
@@ -185,7 +223,7 @@ bool server_embedding_backend::embed_text(const std::string & text, std::vector<
     }
 
     out_embedding.resize((size_t) n_embd_);
-    common_embd_normalize(embd, out_embedding.data(), n_embd_, 2);
+    server_embd_normalize(embd, out_embedding.data(), n_embd_, 2);
     return true;
 }
 
