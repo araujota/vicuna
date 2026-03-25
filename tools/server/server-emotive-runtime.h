@@ -4,6 +4,7 @@
 #include "server-embedding-backend.h"
 
 #include <deque>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -101,6 +102,153 @@ struct server_emotive_trace {
     std::string estimator_version;
     bool provider_streamed = false;
     int32_t retained_block_count = 0;
+    bool cognitive_replay = false;
+    std::string cognitive_replay_entry_id;
+    bool suppress_replay_admission = false;
+    std::string mode_label;
+};
+
+struct server_cognitive_replay_config {
+    bool enabled = true;
+    int32_t max_entries = 16;
+    int32_t max_results = 8;
+    float neg_mass_threshold = 0.02f;
+    float valence_drop_threshold = 0.12f;
+    float dominance_drop_threshold = 0.10f;
+    int32_t persistence_blocks = 2;
+    int32_t context_before = 1;
+    int32_t context_after = 1;
+    int32_t max_attempts = 2;
+    int32_t idle_after_ms = 15000;
+    int32_t poll_interval_ms = 500;
+    float improvement_threshold = 0.08f;
+};
+
+enum server_cognitive_replay_status {
+    SERVER_COGNITIVE_REPLAY_OPEN,
+    SERVER_COGNITIVE_REPLAY_REVIEWING,
+    SERVER_COGNITIVE_REPLAY_RESOLVED,
+    SERVER_COGNITIVE_REPLAY_DEFERRED,
+};
+
+struct server_cognitive_replay_entry {
+    std::string entry_id;
+    server_cognitive_replay_status status = SERVER_COGNITIVE_REPLAY_OPEN;
+    std::string source_trace_id;
+    int64_t created_at_ms = 0;
+    int64_t updated_at_ms = 0;
+    int32_t trigger_block_index = 0;
+    int32_t window_start_block_index = 0;
+    int32_t window_end_block_index = 0;
+    int32_t attempt_count = 0;
+    int32_t max_attempts = 0;
+    float negative_mass = 0.0f;
+    float valence_drop = 0.0f;
+    float dominance_drop = 0.0f;
+    server_emotive_vad baseline_vad_before;
+    server_emotive_vad baseline_vad_after;
+    std::vector<server_emotive_block_record> window_blocks;
+    std::string summary_excerpt;
+    std::string last_error;
+    std::string resolved_result_id;
+};
+
+struct server_cognitive_replay_comparison {
+    float baseline_negative_mass = 0.0f;
+    float replay_negative_mass = 0.0f;
+    float baseline_valence = 0.0f;
+    float replay_valence = 0.0f;
+    float baseline_dominance = 0.0f;
+    float replay_dominance = 0.0f;
+    bool improved = false;
+};
+
+struct server_cognitive_replay_result {
+    bool valid = false;
+    std::string result_id;
+    std::string entry_id;
+    std::string trace_id;
+    int64_t created_at_ms = 0;
+    std::string reasoning_content;
+    std::string content;
+    server_cognitive_replay_comparison comparison;
+    server_emotive_trace replay_trace;
+};
+
+struct server_heuristic_memory_config {
+    bool enabled = true;
+    std::string path = "vicuna-heuristic-memory.json";
+    int32_t max_records = 64;
+    int32_t top_k_semantic = 6;
+    float semantic_threshold = 0.55f;
+    float rerank_threshold = 0.72f;
+    float semantic_weight = 0.55f;
+    float struct_weight = 0.25f;
+    float emotive_weight = 0.20f;
+};
+
+struct server_heuristic_object {
+    std::string heuristic_id;
+    std::string title;
+    std::vector<std::string> task_types;
+    std::vector<std::string> tool_names;
+    std::vector<std::string> struct_tags;
+    std::map<std::string, std::string> emotive_conditions;
+    std::string semantic_trigger_text;
+    std::string failure_mode;
+    std::vector<std::string> evidence;
+    std::vector<std::string> constraints;
+    std::vector<std::string> preferred_actions;
+    std::vector<std::string> action_ranking_rules;
+    std::string mid_reasoning_correction;
+    std::vector<std::string> applies_when;
+    std::vector<std::string> avoid_when;
+    float p_success = 0.5f;
+    std::string calibration = "manual";
+    std::string confidence_notes;
+};
+
+struct server_heuristic_bad_path_object {
+    std::string object_id;
+    std::string kind;
+    std::string text;
+    std::vector<std::string> struct_tags;
+    std::vector<float> embedding;
+};
+
+struct server_heuristic_bad_signature {
+    float negative_mass = 0.0f;
+    float valence = 0.0f;
+    float arousal = 0.0f;
+    float dominance = 0.0f;
+    std::vector<std::string> struct_tags;
+};
+
+struct server_heuristic_memory_record {
+    std::string record_id;
+    std::string entry_id;
+    std::string result_id;
+    std::string source_trace_id;
+    int64_t created_at_ms = 0;
+    std::string bad_path_text;
+    std::string better_path_reasoning_content;
+    std::string better_path_content;
+    std::vector<server_heuristic_bad_path_object> bad_path_objects;
+    server_heuristic_object heuristic;
+    server_heuristic_bad_signature bad_signature;
+};
+
+struct server_heuristic_retrieval_decision {
+    bool matched = false;
+    std::string record_id;
+    std::string heuristic_id;
+    std::string query_text;
+    float semantic_score = 0.0f;
+    float struct_score = 0.0f;
+    float emotive_score = 0.0f;
+    float total_score = 0.0f;
+    float threshold = 0.0f;
+    int64_t created_at_ms = 0;
 };
 
 struct server_emotive_runtime_config {
@@ -111,6 +259,8 @@ struct server_emotive_runtime_config {
     bool degraded_mode_allowed = true;
     float vad_ema_alpha = 0.35f;
     server_embedding_backend_config embedding;
+    server_cognitive_replay_config cognitive_replay;
+    server_heuristic_memory_config heuristic_memory;
 };
 
 server_emotive_runtime_config server_emotive_runtime_config_from_env();
@@ -121,13 +271,23 @@ class server_emotive_runtime;
 
 class server_emotive_turn_builder {
 public:
-    server_emotive_turn_builder(server_emotive_runtime & runtime, const std::string & model_name);
+    server_emotive_turn_builder(
+            server_emotive_runtime & runtime,
+            const std::string & model_name,
+            bool cognitive_replay = false,
+            const std::string & cognitive_replay_entry_id = std::string(),
+            bool suppress_replay_admission = false,
+            const std::string & mode_label = std::string());
     ~server_emotive_turn_builder();
 
     void add_user_message(const std::string & text);
+    void add_replay_block(server_emotive_block_kind kind, const std::string & text);
     void observe_reasoning_delta(const std::string & text);
     void observe_content_delta(const std::string & text);
     void observe_runtime_event(const std::string & text);
+    bool has_current_state() const;
+    server_emotive_vector current_moment() const;
+    server_emotive_vad current_vad() const;
     server_emotive_trace finalize();
 
 private:
@@ -147,6 +307,10 @@ private:
     server_emotive_vad previous_vad_;
     bool have_previous_vad_;
     std::vector<server_emotive_block_record> blocks_;
+    bool cognitive_replay_;
+    std::string cognitive_replay_entry_id_;
+    bool suppress_replay_admission_;
+    std::string mode_label_;
 };
 
 class server_emotive_runtime {
@@ -169,10 +333,39 @@ public:
 
     json health_json() const;
     json latest_trace_json() const;
+    json cognitive_replay_json() const;
+    json heuristic_memory_json() const;
+    bool try_claim_cognitive_replay_entry(server_cognitive_replay_entry * out_entry);
+    void fail_cognitive_replay_entry(const std::string & entry_id, const std::string & error_message);
+    bool get_cognitive_replay_resolution(
+            const std::string & entry_id,
+            server_cognitive_replay_entry * out_entry,
+            server_cognitive_replay_result * out_result) const;
+    void record_cognitive_replay_result(
+            const std::string & entry_id,
+            const std::string & reasoning_content,
+            const std::string & content,
+            const server_emotive_trace & replay_trace);
+    bool store_heuristic_memory_record(
+            const std::string & entry_id,
+            const server_heuristic_object & heuristic,
+            std::string * out_error = nullptr);
+    server_heuristic_retrieval_decision retrieve_matching_heuristic(
+            const std::string & query_text,
+            const std::vector<std::string> & struct_tags,
+            const server_emotive_vector * current_moment,
+            const server_emotive_vad * current_vad,
+            std::string * out_guidance = nullptr);
 
 private:
+    void load_heuristic_memory();
     server_emotive_runtime_config config_;
     mutable server_embedding_backend embedding_backend_;
     mutable std::mutex history_mutex_;
     std::deque<server_emotive_trace> latest_traces_;
+    std::deque<server_cognitive_replay_entry> replay_entries_;
+    std::deque<server_cognitive_replay_result> replay_results_;
+    std::deque<server_heuristic_memory_record> heuristic_records_;
+    server_heuristic_retrieval_decision last_heuristic_retrieval_;
+    std::string heuristic_memory_error_;
 };
