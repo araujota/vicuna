@@ -14,6 +14,9 @@ export type ChaptarrServiceConfig = {
   service: "chaptarr";
   baseUrl: string;
   apiKey?: string;
+  legalImporterBaseUrl?: string;
+  legalImporterWaitMs?: number;
+  legalImporterPollMs?: number;
 };
 
 export type ChaptarrResponseEnvelope = {
@@ -60,14 +63,45 @@ function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.trim().replace(/\/+$/, "");
 }
 
+function deriveLegalImporterBaseUrl(chaptarrBaseUrl: string): string | undefined {
+  try {
+    const url = new URL(chaptarrBaseUrl);
+    url.port = "5000";
+    url.pathname = "";
+    url.search = "";
+    url.hash = "";
+    return normalizeBaseUrl(url.toString());
+  } catch {
+    return undefined;
+  }
+}
+
 export function resolveChaptarrConfig(secretsPath: string): ChaptarrServiceConfig {
   const secrets = loadToolSecrets(secretsPath);
   const baseUrl = normalizeBaseUrl(secrets.tools?.chaptarr?.base_url?.trim() || DEFAULT_CHAPTARR_BASE_URL);
   const apiKey = secrets.tools?.chaptarr?.api_key?.trim();
+  const configuredLegalImporterUrl = secrets.tools?.chaptarr?.legal_importer_url?.trim();
+  const legalImporterBaseUrl = configuredLegalImporterUrl
+    ? normalizeBaseUrl(configuredLegalImporterUrl)
+    : deriveLegalImporterBaseUrl(baseUrl);
+  const rawWaitMs = secrets.tools?.chaptarr?.legal_importer_wait_ms;
+  const rawPollMs = secrets.tools?.chaptarr?.legal_importer_poll_ms;
+  const legalImporterWaitMs =
+    typeof rawWaitMs === "number" && Number.isFinite(rawWaitMs) && rawWaitMs > 0
+      ? Math.trunc(rawWaitMs)
+      : 120000;
+  const legalImporterPollMs =
+    typeof rawPollMs === "number" && Number.isFinite(rawPollMs) && rawPollMs > 0
+      ? Math.trunc(rawPollMs)
+      : 5000;
   return {
     service: "chaptarr",
     baseUrl,
     apiKey: apiKey && apiKey.length > 0 ? apiKey : undefined
+    ,
+    legalImporterBaseUrl: legalImporterBaseUrl && legalImporterBaseUrl.length > 0 ? legalImporterBaseUrl : undefined,
+    legalImporterWaitMs,
+    legalImporterPollMs,
   };
 }
 
@@ -117,7 +151,7 @@ export function requireAction(payload: ChaptarrInvocation): string {
 }
 
 export function canonicalizeChaptarrAction(action: string): string {
-  return action === "inspect" ? "list_authors" : action;
+  return action === "inspect" ? "list_downloaded_books" : action;
 }
 
 export function optionalString(payload: ChaptarrInvocation, key: string): string | undefined {
@@ -163,6 +197,18 @@ export function optionalIntegerArray(payload: ChaptarrInvocation, key: string): 
     throw new ChaptarrToolError("invalid_argument", `${key} must be an array of integers`);
   }
   return value as number[];
+}
+
+export function optionalStringArray(payload: ChaptarrInvocation, key: string): string[] | undefined {
+  const value = payload[key];
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throw new ChaptarrToolError("invalid_argument", `${key} must be an array of strings`);
+  }
+  const items = value.map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+  return items.length > 0 ? items : undefined;
 }
 
 export function requireString(payload: ChaptarrInvocation, key: string, helpText?: string): string {
@@ -349,7 +395,10 @@ export async function runChaptarrCli(
   let config: ChaptarrServiceConfig = {
     service: "chaptarr",
     baseUrl: DEFAULT_CHAPTARR_BASE_URL,
-    apiKey: undefined
+    apiKey: undefined,
+    legalImporterBaseUrl: deriveLegalImporterBaseUrl(DEFAULT_CHAPTARR_BASE_URL),
+    legalImporterWaitMs: 120000,
+    legalImporterPollMs: 5000,
   };
   let action = "unknown";
 

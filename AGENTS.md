@@ -77,6 +77,8 @@ Runtime verification after rebuild:
 - In-memory runtime state with existing snapshot/export/import surfaces for self-state, provenance, and LoRA archives (070-truth-runtime-refactor)
 - C++17 and TypeScript/Node.js + `server_context`, `server_task`, OpenClaw fabric, common OpenClaw catalog types, Telegram bridge middleware, TypeScript OpenClaw harness, existing media wrappers (083-async-ack-react)
 - Runtime snapshot JSON, proactive mailbox state, Telegram dialogue state, OpenClaw catalog JSON, OpenClaw tool secrets JSON (083-async-ack-react)
+- C++17 native server/runtime code plus existing Python integration tests + existing `cpp-httplib` client/server stack, `nlohmann::json`, existing llama.cpp model/context APIs for local embeddings, existing `common` helpers (111-emotive-moment-blocks)
+- In-memory bounded turn history only for this slice; no new persistent storage ye (111-emotive-moment-blocks)
 
 ## Recent Changes
 - 044-process-functional-lora: Added C++17 with the existing `llama.cpp`/Vicuña runtime and C API surfaces + Existing Active LoRA manager, cognitive loop runtime, self-state and server serialization surfaces

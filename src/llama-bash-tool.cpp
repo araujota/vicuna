@@ -44,7 +44,7 @@ llama_bash_tool_config llama_bash_tool_default_config(void) {
     config.timeout_ms = 5000;
     config.cpu_time_limit_secs = 5;
     config.max_child_processes = 8;
-    config.max_open_files = 32;
+    config.max_open_files = 256;
     config.max_file_size_bytes = 1 << 20;
     config.max_stdout_bytes = LLAMA_BASH_TOOL_STDOUT_MAX_CHARS - 1;
     config.max_stderr_bytes = LLAMA_BASH_TOOL_STDERR_MAX_CHARS - 1;

@@ -10,6 +10,7 @@ Group=@VICUNA_SERVICE_GROUP@
 WorkingDirectory=@VICUNA_REPO_ROOT@
 EnvironmentFile=-@VICUNA_ENV_FILE@
 ExecStart=@VICUNA_REPO_ROOT@/tools/ops/run-vicuna-runtime.sh
+LimitNOFILE=65536
 Restart=always
 RestartSec=2
 TimeoutStopSec=20

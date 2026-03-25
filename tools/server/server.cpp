@@ -1,18 +1,24 @@
-#include "server-context.h"
+#include "server-common.h"
+#include "server-deepseek.h"
+#include "server-emotive-runtime.h"
 #include "server-http.h"
-#include "server-models.h"
-#include "server-cors-proxy.h"
 
-#include "arg.h"
 #include "common.h"
-#include "llama.h"
+#include "arg.h"
 #include "log.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <clocale>
+#include <cctype>
+#include <cstdlib>
+#include <deque>
 #include <exception>
+#include <memory>
+#include <mutex>
 #include <signal.h>
-#include <thread> // for std::thread::hardware_concurrency
+#include <thread>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -21,10 +27,21 @@
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
+static std::string trim_copy(std::string value) {
+    const auto is_not_space = [](unsigned char ch) {
+        return std::isspace(ch) == 0;
+    };
+
+    auto begin = std::find_if(value.begin(), value.end(), is_not_space);
+    auto end = std::find_if(value.rbegin(), value.rend(), is_not_space).base();
+    if (begin >= end) {
+        return std::string();
+    }
+    return std::string(begin, end);
+}
+
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
-        // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
-        // this is for better developer experience, we can remove when the server is stable enough
         fprintf(stderr, "Received second interrupt, terminating immediately.\n");
         exit(1);
     }
@@ -32,272 +49,596 @@ static inline void signal_handler(int signal) {
     shutdown_handler(signal);
 }
 
-// wrapper function that handles exceptions and logs errors
-// this is to make sure handler_t never throws exceptions; instead, it returns an error response
+static server_http_res_ptr make_json_response(const json & payload, int status = 200) {
+    auto res = std::make_unique<server_http_res>();
+    res->status = status;
+    res->data = safe_json_to_str(payload);
+    return res;
+}
+
+static server_http_res_ptr make_error_response(const json & error) {
+    const int status = json_value(error, "code", 500);
+    return make_json_response({{"error", error}}, status);
+}
+
+struct telegram_outbox_item {
+    uint64_t sequence_number = 0;
+    std::string kind = "message";
+    std::string chat_scope;
+    std::string text;
+    int64_t reply_to_message_id = 0;
+    std::string intent;
+    std::string dedupe_key;
+    double urgency = 0.0;
+};
+
+struct telegram_outbox_state {
+    mutable std::mutex mutex;
+    std::deque<telegram_outbox_item> items;
+    uint64_t next_sequence_number = 1;
+    size_t max_items = 128;
+};
+
+static json telegram_outbox_item_to_json(const telegram_outbox_item & item) {
+    json payload = {
+        {"sequence_number", item.sequence_number},
+        {"kind", item.kind},
+        {"chat_scope", item.chat_scope},
+        {"text", item.text},
+    };
+    if (item.reply_to_message_id > 0) {
+        payload["reply_to_message_id"] = item.reply_to_message_id;
+    }
+    if (!item.intent.empty()) {
+        payload["intent"] = item.intent;
+    }
+    if (!item.dedupe_key.empty()) {
+        payload["dedupe_key"] = item.dedupe_key;
+    }
+    if (item.urgency > 0.0) {
+        payload["urgency"] = item.urgency;
+    }
+    return payload;
+}
+
+static json telegram_outbox_read_json(const telegram_outbox_state & outbox, uint64_t after) {
+    std::lock_guard<std::mutex> lock(outbox.mutex);
+
+    json items = json::array();
+    uint64_t newest_sequence = 0;
+    uint64_t oldest_sequence = 0;
+    if (!outbox.items.empty()) {
+        oldest_sequence = outbox.items.front().sequence_number;
+        newest_sequence = outbox.items.back().sequence_number;
+    }
+
+    for (const auto & item : outbox.items) {
+        if (item.sequence_number > after) {
+            items.push_back(telegram_outbox_item_to_json(item));
+        }
+    }
+
+    return {
+        {"items", std::move(items)},
+        {"last_sequence", newest_sequence},
+        {"stored_items", outbox.items.size()},
+        {"next_sequence_number", outbox.next_sequence_number},
+        {"oldest_sequence", oldest_sequence},
+        {"newest_sequence", newest_sequence},
+    };
+}
+
+static json telegram_outbox_health_json(const telegram_outbox_state & outbox) {
+    std::lock_guard<std::mutex> lock(outbox.mutex);
+    const uint64_t newest_sequence = outbox.items.empty() ? 0 : outbox.items.back().sequence_number;
+    const uint64_t oldest_sequence = outbox.items.empty() ? 0 : outbox.items.front().sequence_number;
+    return {
+        {"stored_items", outbox.items.size()},
+        {"next_sequence_number", outbox.next_sequence_number},
+        {"oldest_sequence", oldest_sequence},
+        {"newest_sequence", newest_sequence},
+    };
+}
+
+static json telegram_outbox_enqueue_json(telegram_outbox_state * outbox, const json & body) {
+    if (!outbox) {
+        throw std::invalid_argument("telegram outbox state was not configured");
+    }
+
+    const std::string kind = trim_copy(json_value(body, "kind", std::string("message")));
+    if (kind != "message") {
+        throw std::invalid_argument("telegram outbox only supports kind=message on the provider-only path");
+    }
+
+    telegram_outbox_item request = {};
+    request.kind = kind;
+    request.chat_scope = trim_copy(json_value(body, "chat_scope", std::string()));
+    request.text = trim_copy(json_value(body, "text", std::string()));
+    request.reply_to_message_id = std::max<int64_t>(0, json_value(body, "reply_to_message_id", int64_t(0)));
+    request.intent = trim_copy(json_value(body, "intent", std::string()));
+    request.dedupe_key = trim_copy(json_value(body, "dedupe_key", std::string()));
+    request.urgency = std::max(0.0, json_value(body, "urgency", 0.0));
+
+    if (request.chat_scope.empty()) {
+        throw std::invalid_argument("telegram outbox write requires non-empty chat_scope");
+    }
+    if (request.text.empty()) {
+        throw std::invalid_argument("telegram outbox write requires non-empty text");
+    }
+
+    std::lock_guard<std::mutex> lock(outbox->mutex);
+
+    if (!request.dedupe_key.empty()) {
+        for (const auto & existing : outbox->items) {
+            if (existing.kind == request.kind &&
+                    existing.chat_scope == request.chat_scope &&
+                    existing.dedupe_key == request.dedupe_key) {
+                return {
+                    {"ok", true},
+                    {"queued", false},
+                    {"deduplicated", true},
+                    {"sequence_number", existing.sequence_number},
+                    {"chat_scope", existing.chat_scope},
+                    {"stored_items", outbox->items.size()},
+                    {"next_sequence_number", outbox->next_sequence_number},
+                };
+            }
+        }
+    }
+
+    request.sequence_number = outbox->next_sequence_number++;
+    outbox->items.push_back(request);
+    while (outbox->items.size() > outbox->max_items) {
+        outbox->items.pop_front();
+    }
+
+    return {
+        {"ok", true},
+        {"queued", true},
+        {"deduplicated", false},
+        {"sequence_number", request.sequence_number},
+        {"chat_scope", request.chat_scope},
+        {"stored_items", outbox->items.size()},
+        {"next_sequence_number", outbox->next_sequence_number},
+    };
+}
+
 static server_http_context::handler_t ex_wrapper(server_http_context::handler_t func) {
     return [func = std::move(func)](const server_http_req & req) -> server_http_res_ptr {
-        std::string message;
-        error_type error;
         try {
             return func(req);
         } catch (const std::invalid_argument & e) {
-            // treat invalid_argument as invalid request (400)
-            error = ERROR_TYPE_INVALID_REQUEST;
-            message = e.what();
+            return make_error_response(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         } catch (const std::exception & e) {
-            // treat other exceptions as server error (500)
-            error = ERROR_TYPE_SERVER;
-            message = e.what();
+            return make_error_response(format_error_response(e.what(), ERROR_TYPE_SERVER));
         } catch (...) {
-            error = ERROR_TYPE_SERVER;
-            message = "unknown error";
+            return make_error_response(format_error_response("unknown error", ERROR_TYPE_SERVER));
+        }
+    };
+}
+
+static std::string request_content_to_text(const json & content) {
+    if (content.is_null()) {
+        return std::string();
+    }
+    if (content.is_string()) {
+        return content.get<std::string>();
+    }
+    if (!content.is_array()) {
+        return std::string();
+    }
+
+    std::string text;
+    for (const auto & part : content) {
+        if (part.is_string()) {
+            text += part.get<std::string>();
+            continue;
+        }
+        if (!part.is_object()) {
+            continue;
         }
 
-        auto res = std::make_unique<server_http_res>();
-        res->status = 500;
-        try {
-            json error_data = format_error_response(message, error);
-            res->status = json_value(error_data, "code", 500);
-            res->data = safe_json_to_str({{ "error", error_data }});
-            SRV_WRN("got exception: %s\n", res->data.c_str());
-        } catch (const std::exception & e) {
-            SRV_ERR("got another exception: %s | while handling exception: %s\n", e.what(), message.c_str());
-            res->data = "Internal Server Error";
+        const std::string type = json_value(part, "type", std::string());
+        if (type.empty() || type == "text" || type == "input_text" || type == "output_text") {
+            text += json_value(part, "text", std::string());
         }
-        return res;
+    }
+
+    return text;
+}
+
+static void seed_emotive_turn_from_request(const json & body, server_emotive_turn_builder * builder) {
+    if (!builder) {
+        return;
+    }
+
+    if (body.contains("messages") && body.at("messages").is_array()) {
+        for (const auto & item : body.at("messages")) {
+            if (!item.is_object() || json_value(item, "role", std::string()) != "user") {
+                continue;
+            }
+
+            const std::string text = item.contains("content") ?
+                    request_content_to_text(item.at("content")) :
+                    std::string();
+            if (!text.empty()) {
+                builder->add_user_message(text);
+            }
+        }
+        return;
+    }
+
+    if (body.contains("prompt")) {
+        const std::string prompt_text = request_content_to_text(body.at("prompt"));
+        if (!prompt_text.empty()) {
+            builder->add_user_message(prompt_text);
+        }
+    }
+}
+
+static json convert_responses_input_to_chat(const json & body) {
+    json converted = {
+        {"messages", json::array()},
+        {"stream", json_value(body, "stream", false)},
     };
+
+    const std::string model = json_value(body, "model", std::string());
+    if (!model.empty()) {
+        converted["model"] = model;
+    }
+    if (body.contains("stream_options")) {
+        converted["stream_options"] = body.at("stream_options");
+    }
+    if (body.contains("temperature")) {
+        converted["temperature"] = body.at("temperature");
+    }
+    if (body.contains("top_p")) {
+        converted["top_p"] = body.at("top_p");
+    }
+    if (body.contains("presence_penalty")) {
+        converted["presence_penalty"] = body.at("presence_penalty");
+    }
+    if (body.contains("frequency_penalty")) {
+        converted["frequency_penalty"] = body.at("frequency_penalty");
+    }
+    if (body.contains("max_output_tokens")) {
+        converted["max_output_tokens"] = body.at("max_output_tokens");
+    }
+    if (body.contains("max_completion_tokens")) {
+        converted["max_completion_tokens"] = body.at("max_completion_tokens");
+    }
+    if (body.contains("tools")) {
+        converted["tools"] = body.at("tools");
+    }
+    if (body.contains("tool_choice")) {
+        converted["tool_choice"] = body.at("tool_choice");
+    }
+    if (body.contains("parallel_tool_calls")) {
+        converted["parallel_tool_calls"] = body.at("parallel_tool_calls");
+    }
+
+    const std::string instructions = json_value(body, "instructions", std::string());
+    if (!instructions.empty()) {
+        converted["messages"].push_back({
+            {"role", "system"},
+            {"content", instructions},
+        });
+    }
+
+    if (!body.contains("input")) {
+        throw std::invalid_argument("Responses request must include \"input\".");
+    }
+
+    const json & input = body.at("input");
+    if (input.is_string()) {
+        converted["messages"].push_back({
+            {"role", "user"},
+            {"content", input},
+        });
+        return converted;
+    }
+
+    if (!input.is_array()) {
+        throw std::invalid_argument("\"input\" must be a string or an array.");
+    }
+
+    for (const auto & item : input) {
+        if (item.is_string()) {
+            converted["messages"].push_back({
+                {"role", "user"},
+                {"content", item},
+            });
+            continue;
+        }
+
+        if (!item.is_object()) {
+            continue;
+        }
+
+        const std::string type = json_value(item, "type", std::string());
+        if (type == "input_text") {
+            converted["messages"].push_back({
+                {"role", "user"},
+                {"content", json_value(item, "text", std::string())},
+            });
+            continue;
+        }
+        if (type == "function_call_output") {
+            converted["messages"].push_back({
+                {"role", "tool"},
+                {"tool_call_id", json_value(item, "call_id", std::string())},
+                {"content", item.contains("output") ? item.at("output") : item.value("content", json(""))},
+            });
+            continue;
+        }
+
+        if (item.contains("role")) {
+            json message = {
+                {"role", json_value(item, "role", std::string("user"))},
+                {"content", item.contains("content") ? item.at("content") : json("")},
+            };
+            if (item.contains("tool_calls")) {
+                message["tool_calls"] = item.at("tool_calls");
+            }
+            if (item.contains("tool_call_id")) {
+                message["tool_call_id"] = item.at("tool_call_id");
+            }
+            converted["messages"].push_back(std::move(message));
+            continue;
+        }
+
+        if (type == "message") {
+            json message = {
+                {"role", json_value(item, "role", std::string("user"))},
+                {"content", item.contains("content") ? item.at("content") : json("")},
+            };
+            if (item.contains("tool_calls")) {
+                message["tool_calls"] = item.at("tool_calls");
+            }
+            if (item.contains("tool_call_id")) {
+                message["tool_call_id"] = item.at("tool_call_id");
+            }
+            converted["messages"].push_back(std::move(message));
+        }
+    }
+
+    if (converted.at("messages").empty()) {
+        throw std::invalid_argument("Responses request did not contain any usable input messages.");
+    }
+
+    return converted;
+}
+
+struct bridge_compat_state {
+    std::atomic<bool> live_stream_connected = false;
+};
+
+static server_http_res_ptr handle_deepseek_chat(
+        const deepseek_runtime_config & config,
+        server_emotive_runtime & emotive_runtime,
+        const json & body,
+        bool responses_api,
+        bool text_completion_api) {
+    json error;
+    if (!deepseek_validate_runtime_config(config, &error)) {
+        return make_error_response(error);
+    }
+
+    deepseek_chat_result result;
+    std::unique_ptr<server_emotive_turn_builder> turn_builder;
+    if (emotive_runtime.config().enabled) {
+        turn_builder = std::make_unique<server_emotive_turn_builder>(emotive_runtime, config.model);
+        seed_emotive_turn_from_request(body, turn_builder.get());
+    }
+
+    deepseek_stream_observer observer;
+    if (turn_builder) {
+        observer.on_reasoning_delta = [&turn_builder](const std::string & text) {
+            turn_builder->observe_reasoning_delta(text);
+        };
+        observer.on_content_delta = [&turn_builder](const std::string & text) {
+            turn_builder->observe_content_delta(text);
+        };
+        observer.on_runtime_event = [&turn_builder](const std::string & text) {
+            turn_builder->observe_runtime_event(text);
+        };
+    }
+
+    if (!deepseek_complete_chat(config, body, &result, turn_builder ? &observer : nullptr, &error)) {
+        return make_error_response(error);
+    }
+    if (turn_builder) {
+        turn_builder->observe_runtime_event("provider_finish:" + (result.finish_reason.empty() ? std::string("stop") : result.finish_reason));
+        result.emotive_trace = server_emotive_trace_to_json(turn_builder->finalize());
+    }
+
+    const std::string completion_id = gen_chatcmplid();
+    if (responses_api) {
+        return make_json_response(deepseek_format_responses_response(config, result));
+    }
+    if (text_completion_api) {
+        return make_json_response(deepseek_format_text_completion_response(config, result, completion_id));
+    }
+
+    const bool stream = json_value(body, "stream", false);
+    if (stream) {
+        const json stream_options = json_value(body, "stream_options", json::object());
+        const bool include_usage = json_value(stream_options, "include_usage", false);
+
+        auto res = std::make_unique<server_http_res>();
+        res->status = 200;
+        res->content_type = "text/event-stream";
+        res->data = format_oai_sse(
+                deepseek_format_chat_completion_stream(config, result, completion_id, include_usage));
+        return res;
+    }
+
+    return make_json_response(deepseek_format_chat_completion_response(config, result, completion_id));
 }
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
-    // own arguments required by this example
     common_params params;
-
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
     }
 
-    // validate batch size for embeddings
-    // embeddings require all tokens to be processed in a single ubatch
-    // see https://github.com/ggml-org/llama.cpp/issues/12836
-    if (params.embedding && params.n_batch > params.n_ubatch) {
-        LOG_WRN("%s: embeddings enabled with n_batch (%d) > n_ubatch (%d)\n", __func__, params.n_batch, params.n_ubatch);
-        LOG_WRN("%s: setting n_batch = n_ubatch = %d to avoid assertion failure\n", __func__, params.n_ubatch);
-        params.n_batch = params.n_ubatch;
-    }
-
     if (params.n_parallel < 0) {
-        LOG_INF("%s: n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n", __func__);
-
         params.n_parallel = 4;
-        params.kv_unified = true;
-    }
-
-    // for consistency between server router mode and single-model mode, we set the same model name as alias
-    if (params.model_alias.empty() && !params.model.name.empty()) {
-        params.model_alias.insert(params.model.name);
     }
 
     common_init();
 
-    // struct that contains llama context and inference
-    server_context ctx_server;
-
-    llama_backend_init();
-    llama_numa_init(params.numa);
-
-    LOG_INF("system info: n_threads = %d, n_threads_batch = %d, total_threads = %d\n", params.cpuparams.n_threads, params.cpuparams_batch.n_threads, std::thread::hardware_concurrency());
+    LOG_INF("system info: n_threads = %d, n_threads_batch = %d, total_threads = %d\n",
+            params.cpuparams.n_threads,
+            params.cpuparams_batch.n_threads,
+            std::thread::hardware_concurrency());
     LOG_INF("\n");
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
     LOG_INF("\n");
 
+    const deepseek_runtime_config deepseek_config = deepseek_runtime_config_from_env();
+    const server_emotive_runtime_config emotive_config = server_emotive_runtime_config_from_env();
+    server_emotive_runtime emotive_runtime(emotive_config);
+    json config_error;
+    if (!deepseek_validate_runtime_config(deepseek_config, &config_error)) {
+        LOG_ERR("%s: %s\n", __func__, json_value(config_error, "message", std::string("invalid provider config")).c_str());
+        return 1;
+    }
+
+    bridge_compat_state bridge_state;
+    telegram_outbox_state telegram_outbox;
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {
         LOG_ERR("%s: failed to initialize HTTP server\n", __func__);
         return 1;
     }
 
-    //
-    // Router
-    //
+    const auto get_health = [&bridge_state, &deepseek_config, &emotive_runtime, &telegram_outbox](const server_http_req &) {
+        json payload = deepseek_build_health_json(deepseek_config);
+        payload["proactive_mailbox"] = {
+            {"stored_responses", 0},
+            {"publish_total", 0},
+            {"live_stream_connected", bridge_state.live_stream_connected.load()},
+        };
+        payload["telegram_outbox"] = telegram_outbox_health_json(telegram_outbox);
+        payload["emotive_runtime"] = emotive_runtime.health_json();
+        return make_json_response(payload);
+    };
 
-    // register API routes
-    server_routes routes(params, ctx_server);
+    const auto get_models = [&deepseek_config](const server_http_req &) {
+        return make_json_response(deepseek_build_models_json(deepseek_config));
+    };
 
-    const bool openai_surface = params.api_surface == COMMON_SERVER_API_SURFACE_OPENAI;
+    const auto get_latest_emotive_trace = [&emotive_runtime](const server_http_req &) {
+        return make_json_response(emotive_runtime.latest_trace_json());
+    };
 
-    bool is_router_server = params.model.path.empty();
-    std::optional<server_models_routes> models_routes{};
-    if (is_router_server) {
-        // setup server instances manager
-        try {
-            models_routes.emplace(params, argc, argv);
-        } catch (const std::exception & e) {
-            LOG_ERR("%s: failed to initialize router models: %s\n", __func__, e.what());
-            return 1;
-        }
+    const auto post_chat_completions = [&deepseek_config, &emotive_runtime](const server_http_req & req) {
+        const json body = json::parse(req.body);
+        return handle_deepseek_chat(deepseek_config, emotive_runtime, body, false, false);
+    };
 
-        // proxy handlers
-        // note: routes.get_health stays the same
-        routes.get_metrics                 = models_routes->proxy_get;
-        routes.post_props                  = models_routes->proxy_post;
-        routes.get_api_show                = models_routes->proxy_get;
-        routes.post_completions            = models_routes->proxy_post;
-        routes.post_completions_oai        = models_routes->proxy_post;
-        routes.post_chat_completions       = models_routes->proxy_post;
-        routes.post_responses_oai          = models_routes->proxy_post;
-        routes.post_anthropic_messages     = models_routes->proxy_post;
-        routes.post_anthropic_count_tokens = models_routes->proxy_post;
-        routes.post_infill                 = models_routes->proxy_post;
-        routes.post_embeddings             = models_routes->proxy_post;
-        routes.post_embeddings_oai         = models_routes->proxy_post;
-        routes.post_rerank                 = models_routes->proxy_post;
-        routes.post_tokenize               = models_routes->proxy_post;
-        routes.post_detokenize             = models_routes->proxy_post;
-        routes.post_apply_template         = models_routes->proxy_post;
-        routes.get_lora_adapters           = models_routes->proxy_get;
-        routes.post_lora_adapters          = models_routes->proxy_post;
-        routes.get_slots                   = models_routes->proxy_get;
-        routes.post_slots                  = models_routes->proxy_post;
+    const auto post_completions = [&deepseek_config, &emotive_runtime](const server_http_req & req) {
+        const json body = json::parse(req.body);
+        return handle_deepseek_chat(deepseek_config, emotive_runtime, body, false, true);
+    };
 
-        // custom routes for router
-        routes.get_props  = models_routes->get_router_props;
-        routes.get_models = models_routes->get_router_models;
-        if (!openai_surface) {
-            ctx_http.post("/models/load",   ex_wrapper(models_routes->post_router_models_load));
-            ctx_http.post("/models/unload", ex_wrapper(models_routes->post_router_models_unload));
-        }
-    }
+    const auto post_responses = [&deepseek_config, &emotive_runtime](const server_http_req & req) {
+        const json body = convert_responses_input_to_chat(json::parse(req.body));
+        return handle_deepseek_chat(deepseek_config, emotive_runtime, body, true, false);
+    };
 
-    ctx_http.get ("/health",              ex_wrapper(routes.get_health)); // public endpoint (no API key check)
-    ctx_http.get ("/v1/health",           ex_wrapper(routes.get_health)); // public endpoint (no API key check)
-    ctx_http.get ("/metrics",             ex_wrapper(routes.get_metrics));
-    ctx_http.get ("/v1/models",           ex_wrapper(routes.get_models));
-    ctx_http.post("/v1/completions",      ex_wrapper(routes.post_completions_oai));
-    ctx_http.post("/v1/chat/completions", ex_wrapper(routes.post_chat_completions));
-    ctx_http.post("/v1/responses",        ex_wrapper(routes.post_responses_oai));
-    ctx_http.post("/v1/embeddings",       ex_wrapper(routes.post_embeddings_oai));
-    if (!is_router_server) {
-        ctx_http.get ("/v1/responses/stream",      ex_wrapper(routes.get_self_emit_stream_oai));
-        ctx_http.get ("/v1/responses/:response_id", ex_wrapper(routes.get_response_oai));
-        ctx_http.get ("/v1/telegram/outbox",       ex_wrapper(routes.get_telegram_outbox));
-        ctx_http.post("/v1/telegram/approval",     ex_wrapper(routes.post_telegram_approval));
-        ctx_http.post("/v1/telegram/interruption", ex_wrapper(routes.post_telegram_interruption));
-    }
+    const auto get_responses_stream = [&bridge_state](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        res->status = 200;
+        res->content_type = "text/event-stream";
+        res->headers["Cache-Control"] = "no-cache";
+        res->headers["Connection"] = "keep-alive";
+        res->data = ": connected\n\n";
 
-    if (!openai_surface) {
-        ctx_http.get ("/props",               ex_wrapper(routes.get_props));
-        ctx_http.post("/props",               ex_wrapper(routes.post_props));
-        ctx_http.post("/api/show",            ex_wrapper(routes.get_api_show));
-        ctx_http.get ("/models",              ex_wrapper(routes.get_models)); // public endpoint (no API key check)
-        ctx_http.get ("/api/tags",            ex_wrapper(routes.get_models)); // ollama specific endpoint. public endpoint (no API key check)
-        ctx_http.post("/completion",          ex_wrapper(routes.post_completions)); // legacy
-        ctx_http.post("/completions",         ex_wrapper(routes.post_completions));
-        ctx_http.post("/chat/completions",    ex_wrapper(routes.post_chat_completions));
-        ctx_http.post("/api/chat",            ex_wrapper(routes.post_chat_completions)); // ollama specific endpoint
-        ctx_http.post("/responses",           ex_wrapper(routes.post_responses_oai));
-        ctx_http.post("/v1/messages",         ex_wrapper(routes.post_anthropic_messages)); // anthropic messages API
-        ctx_http.post("/v1/messages/count_tokens", ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting
-        ctx_http.post("/infill",              ex_wrapper(routes.post_infill));
-        ctx_http.post("/embedding",           ex_wrapper(routes.post_embeddings)); // legacy
-        ctx_http.post("/embeddings",          ex_wrapper(routes.post_embeddings));
-        ctx_http.post("/rerank",              ex_wrapper(routes.post_rerank));
-        ctx_http.post("/reranking",           ex_wrapper(routes.post_rerank));
-        ctx_http.post("/v1/rerank",           ex_wrapper(routes.post_rerank));
-        ctx_http.post("/v1/reranking",        ex_wrapper(routes.post_rerank));
-        ctx_http.post("/tokenize",            ex_wrapper(routes.post_tokenize));
-        ctx_http.post("/detokenize",          ex_wrapper(routes.post_detokenize));
-        ctx_http.post("/apply-template",      ex_wrapper(routes.post_apply_template));
-        // LoRA adapters hotswap
-        ctx_http.get ("/lora-adapters",       ex_wrapper(routes.get_lora_adapters));
-        ctx_http.post("/lora-adapters",       ex_wrapper(routes.post_lora_adapters));
-        // Save & load slots
-        ctx_http.get ("/slots",               ex_wrapper(routes.get_slots));
-        ctx_http.post("/slots/:id_slot",      ex_wrapper(routes.post_slots));
-    }
-    // CORS proxy (EXPERIMENTAL, only used by the Web UI for MCP)
-    if (params.webui_mcp_proxy) {
-        SRV_WRN("%s", "-----------------\n");
-        SRV_WRN("%s", "CORS proxy is enabled, do not expose server to untrusted environments\n");
-        SRV_WRN("%s", "This feature is EXPERIMENTAL and may be removed or changed in future versions\n");
-        SRV_WRN("%s", "-----------------\n");
-        ctx_http.get ("/cors-proxy",      ex_wrapper(proxy_handler_get));
-        ctx_http.post("/cors-proxy",      ex_wrapper(proxy_handler_post));
-    }
-
-    //
-    // Start the server
-    //
-
-    std::function<void()> clean_up;
-
-    if (is_router_server) {
-        LOG_INF("%s: starting router server, no model will be loaded in this process\n", __func__);
-
-        clean_up = [&models_routes]() {
-            SRV_INF("%s: cleaning up before exit...\n", __func__);
-            if (models_routes.has_value()) {
-                models_routes->models.unload_all();
+        bridge_state.live_stream_connected.store(true);
+        auto should_stop = req.should_stop;
+        res->next = [&bridge_state, should_stop, last_heartbeat = std::chrono::steady_clock::now()](std::string & output) mutable -> bool {
+            if (should_stop()) {
+                bridge_state.live_stream_connected.store(false);
+                return false;
             }
-            llama_backend_free();
-        };
 
-        if (!ctx_http.start()) {
-            clean_up();
-            LOG_ERR("%s: exiting due to HTTP server error\n", __func__);
-            return 1;
-        }
-        ctx_http.is_ready.store(true);
-
-        shutdown_handler = [&](int) {
-            ctx_http.stop();
-        };
-
-    } else {
-        // setup clean up function, to be called before exit
-        clean_up = [&ctx_http, &ctx_server]() {
-            SRV_INF("%s: cleaning up before exit...\n", __func__);
-            ctx_http.stop();
-            ctx_server.terminate();
-            llama_backend_free();
-        };
-
-        // start the HTTP server before loading the model to be able to serve /health requests
-        if (!ctx_http.start()) {
-            clean_up();
-            LOG_ERR("%s: exiting due to HTTP server error\n", __func__);
-            return 1;
-        }
-
-        // load the model
-        LOG_INF("%s: loading model\n", __func__);
-
-        if (!ctx_server.load_model(params)) {
-            clean_up();
-            if (ctx_http.thread.joinable()) {
-                ctx_http.thread.join();
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_heartbeat >= std::chrono::seconds(15)) {
+                output = ": keepalive\n\n";
+                last_heartbeat = now;
+            } else {
+                output.clear();
             }
-            LOG_ERR("%s: exiting due to model loading error\n", __func__);
-            return 1;
-        }
-
-        routes.update_meta(ctx_server);
-        ctx_http.is_ready.store(true);
-
-        LOG_INF("%s: model loaded\n", __func__);
-
-        shutdown_handler = [&](int) {
-            // this will unblock start_loop()
-            ctx_server.terminate();
+            return true;
         };
+        return res;
+    };
+
+    const auto get_telegram_outbox = [&telegram_outbox](const server_http_req & req) {
+        const uint64_t after = std::max<uint64_t>(0, std::strtoull(req.get_param("after", "0").c_str(), nullptr, 10));
+        return make_json_response(telegram_outbox_read_json(telegram_outbox, after));
+    };
+
+    const auto post_telegram_outbox = [&telegram_outbox](const server_http_req & req) {
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        return make_json_response(telegram_outbox_enqueue_json(&telegram_outbox, body));
+    };
+
+    const auto post_telegram_approval = [](const server_http_req & req) {
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        return make_json_response({
+            {"ok", true},
+            {"status", "accepted"},
+            {"approval_id", json_value(body, "approval_id", std::string())},
+        });
+    };
+
+    const auto post_telegram_interruption = [](const server_http_req &) {
+        return make_json_response({
+            {"ok", true},
+            {"cancelled_dmn_approval_ids", json::array()},
+        });
+    };
+
+    ctx_http.get("/health", ex_wrapper(get_health));
+    ctx_http.get("/v1/health", ex_wrapper(get_health));
+    ctx_http.get("/v1/models", ex_wrapper(get_models));
+    ctx_http.get("/v1/emotive/trace/latest", ex_wrapper(get_latest_emotive_trace));
+    ctx_http.post("/v1/chat/completions", ex_wrapper(post_chat_completions));
+    ctx_http.post("/v1/completions", ex_wrapper(post_completions));
+    ctx_http.post("/v1/responses", ex_wrapper(post_responses));
+    ctx_http.get("/v1/responses/stream", ex_wrapper(get_responses_stream));
+    ctx_http.get("/v1/telegram/outbox", ex_wrapper(get_telegram_outbox));
+    ctx_http.post("/v1/telegram/outbox", ex_wrapper(post_telegram_outbox));
+    ctx_http.post("/v1/telegram/approval", ex_wrapper(post_telegram_approval));
+    ctx_http.post("/v1/telegram/interruption", ex_wrapper(post_telegram_interruption));
+
+    if (params.api_surface != COMMON_SERVER_API_SURFACE_OPENAI) {
+        ctx_http.post("/chat/completions", ex_wrapper(post_chat_completions));
+        ctx_http.post("/completions", ex_wrapper(post_completions));
+        ctx_http.post("/responses", ex_wrapper(post_responses));
+        ctx_http.get("/models", ex_wrapper(get_models));
     }
 
-    // TODO: refactor in common/console
+    if (!ctx_http.start()) {
+        LOG_ERR("%s: exiting due to HTTP server error\n", __func__);
+        return 1;
+    }
+    ctx_http.is_ready.store(true);
+
+    shutdown_handler = [&](int) {
+        ctx_http.stop();
+    };
+
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
     struct sigaction sigint_action;
     sigint_action.sa_handler = signal_handler;
-    sigemptyset (&sigint_action.sa_mask);
+    sigemptyset(&sigint_action.sa_mask);
     sigint_action.sa_flags = 0;
     sigaction(SIGINT, &sigint_action, NULL);
     sigaction(SIGTERM, &sigint_action, NULL);
@@ -308,42 +649,9 @@ int main(int argc, char ** argv) {
     SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
 
-    if (is_router_server) {
-        LOG_INF("%s: router server is listening on %s\n", __func__, ctx_http.listening_address.c_str());
-        LOG_INF("%s: NOTE: router mode is experimental\n", __func__);
-        LOG_INF("%s:       it is not recommended to use this mode in untrusted environments\n", __func__);
-        if (ctx_http.thread.joinable()) {
-            ctx_http.thread.join(); // keep the main thread alive
-        }
-
-        // when the HTTP server stops, clean up and exit
-        clean_up();
-    } else {
-        LOG_INF("%s: server is listening on %s\n", __func__, ctx_http.listening_address.c_str());
-        LOG_INF("%s: starting the main loop...\n", __func__);
-
-        // optionally, notify router server that this instance is ready
-        const char * router_port = std::getenv("LLAMA_SERVER_ROUTER_PORT");
-        std::thread monitor_thread;
-        if (router_port != nullptr) {
-            monitor_thread = server_models::setup_child_server(shutdown_handler);
-        }
-
-        // this call blocks the main thread until queue_tasks.terminate() is called
-        ctx_server.start_loop();
-
-        clean_up();
-        if (ctx_http.thread.joinable()) {
-            ctx_http.thread.join();
-        }
-        if (monitor_thread.joinable()) {
-            monitor_thread.join();
-        }
-
-        auto * ll_ctx = ctx_server.get_llama_context();
-        if (ll_ctx != nullptr) {
-            llama_memory_breakdown_print(ll_ctx);
-        }
+    LOG_INF("%s: DeepSeek provider server is listening on %s\n", __func__, ctx_http.listening_address.c_str());
+    if (ctx_http.thread.joinable()) {
+        ctx_http.thread.join();
     }
 
     return 0;

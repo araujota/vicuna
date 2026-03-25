@@ -267,6 +267,48 @@ int main() {
                 "expected child task to preserve staged react history contents")) {
         return 1;
     }
+    server_task compacted_post_tool_task(SERVER_TASK_TYPE_COMPLETION);
+    compacted_post_tool_task.react_resuming_from_tool_result = true;
+    compacted_post_tool_task.react_last_tool_family_id = "sonarr";
+    compacted_post_tool_task.react_last_tool_method_name = "inspect";
+    compacted_post_tool_task.react_last_tool_capability_id = "openclaw.servarr.sonarr.inspect";
+    compacted_post_tool_task.react_last_tool_observation = "{\"series_count\":2}";
+    compacted_post_tool_task.react_last_step_name = "decide_after_tool";
+    compacted_post_tool_task.react_last_step_output = "{\"action\":\"decide\"}";
+    compacted_post_tool_task.react_last_step_result = "{\"decision\":\"answer\"}";
+    compacted_post_tool_task.react_history.push_back(server_react_history_entry{
+            "tool_result",
+            "tool_result",
+            "{\"series_count\":2}"});
+    compacted_post_tool_task.react_history.push_back(server_react_history_entry{
+            "decide_after_tool",
+            "reasoning",
+            "<think>retry one</think>"});
+    compacted_post_tool_task.react_history.push_back(server_react_history_entry{
+            "emit_response",
+            "reasoning",
+            "<think>retry two</think>"});
+    compacted_post_tool_task.compact_post_tool_retry_state();
+    if (!expect(compacted_post_tool_task.react_history.size() == 1,
+                "expected post-tool retry compaction to remove trailing decide/emit retry history")) {
+        return 1;
+    }
+    if (!expect(compacted_post_tool_task.react_history[0].phase == "tool_result",
+                "expected post-tool retry compaction to preserve the admitted tool result")) {
+        return 1;
+    }
+    if (!expect(compacted_post_tool_task.react_last_step_name == "tool_result",
+                "expected post-tool retry compaction to reset the pinned last step to the tool result")) {
+        return 1;
+    }
+    if (!expect(compacted_post_tool_task.react_last_step_result == compacted_post_tool_task.react_last_tool_observation,
+                "expected post-tool retry compaction to keep the admitted tool observation as the pinned result")) {
+        return 1;
+    }
+    if (!expect(compacted_post_tool_task.react_last_step_output.find("openclaw.servarr.sonarr.inspect") != std::string::npos,
+                "expected post-tool retry compaction to preserve the last tool capability in the pinned step output")) {
+        return 1;
+    }
 
     server_task wrong_type_task(SERVER_TASK_TYPE_EMBEDDING);
     wrong_type_task.has_active_trace = true;

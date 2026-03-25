@@ -2,6 +2,10 @@
 
 This document is the high-level architectural source of truth for Vicuña, a fork of `llama.cpp` aimed at building an organism-level agent runtime rather than a chat wrapper.
 
+For the current parallel-processing rebuild, the guiding document is
+[deep-research-report.md](./deep-research-report.md). This file remains the
+broader architectural overview for the repository.
+
 The project thesis is simple: Vicuña should not wait passively for prompts. Its own evolving state should continuously generate reasons to retrieve memory, think, use tools, and decide whether to speak.
 
 ## Executive Thesis

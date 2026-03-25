@@ -18,6 +18,23 @@ export type OpenClawToolSecrets = {
     chaptarr?: {
       base_url?: string;
       api_key?: string;
+      legal_importer_url?: string;
+      legal_importer_wait_ms?: number;
+      legal_importer_poll_ms?: number;
+    };
+    ongoing_tasks?: {
+      base_url?: string;
+      auth_token?: string;
+      container_tag?: string;
+      runtime_identity?: string;
+      registry_key?: string;
+      registry_title?: string;
+      query_threshold?: number;
+    };
+    telegram_relay?: {
+      base_url?: string;
+      auth_token?: string;
+      default_chat_scope?: string;
     };
   };
 };
@@ -31,6 +48,8 @@ export type OpenClawPaths = {
   radarrWrapperPath: string;
   sonarrWrapperPath: string;
   chaptarrWrapperPath: string;
+  ongoingTasksWrapperPath: string;
+  telegramRelayWrapperPath: string;
 };
 
 export type OpenClawServarrToolId = "radarr" | "sonarr";
@@ -61,7 +80,9 @@ export function defaultPaths(repoRoot = defaultRepoRoot()): OpenClawPaths {
     tavilyWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "tavily-web-search"),
     radarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "radarr-api"),
     sonarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "sonarr-api"),
-    chaptarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "chaptarr-api")
+    chaptarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "chaptarr-api"),
+    ongoingTasksWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "ongoing-tasks-api"),
+    telegramRelayWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "telegram-relay-api")
   };
 }
 

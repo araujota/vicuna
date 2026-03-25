@@ -325,6 +325,50 @@ int main() {
     }
 
     {
+        std::string reason;
+        if (!expect(runtime_telegram_assistant_message_is_carryable(
+                            "Not much, just here to help! What's up with you?",
+                            "telegram_relay_active",
+                            &reason),
+                    "expected ordinary Telegram assistant text to remain carryable")) {
+            return 1;
+        }
+        if (!expect(!runtime_telegram_assistant_message_is_carryable(
+                             "I ran into a problem while working on that request and could not complete it: request (22812 tokens) exceeds the available context size (16384 tokens), try increasing it",
+                             "telegram_relay_active_error",
+                             &reason),
+                    "expected runtime context-window boilerplate to be non-carryable")) {
+            return 1;
+        }
+        if (!expect(reason == "runtime_error_source" || reason == "terminal_failure_boilerplate",
+                    "expected runtime error carryability rejection to explain why the message was dropped")) {
+            return 1;
+        }
+        if (!expect(!runtime_telegram_assistant_message_is_carryable(
+                             "The system's response to the user's greeting \"Hello!\" was to select the \"hard_memory\" tool, which is designed for managing memory storage tasks. However, since the user's greeting didn't specify a particular request, the system should have either prompted the user for their needs or provided a general assistance question.",
+                             "telegram_relay_active",
+                             &reason),
+                    "expected controller meta-analysis to be non-carryable runtime Telegram dialogue")) {
+            return 1;
+        }
+        if (!expect(reason == "controller_meta_analysis",
+                    "expected controller meta-analysis carryability rejection reason")) {
+            return 1;
+        }
+        if (!expect(!runtime_telegram_assistant_message_is_carryable(
+                             "{\"action\":\"select_tool\",\"tool_family_id\":\"hard_memory\"}",
+                             "telegram_relay_active",
+                             &reason),
+                    "expected staged control JSON to be non-carryable runtime Telegram dialogue")) {
+            return 1;
+        }
+        if (!expect(reason == "controller_markup",
+                    "expected control-json carryability rejection reason")) {
+            return 1;
+        }
+    }
+
+    {
         server_task task(SERVER_TASK_TYPE_COMPLETION);
         task.has_active_trace = true;
         task.disable_authoritative_react = true;

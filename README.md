@@ -69,6 +69,16 @@ range of hardware - locally and in the cloud.
 
 The `llama.cpp` project is the main playground for developing new features for the [ggml](https://github.com/ggml-org/ggml) library.
 
+## Vicuña Parallel Runtime Guide
+
+The guiding document for Vicuña's parallel-processing rebuild now lives in
+[deep-research-report.md](./deep-research-report.md).
+
+The legacy whitepaper has been retired. Use the deep research report when
+working on the bolt-on parallel cognitive runtime, reasoning-trace processing,
+VAD projection, unfinished-business review, heuristic replay, and interruption
+control surfaces.
+
 ## Vicuña Self-Model Extensions
 
 Vicuña keeps its authored self-model as the fixed core, then layers a bounded

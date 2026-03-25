@@ -14,7 +14,18 @@ export * from "./contracts.js";
 export * from "./catalog.js";
 export * from "./config.js";
 export * from "./invoke.js";
+export * from "./ongoing-tasks.js";
 export * from "./runtime-catalog.js";
+export {
+  TelegramRelayToolError,
+  errorEnvelope as telegramRelayErrorEnvelope,
+  handleTelegramRelay,
+  parseCliInvocation as parseTelegramRelayCliInvocation,
+  resolveTelegramRelayConfig,
+  type TelegramRelayConfig,
+  type TelegramRelayInvocation,
+  type TelegramRelayResponseEnvelope,
+} from "./telegram-relay.js";
 
 function defaultCliPaths() {
   return defaultPaths();

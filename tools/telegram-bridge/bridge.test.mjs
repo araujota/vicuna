@@ -19,7 +19,9 @@ import {
   getConversationForTelegramMessage,
   getChatTranscript,
   getLatestConversationId,
+  getTelegramRequestDeltaMessages,
   ingestTelegramDocumentMessage,
+  isTelegramCarryableAssistantMessage,
   isTelegramReplyTargetErrorMessage,
   isTelegramTerminalDeliveryErrorMessage,
   loadState,
@@ -228,7 +230,7 @@ test('buildTelegramFileUrl creates telegram file endpoint', () => {
 test('buildTelegramRelaySystemPrompt prefers exposed media tools over stale refusals', () => {
   const prompt = buildTelegramRelaySystemPrompt();
 
-  assert.match(prompt, /Maintain continuity across the provided transcript\./);
+  assert.match(prompt, /Maintain continuity from the runtime-managed Telegram dialogue state and the current user turn\./);
   assert.match(prompt, /Sonarr, Radarr, Chaptarr, or another relevant live tool/);
   assert.match(prompt, /use the relevant tool instead of claiming you lack access/i);
   assert.match(prompt, /cannot interact with external systems/i);
@@ -509,6 +511,56 @@ test('appendChatTranscriptMessage can filter transcript continuity by conversati
   ]);
   assert.equal(getConversationForTelegramMessage(state, 1, 12), 'tc1');
   assert.equal(getLatestConversationId(state, 1), 'tc2');
+});
+
+test('terminal Telegram error replies are not carryable transcript history', () => {
+  assert.equal(
+    isTelegramCarryableAssistantMessage('I ran into a problem while working on that request and could not complete it: vicuna chat failed: 400 {"error":{"code":400,"message":"request (22963 tokens) exceeds the available context size (16384 tokens), try increasing it","type":"exceed_context_size_error"}}'),
+    false,
+  );
+  assert.equal(
+    isTelegramCarryableAssistantMessage('The import has started for Dante\'s Inferno.'),
+    true,
+  );
+
+  let state = normalizeState({});
+  state = appendChatTranscriptMessage(state, 1, 'user', 'hello', { maxHistoryMessages: 8 });
+  state = appendChatTranscriptMessage(
+    state,
+    1,
+    'assistant',
+    'I ran into a problem while working on that request and could not complete it: vicuna chat failed: 500 {"error":{"code":500,"message":"Failed to continue authoritative ReAct turn after exhausted terminal-policy repair","type":"server_error"}}',
+    { maxHistoryMessages: 8 },
+  );
+  state = appendChatTranscriptMessage(state, 1, 'assistant', 'clean reply', { maxHistoryMessages: 8 });
+
+  assert.deepEqual(getChatTranscript(state, 1), [
+    { role: 'user', content: 'hello' },
+    { role: 'assistant', content: 'clean reply' },
+  ]);
+});
+
+test('getTelegramRequestDeltaMessages keeps only the newest user turn', () => {
+  let state = normalizeState({});
+  state = appendChatTranscriptMessage(state, 7502424413, 'user', 'first user', {
+    maxHistoryMessages: 8,
+    conversationId: 'tc3',
+    telegramMessageId: 101,
+  });
+  state = appendChatTranscriptMessage(state, 7502424413, 'assistant', 'first assistant', {
+    maxHistoryMessages: 8,
+    conversationId: 'tc3',
+    telegramMessageId: 102,
+  });
+  state = appendChatTranscriptMessage(state, 7502424413, 'user', 'latest user', {
+    maxHistoryMessages: 8,
+    conversationId: 'tc3',
+    telegramMessageId: 103,
+  });
+
+  assert.deepEqual(getTelegramRequestDeltaMessages(state, 7502424413, { conversationId: 'tc3' }), [
+    { role: 'user', content: 'latest user' },
+  ]);
 });
 
 test('resolveTelegramConversationForMessage prefers reply linkage and otherwise reuses latest conversation', () => {

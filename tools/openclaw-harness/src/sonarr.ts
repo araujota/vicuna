@@ -6,6 +6,7 @@ import {
   optionalBoolean,
   optionalInteger,
   optionalIntegerArray,
+  optionalStringArray,
   optionalString,
   requireString,
   runServarrCli,
@@ -13,6 +14,10 @@ import {
   ServarrToolError,
   successEnvelope,
   summarizeServarrCommand,
+  summarizeServarrQualityProfiles,
+  summarizeServarrRootFolders,
+  summarizeServarrSystemStatus,
+  summarizeSonarrCalendar,
   summarizeSonarrLookupResults,
   summarizeSonarrQueue,
   summarizeSonarrSeriesList,
@@ -185,44 +190,65 @@ function resolveDeleteSeriesTarget(
   throw new ServarrToolError("lookup_no_match", `no tracked Sonarr series matched '${term}'`);
 }
 
+function collectDeleteSeriesTargets(
+  existingSeries: unknown,
+  payload: ServarrInvocation
+): Record<string, unknown>[] {
+  const targets: Record<string, unknown>[] = [];
+  const seenIds = new Set<number>();
+
+  const pushTarget = (target: Record<string, unknown>) => {
+    const seriesId = typeof target.id === "number" ? target.id : undefined;
+    if (seriesId === undefined || seenIds.has(seriesId)) {
+      return;
+    }
+    seenIds.add(seriesId);
+    targets.push(target);
+  };
+
+  const seriesIds = optionalIntegerArray(payload, "series_ids") ?? [];
+  for (const seriesId of seriesIds) {
+    pushTarget(resolveDeleteSeriesTarget(existingSeries, { action: "delete_series", series_id: seriesId }));
+  }
+
+  if (
+    optionalInteger(payload, "series_id") !== undefined ||
+    optionalInteger(payload, "tvdb_id") !== undefined ||
+    optionalInteger(payload, "tmdb_id") !== undefined
+  ) {
+    pushTarget(resolveDeleteSeriesTarget(existingSeries, payload));
+  }
+
+  const terms = optionalStringArray(payload, "terms") ?? [];
+  for (const term of terms) {
+    pushTarget(resolveDeleteSeriesTarget(existingSeries, { action: "delete_series", term }));
+  }
+
+  if (optionalString(payload, "term")) {
+    pushTarget(resolveDeleteSeriesTarget(existingSeries, payload));
+  }
+
+  if (targets.length === 0) {
+    throw new ServarrToolError(
+      "missing_argument",
+      "delete_series requires series_id, series_ids, term, terms, tvdb_id, or tmdb_id"
+    );
+  }
+
+  return targets;
+}
+
 export async function handleSonarr(context: ServarrCliContext) {
   const { payload, config } = context;
   const action = String(payload.action);
   const resolvedAction = canonicalizeServarrAction("sonarr", action);
 
-  if (resolvedAction === "system_status") {
-    const data = await servarrRequestJson(config, "GET", "/api/v3/system/status");
-    return successEnvelope("sonarr", action, config.baseUrl, "GET", "/api/v3/system/status", undefined, data);
-  }
-  if (resolvedAction === "queue") {
-    const data = await servarrRequestJson(config, "GET", "/api/v3/queue");
-    return successEnvelope("sonarr", action, config.baseUrl, "GET", "/api/v3/queue", undefined, summarizeSonarrQueue(data));
-  }
-  if (resolvedAction === "calendar") {
-    const query = calendarQuery(payload);
-    const data = await servarrRequestJson(config, "GET", "/api/v3/calendar", query);
-    return successEnvelope("sonarr", action, config.baseUrl, "GET", "/api/v3/calendar", query, data);
-  }
-  if (resolvedAction === "root_folders") {
-    const data = await servarrRequestJson(config, "GET", "/api/v3/rootfolder");
-    return successEnvelope("sonarr", action, config.baseUrl, "GET", "/api/v3/rootfolder", undefined, data);
-  }
-  if (resolvedAction === "quality_profiles") {
-    const data = await servarrRequestJson(config, "GET", "/api/v3/qualityprofile");
-    return successEnvelope("sonarr", action, config.baseUrl, "GET", "/api/v3/qualityprofile", undefined, data);
-  }
-  if (resolvedAction === "list_series") {
+  if (resolvedAction === "list_downloaded_series" || resolvedAction === "list_series") {
     const data = await servarrRequestJson(config, "GET", "/api/v3/series");
     return successEnvelope("sonarr", action, config.baseUrl, "GET", "/api/v3/series", undefined, summarizeSonarrSeriesList(data));
   }
-  if (resolvedAction === "lookup_series") {
-    const term = requireString(payload, "term", "term is required for lookup_series");
-    const query = { term };
-    const data = await servarrRequestJson(config, "GET", "/api/v3/series/lookup", query);
-    return successEnvelope("sonarr", action, config.baseUrl, "GET", "/api/v3/series/lookup", query, summarizeSonarrLookupResults(data));
-  }
-  if (resolvedAction === "add_series" || resolvedAction === "download_series") {
-    const term = requireString(payload, "term", "term is required for add_series");
+  if (resolvedAction === "download_series") {
+    const term = requireString(payload, "term", "term is required for download_series");
     const rootFolderPath = FIXED_SONARR_ROOT_FOLDER_PATH;
     const qualityProfileId = FIXED_SONARR_QUALITY_PROFILE_ID;
     const lookupResults = await servarrRequestJson(config, "GET", "/api/v3/series/lookup", { term });
@@ -241,9 +267,10 @@ export async function handleSonarr(context: ServarrCliContext) {
     if (existing && typeof existing.id === "number") {
       const command = await triggerSeriesSearch(context, existing.id);
       return successEnvelope("sonarr", action, config.baseUrl, "POST", "/api/v3/command", { term }, {
-        mode: "existing_series_search",
-        existing_series: summarizeSonarrSeriesRecord(existing),
-        command: summarizeServarrCommand(command),
+        mode: "existing_series_search_started",
+        message: `Started a Sonarr search for '${typeof existing.title === "string" ? existing.title : term}'.`,
+        series: summarizeSonarrSeriesRecord(existing),
+        search_command: summarizeServarrCommand(command),
       });
     }
     const requestBody: Record<string, unknown> = {
@@ -265,25 +292,35 @@ export async function handleSonarr(context: ServarrCliContext) {
     delete requestBody.id;
     const data = await servarrRequestJson(config, "POST", "/api/v3/series", undefined, requestBody);
     return successEnvelope("sonarr", action, config.baseUrl, "POST", "/api/v3/series", { term }, {
-      mode: "new_series_add",
+      mode: "new_series_added_and_search_requested",
+      message: `Added '${term}' to Sonarr and requested an immediate search.`,
       series: summarizeSonarrSeriesRecord(data),
     });
   }
   if (resolvedAction === "delete_series") {
     const existingSeries = await servarrRequestJson(config, "GET", "/api/v3/series");
-    const target = resolveDeleteSeriesTarget(existingSeries, payload);
-    const seriesId = typeof target.id === "number" ? target.id : undefined;
-    if (seriesId === undefined) {
-      throw new ServarrToolError("lookup_no_match", "matched Sonarr series did not include an id");
-    }
     const query = {
       deleteFiles: optionalBoolean(payload, "delete_files") ?? true,
       addImportListExclusion: optionalBoolean(payload, "add_import_list_exclusion") ?? false,
     };
-    await servarrRequestJson(config, "DELETE", `/api/v3/series/${seriesId}`, query);
-    return successEnvelope("sonarr", action, config.baseUrl, "DELETE", `/api/v3/series/${seriesId}`, query, {
-      mode: "tracked_series_delete",
-      deleted_series: summarizeSonarrSeriesRecord(target),
+    const targets = collectDeleteSeriesTargets(existingSeries, payload);
+    const deletedSeries: unknown[] = [];
+    for (const target of targets) {
+      const seriesId = typeof target.id === "number" ? target.id : undefined;
+      if (seriesId === undefined) {
+        throw new ServarrToolError("lookup_no_match", "matched Sonarr series did not include an id");
+      }
+      await servarrRequestJson(config, "DELETE", `/api/v3/series/${seriesId}`, query);
+      deletedSeries.push(summarizeSonarrSeriesRecord(target));
+    }
+    return successEnvelope("sonarr", action, config.baseUrl, "DELETE", "/api/v3/series/:id", query, {
+      mode: "series_deleted",
+      message:
+        deletedSeries.length === 1
+          ? "Deleted 1 series from Sonarr."
+          : `Deleted ${deletedSeries.length} series from Sonarr.`,
+      deleted_count: deletedSeries.length,
+      deleted_series: deletedSeries,
     });
   }
 

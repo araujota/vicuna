@@ -8,9 +8,8 @@ It does two jobs in one process:
   `/v1/chat/completions`
 - subscribes to `/v1/responses/stream` and relays proactive self-emits to every
   registered Telegram chat
-- polls `/v1/telegram/outbox` for runtime-owned `ask_with_options` prompts and
-  approval-gate prompts, then delivers them with Telegram
-  `reply_markup.inline_keyboard`
+- polls `/v1/telegram/outbox` for runtime-owned follow-up messages and other
+  retained compatibility items
 
 ## Environment
 
@@ -93,43 +92,13 @@ The launchers they use are:
 - [run-vicuna-runtime.sh](/home/tyler-araujo/Projects/vicuna/tools/ops/run-vicuna-runtime.sh)
 - [run-telegram-bridge.sh](/home/tyler-araujo/Projects/vicuna/tools/ops/run-telegram-bridge.sh)
 
-The managed runtime launcher now owns an explicit reasoning GGUF instead of an
-Ollama blob path. By default it expects:
+The managed runtime launcher now starts the provider-backed server directly.
+The key runtime variables are:
 
-- `VICUNA_RUNTIME_MODEL_PATH`:
-  `/home/tyler-araujo/Projects/vicuna/models/runtime/DeepSeek-R1-Distill-Llama-8B-Q6_K.gguf`
-- `VICUNA_RUNTIME_MODEL_URL`:
-  [bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF](https://huggingface.co/bartowski/DeepSeek-R1-Distill-Llama-8B-GGUF)
-- `VICUNA_RUNTIME_MODEL_CHAT_TEMPLATE_FILE`:
-  [deepseek-ai-DeepSeek-R1-Distill-Llama-8B.jinja](/Users/tyleraraujo/vicuna/models/templates/deepseek-ai-DeepSeek-R1-Distill-Llama-8B.jinja)
-- `VICUNA_RUNTIME_MODEL_REASONING_FORMAT`: `deepseek`
-
-If the model file is missing, the launcher fetches it through
-[fetch-runtime-model.sh](/Users/tyleraraujo/vicuna/tools/ops/fetch-runtime-model.sh)
-before starting `llama-server`.
-
-The runtime launcher now enables the repo-owned cognitive bash tool path by
-default for managed operation. Override these if needed:
-
-- `VICUNA_BASH_TOOL_ENABLED` default: `1`
-- `VICUNA_BASH_TOOL_PATH` default: `$(command -v bash)` from the launcher host
-- `VICUNA_BASH_TOOL_WORKDIR` default: repo root
-- `VICUNA_BASH_TOOL_TIMEOUT_MS` default: `15000`
-- `VICUNA_BASH_TOOL_MAX_STDOUT_BYTES` default: `16384`
-- `VICUNA_BASH_TOOL_MAX_STDERR_BYTES` default: `8192`
-- `VICUNA_BASH_TOOL_LOGIN_SHELL` default: `0`
-- `VICUNA_BASH_TOOL_INHERIT_ENV` default: `1`
-- `VICUNA_BASH_TOOL_MAX_CHILD_PROCESSES` default: `4096`
-
-`VICUNA_BASH_TOOL_LOGIN_SHELL=0` keeps the runtime on `bash -c` by default so
-bounded tool commands do not depend on host login-shell startup hooks such as
-`/etc/profile.d/*`. Set it back to `1` only when a specific command truly
-requires login-shell initialization.
-
-The managed default for `VICUNA_BASH_TOOL_MAX_CHILD_PROCESSES` is intentionally
-much higher than the runtime's old low safety floor because Linux applies
-`RLIMIT_NPROC` per user, not per command. Values that are too small can prevent
-even simple allowed commands from forking on a busy workstation.
+- `VICUNA_DEEPSEEK_API_KEY`
+- `VICUNA_DEEPSEEK_BASE_URL` default: `https://api.deepseek.com`
+- `VICUNA_DEEPSEEK_MODEL` default: `deepseek-reasoner`
+- `VICUNA_DEEPSEEK_TIMEOUT_MS` default: `60000`
 
 ## Behavior
 
@@ -141,8 +110,9 @@ even simple allowed commands from forking on a busy workstation.
   runtime-authored assistant messages, plus plain next messages when one latest
   active conversation is clear, stay attached to the same bounded continuity
   transcript instead of starting an unrelated follow-up thread
-- runtime-owned `ask_with_options` tool calls are delivered through a dedicated
-  Telegram outbox surface, not through fallback assistant text
+- runtime-owned follow-up messages delivered through the provider-only
+  `telegram_relay` tool now arrive through the dedicated Telegram outbox
+  surface, not through fallback assistant text
 - runtime-owned mutation approvals are delivered through the same outbox as
   `approval_request` items; the bridge submits inline-button decisions back to
   `/v1/telegram/approval` as structured approval events instead of rewriting
@@ -150,13 +120,9 @@ even simple allowed commands from forking on a busy workstation.
 - before forwarding a fresh Telegram user message, the bridge calls the runtime
   interruption surface so pending DMN-owned approval waits for that chat are
   superseded cleanly rather than blocking the new foreground turn
-- inline option clicks arrive as Telegram `callback_query` updates; ordinary
-  `ask_with_options` prompts are still rewritten into the bounded transcript,
-  while approval prompts are resolved through the runtime-owned approval object
-  and do not create a synthetic user turn
-- plain-text answers sent in response to an `ask_with_options` prompt are still
-  treated as normal user messages rather than structured option selections, but
-  they remain attached to the same Telegram conversation anchor as the prompt
+- inline approval clicks still arrive as Telegram `callback_query` updates and
+  are resolved through the runtime-owned approval object instead of becoming a
+  synthetic user turn
 - forwarded chat requests now include Telegram chat metadata headers so the
   runtime can maintain its own bounded last-`N` turn dialogue object instead of
   depending only on bridge-local transcript state
@@ -209,7 +175,7 @@ even simple allowed commands from forking on a busy workstation.
   shaping rather than Telegram update replay
 - intentionally empty completion text is now allowed on Telegram turns because
   the user-visible payload may already have been delivered by a tool such as
-  `ask_with_options`
+  `telegram_relay`
 
 ## Reset Guidance
 

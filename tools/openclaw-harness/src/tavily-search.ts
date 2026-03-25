@@ -1,10 +1,18 @@
 import { loadToolSecrets } from "./config.js";
 
-type TavilySearchResult = {
+type TavilyApiSearchResult = {
   title?: string;
   url?: string;
   content?: string;
   raw_content?: string | null;
+  score?: number;
+  published_date?: string;
+};
+
+type TavilySearchResult = {
+  title?: string;
+  url?: string;
+  excerpt?: string;
   score?: number;
   published_date?: string;
 };
@@ -193,17 +201,13 @@ export function buildTavilySearchRequest(query: string, options: TavilyCliOption
   return request;
 }
 
-function boundedResults(results: TavilySearchResult[] | undefined, maxResults: number): TavilySearchResult[] {
+function boundedResults(results: TavilyApiSearchResult[] | undefined, maxResults: number): TavilySearchResult[] {
   return (results ?? []).slice(0, clampMaxResults(maxResults)).map((result) => {
-    let rawContent = result.raw_content ?? undefined;
-    if (rawContent) {
-      rawContent = rawContent.slice(0, 1200);
-    }
+    const excerptSource = result.content?.trim() || result.raw_content?.trim() || undefined;
     return {
       title: result.title,
       url: result.url,
-      content: result.content?.slice(0, 400),
-      raw_content: rawContent ?? null,
+      excerpt: excerptSource?.slice(0, 400),
       score: result.score,
       published_date: result.published_date
     };
@@ -211,7 +215,7 @@ function boundedResults(results: TavilySearchResult[] | undefined, maxResults: n
 }
 
 export function sanitizeTavilyResponse(
-  payload: TavilySearchResponse & { answer?: string },
+  payload: Omit<TavilySearchResponse, "results"> & { answer?: string; results?: TavilyApiSearchResult[] },
   request: TavilySearchRequestBody
 ): TavilySearchResponse {
   return {

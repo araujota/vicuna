@@ -19,6 +19,7 @@ import {
   formatTelegramMessage,
   getPendingOptionPrompt,
   getChatTranscript,
+  getTelegramRequestDeltaMessages,
   ingestTelegramDocumentMessage,
   isTelegramReplyTargetErrorMessage,
   isTelegramTerminalDeliveryErrorMessage,
@@ -45,7 +46,7 @@ const execFileAsync = promisify(execFile);
 const env = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
   vicunaBaseUrl: (process.env.TELEGRAM_BRIDGE_VICUNA_BASE_URL ?? 'http://127.0.0.1:8080').replace(/\/+$/, ''),
-  model: process.env.TELEGRAM_BRIDGE_MODEL ?? process.env.VICUNA_RUNTIME_MODEL_ALIAS ?? 'vicuna-runtime',
+  model: process.env.TELEGRAM_BRIDGE_MODEL ?? process.env.VICUNA_DEEPSEEK_MODEL ?? 'deepseek-reasoner',
   statePath: process.env.TELEGRAM_BRIDGE_STATE_PATH ?? '/tmp/vicuna-telegram-bridge-state.json',
   pollTimeoutSeconds: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS, 30)),
   maxHistoryMessages: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES, 12)),
@@ -377,6 +378,11 @@ async function broadcastToChats(text) {
 async function callVicunaForTelegramMessage(chatId, messageId = 0, extraSystemMessages = [], options = {}) {
   const conversationId = typeof options?.conversationId === 'string' ? options.conversationId.trim() : '';
   const transcript = getChatTranscript(state, chatId, conversationId ? { conversationId } : {});
+  const requestDeltaMessages = getTelegramRequestDeltaMessages(
+    state,
+    chatId,
+    conversationId ? { conversationId } : {},
+  );
   const historyTurns = Math.max(1, Math.ceil(transcript.length / 2));
   const baseSystemPrompt = buildTelegramRelaySystemPrompt();
   const deferredDelivery = options?.deferredDelivery === true;
@@ -389,7 +395,7 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, extraSystemMe
       },
       ...extraSystemMessages,
       ...retrySystemMessages,
-      ...transcript,
+      ...requestDeltaMessages,
     ];
     const response = await fetch(`${env.vicunaBaseUrl}/v1/chat/completions`, {
       method: 'POST',
@@ -418,7 +424,8 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, extraSystemMe
   log('forwarding Telegram transcript to Vicuna', {
     chatId: String(chatId),
     conversationId,
-    messageCount: transcript.length,
+    carriedTranscriptMessageCount: transcript.length,
+    requestDeltaMessageCount: requestDeltaMessages.length,
     roles: transcript.map((entry) => entry.role),
     maxTokens: env.maxTokens,
     deferredDelivery,

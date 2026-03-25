@@ -5,13 +5,15 @@ Vicuña consumes.
 
 Current scope:
 
-- typed capability descriptors for migrated `exec` and `hard_memory_query`
+- typed capability descriptors for the current provider-only tool surface
 - external runtime-catalog emission for OpenClaw-managed tools
 - file-backed OpenClaw tool secrets under `.cache/vicuna`
 - Tavily-backed `web_search` wrapper command
 - Radarr-backed `radarr` wrapper command for movie-library inspection and explicit download-start flows
 - Sonarr-backed `sonarr` wrapper command for series-library inspection and explicit download-start flows
 - Chaptarr-backed `chaptarr` wrapper command for ebook-library inspection, Hardcover-backed search, and explicit ebook download-start flows
+- hard-memory-backed `ongoing_tasks` wrapper command for recurring task CRUD and due polling
+- provider-backed `telegram_relay` wrapper command for direct user-facing follow-up messages
 - exact selector validation on `tool_surface_id` plus `capability_id`
 - simple CLI entrypoint for emitting the catalog and validating invocations
 - registry-style catalog construction so more tools can be added without
@@ -19,24 +21,15 @@ Current scope:
 - explicit cognitive eligibility flags so external tools appear in the intended
   active and DMN ReAct loops
 
-The `exec` capability descriptor is meant to be semantically rich, not just
-syntactically valid. It should tell the ReAct loop that `exec` is the bounded
-shell tool for host-local observation and action, such as filesystem state,
-current working directory, repository state, environment state, running
-processes, and direct command output.
-
 The same rule applies to every OpenClaw capability in the harness: exposed
 parameters must carry descriptions, including nested object fields and array
 item surfaces. The harness and the server fabric share the same capability
 contract so ReAct sees one authoritative tool system rather than competing
 descriptor registries.
 
-For authoritative ReAct, that contract reaches the model in two forms:
-
-- the chat-tool JSON schema, which preserves the full parameter schema
-- the planner-facing staged JSON controller contracts, which expose family
-  selection, method selection, and method-local argument schemas one stage at
-  a time
+For provider-backed execution, that contract primarily reaches the model as
+chat-tool JSON schema. The harness keeps the argument surface narrow so the
+provider can select the right tool without the older staged local controller.
 
 Example:
 
@@ -81,37 +74,24 @@ loop synthesize from the returned URLs and excerpts.
 ## Media Tools
 
 The harness now emits planner-facing media capability aliases instead of only
-one overloaded tool per service. The underlying wrappers are still the same
-Radarr, Sonarr, and Chaptarr executables, but the runtime catalog now presents
-narrower selectable tools such as:
+one overloaded tool per service. The runtime catalog presents only the narrowed
+current aliases:
 
-- `radarr_inspect`, `radarr_queue`, `radarr_root_folders`,
-  `radarr_quality_profiles`, `radarr_search`, `radarr_download_movie`,
-  `radarr_delete_movie`
-- `sonarr_inspect`, `sonarr_queue`, `sonarr_root_folders`,
-  `sonarr_quality_profiles`, `sonarr_search`, `sonarr_download_series`,
+- `radarr_list_downloaded_movies`, `radarr_download_movie`,
+  `radarr_delete_movies`
+- `sonarr_list_downloaded_series`, `sonarr_download_series`,
   `sonarr_delete_series`
-- `chaptarr_inspect`, `chaptarr_queue`, `chaptarr_root_folders`,
-  `chaptarr_quality_profiles`, `chaptarr_metadata_profiles`,
-  `chaptarr_search`, `chaptarr_author_lookup`, `chaptarr_book_lookup`,
-  `chaptarr_download_author`, `chaptarr_download_book`,
-  `chaptarr_delete_book`
+- `chaptarr_list_downloaded_books`, `chaptarr_download_book`,
+  `chaptarr_delete_books`
 
-Each alias exposes only the fields needed for that operation. Discovery aliases
-such as `radarr_search`, `sonarr_search`, and `chaptarr_book_lookup` are
-read-only and do not start downloads. Acquisition aliases such as
-`radarr_download_movie`, `sonarr_download_series`, and
+Each alias exposes only the fields needed for that operation. List aliases are
+read-only and return compact downloaded-item summaries. Acquisition aliases
+such as `radarr_download_movie`, `sonarr_download_series`, and
 `chaptarr_download_book` are the methods intended to start the actual
-acquisition workflow. For Chaptarr specifically, both the generic tracked-add
-actions (`add_author`, `add_book`) and the download aliases are ebook-only, use
-deployment-fixed profile defaults, repair existing tracked authors/books into
-ebook-acquisition state, and then trigger Chaptarr's native search commands in
-the same wrapper call. They start acquisition/search; they do not guarantee a
-completed import. The runtime then
-merges fixed/default arguments, such as the downstream `action`, before the
-wrapper call is dispatched. This keeps the planner-facing contract smaller for
-local models while preserving one authoritative wrapper implementation per
-service.
+acquisition workflow. The runtime merges fixed/default arguments, such as the
+downstream `action`, before the wrapper call is dispatched. This keeps the
+planner-facing contract smaller while preserving one authoritative wrapper
+implementation per service.
 
 The destructive delete aliases are tracked-item removals rather than soft
 unmonitor or untrack operations:
@@ -169,6 +149,52 @@ summaries instead of raw upstream payload dumps. This keeps grounded media
 observations inside the runtime bash stdout budget so post-tool response
 stages can still see complete title lists and queue state.
 
+## Ongoing Tasks
+
+The harness now emits a narrow `ongoing_tasks` family that follows the same
+planner-facing alias pattern as the media tools:
+
+- `ongoing_tasks_create`
+- `ongoing_tasks_get`
+- `ongoing_tasks_get_due`
+- `ongoing_tasks_edit`
+- `ongoing_tasks_delete`
+- `ongoing_tasks_complete`
+
+These aliases all route through one wrapper, but each alias exposes only the
+fields needed for that one action. The durable state is stored as one
+hard-memory-backed registry document keyed by a stable semantic key. That
+keeps create/edit/delete semantics deterministic even though the hard-memory
+backend itself is append/update oriented.
+
+The wrapper computes due state locally and returns only compact summaries:
+
+- `task_id`
+- `task_text`
+- `frequency`
+- `last_done_at`
+- `next_due_at`
+- `due_now`
+- `active`
+
+It does not echo raw `/v4/profile` or `/v4/memories` payloads back into the
+system loop.
+
+## Telegram Relay
+
+The harness also emits one provider-only `telegram_relay` capability for direct
+user-facing follow-up messages.
+
+- it writes one retained outbox item into the current provider server
+- the server exposes that item through `GET /v1/telegram/outbox` for the bridge
+- the wrapper returns only:
+  - `sequence_number`
+  - `chat_scope`
+  - `deduplicated`
+
+The current tool surface intentionally does not include `ask_with_options` or
+`codex`.
+
 Secrets layout:
 
 ```json
@@ -184,12 +210,44 @@ Secrets layout:
     },
     "chaptarr": {
       "base_url": "http://10.0.0.218:8789",
-      "api_key": "chaptarr-api-key"
+      "api_key": "chaptarr-api-key",
+      "legal_importer_url": "http://10.0.0.218:5050",
+      "legal_importer_wait_ms": 20000,
+      "legal_importer_poll_ms": 2000
+    },
+    "ongoing_tasks": {
+      "base_url": "https://api.supermemory.ai",
+      "auth_token": "supermemory-api-key",
+      "container_tag": "vicuna",
+      "runtime_identity": "vicuna",
+      "registry_key": "ongoing-tasks-registry",
+      "registry_title": "Ongoing task registry",
+      "query_threshold": 0
+    },
+    "telegram_relay": {
+      "base_url": "http://127.0.0.1:8080",
+      "auth_token": "vicuna-bearer-token",
+      "default_chat_scope": "7502424413"
     }
   }
 }
 ```
 
+For Chaptarr, `legal_importer_url` is optional. If it is omitted, the harness
+derives a default by taking the configured Chaptarr host and substituting port
+`5000`, which matches the image's internal listener. The current NAS deployment
+overrides that to `http://10.0.0.218:5050` because Synology host port `5000`
+was not reusable cleanly. The wait and poll values are also optional and
+default to `120000` ms and `5000` ms.
+
 If the API keys are missing, the tools still remain visible in the runtime
 catalog, but each invocation returns a typed configuration/auth failure payload
 instead of silently disappearing from the OpenClaw surface.
+
+The `ongoing_tasks` wrapper accepts either the secrets values above or the
+standard `SUPERMEMORY_BASE_URL` / `SUPERMEMORY_API_KEY` environment variables
+as a fallback for hard-memory access.
+
+The `telegram_relay` wrapper accepts either the secrets values above or the
+standard `TELEGRAM_BRIDGE_VICUNA_BASE_URL`, `VICUNA_API_KEY`, and
+`TELEGRAM_DEFAULT_CHAT_SCOPE` environment variables as fallbacks.

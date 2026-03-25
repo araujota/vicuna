@@ -52,28 +52,27 @@ Hard-memory result summaries also preserve top-hit titles and short content
 snippets so "what have you been up to while I was away?" can recover a usable
 narrative instead of only status metadata.
 
-## Built-In Capabilities
+## Current Capabilities
 
-Current built-ins are registered in
-[`tools/server/server-openclaw-fabric.cpp`](../../tools/server/server-openclaw-fabric.cpp)
-and mirrored in
-[`tools/openclaw-harness/src/catalog.ts`](../../tools/openclaw-harness/src/catalog.ts):
+On the current provider-only path, the live catalog is generated in
+[`tools/openclaw-harness/src/catalog.ts`](../../tools/openclaw-harness/src/catalog.ts).
 
-- `hard_memory_query`
-  `tool_surface_id=vicuna.memory.hard_query`
-  `capability_id=openclaw.vicuna.hard_memory_query`
-- `hard_memory_write`
-  `tool_surface_id=vicuna.memory.hard_write`
-  `capability_id=openclaw.vicuna.hard_memory_write`
-- `codex`
-  `tool_surface_id=vicuna.codex.main`
-  `capability_id=openclaw.vicuna.codex_cli`
+Current families include:
+
+- hard memory
+- Tavily web search
+- narrowed Radarr, Sonarr, and Chaptarr media aliases
+- `ongoing_tasks`
+- `telegram_relay`
+
+The current provider-only surface intentionally does not include `codex` or
+`ask_with_options`.
 
 ## Runtime Flags
 
 - `VICUNA_OPENCLAW_TOOL_FABRIC_ENABLED=1`
   Enables catalog installation and strict dispatch resolution.
-- `VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS=hard_memory_query,hard_memory_write,codex`
+- `VICUNA_OPENCLAW_TOOL_FABRIC_TOOLS=hard_memory_query,hard_memory_write`
   Optional comma-separated allowlist of registered built-ins.
 - `VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH=/path/to/openclaw-catalog.json`
   Optional external catalog file merged with the built-ins.
@@ -89,7 +88,7 @@ dropped.
 At runtime, `llama-server` now logs the effective prerequisite state and the
 installed capability set, for example:
 
-- `bash=1 hard_memory=1 codex=1`
+- `bash=1 hard_memory=1`
 - `catalog_path=/var/cache/vicuna/openclaw-catalog.json catalog_exists=1`
 - `OpenClaw capability set: hard_memory_query=..., hard_memory_write=..., ...`
 

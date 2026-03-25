@@ -23,7 +23,25 @@ export const DEFAULT_MAX_CONVERSATION_MESSAGE_LINKS = 64;
 export const TELEGRAM_BRIDGE_STATE_SCHEMA_VERSION = 2;
 
 export function buildTelegramRelaySystemPrompt() {
-  return 'You are replying to a Telegram user through middleware. Keep responses clear and concise unless the user asks for depth. Maintain continuity across the provided transcript. When the user explicitly asks to search the web or needs fresh current information, prefer the web search tool if the runtime makes it available. Use direct command-execution tools only when appropriate instead of pretending a command ran. If the runtime exposes Sonarr, Radarr, Chaptarr, or another relevant live tool for this turn, use the relevant tool instead of claiming you lack access or cannot interact with external systems. If earlier transcript messages said you could not access those systems, treat that as stale and use the currently available tool on this turn.';
+  return 'You are replying to a Telegram user through middleware. Keep responses clear and concise unless the user asks for depth. Maintain continuity from the runtime-managed Telegram dialogue state and the current user turn. When the user explicitly asks to search the web or needs fresh current information, prefer the web search tool if the runtime makes it available. Use direct command-execution tools only when appropriate instead of pretending a command ran. If the runtime exposes Sonarr, Radarr, Chaptarr, or another relevant live tool for this turn, use the relevant tool instead of claiming you lack access or cannot interact with external systems. If earlier dialogue said you could not access those systems, treat that as stale and use the currently available tool on this turn.';
+}
+
+export function isTelegramCarryableAssistantMessage(content) {
+  const trimmed = String(content ?? '').trim();
+  if (!trimmed) {
+    return false;
+  }
+  const lowered = trimmed.toLowerCase();
+  if (!lowered.startsWith('i ran into a problem while working on that request')) {
+    return true;
+  }
+  return !(
+    lowered.includes('vicuna chat failed:') ||
+    lowered.includes('exceeds the available context size') ||
+    lowered.includes('failed to continue authoritative react turn') ||
+    lowered.includes('"type":"server_error"') ||
+    lowered.includes('"type":"exceed_context_size_error"')
+  );
 }
 
 const PDF_MIME_TYPES = new Set([
@@ -328,6 +346,9 @@ function normalizeTranscriptMessage(raw) {
   const role = raw.role === 'assistant' ? 'assistant' : raw.role === 'user' ? 'user' : '';
   const content = typeof raw.content === 'string' ? raw.content.trim() : '';
   if (!role || !content) {
+    return null;
+  }
+  if (role === 'assistant' && !isTelegramCarryableAssistantMessage(content)) {
     return null;
   }
   const conversationId = typeof raw.conversationId === 'string' ? raw.conversationId.trim() : '';
@@ -757,6 +778,20 @@ export function getChatTranscript(state, chatId, options = {}) {
     return messages;
   }
   return messages.filter((entry) => String(entry?.conversationId ?? '').trim() === conversationId);
+}
+
+export function getTelegramRequestDeltaMessages(state, chatId, options = {}) {
+  const transcript = getChatTranscript(state, chatId, options);
+  for (let index = transcript.length - 1; index >= 0; index -= 1) {
+    const entry = transcript[index];
+    if (entry?.role === 'user' && typeof entry.content === 'string' && entry.content.trim()) {
+      return [{
+        role: 'user',
+        content: entry.content,
+      }];
+    }
+  }
+  return [];
 }
 
 export function appendChatTranscriptMessage(state, chatId, role, content, options = {}) {

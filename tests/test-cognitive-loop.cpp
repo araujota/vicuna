@@ -224,6 +224,11 @@ static llama_context * create_context(llama_model * model) {
 
     llama_bash_tool_config bash = llama_bash_tool_default_config();
     bash.enabled = true;
+    if (bash.max_open_files < 256) {
+        std::fprintf(stderr, "unexpected bash tool max_open_files default: %d\n", bash.max_open_files);
+        llama_free(ctx);
+        return nullptr;
+    }
     if (llama_bash_tool_configure(ctx, &bash) != 0) {
         llama_free(ctx);
         return nullptr;

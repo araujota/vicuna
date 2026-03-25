@@ -49,7 +49,7 @@ test("Tavily request preserves richer filters", () => {
   assert.equal(request.country, "united states");
 });
 
-test("Tavily response sanitization strips provider answer and preserves bounded evidence", () => {
+test("Tavily response sanitization strips provider answer and keeps one bounded excerpt field", () => {
   const request = buildTavilySearchRequest("current weather chicago", {
     queryUrl: "current%20weather%20chicago",
     secretsPath: "/tmp/secrets.json",
@@ -83,5 +83,7 @@ test("Tavily response sanitization strips provider answer and preserves bounded 
   assert.equal(response.retrieval_policy?.source_first, true);
   assert.equal(response.retrieval_policy?.include_answer, false);
   assert.equal(response.results?.length, 1);
-  assert.equal(response.results?.[0]?.raw_content?.length, 1200);
+  assert.equal(response.results?.[0]?.excerpt?.length, "Short snippet".length);
+  assert.equal("raw_content" in (response.results?.[0] ?? {}), false);
+  assert.equal("content" in (response.results?.[0] ?? {}), false);
 });

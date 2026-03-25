@@ -6,6 +6,7 @@ import {
   optionalBoolean,
   optionalInteger,
   optionalIntegerArray,
+  optionalStringArray,
   optionalString,
   requireString,
   runServarrCli,
@@ -16,7 +17,11 @@ import {
   summarizeRadarrLookupResults,
   summarizeRadarrMovieList,
   summarizeRadarrQueue,
+  summarizeRadarrCalendar,
   summarizeServarrCommand,
+  summarizeServarrQualityProfiles,
+  summarizeServarrRootFolders,
+  summarizeServarrSystemStatus,
   type ServarrCliContext,
   type ServarrInvocation,
 } from "./servarr.js";
@@ -171,44 +176,61 @@ function resolveDeleteMovieTarget(
   throw new ServarrToolError("lookup_no_match", `no tracked Radarr movie matched '${term}'`);
 }
 
+function collectDeleteMovieTargets(
+  existingMovies: unknown,
+  payload: ServarrInvocation
+): Record<string, unknown>[] {
+  const targets: Record<string, unknown>[] = [];
+  const seenIds = new Set<number>();
+
+  const pushTarget = (target: Record<string, unknown>) => {
+    const movieId = typeof target.id === "number" ? target.id : undefined;
+    if (movieId === undefined || seenIds.has(movieId)) {
+      return;
+    }
+    seenIds.add(movieId);
+    targets.push(target);
+  };
+
+  const movieIds = optionalIntegerArray(payload, "movie_ids") ?? [];
+  for (const movieId of movieIds) {
+    pushTarget(resolveDeleteMovieTarget(existingMovies, { action: "delete_movies", movie_id: movieId }));
+  }
+
+  if (optionalInteger(payload, "movie_id") !== undefined || optionalInteger(payload, "tmdb_id") !== undefined) {
+    pushTarget(resolveDeleteMovieTarget(existingMovies, payload));
+  }
+
+  const terms = optionalStringArray(payload, "terms") ?? [];
+  for (const term of terms) {
+    pushTarget(resolveDeleteMovieTarget(existingMovies, { action: "delete_movies", term }));
+  }
+
+  if (optionalString(payload, "term")) {
+    pushTarget(resolveDeleteMovieTarget(existingMovies, payload));
+  }
+
+  if (targets.length === 0) {
+    throw new ServarrToolError(
+      "missing_argument",
+      "delete_movies requires movie_id, movie_ids, term, terms, or tmdb_id"
+    );
+  }
+
+  return targets;
+}
+
 export async function handleRadarr(context: ServarrCliContext) {
   const { payload, config } = context;
   const action = String(payload.action);
   const resolvedAction = canonicalizeServarrAction("radarr", action);
 
-  if (resolvedAction === "system_status") {
-    const data = await servarrRequestJson(config, "GET", "/api/v3/system/status");
-    return successEnvelope("radarr", action, config.baseUrl, "GET", "/api/v3/system/status", undefined, data);
-  }
-  if (resolvedAction === "queue") {
-    const data = await servarrRequestJson(config, "GET", "/api/v3/queue");
-    return successEnvelope("radarr", action, config.baseUrl, "GET", "/api/v3/queue", undefined, summarizeRadarrQueue(data));
-  }
-  if (resolvedAction === "calendar") {
-    const query = calendarQuery(payload);
-    const data = await servarrRequestJson(config, "GET", "/api/v3/calendar", query);
-    return successEnvelope("radarr", action, config.baseUrl, "GET", "/api/v3/calendar", query, data);
-  }
-  if (resolvedAction === "root_folders") {
-    const data = await servarrRequestJson(config, "GET", "/api/v3/rootfolder");
-    return successEnvelope("radarr", action, config.baseUrl, "GET", "/api/v3/rootfolder", undefined, data);
-  }
-  if (resolvedAction === "quality_profiles") {
-    const data = await servarrRequestJson(config, "GET", "/api/v3/qualityprofile");
-    return successEnvelope("radarr", action, config.baseUrl, "GET", "/api/v3/qualityprofile", undefined, data);
-  }
-  if (resolvedAction === "list_movies") {
+  if (resolvedAction === "list_downloaded_movies" || resolvedAction === "list_movies") {
     const data = await servarrRequestJson(config, "GET", "/api/v3/movie");
     return successEnvelope("radarr", action, config.baseUrl, "GET", "/api/v3/movie", undefined, summarizeRadarrMovieList(data));
   }
-  if (resolvedAction === "lookup_movie") {
-    const term = requireString(payload, "term", "term is required for lookup_movie");
-    const query = { term };
-    const data = await servarrRequestJson(config, "GET", "/api/v3/movie/lookup", query);
-    return successEnvelope("radarr", action, config.baseUrl, "GET", "/api/v3/movie/lookup", query, summarizeRadarrLookupResults(data));
-  }
-  if (resolvedAction === "add_movie" || resolvedAction === "download_movie") {
-    const term = requireString(payload, "term", "term is required for add_movie");
+  if (resolvedAction === "download_movie") {
+    const term = requireString(payload, "term", "term is required for download_movie");
     const rootFolderPath = FIXED_RADARR_ROOT_FOLDER_PATH;
     const qualityProfileId = FIXED_RADARR_QUALITY_PROFILE_ID;
     const lookupResults = await servarrRequestJson(config, "GET", "/api/v3/movie/lookup", { term });
@@ -225,9 +247,10 @@ export async function handleRadarr(context: ServarrCliContext) {
     if (existingMovie && typeof existingMovie.id === "number") {
       const command = await triggerMovieSearch(context, existingMovie.id);
       return successEnvelope("radarr", action, config.baseUrl, "POST", "/api/v3/command", { term }, {
-        mode: "existing_movie_search",
-        existing_movie: summarizeRadarrMovieRecord(existingMovie),
-        command: summarizeServarrCommand(command),
+        mode: "existing_movie_search_started",
+        message: `Started a Radarr search for '${typeof existingMovie.title === "string" ? existingMovie.title : term}'.`,
+        movie: summarizeRadarrMovieRecord(existingMovie),
+        search_command: summarizeServarrCommand(command),
       });
     }
     const requestBody: Record<string, unknown> = {
@@ -247,25 +270,35 @@ export async function handleRadarr(context: ServarrCliContext) {
     delete requestBody.id;
     const data = await servarrRequestJson(config, "POST", "/api/v3/movie", undefined, requestBody);
     return successEnvelope("radarr", action, config.baseUrl, "POST", "/api/v3/movie", { term }, {
-      mode: "new_movie_add",
+      mode: "new_movie_added_and_search_requested",
+      message: `Added '${term}' to Radarr and requested an immediate search.`,
       movie: summarizeRadarrMovieRecord(data),
     });
   }
-  if (resolvedAction === "delete_movie") {
+  if (resolvedAction === "delete_movie" || resolvedAction === "delete_movies") {
     const existingMovies = await servarrRequestJson(config, "GET", "/api/v3/movie");
-    const target = resolveDeleteMovieTarget(existingMovies, payload);
-    const movieId = typeof target.id === "number" ? target.id : undefined;
-    if (movieId === undefined) {
-      throw new ServarrToolError("lookup_no_match", "matched Radarr movie did not include an id");
-    }
     const query = {
       deleteFiles: optionalBoolean(payload, "delete_files") ?? true,
       addImportExclusion: optionalBoolean(payload, "add_import_exclusion") ?? false,
     };
-    await servarrRequestJson(config, "DELETE", `/api/v3/movie/${movieId}`, query);
-    return successEnvelope("radarr", action, config.baseUrl, "DELETE", `/api/v3/movie/${movieId}`, query, {
-      mode: "tracked_movie_delete",
-      deleted_movie: summarizeRadarrMovieRecord(target),
+    const targets = collectDeleteMovieTargets(existingMovies, payload);
+    const deletedMovies: unknown[] = [];
+    for (const target of targets) {
+      const movieId = typeof target.id === "number" ? target.id : undefined;
+      if (movieId === undefined) {
+        throw new ServarrToolError("lookup_no_match", "matched Radarr movie did not include an id");
+      }
+      await servarrRequestJson(config, "DELETE", `/api/v3/movie/${movieId}`, query);
+      deletedMovies.push(summarizeRadarrMovieRecord(target));
+    }
+    return successEnvelope("radarr", action, config.baseUrl, "DELETE", "/api/v3/movie/:id", query, {
+      mode: "movies_deleted",
+      message:
+        deletedMovies.length === 1
+          ? "Deleted 1 movie from Radarr."
+          : `Deleted ${deletedMovies.length} movies from Radarr.`,
+      deleted_count: deletedMovies.length,
+      deleted_movies: deletedMovies,
     });
   }
 

@@ -134,7 +134,7 @@ export function canonicalizeServarrAction(service: ServarrService, action: strin
   if (action !== "inspect") {
     return action;
   }
-  return service === "radarr" ? "list_movies" : "list_series";
+  return service === "radarr" ? "list_downloaded_movies" : "list_downloaded_series";
 }
 
 export function optionalString(payload: ServarrInvocation, key: string): string | undefined {
@@ -180,6 +180,18 @@ export function optionalIntegerArray(payload: ServarrInvocation, key: string): n
     throw new ServarrToolError("invalid_argument", `${key} must be an array of integers`);
   }
   return value as number[];
+}
+
+export function optionalStringArray(payload: ServarrInvocation, key: string): string[] | undefined {
+  const value = payload[key];
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throw new ServarrToolError("invalid_argument", `${key} must be an array of strings`);
+  }
+  const items = value.map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+  return items.length > 0 ? items : undefined;
 }
 
 export function requireString(payload: ServarrInvocation, key: string, helpText?: string): string {
@@ -245,13 +257,6 @@ function recordNumber(record: JsonRecord | undefined, key: string): number | und
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function sortTitles(titles: string[]): string[] {
-  return titles
-    .map((title) => title.trim())
-    .filter((title) => title.length > 0)
-    .sort((left, right) => left.localeCompare(right));
-}
-
 export function summarizeServarrCommand(data: unknown): unknown {
   const record = asRecord(data);
   if (!record) {
@@ -268,6 +273,170 @@ export function summarizeServarrCommand(data: unknown): unknown {
   };
 }
 
+export function summarizeServarrSystemStatus(data: unknown): unknown {
+  const record = asRecord(data);
+  if (!record) {
+    return data;
+  }
+
+  return {
+    app_name: recordString(record, "appName"),
+    instance_name: recordString(record, "instanceName"),
+    version: recordString(record, "version"),
+    branch: recordString(record, "branch"),
+    authentication: recordString(record, "authentication"),
+    url_base: recordString(record, "urlBase"),
+    is_debug: recordBoolean(record, "isDebug"),
+    is_docker: recordBoolean(record, "isDocker"),
+  };
+}
+
+export function summarizeServarrHealth(data: unknown): unknown {
+  if (!Array.isArray(data)) {
+    return data;
+  }
+
+  const items = data.flatMap((entry) => {
+    const record = asRecord(entry);
+    if (!record) {
+      return [];
+    }
+
+    return [{
+      source: recordString(record, "source"),
+      type: recordString(record, "type"),
+      message: recordString(record, "message"),
+      wiki_url: recordString(record, "wikiUrl"),
+    }];
+  });
+
+  return {
+    check_count: items.length,
+    failing_check_count: items.filter((item) => typeof item.type === "string" && item.type.toLowerCase() !== "ok").length,
+    items,
+  };
+}
+
+export function summarizeServarrRootFolders(data: unknown): unknown {
+  if (!Array.isArray(data)) {
+    return data;
+  }
+
+  const items = data.flatMap((entry) => {
+    const record = asRecord(entry);
+    if (!record) {
+      return [];
+    }
+
+    return [{
+      id: recordInteger(record, "id"),
+      path: recordString(record, "path"),
+      accessible: recordBoolean(record, "accessible"),
+      free_space: recordNumber(record, "freeSpace"),
+      unmapped_folders: Array.isArray(record.unmappedFolders) ? record.unmappedFolders.length : undefined,
+    }];
+  });
+
+  return {
+    root_folder_count: items.length,
+    items,
+  };
+}
+
+export function summarizeServarrQualityProfiles(data: unknown): unknown {
+  if (!Array.isArray(data)) {
+    return data;
+  }
+
+  const items = data.flatMap((entry) => {
+    const record = asRecord(entry);
+    if (!record) {
+      return [];
+    }
+
+    const cutoff = asRecord(record.cutoff);
+    return [{
+      id: recordInteger(record, "id"),
+      name: recordString(record, "name"),
+      upgrade_allowed: recordBoolean(record, "upgradeAllowed"),
+      cutoff_name: recordString(cutoff, "name") ?? recordString(record, "cutoff"),
+    }];
+  });
+
+  return {
+    profile_count: items.length,
+    items,
+  };
+}
+
+export function summarizeRadarrCalendar(data: unknown): unknown {
+  if (!Array.isArray(data)) {
+    return data;
+  }
+
+  const items = data.flatMap((entry) => {
+    const record = asRecord(entry);
+    if (!record) {
+      return [];
+    }
+
+    return [{
+      title: recordString(record, "title"),
+      year: recordInteger(record, "year"),
+      release_date:
+        recordString(record, "releaseDate") ??
+        recordString(record, "digitalRelease") ??
+        recordString(record, "physicalRelease") ??
+        recordString(record, "inCinemas"),
+      monitored: recordBoolean(record, "monitored"),
+      has_file: recordBoolean(record, "hasFile"),
+      minimum_availability: recordString(record, "minimumAvailability"),
+      tmdb_id: recordInteger(record, "tmdbId"),
+      imdb_id: recordString(record, "imdbId"),
+    }];
+  }).filter((entry) => typeof entry.title === "string" && entry.title.length > 0);
+
+  return {
+    calendar_count: items.length,
+    items,
+  };
+}
+
+export function summarizeSonarrCalendar(data: unknown): unknown {
+  if (!Array.isArray(data)) {
+    return data;
+  }
+
+  const items = data.flatMap((entry) => {
+    const record = asRecord(entry);
+    if (!record) {
+      return [];
+    }
+    const series = asRecord(record.series);
+    const seriesTitle = recordString(series, "title");
+    if (!seriesTitle) {
+      return [];
+    }
+
+    return [{
+      series_title: seriesTitle,
+      episode_title: recordString(record, "title"),
+      season_number: recordInteger(record, "seasonNumber"),
+      episode_number: recordInteger(record, "episodeNumber"),
+      air_date_utc: recordString(record, "airDateUtc"),
+      monitored: recordBoolean(record, "monitored"),
+      series_id: recordInteger(series, "id"),
+      tvdb_id: recordInteger(series, "tvdbId"),
+      tmdb_id: recordInteger(series, "tmdbId"),
+    }];
+  });
+
+  return {
+    calendar_count: items.length,
+    items,
+  };
+}
+
 export function summarizeSonarrSeriesRecord(data: unknown): unknown {
   const record = asRecord(data);
   if (!record) {
@@ -279,8 +448,6 @@ export function summarizeSonarrSeriesRecord(data: unknown): unknown {
     id: recordInteger(record, "id"),
     title: recordString(record, "title"),
     year: recordInteger(record, "year"),
-    status: recordString(record, "status"),
-    monitored: recordBoolean(record, "monitored") ?? false,
     downloaded: (recordInteger(statistics, "episodeFileCount") ?? 0) > 0,
     tvdb_id: recordInteger(record, "tvdbId"),
     tmdb_id: recordInteger(record, "tmdbId"),
@@ -294,8 +461,12 @@ export function summarizeSonarrSeriesList(data: unknown): unknown {
     return data;
   }
 
-  const titles: string[] = [];
   const items = data.flatMap((entry) => {
+    const record = asRecord(entry);
+    const statistics = asRecord(record?.statistics);
+    if ((recordInteger(statistics, "episodeFileCount") ?? 0) <= 0) {
+      return [];
+    }
     const summary = summarizeSonarrSeriesRecord(entry);
     if (!summary || typeof summary !== "object" || Array.isArray(summary)) {
       return [];
@@ -306,42 +477,8 @@ export function summarizeSonarrSeriesList(data: unknown): unknown {
     }
     return [summary];
   });
-  let monitoredSeries = 0;
-  let continuingSeries = 0;
-  let endedSeries = 0;
-  let downloadedSeries = 0;
-
-  for (const entry of data) {
-    const record = asRecord(entry);
-    if (!record) {
-      continue;
-    }
-    const title = recordString(record, "title");
-    if (title) {
-      titles.push(title);
-    }
-    if (recordBoolean(record, "monitored")) {
-      monitoredSeries += 1;
-    }
-    const status = recordString(record, "status");
-    if (status === "continuing") {
-      continuingSeries += 1;
-    } else if (status === "ended") {
-      endedSeries += 1;
-    }
-    const statistics = asRecord(record.statistics);
-    if ((recordInteger(statistics, "episodeFileCount") ?? 0) > 0) {
-      downloadedSeries += 1;
-    }
-  }
-
   return {
-    total_series: data.length,
-    monitored_series: monitoredSeries,
-    continuing_series: continuingSeries,
-    ended_series: endedSeries,
-    downloaded_series: downloadedSeries,
-    titles: sortTitles(titles),
+    downloaded_series_count: items.length,
     items,
   };
 }
@@ -375,7 +512,6 @@ export function summarizeSonarrLookupResults(data: unknown): unknown {
 
   return {
     result_count: items.length,
-    titles: sortTitles(items.map((item) => item.title)),
     items,
   };
 }
@@ -410,7 +546,6 @@ export function summarizeSonarrQueue(data: unknown): unknown {
 
   return {
     queue_count: items.length,
-    titles: sortTitles(items.map((item) => item.title)),
     items,
   };
 }
@@ -420,8 +555,11 @@ export function summarizeRadarrMovieList(data: unknown): unknown {
     return data;
   }
 
-  const titles: string[] = [];
   const items = data.flatMap((entry) => {
+    const record = asRecord(entry);
+    if (!(recordBoolean(record, "hasFile") || Boolean(asRecord(record?.movieFile)))) {
+      return [];
+    }
     const summary = summarizeRadarrMovieRecord(entry);
     if (!summary || typeof summary !== "object" || Array.isArray(summary)) {
       return [];
@@ -432,36 +570,8 @@ export function summarizeRadarrMovieList(data: unknown): unknown {
     }
     return [summary];
   });
-  let monitoredMovies = 0;
-  let downloadedMovies = 0;
-  let releasedMovies = 0;
-
-  for (const entry of data) {
-    const record = asRecord(entry);
-    if (!record) {
-      continue;
-    }
-    const title = recordString(record, "title");
-    if (title) {
-      titles.push(title);
-    }
-    if (recordBoolean(record, "monitored")) {
-      monitoredMovies += 1;
-    }
-    if (recordBoolean(record, "hasFile") || asRecord(record.movieFile)) {
-      downloadedMovies += 1;
-    }
-    if (recordString(record, "minimumAvailability") === "released") {
-      releasedMovies += 1;
-    }
-  }
-
   return {
-    total_movies: data.length,
-    monitored_movies: monitoredMovies,
-    downloaded_movies: downloadedMovies,
-    released_movies: releasedMovies,
-    titles: sortTitles(titles),
+    downloaded_movie_count: items.length,
     items,
   };
 }
@@ -495,7 +605,6 @@ export function summarizeRadarrLookupResults(data: unknown): unknown {
 
   return {
     result_count: items.length,
-    titles: sortTitles(items.map((item) => item.title)),
     items,
   };
 }
@@ -529,7 +638,6 @@ export function summarizeRadarrQueue(data: unknown): unknown {
 
   return {
     queue_count: items.length,
-    titles: sortTitles(items.map((item) => item.title)),
     items,
   };
 }
@@ -544,9 +652,7 @@ export function summarizeRadarrMovieRecord(data: unknown): unknown {
     id: recordInteger(record, "id"),
     title: recordString(record, "title"),
     year: recordInteger(record, "year"),
-    monitored: recordBoolean(record, "monitored") ?? false,
     downloaded: recordBoolean(record, "hasFile") || Boolean(asRecord(record.movieFile)),
-    minimum_availability: recordString(record, "minimumAvailability"),
     tmdb_id: recordInteger(record, "tmdbId"),
     imdb_id: recordString(record, "imdbId"),
     path: recordString(record, "path"),

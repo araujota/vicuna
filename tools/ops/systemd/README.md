@@ -23,6 +23,9 @@ The installer:
 - disables the matching `--user` services when it can reach the owner's user
   bus
 - enables and restarts the system services
+- sets a durable Node-wrapper file-descriptor floor through
+  `VICUNA_BASH_TOOL_MAX_OPEN_FILES=256` and `LimitNOFILE=65536` on the runtime
+  unit
 
 ## Rebuild
 
@@ -42,6 +45,8 @@ service stop/start/reset steps.
 ```bash
 sudo systemctl status vicuna-runtime.service --no-pager
 sudo systemctl status vicuna-telegram-bridge.service --no-pager
+systemctl cat vicuna-runtime.service | grep LimitNOFILE
+grep '^VICUNA_BASH_TOOL_MAX_OPEN_FILES=' /etc/vicuna/vicuna.env
 curl http://127.0.0.1:8080/health
 ```
 
