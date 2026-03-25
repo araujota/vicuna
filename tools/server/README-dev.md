@@ -71,6 +71,7 @@ Staged tool-loop policy:
 - allow `back` from method and payload stages and `complete` from method selection
 - after payload validation, emit one normal OpenAI tool call back to the caller
 - when `complete` is chosen, run one final direct-response turn without tools
+- if DeepSeek JSON mode returns empty or malformed family/method output, retry that staged selector once with the validation error injected back into the prompt
 - prefer explicit request-tool metadata:
   - `x-vicuna-family-id`
   - `x-vicuna-family-name`

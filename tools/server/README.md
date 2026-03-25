@@ -210,6 +210,10 @@ Run the focused provider tests:
 LLAMA_SERVER_BIN_PATH=./build/bin/llama-server pytest tools/server/tests/unit/test_deepseek_provider.py -q -k "tool or interleaved or staged"
 ```
 
+The staged family/method selectors retry one corrective JSON turn if DeepSeek
+returns empty or malformed JSON, which matches DeepSeek's documented occasional
+JSON-mode empty-content behavior.
+
 Run the cognitive replay coverage:
 
 ```bash

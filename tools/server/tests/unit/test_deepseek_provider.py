@@ -900,6 +900,218 @@ def test_provider_mode_staged_tool_loop_supports_back_navigation_and_completion(
             server.stop()
 
 
+def test_provider_mode_retries_invalid_staged_family_selection_once():
+    global server
+    family_attempts = {"count": 0}
+
+    def staged_response(payload):
+        stage_prompt = payload["messages"][-1]["content"]
+        if "choosing one tool family" in stage_prompt.lower():
+            family_attempts["count"] += 1
+            content = "" if family_attempts["count"] == 1 else json.dumps({"family": "Ongoing Tasks"})
+            return {
+                "id": f"retry-family-{family_attempts['count']}",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": content,
+                        "reasoning_content": "Pick the ongoing task family once the JSON is valid.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "choosing a method of the ongoing tasks" in stage_prompt.lower():
+            return {
+                "id": "retry-family-method",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"method": "get_due"}),
+                        "reasoning_content": "Use the due-task getter.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "constructing a payload for the get_due" in stage_prompt.lower():
+            return {
+                "id": "retry-family-payload",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"action": "submit", "payload": {}}),
+                        "reasoning_content": "No payload fields are required.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        return {
+            "id": "retry-family-unexpected",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "unexpected",
+                    "reasoning_content": "unexpected",
+                },
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+        }
+
+    with run_mock_deepseek(staged_response) as (base_url, state):
+        server = make_provider_server(base_url)
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-reasoner",
+                "messages": [
+                    {"role": "user", "content": "Check due tasks."},
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "ongoing_tasks_get_due",
+                        "description": "Return due recurring tasks.",
+                        "parameters": {
+                            "type": "object",
+                            "description": "The due-task query payload.",
+                            "properties": {}
+                        }
+                    }
+                }],
+                "stream": False,
+            })
+
+            assert response.status_code == 200
+            assert response.body["choices"][0]["finish_reason"] == "tool_calls"
+            assert response.body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "ongoing_tasks_get_due"
+            assert response.body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] == "{}"
+            assert len(state["requests"]) == 4
+            assert "Previous response error:" not in state["requests"][0]["body"]["messages"][-1]["content"]
+            assert "Previous response error:" in state["requests"][1]["body"]["messages"][-1]["content"]
+            assert "non-empty JSON object" in state["requests"][1]["body"]["messages"][-1]["content"]
+        finally:
+            server.stop()
+
+
+def test_provider_mode_retries_invalid_staged_method_selection_once():
+    global server
+    method_attempts = {"count": 0}
+
+    def staged_response(payload):
+        stage_prompt = payload["messages"][-1]["content"]
+        if "choosing one tool family" in stage_prompt.lower():
+            return {
+                "id": "retry-method-family",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"family": "Ongoing Tasks"}),
+                        "reasoning_content": "Choose the ongoing tasks family.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "choosing a method of the ongoing tasks" in stage_prompt.lower():
+            method_attempts["count"] += 1
+            content = "" if method_attempts["count"] == 1 else json.dumps({"method": "get_due"})
+            return {
+                "id": f"retry-method-{method_attempts['count']}",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": content,
+                        "reasoning_content": "Pick the due-task getter once the JSON is valid.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "constructing a payload for the get_due" in stage_prompt.lower():
+            return {
+                "id": "retry-method-payload",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"action": "submit", "payload": {}}),
+                        "reasoning_content": "No payload fields are required.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        return {
+            "id": "retry-method-unexpected",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "unexpected",
+                    "reasoning_content": "unexpected",
+                },
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+        }
+
+    with run_mock_deepseek(staged_response) as (base_url, state):
+        server = make_provider_server(base_url)
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-reasoner",
+                "messages": [
+                    {"role": "user", "content": "Check due tasks."},
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "ongoing_tasks_get_due",
+                        "description": "Return due recurring tasks.",
+                        "parameters": {
+                            "type": "object",
+                            "description": "The due-task query payload.",
+                            "properties": {}
+                        }
+                    }
+                }],
+                "stream": False,
+            })
+
+            assert response.status_code == 200
+            assert response.body["choices"][0]["finish_reason"] == "tool_calls"
+            assert response.body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "ongoing_tasks_get_due"
+            assert response.body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] == "{}"
+            assert len(state["requests"]) == 4
+            assert "Previous response error:" not in state["requests"][1]["body"]["messages"][-1]["content"]
+            assert "Previous response error:" in state["requests"][2]["body"]["messages"][-1]["content"]
+            assert "non-empty JSON object" in state["requests"][2]["body"]["messages"][-1]["content"]
+        finally:
+            server.stop()
+
+
 def test_provider_mode_retains_only_bounded_latest_traces():
     global server
     with run_mock_deepseek() as (base_url, _):

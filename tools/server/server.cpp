@@ -670,6 +670,19 @@ static json build_staged_provider_body(const json & base_body, const json & mess
     return staged;
 }
 
+static std::string build_staged_retry_prompt(
+        const std::string & stage_prompt,
+        const std::string & validation_error) {
+    if (validation_error.empty()) {
+        return stage_prompt;
+    }
+    std::ostringstream out;
+    out << stage_prompt;
+    out << "Previous response error: " << validation_error << "\n";
+    out << "Return exactly one non-empty JSON object with no prose, markdown, or code fences.\n";
+    return out.str();
+}
+
 static bool parse_staged_family_selection_response(
         const std::string & text,
         const staged_tool_catalog & catalog,
@@ -995,27 +1008,39 @@ static bool execute_deepseek_chat_with_staged_tools(
     }
 
     const int max_stage_turns = 24;
+    const int max_stage_json_attempts = 2;
     int stage_turn = 0;
     std::string selected_family_name;
     while (stage_turn < max_stage_turns) {
-        ++stage_turn;
-        deepseek_chat_result family_result;
-        if (!execute_staged_selection_turn(
-                    config,
-                    emotive_runtime,
-                    body,
-                    build_staged_family_selection_prompt(catalog),
-                    &family_result,
-                    out_error,
-                    suppress_replay_admission,
-                    mode_label.empty() ? "staged_family_select" : mode_label + "_family_select")) {
-            return false;
-        }
+        bool family_valid = false;
+        std::string family_validation_error;
+        for (int family_attempt = 0; family_attempt < max_stage_json_attempts && stage_turn < max_stage_turns; ++family_attempt) {
+            ++stage_turn;
+            deepseek_chat_result family_result;
+            if (!execute_staged_selection_turn(
+                        config,
+                        emotive_runtime,
+                        body,
+                        build_staged_retry_prompt(
+                                build_staged_family_selection_prompt(catalog),
+                                family_validation_error),
+                        &family_result,
+                        out_error,
+                        suppress_replay_admission,
+                        mode_label.empty() ? "staged_family_select" : mode_label + "_family_select")) {
+                return false;
+            }
 
-        std::string parse_error;
-        if (!parse_staged_family_selection_response(family_result.content, catalog, &selected_family_name, &parse_error)) {
+            std::string parse_error;
+            if (parse_staged_family_selection_response(family_result.content, catalog, &selected_family_name, &parse_error)) {
+                family_valid = true;
+                break;
+            }
+            family_validation_error = parse_error;
+        }
+        if (!family_valid) {
             if (out_error) {
-                *out_error = format_error_response(parse_error, ERROR_TYPE_SERVER);
+                *out_error = format_error_response(family_validation_error, ERROR_TYPE_SERVER);
             }
             return false;
         }
@@ -1028,25 +1053,36 @@ static bool execute_deepseek_chat_with_staged_tools(
         }
 
         while (stage_turn < max_stage_turns) {
-            ++stage_turn;
-            deepseek_chat_result method_result;
-            if (!execute_staged_selection_turn(
-                        config,
-                        emotive_runtime,
-                        body,
-                        build_staged_method_selection_prompt(*family, true),
-                        &method_result,
-                        out_error,
-                        suppress_replay_admission,
-                        mode_label.empty() ? "staged_method_select" : mode_label + "_method_select")) {
-                return false;
-            }
-
             staged_tool_method_choice method_choice = {};
-            std::string method_error;
-            if (!parse_staged_method_selection_response(method_result.content, *family, true, &method_choice, &method_error)) {
+            bool method_valid = false;
+            std::string method_validation_error;
+            for (int method_attempt = 0; method_attempt < max_stage_json_attempts && stage_turn < max_stage_turns; ++method_attempt) {
+                ++stage_turn;
+                deepseek_chat_result method_result;
+                if (!execute_staged_selection_turn(
+                            config,
+                            emotive_runtime,
+                            body,
+                            build_staged_retry_prompt(
+                                    build_staged_method_selection_prompt(*family, true),
+                                    method_validation_error),
+                            &method_result,
+                            out_error,
+                            suppress_replay_admission,
+                            mode_label.empty() ? "staged_method_select" : mode_label + "_method_select")) {
+                    return false;
+                }
+
+                std::string method_error;
+                if (parse_staged_method_selection_response(method_result.content, *family, true, &method_choice, &method_error)) {
+                    method_valid = true;
+                    break;
+                }
+                method_validation_error = method_error;
+            }
+            if (!method_valid) {
                 if (out_error) {
-                    *out_error = format_error_response(method_error, ERROR_TYPE_SERVER);
+                    *out_error = format_error_response(method_validation_error, ERROR_TYPE_SERVER);
                 }
                 return false;
             }
