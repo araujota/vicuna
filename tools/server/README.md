@@ -19,6 +19,11 @@ When a request resumes an active DeepSeek tool loop, the server now:
 If you send a provider-native `thinking` object, the server forwards it
 unchanged to DeepSeek.
 
+All outbound DeepSeek turns, including staged family/method/payload turns and
+background/internal provider passes, are capped at `max_tokens: 1024`. The
+server enforces that ceiling even if the caller supplies a different output
+token field, and it does so without disabling reasoning traces.
+
 ## Staged tool loop
 
 When an incoming OpenAI-compatible request includes `tools` with automatic tool
@@ -38,6 +43,19 @@ After a valid payload is produced, the server emits one normal OpenAI tool call
 back to the caller. After the caller returns a real tool result on the next
 request, the staged loop begins again from family selection.
 
+The server now assumes callers inject the real direct tool definitions they
+want exposed for that turn. It does not maintain a second hidden live-tool
+registry for bridge requests. The retained Telegram bridge, for example,
+injects every installed OpenClaw runtime tool definition directly, then
+continues the returned tool loop itself by executing the selected tool and
+reposting the tool observation.
+
+Bridge-scoped Telegram turns are the one built-in exception: when a request
+arrives with Telegram bridge headers and resolves to `telegram_relay`, the
+server enqueues the Telegram outbox item itself, clears the outward tool call,
+and returns additive `vicuna_telegram_delivery` metadata so the bridge can wait
+for outbox delivery instead of trying to relay assistant text directly.
+
 The staged prompts are additive and keep:
 
 - replayed assistant `reasoning_content` unchanged
@@ -56,6 +74,9 @@ Tool metadata policy:
   - `x-vicuna-method-description`
 - if those fields are absent, the server derives family/method names from the
   function name, but explicit metadata is preferred
+- future tools and bridge/runtime integrations should provide those explicit
+  layers at the tool-definition source rather than trying to patch them in only
+  inside the server
 
 ## Cognitive replay
 

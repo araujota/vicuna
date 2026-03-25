@@ -12,6 +12,7 @@ import {
   upsertServarrConfig,
   upsertTavilyApiKey
 } from "../src/config.js";
+import { buildProviderToolsFromRuntimeCatalog, invokeRuntimeCapability } from "../src/invoke.js";
 import { writeRuntimeCatalog } from "../src/runtime-catalog.js";
 
 const MEDIA_CAPABILITY_IDS = [
@@ -176,11 +177,15 @@ test("telegram relay capability stays narrow and does not expose the deleted ask
   assert.equal(telegramRelay.tool_surface_id, "vicuna.telegram.relay");
   assert.equal(telegramRelay.tool_name, "telegram_relay");
 
-  const relaySchema = telegramRelay.input_schema_json as { properties: Record<string, unknown>; required?: string[] };
-  assert.deepEqual(relaySchema.required, ["text"]);
+  const relaySchema = telegramRelay.input_schema_json as { properties: Record<string, unknown>; required?: string[]; anyOf?: unknown[] };
+  assert.equal(Array.isArray(relaySchema.anyOf), true);
   assert.equal("chat_scope" in relaySchema.properties, true);
+  assert.equal("request" in relaySchema.properties, true);
   assert.equal("reply_to_message_id" in relaySchema.properties, true);
   assert.equal("dedupe_key" in relaySchema.properties, true);
+  assert.match(String((relaySchema.properties.request as { description?: string }).description ?? ""), /sendMessage/);
+  assert.match(String(telegramRelay.method_description ?? ""), /structured Bot API send request/i);
+  assert.match(String(telegramRelay.description ?? ""), /parse_mode/i);
   assert.equal(capabilities.has("openclaw.vicuna.codex_cli"), false);
   assert.equal(capabilities.has("openclaw.vicuna.ask_with_options"), false);
 });
@@ -229,10 +234,102 @@ test("runtime catalog writing preserves the narrowed tool surface", () => {
   assert.equal(capabilityIds.has("openclaw.vicuna.codex_cli"), false);
 });
 
+test("runtime catalog converts into provider tool definitions with staged metadata", () => {
+  const runtimeCatalog = buildRuntimeCatalog();
+  const converted = buildProviderToolsFromRuntimeCatalog(runtimeCatalog, {
+    excludeToolNames: ["telegram_relay"],
+  });
+
+  assert.equal(converted.tools.some((tool) => tool.function.name === "radarr_download_movie"), true);
+  assert.equal(converted.tools.some((tool) => tool.function.name === "telegram_relay"), false);
+  assert.equal(converted.excluded.some((entry) => entry.tool_name === "telegram_relay"), true);
+
+  const radarrDownload = converted.tools.find((tool) => tool.function.name === "radarr_download_movie");
+  assert.ok(radarrDownload);
+  const functionRecord = radarrDownload.function as Record<string, unknown>;
+  const parameters = functionRecord.parameters as Record<string, unknown>;
+  assert.equal(functionRecord["x-vicuna-family-id"], "radarr");
+  assert.equal(functionRecord["x-vicuna-family-name"], "Radarr");
+  assert.equal(functionRecord["x-vicuna-method-name"], "download_movie");
+  assert.equal(functionRecord["x-vicuna-method-description"], "Start Radarr movie acquisition for the requested title.");
+  assert.equal(typeof parameters.description, "string");
+  assert.match(String(parameters.description ?? ""), /Start Radarr movie acquisition/i);
+});
+
+test("provider tool conversion excludes capabilities with missing nested schema descriptions", () => {
+  const runtimeCatalog = buildRuntimeCatalog();
+  const baseCapability = runtimeCatalog.capabilities.find(
+    (capability) => capability.tool_name === "radarr_download_movie",
+  );
+  assert.ok(baseCapability);
+  const brokenCapability = {
+    ...baseCapability,
+    capability_id: "openclaw.test.broken-radarr",
+    tool_surface_id: "vicuna.test.broken_radarr",
+    tool_name: "broken_radarr_download_movie",
+    input_schema_json: {
+      type: "object",
+      properties: {
+        term: {
+          type: "string",
+        },
+      },
+      required: ["term"],
+    },
+  };
+
+  const converted = buildProviderToolsFromRuntimeCatalog({
+    catalog_version: runtimeCatalog.catalog_version,
+    capabilities: [brokenCapability],
+  });
+
+  assert.equal(converted.tools.length, 0);
+  assert.equal(converted.excluded.length, 1);
+  assert.match(converted.excluded[0].reason, /missing a description/i);
+});
+
+test("invokeRuntimeCapability dispatches wrapper commands using merged fixed arguments", async () => {
+  const capability = buildRuntimeCatalog().capabilities.find(
+    (entry) => entry.tool_name === "radarr_download_movie",
+  );
+  assert.ok(capability);
+
+  const calls: Array<{ command: string; args: string[] }> = [];
+  const result = await invokeRuntimeCapability(capability, {
+    term: "Aliens",
+    monitored: true,
+  }, {
+    paths: {
+      ...defaultPaths("/tmp/vicuna-openclaw-test"),
+      radarrWrapperPath: "/tmp/vicuna-openclaw-test/bin/radarr-api",
+    },
+    execFileImpl: async (command, args) => {
+      calls.push({ command, args });
+      return {
+        stdout: JSON.stringify({ ok: true, started: true }),
+        stderr: "",
+      };
+    },
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, "/tmp/vicuna-openclaw-test/bin/radarr-api");
+  const payloadArg = calls[0].args.find((entry) => entry.startsWith("--payload-base64="));
+  assert.ok(payloadArg);
+  const mergedArguments = JSON.parse(
+    Buffer.from(payloadArg.slice("--payload-base64=".length), "base64").toString("utf8"),
+  );
+  assert.equal(mergedArguments.action, "download_movie");
+  assert.equal(mergedArguments.term, "Aliens");
+  assert.equal(mergedArguments.monitored, true);
+  assert.deepEqual(result.observation, { ok: true, started: true });
+});
+
 test("OpenClaw secrets still persist media-tool config and configured runtime catalog paths", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vicuna-openclaw-secrets-"));
   const secretsPath = path.join(tempDir, "openclaw-tool-secrets.json");
   const configuredCatalogPath = path.join(tempDir, "configured", "runtime-catalog.json");
+  const configuredSecretsPath = path.join(tempDir, "configured", "tool-secrets.json");
 
   const secrets = upsertServarrConfig({}, "radarr", "radarr-key", "http://10.0.0.218:7878");
   saveToolSecrets(secretsPath, secrets);
@@ -241,8 +338,10 @@ test("OpenClaw secrets still persist media-tool config and configured runtime ca
   assert.equal(loadToolSecrets(secretsPath).tools?.radarr?.base_url, "http://10.0.0.218:7878");
 
   process.env.VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH = configuredCatalogPath;
+  process.env.VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH = configuredSecretsPath;
   const paths = defaultPaths(tempDir);
   assert.equal(paths.runtimeCatalogPath, configuredCatalogPath);
+  assert.equal(paths.secretsPath, configuredSecretsPath);
   assert.equal(
     paths.ongoingTasksWrapperPath,
     path.join(tempDir, "tools", "openclaw-harness", "bin", "ongoing-tasks-api")
@@ -256,4 +355,5 @@ test("OpenClaw secrets still persist media-tool config and configured runtime ca
     path.join(tempDir, "tools", "openclaw-harness", "bin", "parsed-documents-search")
   );
   delete process.env.VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH;
+  delete process.env.VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH;
 });

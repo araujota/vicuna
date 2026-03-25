@@ -46,6 +46,11 @@ Telegram outbox policy:
   queueing a message item
 - queued items keep a normalized summary `text` field for bridge transcript and
   delivery logging purposes
+- bridge-scoped Telegram requests may now resolve `telegram_relay` internally:
+  the server queues the outbox item itself, returns `vicuna_telegram_delivery`,
+  and suppresses outward tool calls so the bridge only delivers from outbox
+- bridge-scoped plain assistant text is normalized into a `sendMessage` outbox
+  item as a compatibility backstop instead of being allowed to drop
 
 Interleaved-thinking policy:
 
@@ -55,6 +60,8 @@ Interleaved-thinking policy:
 - inject the VAD sentence as a separate `system` message so tool payloads stay unchanged
 - preserve `reasoning_content` exactly while adding any VAD or heuristic guidance messages
 - pass through DeepSeek's top-level `thinking` field when callers provide it
+- force every outbound DeepSeek request, including staged and background turns, to use `max_tokens: 1024`
+- ignore caller-supplied `max_tokens`, `max_completion_tokens`, and `max_output_tokens` values that differ from the fixed runtime cap
 
 Staged tool-loop policy:
 
@@ -71,6 +78,11 @@ Staged tool-loop policy:
   - `x-vicuna-method-name`
   - `x-vicuna-method-description`
 - require typed field descriptions throughout the method contract so payload prompts stay inspectable
+- expect live callers to inject the authoritative direct tool definitions for
+  that turn; do not reintroduce a second hidden live-tool catalog inside the
+  server
+- the Telegram bridge now follows that rule by injecting the full installed
+  OpenClaw runtime catalog directly and executing returned tool calls itself
 
 Cognitive replay policy:
 

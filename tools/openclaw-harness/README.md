@@ -45,6 +45,26 @@ If a capability omits those layers, it can still exist in the catalog, but it
 is a poor fit for staged family -> method -> payload prompting and may be
 excluded from that higher-level controller.
 
+The retained Telegram bridge now consumes the runtime catalog directly. For
+live turns it injects every installed provider-tool definition from the
+authoritative runtime catalog into `tools[]`, then lets the server derive the
+family and method stages from those direct tool definitions. That means future
+OpenClaw capabilities must provide all three metadata layers above; otherwise
+they will not participate cleanly in the staged controller.
+
+Runtime catalog loading is explicit:
+
+- `node dist/index.js runtime-catalog` returns the authoritative runtime
+  catalog, preferring the persisted catalog file when present
+- `node dist/index.js runtime-tools` converts that catalog into provider-ready
+  direct tool definitions with staged metadata attached
+- `node dist/index.js invoke-runtime --tool-name=... --arguments-base64=...`
+  executes one direct provider tool by `tool_name`
+
+When a persisted runtime catalog file exists, it is authoritative for live
+turns. This allows operators to expose a richer installed tool set than the
+repo-default narrowed fallback catalog without changing the bridge contract.
+
 For provider-backed execution, that contract primarily reaches the model as
 chat-tool JSON schema plus the staged family/method/contract surfaces used by
 the retained provider server. The harness keeps the argument surface narrow so

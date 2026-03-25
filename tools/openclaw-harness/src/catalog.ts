@@ -866,6 +866,11 @@ function ongoingTasksCapability(): CapabilityDescriptor {
 }
 
 function telegramRelayCapability(): CapabilityDescriptor {
+  const telegramRelayWriteup =
+    "Simple text is OK. For richer Telegram-native output, send request={method,payload}. " +
+    "Prefer sendMessage with parse_mode plus reply_markup for most rich text and button replies. " +
+    "Use reply_markup.inline_keyboard for inline buttons and other Telegram reply markup only when needed. " +
+    "Prefer parse_mode over raw entity offsets unless you intentionally provide valid UTF-16-based entities.";
   return {
     capability_id: "openclaw.vicuna.telegram_relay",
     tool_surface_id: "vicuna.telegram.relay",
@@ -877,16 +882,37 @@ function telegramRelayCapability(): CapabilityDescriptor {
     tool_family_description:
       "Send direct user-facing follow-up messages through the provider-only Telegram bridge outbox.",
     method_name: "relay",
-    method_description: "Queue one plain-prose Telegram follow-up message.",
+    method_description: "Queue one Telegram follow-up message as plain text or a structured Bot API send request.",
     description:
-      "Send one direct follow-up message to a Telegram user through the provider-only bridge outbox without reviving the older ask-with-options or approval runtime.",
+      `Send one direct follow-up message to a Telegram user through the provider-only bridge outbox without reviving the older ask-with-options or approval runtime. ${telegramRelayWriteup}`,
     input_schema_json: {
       type: "object",
-      required: ["text"],
+      anyOf: [
+        { required: ["text"] },
+        { required: ["request"] }
+      ],
       properties: {
         text: {
           type: "string",
-          description: "The plain-prose Telegram message to send."
+          description: "Optional simple plain-text Telegram message. Use this when rich formatting or custom Telegram UI is unnecessary."
+        },
+        request: {
+          type: "object",
+          description:
+            `Optional structured Telegram Bot API send request. ${telegramRelayWriteup} Do not include chat_id; the relay fills routing.`,
+          required: ["method", "payload"],
+          properties: {
+            method: {
+              type: "string",
+              description:
+                "Allowed outbound Telegram method, such as sendMessage, sendPhoto, sendDocument, sendVideo, sendAnimation, sendAudio, sendVoice, sendSticker, sendMediaGroup, sendLocation, sendVenue, sendContact, sendPoll, or sendDice."
+            },
+            payload: {
+              type: "object",
+              description:
+                "Telegram Bot API payload for the selected method. Prefer sendMessage plus parse_mode, link_preview_options, and reply_markup for most rich text/button replies."
+            }
+          }
         },
         chat_scope: {
           type: "string",

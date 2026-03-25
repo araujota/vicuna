@@ -13,6 +13,7 @@ import {
   appendProactiveId,
   appendChatTranscriptMessage,
   buildTelegramFileUrl,
+  buildTelegramRelayTool,
   buildTelegramRelaySystemPrompt,
   bootstrapTelegramOutboxOffset,
   deletePendingOptionPrompt,
@@ -27,6 +28,7 @@ import {
   isTelegramTerminalDeliveryErrorMessage,
   loadState,
   normalizeTelegramOutboxItem,
+  parseChatCompletionToolArguments,
   parseInteger,
   parseSseChunk,
   recordTelegramOutboxDeliveryReceipt,
@@ -39,12 +41,14 @@ import {
   setPendingOptionPrompt,
   shouldBootstrapTelegramOutboxOffset,
   splitSseBuffer,
+  runChatCompletionToolLoop,
   summarizeChatCompletion,
   updateTelegramOffset,
 } from './lib.mjs';
 
 const execFileAsync = promisify(execFile);
 const bridgeDir = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(bridgeDir, '..', '..');
 
 const env = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
@@ -64,6 +68,10 @@ const env = {
   supermemoryApiKey: process.env.SUPERMEMORY_API_KEY ?? '',
   supermemoryBaseUrl: (process.env.SUPERMEMORY_BASE_URL ?? 'https://api.supermemory.ai').replace(/\/+$/, ''),
   hardMemoryRuntimeIdentity: (process.env.VICUNA_HARD_MEMORY_RUNTIME_IDENTITY ?? 'vicuna').trim() || 'vicuna',
+  openclawEntryPath:
+    process.env.TELEGRAM_BRIDGE_OPENCLAW_ENTRY_PATH ??
+    path.join(repoRoot, 'tools', 'openclaw-harness', 'dist', 'index.js'),
+  maxToolRounds: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_TOOL_ROUNDS, 8)),
   documentContainerTag: (
     process.env.TELEGRAM_BRIDGE_DOCUMENT_CONTAINER_TAG ??
     `${(process.env.VICUNA_HARD_MEMORY_RUNTIME_IDENTITY ?? 'vicuna').trim() || 'vicuna'}-telegram-documents`
@@ -129,6 +137,54 @@ async function postVicunaJson(pathname, payload) {
     throw new Error(`vicuna ${pathname} failed: ${response.status} ${JSON.stringify(body)}`);
   }
   return body;
+}
+
+async function execJsonCommand(command, args) {
+  const { stdout, stderr } = await execFileAsync(command, args, {
+    env: process.env,
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  const rawOutput = String(stdout ?? '').trim();
+  if (!rawOutput) {
+    throw new Error(`command produced no JSON output: ${stderr?.trim() || command}`);
+  }
+  try {
+    return JSON.parse(rawOutput);
+  } catch (error) {
+    throw new Error(
+      `command returned invalid JSON: ${stderr?.trim() || (error instanceof Error ? error.message : String(error))}`,
+    );
+  }
+}
+
+async function loadTelegramTurnTools(chatId, messageId = 0) {
+  await access(env.openclawEntryPath);
+  const body = await execJsonCommand(process.execPath, [
+    env.openclawEntryPath,
+    'runtime-tools',
+    '--exclude-tool-name=telegram_relay',
+  ]);
+  const runtimeTools = Array.isArray(body?.tools) ? body.tools : [];
+  return [
+    ...runtimeTools,
+    buildTelegramRelayTool(String(chatId), messageId),
+  ];
+}
+
+async function invokeOpenClawRuntimeTool(toolCall) {
+  const toolName = String(toolCall?.function?.name ?? '').trim();
+  if (!toolName) {
+    throw new Error('tool call is missing a function name');
+  }
+  const providerArguments = parseChatCompletionToolArguments(toolCall);
+  const argumentsBase64 = Buffer.from(JSON.stringify(providerArguments), 'utf8').toString('base64');
+  const body = await execJsonCommand(process.execPath, [
+    env.openclawEntryPath,
+    'invoke-runtime',
+    `--tool-name=${toolName}`,
+    `--arguments-base64=${argumentsBase64}`,
+  ]);
+  return body?.observation ?? {};
 }
 
 async function telegramRequest(method, payload) {
@@ -247,10 +303,52 @@ async function sendTelegramMessage(chatId, text, extra = {}) {
   });
 }
 
-async function sendTelegramOutboxMessage(chatId, text, replyToMessageId = 0) {
-  const normalizedReplyToMessageId = Math.max(0, Number(replyToMessageId ?? 0) || 0);
-  if (normalizedReplyToMessageId <= 0) {
-    const sent = await sendTelegramMessage(chatId, text);
+function cloneTelegramPayload(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return {};
+  }
+  return JSON.parse(JSON.stringify(payload));
+}
+
+function getTelegramReplyAnchorId(payload, fallbackReplyToMessageId = 0) {
+  const payloadReplyToMessageId = Number(payload?.reply_to_message_id ?? 0) || 0;
+  if (payloadReplyToMessageId > 0) {
+    return payloadReplyToMessageId;
+  }
+  const replyParametersMessageId = Number(payload?.reply_parameters?.message_id ?? 0) || 0;
+  if (replyParametersMessageId > 0) {
+    return replyParametersMessageId;
+  }
+  return Math.max(0, Number(fallbackReplyToMessageId ?? 0) || 0);
+}
+
+function withoutTelegramReplyAnchor(payload) {
+  const nextPayload = cloneTelegramPayload(payload);
+  delete nextPayload.reply_to_message_id;
+  delete nextPayload.reply_parameters;
+  return nextPayload;
+}
+
+function getTelegramResultMessageId(result) {
+  if (Array.isArray(result)) {
+    return Number(result[0]?.message_id ?? 0) || 0;
+  }
+  return Number(result?.message_id ?? 0) || 0;
+}
+
+async function sendTelegramOutboxMessage(chatId, method, payload, replyToMessageId = 0) {
+  const deliveryPayload = cloneTelegramPayload(payload);
+  deliveryPayload.chat_id = chatId;
+
+  const requestedReplyToMessageId = getTelegramReplyAnchorId(deliveryPayload, replyToMessageId);
+  if (requestedReplyToMessageId > 0 && deliveryPayload.reply_to_message_id === undefined && deliveryPayload.reply_parameters === undefined) {
+    deliveryPayload.reply_parameters = {
+      message_id: requestedReplyToMessageId,
+    };
+  }
+
+  if (requestedReplyToMessageId <= 0) {
+    const sent = await telegramRequest(method, deliveryPayload);
     return {
       sent,
       deliveryMode: 'no_reply',
@@ -260,13 +358,11 @@ async function sendTelegramOutboxMessage(chatId, text, replyToMessageId = 0) {
   }
 
   try {
-    const sent = await sendTelegramMessage(chatId, text, {
-      reply_to_message_id: normalizedReplyToMessageId,
-    });
+    const sent = await telegramRequest(method, deliveryPayload);
     return {
       sent,
       deliveryMode: 'reply',
-      requestedReplyToMessageId: normalizedReplyToMessageId,
+      requestedReplyToMessageId,
       fallbackError: '',
     };
   } catch (error) {
@@ -275,15 +371,16 @@ async function sendTelegramOutboxMessage(chatId, text, replyToMessageId = 0) {
     }
     const fallbackError = error.message;
     log('Telegram follow-up reply target rejected; retrying without reply anchor', {
+      method,
       chatId: String(chatId),
-      replyToMessageId: normalizedReplyToMessageId,
+      replyToMessageId: requestedReplyToMessageId,
       error: fallbackError,
     });
-    const sent = await sendTelegramMessage(chatId, text);
+    const sent = await telegramRequest(method, withoutTelegramReplyAnchor(deliveryPayload));
     return {
       sent,
       deliveryMode: 'fallback_no_reply',
-      requestedReplyToMessageId: normalizedReplyToMessageId,
+      requestedReplyToMessageId,
       fallbackError,
     };
   }
@@ -426,17 +523,17 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, extraSystemMe
   const historyTurns = Math.max(1, Math.ceil(transcript.length / 2));
   const baseSystemPrompt = buildTelegramRelaySystemPrompt();
   const deferredDelivery = options?.deferredDelivery === true;
+  const tools = await loadTelegramTurnTools(chatId, messageId);
+  const baseMessages = [
+    {
+      role: 'system',
+      content: baseSystemPrompt,
+    },
+    ...extraSystemMessages,
+    ...requestDeltaMessages,
+  ];
 
-  async function requestCompletion(retrySystemMessages = []) {
-    const messages = [
-      {
-        role: 'system',
-        content: baseSystemPrompt,
-      },
-      ...extraSystemMessages,
-      ...retrySystemMessages,
-      ...requestDeltaMessages,
-    ];
+  async function requestCompletion(messages) {
     const response = await fetch(`${env.vicunaBaseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: {
@@ -451,6 +548,7 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, extraSystemMe
         model: env.model,
         temperature: 0.2,
         messages,
+        tools,
         ...(env.maxTokens >= 0 ? { max_tokens: env.maxTokens } : {}),
       }),
     });
@@ -467,20 +565,55 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, extraSystemMe
     carriedTranscriptMessageCount: transcript.length,
     requestDeltaMessageCount: requestDeltaMessages.length,
     roles: transcript.map((entry) => entry.role),
+    toolCount: tools.length,
     maxTokens: env.maxTokens,
     deferredDelivery,
   });
 
-  const firstBody = await requestCompletion();
-  if (deferredDelivery) {
-    log('Vicuna accepted deferred Telegram turn', {
+  async function runLoop(initialMessages, attempt) {
+    return await runChatCompletionToolLoop({
+      initialMessages,
+      maxRounds: env.maxToolRounds,
+      requestCompletion,
+      invokeToolCall: async (toolCall) => {
+        log('executing Telegram-turn runtime tool call', {
+          chatId: String(chatId),
+          conversationId,
+          attempt,
+          toolName: String(toolCall?.function?.name ?? ''),
+        });
+        const observation = await invokeOpenClawRuntimeTool(toolCall);
+        log('completed Telegram-turn runtime tool call', {
+          chatId: String(chatId),
+          conversationId,
+          attempt,
+          toolName: String(toolCall?.function?.name ?? ''),
+        });
+        return observation;
+      },
+    });
+  }
+
+  const firstResult = await runLoop(baseMessages, 1);
+  const firstBody = firstResult.body;
+  if (firstResult.kind === 'delivery') {
+    log('Vicuna queued Telegram delivery through runtime handling', {
       chatId: String(chatId),
       completion: summarizeChatCompletion(firstBody),
+      delivery: firstBody.vicuna_telegram_delivery,
+      rounds: firstResult.rounds,
     });
     return '';
   }
   let reply = extractChatCompletionText(firstBody);
   if (reply) {
+    log('Vicuna completed Telegram turn with direct assistant text', {
+      chatId: String(chatId),
+      conversationId,
+      completion: summarizeChatCompletion(firstBody),
+      rounds: firstResult.rounds,
+      deferredDelivery,
+    });
     return reply;
   }
 
@@ -488,20 +621,35 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, extraSystemMe
     chatId: String(chatId),
     attempt: 1,
     completion: summarizeChatCompletion(firstBody),
+    rounds: firstResult.rounds,
   });
 
-  const retryBody = await requestCompletion([
+  const retryResult = await runLoop([
+    ...baseMessages,
     {
       role: 'system',
-      content: 'Your previous reply for this Telegram turn contained no relayable assistant text. Reply with a short plain-text assistant message for the user and do not emit an empty response.',
+      content: 'Your previous reply for this Telegram turn contained no queued Telegram delivery and no relayable assistant text. Deliver the user-visible reply by calling telegram_relay and do not emit an empty response.',
     },
-  ]);
+  ], 2);
+  const retryBody = retryResult.body;
+  if (retryResult.kind === 'delivery') {
+    log('Vicuna retry queued Telegram delivery through runtime handling', {
+      chatId: String(chatId),
+      attempt: 2,
+      completion: summarizeChatCompletion(retryBody),
+      delivery: retryBody.vicuna_telegram_delivery,
+      rounds: retryResult.rounds,
+    });
+    return '';
+  }
   reply = extractChatCompletionText(retryBody);
   if (reply) {
     log('Vicuna retry recovered Telegram assistant text', {
       chatId: String(chatId),
       attempt: 2,
       completion: summarizeChatCompletion(retryBody),
+      rounds: retryResult.rounds,
+      deferredDelivery,
     });
     return reply;
   }
@@ -510,16 +658,48 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, extraSystemMe
     chatId: String(chatId),
     attempt: 2,
     completion: summarizeChatCompletion(retryBody),
+    rounds: retryResult.rounds,
   });
   return '';
 }
 
 async function runDeferredTelegramTurn({ chatId, messageId = 0, conversationId = '', extraSystemMessages = [] }) {
   try {
-    await callVicunaForTelegramMessage(chatId, messageId, extraSystemMessages, {
+    const reply = await callVicunaForTelegramMessage(chatId, messageId, extraSystemMessages, {
       deferredDelivery: true,
       conversationId,
     });
+    if (reply) {
+      const resolved = resolveTelegramConversationForOutbound(state, chatId, {
+        preferredConversationId: conversationId,
+        replyToMessageId: messageId,
+      });
+      state = resolved.state;
+      const sent = await sendTelegramMessage(
+        chatId,
+        reply,
+        messageId ? { reply_to_message_id: messageId } : {},
+      ).catch(() => null);
+      if (sent?.message_id) {
+        state = appendChatTranscriptMessage(
+          state,
+          chatId,
+          'assistant',
+          reply,
+          {
+            maxHistoryMessages: env.maxHistoryMessages,
+            conversationId: resolved.conversationId,
+            telegramMessageId: Number(sent.message_id) || 0,
+          },
+        );
+        await persistState();
+      }
+      log('deferred Telegram turn fell back to direct bridge delivery', {
+        chatId: String(chatId),
+        messageId,
+        conversationId,
+      });
+    }
   } catch (error) {
     log('deferred Telegram turn failed', {
       chatId: String(chatId),
@@ -867,12 +1047,15 @@ async function pollTelegramAskOutboxLoop() {
             const chatId = normalizedItem.chatId;
             const text = normalizedItem.text;
             const replyToMessageId = normalizedItem.replyToMessageId;
+            const telegramMethod = normalizedItem.telegramMethod;
+            const telegramPayload = normalizedItem.telegramPayload;
             const resolvedConversation = resolveTelegramConversationForOutbound(state, chatId, {
               replyToMessageId,
             });
             state = resolvedConversation.state;
-            const delivery = await sendTelegramOutboxMessage(chatId, text, replyToMessageId);
+            const delivery = await sendTelegramOutboxMessage(chatId, telegramMethod, telegramPayload, replyToMessageId);
             const sent = delivery.sent;
+            const telegramMessageId = getTelegramResultMessageId(sent);
             state = appendChatTranscriptMessage(
               state,
               chatId,
@@ -881,7 +1064,7 @@ async function pollTelegramAskOutboxLoop() {
               {
                 maxHistoryMessages: env.maxHistoryMessages,
                 conversationId: resolvedConversation.conversationId,
-                telegramMessageId: Number(sent?.message_id ?? 0) || 0,
+                telegramMessageId,
               },
             );
             state = setTelegramOutboxCheckpoint(
@@ -894,7 +1077,7 @@ async function pollTelegramAskOutboxLoop() {
               chatId,
               replyToMessageId: delivery.requestedReplyToMessageId,
               deliveryMode: delivery.deliveryMode === 'no_reply' ? 'fallback_no_reply' : delivery.deliveryMode,
-              telegramMessageId: Number(sent?.message_id ?? 0) || 0,
+              telegramMessageId,
               deliveredAtMs: Date.now(),
             }, { maxHistoryMessages: env.maxHistoryMessages });
             await persistState();
@@ -902,9 +1085,10 @@ async function pollTelegramAskOutboxLoop() {
               chatId,
               conversationId: resolvedConversation.conversationId,
               sequenceNumber,
+              telegramMethod,
               replyToMessageId,
               deliveryMode: delivery.deliveryMode,
-              telegramMessageId: Number(sent?.message_id ?? 0) || 0,
+              telegramMessageId,
               fallbackError: delivery.fallbackError || undefined,
             });
             continue;

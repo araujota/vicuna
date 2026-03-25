@@ -107,6 +107,10 @@ test("telegram relay queues one compact outbox message and supports default chat
     assert.equal(firstRequest.chat_scope, "7502424413");
     assert.equal(firstRequest.reply_to_message_id, 91);
     assert.equal(firstRequest.intent, "conclusion");
+    assert.equal(firstRequest.telegram_method, "sendMessage");
+    assert.deepEqual(firstRequest.telegram_payload, {
+      text: "Done. I queued the movie recommendation run.",
+    });
 
     const fallback = await handleTelegramRelay(
       {
@@ -121,9 +125,88 @@ test("telegram relay queues one compact outbox message and supports default chat
 
     const secondRequest = state.requests[1] as Record<string, unknown>;
     assert.equal(secondRequest.chat_scope, "12345");
+    assert.equal(secondRequest.telegram_method, "sendMessage");
   } finally {
     await mock.close();
   }
+});
+
+test("telegram relay queues structured telegram requests and strips transport-owned chat_id", async () => {
+  const state: MockTelegramRelayState = { requests: [], nextSequenceNumber: 1 };
+  const mock = await startMockTelegramRelay(state);
+  try {
+    const result = await handleTelegramRelay(
+      {
+        request: {
+          method: "sendMessage",
+          payload: {
+            chat_id: "ignore-me",
+            text: "<b>Ready</b>",
+            parse_mode: "HTML",
+            reply_markup: {
+              inline_keyboard: [[{ text: "Open", url: "https://example.com" }]],
+            },
+          },
+        },
+        chat_scope: "7502424413",
+      },
+      config(mock.baseUrl)
+    );
+
+    assert.equal(result.ok, true);
+    const request = state.requests[0] as Record<string, unknown>;
+    assert.equal(request.telegram_method, "sendMessage");
+    assert.equal(request.chat_scope, "7502424413");
+    assert.equal(request.text, "<b>Ready</b>");
+    assert.deepEqual(request.telegram_payload, {
+      text: "<b>Ready</b>",
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [[{ text: "Open", url: "https://example.com" }]],
+      },
+    });
+  } finally {
+    await mock.close();
+  }
+});
+
+test("telegram relay rejects ambiguous or malformed structured requests", async () => {
+  await assert.rejects(
+    () => handleTelegramRelay({
+      text: "hello",
+      request: {
+        method: "sendMessage",
+        payload: { text: "world" },
+      },
+      chat_scope: "1",
+    }, config("http://127.0.0.1:8080")),
+    /text or request, but not both/
+  );
+
+  await assert.rejects(
+    () => handleTelegramRelay({
+      request: {
+        method: "deleteMessage",
+        payload: {},
+      },
+      chat_scope: "1",
+    }, config("http://127.0.0.1:8080")),
+    /unsupported telegram method/
+  );
+
+  await assert.rejects(
+    () => handleTelegramRelay({
+      request: {
+        method: "sendPoll",
+        payload: {
+          question: "Choose one",
+          options: ["only-one"],
+        },
+      },
+      chat_scope: "1",
+    }, config("http://127.0.0.1:8080")),
+    /at least two options/
+  );
 });
 
 test("telegram relay returns typed missing-chat-scope errors", async () => {

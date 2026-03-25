@@ -72,7 +72,7 @@ function schemaNodeRequiresDescription(node: unknown, isRoot: boolean): boolean 
   return "type" in record || "properties" in record || "items" in record;
 }
 
-function assertSchemaDescriptions(node: unknown, path: string, isRoot = false): void {
+export function assertSchemaDescriptions(node: unknown, path: string, isRoot = false): void {
   if (typeof node !== "object" || node === null || Array.isArray(node)) {
     return;
   }
@@ -134,12 +134,17 @@ export function assertCapabilityDescriptor(descriptor: CapabilityDescriptor): Ca
 
 export function assertCapabilityCatalog(catalog: CapabilityCatalog): CapabilityCatalog {
   const ids = new Set<string>();
+  const toolNames = new Set<string>();
   for (const capability of catalog.capabilities) {
     assertCapabilityDescriptor(capability);
     if (ids.has(capability.capability_id)) {
       throw new Error(`duplicate capability_id: ${capability.capability_id}`);
     }
     ids.add(capability.capability_id);
+    if (toolNames.has(capability.tool_name)) {
+      throw new Error(`duplicate tool_name: ${capability.tool_name}`);
+    }
+    toolNames.add(capability.tool_name);
   }
   return catalog;
 }

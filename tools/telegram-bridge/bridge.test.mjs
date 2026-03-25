@@ -11,16 +11,21 @@ import {
   buildTelegramDocumentDescriptor,
   buildTelegramDocumentLinkage,
   buildTelegramParsedChunkMemories,
+  buildChatCompletionToolResultMessage,
   buildTelegramFileUrl,
+  buildTelegramRelayTool,
   buildTelegramRelaySystemPrompt,
   createTelegramConversation,
   detectTelegramDocumentLogicalType,
+  extractAssistantToolReplayMessage,
   extractChatCompletionText,
+  extractChatCompletionToolCalls,
   extractResponseText,
   getConversationForTelegramMessage,
   getChatTranscript,
   getLatestConversationId,
   getTelegramRequestDeltaMessages,
+  hasQueuedTelegramDelivery,
   ingestTelegramDocumentMessage,
   isTelegramCarryableAssistantMessage,
   isTelegramReplyTargetErrorMessage,
@@ -29,6 +34,7 @@ import {
   normalizeDoclingParsedDocument,
   normalizeDocumentPlainText,
   normalizeTelegramOutboxItem,
+  parseChatCompletionToolArguments,
   normalizeState,
   parseSseChunk,
   recordTelegramOutboxDeliveryReceipt,
@@ -41,6 +47,7 @@ import {
   setTelegramOutboxCheckpoint,
   shouldBootstrapTelegramOutboxOffset,
   splitSseBuffer,
+  runChatCompletionToolLoop,
   summarizeChatCompletion,
   updateTelegramOffset,
 } from './lib.mjs';
@@ -110,6 +117,147 @@ test('extractChatCompletionText returns empty string for tool-call-only completi
   });
 
   assert.equal(text, '');
+});
+
+test('tool-call extraction and assistant replay preserve reasoning_content exactly', () => {
+  const body = {
+    choices: [
+      {
+        finish_reason: 'tool_calls',
+        message: {
+          role: 'assistant',
+          content: '',
+          reasoning_content: 'Think first.\nThen call Radarr.',
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: {
+                name: 'radarr_download_movie',
+                arguments: '{"term":"Arrival"}',
+              },
+            },
+          ],
+        },
+      },
+    ],
+  };
+
+  const toolCalls = extractChatCompletionToolCalls(body);
+  assert.equal(toolCalls.length, 1);
+  assert.equal(toolCalls[0].function.name, 'radarr_download_movie');
+
+  const replay = extractAssistantToolReplayMessage(body);
+  assert.deepEqual(replay, {
+    role: 'assistant',
+    content: '',
+    reasoning_content: 'Think first.\nThen call Radarr.',
+    tool_calls: [
+      {
+        id: 'call_1',
+        type: 'function',
+        function: {
+          name: 'radarr_download_movie',
+          arguments: '{"term":"Arrival"}',
+        },
+      },
+    ],
+  });
+});
+
+test('parseChatCompletionToolArguments decodes JSON objects and tool results serialize as tool messages', () => {
+  const toolCall = {
+    id: 'call_1',
+    type: 'function',
+    function: {
+      name: 'radarr_download_movie',
+      arguments: '{"term":"Arrival","monitored":true}',
+    },
+  };
+
+  assert.deepEqual(parseChatCompletionToolArguments(toolCall), {
+    term: 'Arrival',
+    monitored: true,
+  });
+  assert.deepEqual(buildChatCompletionToolResultMessage(toolCall, {
+    ok: true,
+    movie: 'Arrival',
+  }), {
+    role: 'tool',
+    tool_call_id: 'call_1',
+    name: 'radarr_download_movie',
+    content: '{"ok":true,"movie":"Arrival"}',
+  });
+});
+
+test('runChatCompletionToolLoop continues through direct runtime tool execution until final reply', async () => {
+  const requestBodies = [];
+  const invokedToolCalls = [];
+  const result = await runChatCompletionToolLoop({
+    initialMessages: [
+      { role: 'system', content: 'You are Vicuña.' },
+      { role: 'user', content: 'Check Radarr for Arrival.' },
+    ],
+    requestCompletion: async (messages, round) => {
+      requestBodies.push({ round, messages: structuredClone(messages) });
+      if (round === 0) {
+        return {
+          choices: [
+            {
+              finish_reason: 'tool_calls',
+              message: {
+                role: 'assistant',
+                content: '',
+                reasoning_content: 'Radarr is available on this turn, so I should inspect it.',
+                tool_calls: [
+                  {
+                    id: 'call_1',
+                    type: 'function',
+                    function: {
+                      name: 'radarr_list_downloaded_movies',
+                      arguments: '{}',
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+        };
+      }
+      return {
+        choices: [
+          {
+            finish_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: 'Arrival is available in Radarr.',
+              reasoning_content: 'I can answer directly now.',
+            },
+          },
+        ],
+      };
+    },
+    invokeToolCall: async (toolCall) => {
+      invokedToolCalls.push(toolCall.function.name);
+      return {
+        ok: true,
+        movies: [{ title: 'Arrival' }],
+      };
+    },
+  });
+
+  assert.equal(result.kind, 'final');
+  assert.equal(invokedToolCalls.length, 1);
+  assert.deepEqual(invokedToolCalls, ['radarr_list_downloaded_movies']);
+  assert.equal(requestBodies.length, 2);
+  assert.equal(requestBodies[1].messages[2].reasoning_content, 'Radarr is available on this turn, so I should inspect it.');
+  assert.deepEqual(requestBodies[1].messages[3], {
+    role: 'tool',
+    tool_call_id: 'call_1',
+    name: 'radarr_list_downloaded_movies',
+    content: '{"ok":true,"movies":[{"title":"Arrival"}]}',
+  });
+  assert.equal(extractChatCompletionText(result.body), 'Arrival is available in Radarr.');
 });
 
 test('summarizeChatCompletion reports non-text completion shape', () => {
@@ -244,6 +392,38 @@ test('buildTelegramRelaySystemPrompt prefers exposed media tools over stale refu
   assert.match(prompt, /use the relevant tool instead of claiming you lack access/i);
   assert.match(prompt, /cannot interact with external systems/i);
   assert.match(prompt, /treat that as stale and use the currently available tool on this turn/i);
+  assert.match(prompt, /Deliver user-visible Telegram replies through telegram_relay instead of plain assistant text\./);
+  assert.match(prompt, /For simple responses, call telegram_relay with text\./);
+  assert.match(prompt, /send request=\{method,payload\}/i);
+  assert.match(prompt, /prefer sendMessage plus parse_mode and reply_markup/i);
+});
+
+test('buildTelegramRelayTool exposes staged Telegram metadata and typed contract', () => {
+  const tool = buildTelegramRelayTool('7502424413', 91);
+
+  assert.equal(tool.type, 'function');
+  assert.equal(tool.function.name, 'telegram_relay');
+  assert.equal(tool.function['x-vicuna-family-id'], 'telegram');
+  assert.equal(tool.function['x-vicuna-method-name'], 'relay');
+  assert.equal(tool.function.parameters.anyOf.length, 2);
+  assert.equal(tool.function.parameters.properties.chat_scope.description.includes('"7502424413"'), true);
+  assert.equal(tool.function.parameters.properties.reply_to_message_id.description.includes('91'), true);
+  assert.match(String(tool.function.parameters.properties.request.description ?? ''), /Allowed methods:/);
+});
+
+test('hasQueuedTelegramDelivery detects runtime-owned Telegram delivery metadata', () => {
+  assert.equal(hasQueuedTelegramDelivery({
+    vicuna_telegram_delivery: {
+      handled: true,
+      queued: true,
+    },
+  }), true);
+  assert.equal(hasQueuedTelegramDelivery({
+    vicuna_telegram_delivery: {
+      handled: false,
+    },
+  }), false);
+  assert.equal(hasQueuedTelegramDelivery({}), false);
 });
 
 test('normalizeDoclingParsedDocument keeps parsed markdown and contextualized chunks', () => {
@@ -975,6 +1155,10 @@ test('normalizeTelegramOutboxItem validates message follow-ups', () => {
     kind: 'message',
     chat_scope: '7502424413',
     text: 'done',
+    telegram_method: 'sendMessage',
+    telegram_payload: {
+      text: 'done',
+    },
     reply_to_message_id: 91,
   }), {
     ok: true,
@@ -983,7 +1167,39 @@ test('normalizeTelegramOutboxItem validates message follow-ups', () => {
     kind: 'message',
     chatId: '7502424413',
     text: 'done',
+    telegramMethod: 'sendMessage',
+    telegramPayload: {
+      text: 'done',
+    },
     replyToMessageId: 91,
+  });
+});
+
+test('normalizeTelegramOutboxItem derives structured message summaries and preserves payloads', () => {
+  assert.deepEqual(normalizeTelegramOutboxItem({
+    sequence_number: 15,
+    kind: 'message',
+    chat_scope: '7502424413',
+    telegram_method: 'sendPhoto',
+    telegram_payload: {
+      photo: 'https://example.com/report.png',
+      caption: '<b>Ready</b>',
+      parse_mode: 'HTML',
+    },
+  }), {
+    ok: true,
+    skippable: true,
+    sequenceNumber: 15,
+    kind: 'message',
+    chatId: '7502424413',
+    text: '<b>Ready</b>',
+    telegramMethod: 'sendPhoto',
+    telegramPayload: {
+      photo: 'https://example.com/report.png',
+      caption: '<b>Ready</b>',
+      parse_mode: 'HTML',
+    },
+    replyToMessageId: 0,
   });
 });
 

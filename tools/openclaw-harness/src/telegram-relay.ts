@@ -4,11 +4,17 @@ import { loadToolSecrets } from "./config.js";
 
 export type TelegramRelayInvocation = {
   text?: unknown;
+  request?: unknown;
   chat_scope?: unknown;
   reply_to_message_id?: unknown;
   intent?: unknown;
   dedupe_key?: unknown;
   urgency?: unknown;
+};
+
+export type TelegramOutboundRequest = {
+  method: string;
+  payload: Record<string, unknown>;
 };
 
 export type TelegramRelayConfig = {
@@ -43,6 +49,22 @@ export class TelegramRelayToolError extends Error {
 }
 
 const DEFAULT_VICUNA_BASE_URL = "http://127.0.0.1:8080";
+const TELEGRAM_ALLOWED_METHODS = new Set([
+  "sendMessage",
+  "sendPhoto",
+  "sendDocument",
+  "sendAudio",
+  "sendVoice",
+  "sendVideo",
+  "sendAnimation",
+  "sendSticker",
+  "sendMediaGroup",
+  "sendLocation",
+  "sendVenue",
+  "sendContact",
+  "sendPoll",
+  "sendDice",
+]);
 
 function trimString(value: string | undefined | null): string | undefined {
   const trimmed = value?.trim();
@@ -95,6 +117,168 @@ function optionalNonNegativeNumber(value: unknown, fieldName: string): number | 
     });
   }
   return value;
+}
+
+function requireObjectRecord(value: unknown, fieldName: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TelegramRelayToolError("invalid_argument", `${fieldName} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function deriveTelegramSummaryText(method: string, payload: Record<string, unknown>): string {
+  const text = trimString(typeof payload.text === "string" ? payload.text : undefined);
+  if (text) {
+    return text;
+  }
+  const caption = trimString(typeof payload.caption === "string" ? payload.caption : undefined);
+  if (caption) {
+    return caption;
+  }
+  if (method === "sendPoll") {
+    return trimString(typeof payload.question === "string" ? payload.question : undefined) ?? "Telegram poll sent.";
+  }
+  if (method === "sendVenue") {
+    const title = trimString(typeof payload.title === "string" ? payload.title : undefined);
+    const address = trimString(typeof payload.address === "string" ? payload.address : undefined);
+    if (title && address) {
+      return `${title}\n${address}`;
+    }
+    return title ?? address ?? "Telegram venue sent.";
+  }
+  if (method === "sendContact") {
+    const firstName = trimString(typeof payload.first_name === "string" ? payload.first_name : undefined);
+    const phoneNumber = trimString(typeof payload.phone_number === "string" ? payload.phone_number : undefined);
+    if (firstName && phoneNumber) {
+      return `${firstName}\n${phoneNumber}`;
+    }
+    return firstName ?? phoneNumber ?? "Telegram contact sent.";
+  }
+  if (method === "sendLocation") {
+    return "Telegram location sent.";
+  }
+  if (method === "sendDice") {
+    return "Telegram dice sent.";
+  }
+  if (method === "sendSticker") {
+    return "Telegram sticker sent.";
+  }
+  if (method === "sendMediaGroup") {
+    const media = Array.isArray(payload.media) ? payload.media : [];
+    for (const item of media) {
+      if (item && typeof item === "object" && !Array.isArray(item)) {
+        const mediaCaption = trimString(typeof (item as Record<string, unknown>).caption === "string"
+          ? (item as Record<string, unknown>).caption as string
+          : undefined);
+        if (mediaCaption) {
+          return mediaCaption;
+        }
+      }
+    }
+    return "Telegram media group sent.";
+  }
+  return `Telegram ${method} sent.`;
+}
+
+function validateRequiredTelegramField(
+  payload: Record<string, unknown>,
+  fieldName: string,
+  method: string
+): void {
+  const value = payload[fieldName];
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new TelegramRelayToolError(
+      "invalid_argument",
+      `${method} payload requires non-empty ${fieldName}`,
+      { method, field: fieldName }
+    );
+  }
+}
+
+function validateStructuredTelegramRequest(value: unknown): TelegramOutboundRequest {
+  const request = requireObjectRecord(value, "request");
+  const method = requireString(request.method, "request.method");
+  if (!TELEGRAM_ALLOWED_METHODS.has(method)) {
+    throw new TelegramRelayToolError("invalid_argument", `unsupported telegram method: ${method}`, {
+      method,
+    });
+  }
+
+  const payload = requireObjectRecord(request.payload, "request.payload");
+  delete payload.chat_id;
+
+  switch (method) {
+    case "sendMessage":
+      validateRequiredTelegramField(payload, "text", method);
+      break;
+    case "sendPhoto":
+      validateRequiredTelegramField(payload, "photo", method);
+      break;
+    case "sendDocument":
+      validateRequiredTelegramField(payload, "document", method);
+      break;
+    case "sendAudio":
+      validateRequiredTelegramField(payload, "audio", method);
+      break;
+    case "sendVoice":
+      validateRequiredTelegramField(payload, "voice", method);
+      break;
+    case "sendVideo":
+      validateRequiredTelegramField(payload, "video", method);
+      break;
+    case "sendAnimation":
+      validateRequiredTelegramField(payload, "animation", method);
+      break;
+    case "sendSticker":
+      validateRequiredTelegramField(payload, "sticker", method);
+      break;
+    case "sendMediaGroup":
+      if (!Array.isArray(payload.media) || payload.media.length === 0) {
+        throw new TelegramRelayToolError("invalid_argument", "sendMediaGroup payload requires non-empty media array", {
+          method,
+          field: "media",
+        });
+      }
+      break;
+    case "sendLocation":
+      if (typeof payload.latitude !== "number" || typeof payload.longitude !== "number") {
+        throw new TelegramRelayToolError("invalid_argument", "sendLocation payload requires numeric latitude and longitude", {
+          method,
+        });
+      }
+      break;
+    case "sendVenue":
+      if (typeof payload.latitude !== "number" || typeof payload.longitude !== "number") {
+        throw new TelegramRelayToolError("invalid_argument", "sendVenue payload requires numeric latitude and longitude", {
+          method,
+        });
+      }
+      validateRequiredTelegramField(payload, "title", method);
+      validateRequiredTelegramField(payload, "address", method);
+      break;
+    case "sendContact":
+      validateRequiredTelegramField(payload, "phone_number", method);
+      validateRequiredTelegramField(payload, "first_name", method);
+      break;
+    case "sendPoll":
+      validateRequiredTelegramField(payload, "question", method);
+      if (!Array.isArray(payload.options) || payload.options.length < 2) {
+        throw new TelegramRelayToolError("invalid_argument", "sendPoll payload requires at least two options", {
+          method,
+          field: "options",
+        });
+      }
+      break;
+    case "sendDice":
+      break;
+    default:
+      break;
+  }
+
+  return {
+    method,
+    payload,
+  };
 }
 
 export function parseCliInvocation(argv: string[]): { payload: TelegramRelayInvocation; secretsPath: string } {
@@ -150,7 +334,16 @@ export function resolveTelegramRelayConfig(secretsPath: string): TelegramRelayCo
 }
 
 function buildRelayRequest(payload: TelegramRelayInvocation, config: TelegramRelayConfig) {
-  const text = requireString(payload.text, "text");
+  const text = optionalString(payload.text, "text");
+  const structuredRequest = payload.request === undefined || payload.request === null
+    ? undefined
+    : validateStructuredTelegramRequest(payload.request);
+  if (!text && !structuredRequest) {
+    throw new TelegramRelayToolError("missing_argument", "telegram relay requires text or request");
+  }
+  if (text && structuredRequest) {
+    throw new TelegramRelayToolError("invalid_argument", "telegram relay accepts text or request, but not both");
+  }
   const chatScope = optionalString(payload.chat_scope, "chat_scope") ?? config.defaultChatScope;
   if (!chatScope) {
     throw new TelegramRelayToolError(
@@ -161,9 +354,19 @@ function buildRelayRequest(payload: TelegramRelayInvocation, config: TelegramRel
 
   const request: Record<string, unknown> = {
     kind: "message",
-    text,
     chat_scope: chatScope,
   };
+  if (structuredRequest) {
+    request.telegram_method = structuredRequest.method;
+    request.telegram_payload = structuredRequest.payload;
+    request.text = deriveTelegramSummaryText(structuredRequest.method, structuredRequest.payload);
+  } else {
+    request.telegram_method = "sendMessage";
+    request.telegram_payload = {
+      text,
+    };
+    request.text = text;
+  }
   const replyToMessageId = optionalPositiveInteger(payload.reply_to_message_id, "reply_to_message_id");
   if (replyToMessageId) {
     request.reply_to_message_id = replyToMessageId;

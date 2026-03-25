@@ -38,9 +38,11 @@ Optional variables:
 - `TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS` default: `30`
 - `TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES` default: `12`
 - `TELEGRAM_BRIDGE_MAX_TOKENS` default: `-1` (unlimited)
+- `TELEGRAM_BRIDGE_MAX_TOOL_ROUNDS` default: `8`
 - `TELEGRAM_BRIDGE_MAX_DOCUMENT_CHARS` default: `12000`
 - `TELEGRAM_BRIDGE_DOCLING_PYTHON_BIN` default: `python3`
 - `TELEGRAM_BRIDGE_DOCLING_PARSER_SCRIPT_PATH` default: repo-local `tools/telegram-bridge/docling-parse.py`
+- `TELEGRAM_BRIDGE_OPENCLAW_ENTRY_PATH` default: repo-local `tools/openclaw-harness/dist/index.js`
 - `TELEGRAM_BRIDGE_DOCUMENT_CONTAINER_TAG` default: `vicuna-telegram-documents`
 - `TELEGRAM_BRIDGE_REPLAY_RETAINED_OUTBOX` default: `0`
   - when `0`, a fresh or reset bridge state fast-forwards to the newest
@@ -120,6 +122,16 @@ The key runtime variables are:
 - plain text user messages are sent to the local Vicuña runtime and the
   assistant follow-up is sent back to the same Telegram chat once the deferred
   turn finishes
+- every forwarded Telegram turn now injects every installed runtime-catalog
+  tool definition directly into `tools[]`, plus one bridge-scoped
+  `telegram_relay` tool for final user-visible delivery
+- the server then derives the staged family -> method -> payload controller
+  from those direct tool definitions rather than from a second hidden registry
+- the bridge owns authoritative tool continuation for Telegram turns: if the
+  runtime returns normal tool calls, the bridge executes them through
+  `tools/openclaw-harness/dist/index.js invoke-runtime`, appends the tool
+  observations, and continues the provider loop until final completion or
+  queued Telegram delivery
 - the bridge now tracks a per-chat Telegram conversation anchor so replies to
   runtime-authored assistant messages, plus plain next messages when one latest
   active conversation is clear, stay attached to the same bounded continuity
@@ -127,6 +139,13 @@ The key runtime variables are:
 - runtime-owned follow-up messages delivered through the provider-only
   `telegram_relay` tool now arrive through the dedicated Telegram outbox
   surface, not through fallback assistant text
+- if a bridge-scoped Telegram turn still comes back as plain assistant text, the
+  runtime now normalizes that into a `sendMessage` outbox item and returns
+  `vicuna_telegram_delivery` metadata so the bridge does not drop or duplicate
+  the reply while waiting for outbox delivery
+- those runtime-owned follow-up messages may now be either simple plain text or
+  structured Telegram Bot API send requests with explicit method/payload
+  envelopes, so formatting, media sends, and reply markup survive the bridge
 - runtime-owned mutation approvals are delivered through the same outbox as
   `approval_request` items; the bridge submits inline-button decisions back to
   `/v1/telegram/approval` as structured approval events instead of rewriting
@@ -190,6 +209,13 @@ The key runtime variables are:
 - intentionally empty completion text is now allowed on Telegram turns because
   the user-visible payload may already have been delivered by a tool such as
   `telegram_relay`
+
+Future tool-family additions must therefore satisfy both sides of the contract:
+
+- the runtime catalog entry must carry explicit family metadata, method
+  metadata, and a fully described typed contract
+- the bridge must inject that direct tool definition unchanged so the server
+  can stage it
 
 ## Reset Guidance
 

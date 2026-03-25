@@ -176,22 +176,18 @@ static json deepseek_build_provider_messages(const json & body) {
     return messages;
 }
 
+static constexpr int64_t VICUNA_OUTBOUND_MAX_TOKENS = 1024;
+
 static json deepseek_build_provider_body(const deepseek_runtime_config & config, const json & body) {
     json provider_body = {
         {"model", config.model},
         {"messages", deepseek_build_provider_messages(body)},
         {"stream", true},
+        {"max_tokens", VICUNA_OUTBOUND_MAX_TOKENS},
     };
 
     if (body.contains("temperature")) {
         provider_body["temperature"] = body.at("temperature");
-    }
-    if (body.contains("max_tokens")) {
-        provider_body["max_tokens"] = body.at("max_tokens");
-    } else if (body.contains("max_completion_tokens")) {
-        provider_body["max_tokens"] = body.at("max_completion_tokens");
-    } else if (body.contains("max_output_tokens")) {
-        provider_body["max_tokens"] = body.at("max_output_tokens");
     }
     if (body.contains("top_p")) {
         provider_body["top_p"] = body.at("top_p");

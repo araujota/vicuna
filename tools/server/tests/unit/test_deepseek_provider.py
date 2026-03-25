@@ -301,7 +301,7 @@ def test_provider_mode_chat_completion_exposes_reasoning_trace():
 
 def test_provider_mode_responses_route_emits_reasoning_item():
     global server
-    with run_mock_deepseek() as (base_url, _):
+    with run_mock_deepseek() as (base_url, state):
         server = make_provider_server(base_url)
         server.api_surface = "openai"
         try:
@@ -309,6 +309,7 @@ def test_provider_mode_responses_route_emits_reasoning_item():
 
             response = server.make_request("POST", "/v1/responses", data={
                 "model": "deepseek-reasoner",
+                "max_output_tokens": 4096,
                 "input": [
                     {"role": "user", "content": "Hello"},
                 ],
@@ -321,6 +322,7 @@ def test_provider_mode_responses_route_emits_reasoning_item():
             assert response.body["output"][1]["content"][0]["text"] == "Hello from DeepSeek."
             assert response.body["vicuna_emotive_trace"]["blocks"][0]["source"]["kind"] == "user_message"
             assert response.body["vicuna_emotive_trace"]["final_vad"]["style_guide"]["tone_label"]
+            assert state["requests"][0]["body"]["max_tokens"] == 1024
         finally:
             server.stop()
 
@@ -423,6 +425,7 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
 
             request = {
                 "model": "deepseek-reasoner",
+                "max_tokens": 4096,
                 "messages": [
                     {"role": "user", "content": "Check the due ongoing tasks."},
                     {
@@ -489,6 +492,7 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
             payload_request = state["requests"][2]["body"]
 
             assert "tools" not in family_request
+            assert family_request["max_tokens"] == 1024
             assert family_request["response_format"] == {"type": "json_object"}
             assert family_request["messages"][2]["reasoning_content"] == request["messages"][1]["reasoning_content"]
             assert family_request["messages"][2]["tool_calls"] == request["messages"][1]["tool_calls"]
@@ -500,10 +504,12 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
             assert family_request["messages"][-1]["role"] == "system"
             assert "choosing one tool family" in family_request["messages"][-1]["content"].lower()
 
+            assert method_request["max_tokens"] == 1024
             assert method_request["response_format"] == {"type": "json_object"}
             assert method_request["messages"][-1]["role"] == "system"
             assert "choosing a method of the ongoing tasks" in method_request["messages"][-1]["content"].lower()
 
+            assert payload_request["max_tokens"] == 1024
             assert payload_request["response_format"] == {"type": "json_object"}
             assert payload_request["messages"][-1]["role"] == "system"
             assert "constructing a payload for the get_due" in payload_request["messages"][-1]["content"].lower()
@@ -577,6 +583,9 @@ def test_provider_mode_interleaved_guidance_is_request_scoped_and_forwards_think
 
             base_request = {
                 "model": "deepseek-chat",
+                "max_tokens": 2048,
+                "max_completion_tokens": 3072,
+                "max_output_tokens": 4096,
                 "thinking": {"type": "enabled"},
                 "messages": [
                     {"role": "user", "content": "Check the next operational step."},
@@ -613,6 +622,8 @@ def test_provider_mode_interleaved_guidance_is_request_scoped_and_forwards_think
 
             first_outbound = state["requests"][0]["body"]
             second_outbound = state["requests"][1]["body"]
+            assert first_outbound["max_tokens"] == 1024
+            assert second_outbound["max_tokens"] == 1024
             assert first_outbound["thinking"] == {"type": "enabled"}
             assert second_outbound["thinking"] == {"type": "enabled"}
             assert first_outbound["messages"][3]["role"] == "system"
@@ -832,6 +843,7 @@ def test_provider_mode_staged_tool_loop_supports_back_navigation_and_completion(
 
             response = server.make_request("POST", "/v1/chat/completions", data={
                 "model": "deepseek-reasoner",
+                "max_completion_tokens": 2048,
                 "messages": [
                     {"role": "user", "content": "Check due tasks, then wrap up if nothing is due."},
                 ],
@@ -878,6 +890,7 @@ def test_provider_mode_staged_tool_loop_supports_back_navigation_and_completion(
             assert response.body["choices"][0]["finish_reason"] == "stop"
             assert response.body["choices"][0]["message"]["content"] == "All set."
             assert len(state["requests"]) == 5
+            assert all(request["body"]["max_tokens"] == 1024 for request in state["requests"])
             assert "choosing one tool family" in state["requests"][0]["body"]["messages"][-1]["content"].lower()
             assert "choosing a method of the ongoing tasks" in state["requests"][1]["body"]["messages"][-1]["content"].lower()
             assert "choosing one tool family" in state["requests"][2]["body"]["messages"][-1]["content"].lower()
@@ -1031,6 +1044,226 @@ def test_provider_mode_keeps_bridge_compatibility_endpoints():
             assert interruption.status_code == 200
             assert interruption.body["ok"] is True
             assert interruption.body["cancelled_approval_ids"] == []
+        finally:
+            server.stop()
+
+
+def test_provider_mode_normalizes_plain_text_bridge_completion_into_telegram_outbox():
+    global server
+    with run_mock_deepseek() as (base_url, _):
+        server = make_provider_server(base_url)
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-reasoner",
+                "messages": [
+                    {"role": "user", "content": "Reply on Telegram."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "77",
+                "X-Vicuna-Telegram-Deferred-Delivery": "1",
+                "X-Vicuna-Telegram-Conversation-Id": "tc1",
+            })
+
+            assert response.status_code == 200
+            assert response.body["choices"][0]["finish_reason"] == "stop"
+            assert response.body["choices"][0]["message"]["content"] == ""
+            assert response.body["vicuna_telegram_delivery"] == {
+                "handled": True,
+                "queued": True,
+                "deduplicated": False,
+                "sequence_number": 1,
+                "chat_scope": "12345",
+                "telegram_method": "sendMessage",
+                "reply_to_message_id": 77,
+                "source": "compat_plain_text",
+            }
+
+            outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
+            assert outbox.status_code == 200
+            assert outbox.body["items"] == [{
+                "sequence_number": 1,
+                "kind": "message",
+                "chat_scope": "12345",
+                "telegram_method": "sendMessage",
+                "telegram_payload": {
+                    "text": "Hello from DeepSeek.",
+                },
+                "text": "Hello from DeepSeek.",
+                "reply_to_message_id": 77,
+                "dedupe_key": "bridge:tc1:77:sendMessage",
+            }]
+        finally:
+            server.stop()
+
+
+def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
+    global server
+
+    def staged_telegram_response(payload):
+        stage_prompt = payload["messages"][-1]["content"].lower()
+        if "choosing one tool family" in stage_prompt:
+            return {
+                "id": "stage-family-telegram",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"family": "Telegram"}),
+                        "reasoning_content": "Use telegram.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "choosing a method of the telegram" in stage_prompt:
+            return {
+                "id": "stage-method-telegram",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"method": "relay"}),
+                        "reasoning_content": "Relay the answer.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "constructing a payload for the relay method of the telegram tool family" in stage_prompt:
+            return {
+                "id": "stage-payload-telegram",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({
+                            "action": "submit",
+                            "payload": {
+                                "request": {
+                                    "method": "sendMessage",
+                                    "payload": {
+                                        "text": "<b>Ready</b>",
+                                        "parse_mode": "HTML",
+                                    },
+                                },
+                                "chat_scope": "12345",
+                                "reply_to_message_id": 88,
+                            },
+                        }),
+                        "reasoning_content": "Queue a structured Telegram reply.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        raise AssertionError(f"unexpected staged prompt: {payload['messages'][-1]['content']}")
+
+    with run_mock_deepseek(staged_telegram_response) as (base_url, state):
+        server = make_provider_server(base_url)
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-reasoner",
+                "messages": [
+                    {"role": "user", "content": "Reply through Telegram."},
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "telegram_relay",
+                        "description": "Queue one Telegram follow-up message through the provider-only bridge outbox.",
+                        "parameters": {
+                            "type": "object",
+                            "description": "The Telegram relay payload.",
+                            "anyOf": [
+                                {"required": ["text"]},
+                                {"required": ["request"]},
+                            ],
+                            "properties": {
+                                "text": {
+                                    "type": "string",
+                                    "description": "Optional simple plain-text Telegram reply.",
+                                },
+                                "request": {
+                                    "type": "object",
+                                    "description": "Optional structured Telegram Bot API send request.",
+                                    "required": ["method", "payload"],
+                                    "properties": {
+                                        "method": {
+                                            "type": "string",
+                                            "description": "Allowed outbound Telegram method.",
+                                        },
+                                        "payload": {
+                                            "type": "object",
+                                            "description": "Telegram Bot API payload for the selected method.",
+                                        },
+                                    },
+                                },
+                                "chat_scope": {
+                                    "type": "string",
+                                    "description": "The Telegram chat scope to route the follow-up into.",
+                                },
+                                "reply_to_message_id": {
+                                    "type": "integer",
+                                    "description": "Optional Telegram message id to use as the reply anchor.",
+                                },
+                            },
+                        },
+                        "x-vicuna-family-id": "telegram",
+                        "x-vicuna-family-name": "Telegram",
+                        "x-vicuna-family-description": "Send direct user-facing follow-up messages through the Telegram bridge outbox.",
+                        "x-vicuna-method-name": "relay",
+                        "x-vicuna-method-description": "Queue one Telegram follow-up message as plain text or a structured Bot API send request.",
+                    },
+                }],
+                "stream": False,
+            }, headers={
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "88",
+                "X-Vicuna-Telegram-Conversation-Id": "tc2",
+            })
+
+            assert response.status_code == 200
+            assert response.body["choices"][0]["finish_reason"] == "stop"
+            assert response.body["choices"][0]["message"]["content"] == ""
+            assert "tool_calls" not in response.body["choices"][0]["message"]
+            assert response.body["vicuna_telegram_delivery"] == {
+                "handled": True,
+                "queued": True,
+                "deduplicated": False,
+                "sequence_number": 1,
+                "chat_scope": "12345",
+                "telegram_method": "sendMessage",
+                "reply_to_message_id": 88,
+                "source": "tool_call",
+            }
+
+            assert len(state["requests"]) == 3
+            outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
+            assert outbox.status_code == 200
+            assert outbox.body["items"] == [{
+                "sequence_number": 1,
+                "kind": "message",
+                "chat_scope": "12345",
+                "telegram_method": "sendMessage",
+                "telegram_payload": {
+                    "text": "<b>Ready</b>",
+                    "parse_mode": "HTML",
+                },
+                "text": "<b>Ready</b>",
+                "reply_to_message_id": 88,
+                "dedupe_key": "bridge:tc2:88:sendMessage",
+            }]
         finally:
             server.stop()
 

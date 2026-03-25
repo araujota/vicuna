@@ -79,13 +79,16 @@ export function defaultRepoRoot(): string {
 
 export function defaultPaths(repoRoot = defaultRepoRoot()): OpenClawPaths {
   const stateDir = path.join(repoRoot, ".cache", "vicuna");
+  const secretsPath =
+    process.env.VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH?.trim() ||
+    path.join(stateDir, "openclaw-tool-secrets.json");
   const runtimeCatalogPath =
     process.env.VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH?.trim() ||
     path.join(stateDir, "openclaw-catalog.json");
   return {
     repoRoot,
     stateDir,
-    secretsPath: path.join(stateDir, "openclaw-tool-secrets.json"),
+    secretsPath,
     runtimeCatalogPath,
     tavilyWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "tavily-web-search"),
     radarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "radarr-api"),

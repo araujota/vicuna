@@ -55,6 +55,28 @@ static std::string trim_copy(std::string value) {
     return std::string(begin, end);
 }
 
+static std::string to_lower_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+static std::string request_header_value(const server_http_req & req, const std::string & key) {
+    const std::string needle = to_lower_copy(key);
+    for (const auto & [header_key, header_value] : req.headers) {
+        if (to_lower_copy(header_key) == needle) {
+            return header_value;
+        }
+    }
+    return std::string();
+}
+
+static bool parse_truthy_header(const std::string & value) {
+    const std::string normalized = to_lower_copy(trim_copy(value));
+    return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
+}
+
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
         fprintf(stderr, "Received second interrupt, terminating immediately.\n");
@@ -95,6 +117,52 @@ struct telegram_outbox_state {
     uint64_t next_sequence_number = 1;
     size_t max_items = 128;
 };
+
+struct telegram_outbox_enqueue_result {
+    bool queued = false;
+    bool deduplicated = false;
+    uint64_t sequence_number = 0;
+    std::string chat_scope;
+};
+
+struct telegram_bridge_request_context {
+    bool active = false;
+    bool deferred_delivery = false;
+    std::string chat_scope;
+    std::string conversation_id;
+    int64_t reply_to_message_id = 0;
+    int32_t history_turns = 0;
+};
+
+struct telegram_delivery_result {
+    bool handled = false;
+    bool queued = false;
+    bool deduplicated = false;
+    uint64_t sequence_number = 0;
+    std::string chat_scope;
+    std::string telegram_method = "sendMessage";
+    int64_t reply_to_message_id = 0;
+    std::string source;
+};
+
+static telegram_bridge_request_context parse_telegram_bridge_request_context(const server_http_req & req) {
+    telegram_bridge_request_context context = {};
+    context.chat_scope = trim_copy(request_header_value(req, "X-Vicuna-Telegram-Chat-Id"));
+    if (context.chat_scope.empty()) {
+        return context;
+    }
+
+    context.active = true;
+    context.deferred_delivery = parse_truthy_header(request_header_value(req, "X-Vicuna-Telegram-Deferred-Delivery"));
+    context.conversation_id = trim_copy(request_header_value(req, "X-Vicuna-Telegram-Conversation-Id"));
+    context.reply_to_message_id = std::max<int64_t>(
+            0,
+            std::strtoll(request_header_value(req, "X-Vicuna-Telegram-Message-Id").c_str(), nullptr, 10));
+    context.history_turns = std::max<int32_t>(
+            0,
+            static_cast<int32_t>(std::strtol(request_header_value(req, "X-Vicuna-Telegram-History-Turns").c_str(), nullptr, 10)));
+    return context;
+}
 
 struct request_activity_state {
     std::atomic<int32_t> active_requests = 0;
@@ -588,12 +656,14 @@ static json build_staged_messages(
 }
 
 static json build_staged_provider_body(const json & base_body, const json & messages) {
+    static constexpr int64_t staged_max_tokens = 1024;
     json staged = base_body;
     staged.erase("tools");
     staged.erase("tool_choice");
     staged.erase("parallel_tool_calls");
     staged["messages"] = messages;
     staged["stream"] = false;
+    staged["max_tokens"] = staged_max_tokens;
     staged["response_format"] = {
         {"type", "json_object"},
     };
@@ -1912,6 +1982,187 @@ static std::string derive_telegram_summary_text(const std::string & method, cons
     return "Telegram " + method + " sent.";
 }
 
+static std::string build_telegram_bridge_dedupe_key(
+        const telegram_bridge_request_context & context,
+        const std::string & telegram_method) {
+    std::ostringstream out;
+    out << "bridge:";
+    if (!context.conversation_id.empty()) {
+        out << context.conversation_id;
+    } else {
+        out << context.chat_scope;
+    }
+    out << ":" << context.reply_to_message_id;
+    out << ":" << telegram_method;
+    return out.str();
+}
+
+static telegram_outbox_enqueue_result telegram_outbox_enqueue(telegram_outbox_state * outbox, telegram_outbox_item request) {
+    if (!outbox) {
+        throw std::invalid_argument("telegram outbox state was not configured");
+    }
+    if (request.chat_scope.empty()) {
+        throw std::invalid_argument("telegram outbox write requires non-empty chat_scope");
+    }
+    validate_telegram_payload_fields(request.telegram_method, request.telegram_payload);
+    if (request.text.empty()) {
+        request.text = derive_telegram_summary_text(request.telegram_method, request.telegram_payload);
+    }
+    if (request.text.empty()) {
+        throw std::invalid_argument("telegram outbox write requires relayable summary text");
+    }
+
+    std::lock_guard<std::mutex> lock(outbox->mutex);
+    if (!request.dedupe_key.empty()) {
+        for (const auto & existing : outbox->items) {
+            if (existing.kind == request.kind &&
+                    existing.chat_scope == request.chat_scope &&
+                    existing.dedupe_key == request.dedupe_key) {
+                return {
+                    false,
+                    true,
+                    existing.sequence_number,
+                    existing.chat_scope,
+                };
+            }
+        }
+    }
+
+    request.sequence_number = outbox->next_sequence_number++;
+    outbox->items.push_back(request);
+    while (outbox->items.size() > outbox->max_items) {
+        outbox->items.pop_front();
+    }
+    return {
+        true,
+        false,
+        request.sequence_number,
+        request.chat_scope,
+    };
+}
+
+static telegram_outbox_item telegram_outbox_item_from_json(const json & body) {
+    const std::string kind = trim_copy(json_value(body, "kind", std::string("message")));
+    if (kind != "message") {
+        throw std::invalid_argument("telegram outbox only supports kind=message on the provider-only path");
+    }
+
+    telegram_outbox_item request = {};
+    request.kind = kind;
+    request.chat_scope = trim_copy(json_value(body, "chat_scope", std::string()));
+    request.text = trim_copy(json_value(body, "text", std::string()));
+    request.telegram_method = trim_copy(json_value(body, "telegram_method", std::string("sendMessage")));
+    if (body.contains("telegram_payload")) {
+        request.telegram_payload = body.at("telegram_payload");
+    } else {
+        request.telegram_payload = json{
+            {"text", request.text},
+        };
+    }
+    request.reply_to_message_id = std::max<int64_t>(0, json_value(body, "reply_to_message_id", int64_t(0)));
+    request.intent = trim_copy(json_value(body, "intent", std::string()));
+    request.dedupe_key = trim_copy(json_value(body, "dedupe_key", std::string()));
+    request.urgency = std::max(0.0, json_value(body, "urgency", 0.0));
+    return request;
+}
+
+static bool parse_telegram_relay_tool_call(
+        const deepseek_tool_call & tool_call,
+        const telegram_bridge_request_context & context,
+        telegram_outbox_item * out_item,
+        std::string * out_error) {
+    if (!out_item) {
+        if (out_error) {
+            *out_error = "telegram relay parsing requires an output item";
+        }
+        return false;
+    }
+
+    json arguments;
+    try {
+        arguments = json::parse(tool_call.arguments_json.empty() ? std::string("{}") : tool_call.arguments_json);
+    } catch (const std::exception & e) {
+        if (out_error) {
+            *out_error = server_string_format("telegram_relay arguments were not valid JSON: %s", e.what());
+        }
+        return false;
+    }
+    if (!arguments.is_object()) {
+        if (out_error) {
+            *out_error = "telegram_relay arguments must be a JSON object";
+        }
+        return false;
+    }
+
+    const bool has_text = !trim_copy(json_value(arguments, "text", std::string())).empty();
+    const bool has_request = arguments.contains("request") && arguments.at("request").is_object();
+    if (has_text == has_request) {
+        if (out_error) {
+            *out_error = "telegram_relay requires exactly one of text or request";
+        }
+        return false;
+    }
+
+    telegram_outbox_item item = {};
+    item.chat_scope = trim_copy(json_value(arguments, "chat_scope", context.chat_scope));
+    item.reply_to_message_id = std::max<int64_t>(
+            0,
+            json_value(arguments, "reply_to_message_id", context.reply_to_message_id));
+    item.intent = trim_copy(json_value(arguments, "intent", std::string()));
+    item.dedupe_key = trim_copy(json_value(arguments, "dedupe_key", std::string()));
+    item.urgency = std::max(0.0, json_value(arguments, "urgency", 0.0));
+
+    if (item.chat_scope.empty()) {
+        if (out_error) {
+            *out_error = "telegram_relay requires chat_scope when no bridge-scoped default is available";
+        }
+        return false;
+    }
+
+    if (has_text) {
+        item.text = trim_copy(json_value(arguments, "text", std::string()));
+        item.telegram_method = "sendMessage";
+        item.telegram_payload = json{
+            {"text", item.text},
+        };
+    } else {
+        const json & request = arguments.at("request");
+        item.telegram_method = trim_copy(json_value(request, "method", std::string()));
+        if (request.contains("payload")) {
+            item.telegram_payload = request.at("payload");
+        } else {
+            item.telegram_payload = json::object();
+        }
+        if (item.telegram_payload.is_object()) {
+            item.telegram_payload.erase("chat_id");
+        }
+    }
+
+    try {
+        validate_telegram_payload_fields(item.telegram_method, item.telegram_payload);
+        if (item.text.empty()) {
+            item.text = derive_telegram_summary_text(item.telegram_method, item.telegram_payload);
+        }
+    } catch (const std::exception & e) {
+        if (out_error) {
+            *out_error = e.what();
+        }
+        return false;
+    }
+
+    if (item.text.empty()) {
+        if (out_error) {
+            *out_error = "telegram_relay did not produce relayable summary text";
+        }
+        return false;
+    }
+    if (item.dedupe_key.empty()) {
+        item.dedupe_key = build_telegram_bridge_dedupe_key(context, item.telegram_method);
+    }
+    *out_item = std::move(item);
+    return true;
+}
+
 static json telegram_outbox_item_to_json(const telegram_outbox_item & item) {
     json payload = {
         {"sequence_number", item.sequence_number},
@@ -1976,78 +2227,120 @@ static json telegram_outbox_health_json(const telegram_outbox_state & outbox) {
 }
 
 static json telegram_outbox_enqueue_json(telegram_outbox_state * outbox, const json & body) {
-    if (!outbox) {
-        throw std::invalid_argument("telegram outbox state was not configured");
-    }
-
-    const std::string kind = trim_copy(json_value(body, "kind", std::string("message")));
-    if (kind != "message") {
-        throw std::invalid_argument("telegram outbox only supports kind=message on the provider-only path");
-    }
-
-    telegram_outbox_item request = {};
-    request.kind = kind;
-    request.chat_scope = trim_copy(json_value(body, "chat_scope", std::string()));
-    request.text = trim_copy(json_value(body, "text", std::string()));
-    request.telegram_method = trim_copy(json_value(body, "telegram_method", std::string("sendMessage")));
-    if (body.contains("telegram_payload")) {
-        request.telegram_payload = body.at("telegram_payload");
-    } else {
-        request.telegram_payload = json{
-            {"text", request.text},
-        };
-    }
-    request.reply_to_message_id = std::max<int64_t>(0, json_value(body, "reply_to_message_id", int64_t(0)));
-    request.intent = trim_copy(json_value(body, "intent", std::string()));
-    request.dedupe_key = trim_copy(json_value(body, "dedupe_key", std::string()));
-    request.urgency = std::max(0.0, json_value(body, "urgency", 0.0));
-
-    if (request.chat_scope.empty()) {
-        throw std::invalid_argument("telegram outbox write requires non-empty chat_scope");
-    }
-    validate_telegram_payload_fields(request.telegram_method, request.telegram_payload);
-    if (request.text.empty()) {
-        request.text = derive_telegram_summary_text(request.telegram_method, request.telegram_payload);
-    }
-    if (request.text.empty()) {
-        throw std::invalid_argument("telegram outbox write requires relayable summary text");
-    }
-
+    const telegram_outbox_item request = telegram_outbox_item_from_json(body);
+    const telegram_outbox_enqueue_result enqueue = telegram_outbox_enqueue(outbox, request);
     std::lock_guard<std::mutex> lock(outbox->mutex);
-
-    if (!request.dedupe_key.empty()) {
-        for (const auto & existing : outbox->items) {
-            if (existing.kind == request.kind &&
-                    existing.chat_scope == request.chat_scope &&
-                    existing.dedupe_key == request.dedupe_key) {
-                return {
-                    {"ok", true},
-                    {"queued", false},
-                    {"deduplicated", true},
-                    {"sequence_number", existing.sequence_number},
-                    {"chat_scope", existing.chat_scope},
-                    {"stored_items", outbox->items.size()},
-                    {"next_sequence_number", outbox->next_sequence_number},
-                };
-            }
-        }
-    }
-
-    request.sequence_number = outbox->next_sequence_number++;
-    outbox->items.push_back(request);
-    while (outbox->items.size() > outbox->max_items) {
-        outbox->items.pop_front();
-    }
-
     return {
         {"ok", true},
-        {"queued", true},
-        {"deduplicated", false},
-        {"sequence_number", request.sequence_number},
-        {"chat_scope", request.chat_scope},
+        {"queued", enqueue.queued},
+        {"deduplicated", enqueue.deduplicated},
+        {"sequence_number", enqueue.sequence_number},
+        {"chat_scope", enqueue.chat_scope},
         {"stored_items", outbox->items.size()},
         {"next_sequence_number", outbox->next_sequence_number},
     };
+}
+
+static json telegram_delivery_result_to_json(const telegram_delivery_result & delivery) {
+    if (!delivery.handled) {
+        return nullptr;
+    }
+    return {
+        {"handled", true},
+        {"queued", delivery.queued},
+        {"deduplicated", delivery.deduplicated},
+        {"sequence_number", delivery.sequence_number},
+        {"chat_scope", delivery.chat_scope},
+        {"telegram_method", delivery.telegram_method},
+        {"reply_to_message_id", delivery.reply_to_message_id},
+        {"source", delivery.source},
+    };
+}
+
+static bool execute_telegram_delivery_for_bridge_request(
+        const server_http_req & req,
+        telegram_outbox_state * outbox,
+        deepseek_chat_result * result,
+        telegram_delivery_result * out_delivery,
+        json * out_error) {
+    if (!result) {
+        if (out_error) {
+            *out_error = format_error_response("telegram delivery execution requires a result", ERROR_TYPE_SERVER);
+        }
+        return false;
+    }
+    if (out_delivery) {
+        *out_delivery = telegram_delivery_result();
+    }
+    if (!outbox) {
+        return true;
+    }
+
+    const telegram_bridge_request_context context = parse_telegram_bridge_request_context(req);
+    if (!context.active) {
+        return true;
+    }
+
+    telegram_outbox_item item = {};
+    std::string delivery_source;
+    if (result->tool_calls.size() == 1 && result->tool_calls.front().name == "telegram_relay") {
+        std::string parse_error;
+        if (!parse_telegram_relay_tool_call(result->tool_calls.front(), context, &item, &parse_error)) {
+            if (out_error) {
+                *out_error = format_error_response(parse_error, ERROR_TYPE_SERVER);
+            }
+            return false;
+        }
+        delivery_source = "tool_call";
+    } else {
+        if (!result->tool_calls.empty()) {
+            if (out_error) {
+                *out_error = format_error_response(
+                        "Telegram bridge request returned unresolved tool calls instead of a Telegram delivery.",
+                        ERROR_TYPE_SERVER);
+            }
+            return false;
+        }
+        const std::string text = trim_copy(result->content);
+        if (text.empty()) {
+            return true;
+        }
+        item.chat_scope = context.chat_scope;
+        item.reply_to_message_id = context.reply_to_message_id;
+        item.text = text;
+        item.telegram_method = "sendMessage";
+        item.telegram_payload = json{
+            {"text", text},
+        };
+        item.dedupe_key = build_telegram_bridge_dedupe_key(context, item.telegram_method);
+        delivery_source = "compat_plain_text";
+    }
+
+    telegram_outbox_enqueue_result enqueue = {};
+    try {
+        enqueue = telegram_outbox_enqueue(outbox, item);
+    } catch (const std::exception & e) {
+        if (out_error) {
+            *out_error = format_error_response(e.what(), ERROR_TYPE_SERVER);
+        }
+        return false;
+    }
+
+    result->content.clear();
+    result->tool_calls.clear();
+    result->finish_reason = "stop";
+
+    if (out_delivery) {
+        out_delivery->handled = true;
+        out_delivery->queued = enqueue.queued;
+        out_delivery->deduplicated = enqueue.deduplicated;
+        out_delivery->sequence_number = enqueue.sequence_number;
+        out_delivery->chat_scope = enqueue.chat_scope;
+        out_delivery->telegram_method = item.telegram_method;
+        out_delivery->reply_to_message_id = item.reply_to_message_id;
+        out_delivery->source = delivery_source;
+    }
+    return true;
 }
 
 static server_http_context::handler_t ex_wrapper(server_http_context::handler_t func, request_activity_state * activity_state = nullptr) {
@@ -2771,6 +3064,8 @@ static json ongoing_task_worker_json(
 static server_http_res_ptr handle_deepseek_chat(
         const deepseek_runtime_config & config,
         server_emotive_runtime & emotive_runtime,
+        const server_http_req & req,
+        telegram_outbox_state * telegram_outbox,
         const json & body,
         bool responses_api,
         bool text_completion_api) {
@@ -2788,12 +3083,27 @@ static server_http_res_ptr handle_deepseek_chat(
         return make_error_response(error);
     }
 
+    telegram_delivery_result telegram_delivery = {};
+    if (!execute_telegram_delivery_for_bridge_request(req, telegram_outbox, &result, &telegram_delivery, &error)) {
+        return make_error_response(error);
+    }
+
     const std::string completion_id = gen_chatcmplid();
     if (responses_api) {
-        return make_json_response(deepseek_format_responses_response(config, result));
+        json response = deepseek_format_responses_response(config, result);
+        const json delivery_json = telegram_delivery_result_to_json(telegram_delivery);
+        if (!delivery_json.is_null()) {
+            response["vicuna_telegram_delivery"] = delivery_json;
+        }
+        return make_json_response(response);
     }
     if (text_completion_api) {
-        return make_json_response(deepseek_format_text_completion_response(config, result, completion_id));
+        json response = deepseek_format_text_completion_response(config, result, completion_id);
+        const json delivery_json = telegram_delivery_result_to_json(telegram_delivery);
+        if (!delivery_json.is_null()) {
+            response["vicuna_telegram_delivery"] = delivery_json;
+        }
+        return make_json_response(response);
     }
 
     const bool stream = json_value(body, "stream", false);
@@ -2809,7 +3119,12 @@ static server_http_res_ptr handle_deepseek_chat(
         return res;
     }
 
-    return make_json_response(deepseek_format_chat_completion_response(config, result, completion_id));
+    json response = deepseek_format_chat_completion_response(config, result, completion_id);
+    const json delivery_json = telegram_delivery_result_to_json(telegram_delivery);
+    if (!delivery_json.is_null()) {
+        response["vicuna_telegram_delivery"] = delivery_json;
+    }
+    return make_json_response(response);
 }
 
 static void ongoing_task_worker_set_mode(
@@ -3499,19 +3814,19 @@ int main(int argc, char ** argv) {
         });
     };
 
-    const auto post_chat_completions = [&deepseek_config, &emotive_runtime](const server_http_req & req) {
+    const auto post_chat_completions = [&deepseek_config, &emotive_runtime, &telegram_outbox](const server_http_req & req) {
         const json body = json::parse(req.body);
-        return handle_deepseek_chat(deepseek_config, emotive_runtime, body, false, false);
+        return handle_deepseek_chat(deepseek_config, emotive_runtime, req, &telegram_outbox, body, false, false);
     };
 
-    const auto post_completions = [&deepseek_config, &emotive_runtime](const server_http_req & req) {
+    const auto post_completions = [&deepseek_config, &emotive_runtime, &telegram_outbox](const server_http_req & req) {
         const json body = json::parse(req.body);
-        return handle_deepseek_chat(deepseek_config, emotive_runtime, body, false, true);
+        return handle_deepseek_chat(deepseek_config, emotive_runtime, req, &telegram_outbox, body, false, true);
     };
 
-    const auto post_responses = [&deepseek_config, &emotive_runtime](const server_http_req & req) {
+    const auto post_responses = [&deepseek_config, &emotive_runtime, &telegram_outbox](const server_http_req & req) {
         const json body = convert_responses_input_to_chat(json::parse(req.body));
-        return handle_deepseek_chat(deepseek_config, emotive_runtime, body, true, false);
+        return handle_deepseek_chat(deepseek_config, emotive_runtime, req, &telegram_outbox, body, true, false);
     };
 
     const auto get_responses_stream = [&bridge_state](const server_http_req & req) {
