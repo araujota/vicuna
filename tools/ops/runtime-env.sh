@@ -5,6 +5,7 @@ REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
 VICUNA_SYSTEM_ENV_FILE="${VICUNA_SYSTEM_ENV_FILE:-/etc/vicuna/vicuna.env}"
 
+set -a
 if [[ -r "$REPO_ROOT/.envrc" ]]; then
     # shellcheck disable=SC1091
     source "$REPO_ROOT/.envrc"
@@ -16,6 +17,7 @@ if [[ -r "$VICUNA_SYSTEM_ENV_FILE" ]]; then
 elif [[ -f "$VICUNA_SYSTEM_ENV_FILE" ]]; then
     printf '[vicuna-runtime-env] warning: %s exists but is not readable\n' "$VICUNA_SYSTEM_ENV_FILE" >&2
 fi
+set +a
 
 export PATH="/usr/local/cuda-12.8/bin:$PATH"
 export CUDACXX="${CUDACXX:-/usr/local/cuda-12.8/bin/nvcc}"
