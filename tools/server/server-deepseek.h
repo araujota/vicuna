@@ -41,6 +41,7 @@ struct deepseek_chat_result {
     int32_t completion_tokens = 0;
     std::vector<deepseek_tool_call> tool_calls;
     json emotive_trace = nullptr;
+    json rich_response = nullptr;
 };
 
 deepseek_runtime_config deepseek_runtime_config_from_env();
