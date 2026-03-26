@@ -6,6 +6,7 @@ REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "$REPO_ROOT"
 preserved_env_vars=(
     REPO_ROOT
+    VICUNA_SYSTEM_ENV_FILE
     TELEGRAM_BOT_TOKEN
     TELEGRAM_BRIDGE_VICUNA_BASE_URL
     TELEGRAM_BRIDGE_MODEL
@@ -17,6 +18,16 @@ preserved_env_vars=(
     TELEGRAM_BRIDGE_NODE_BIN
     SUPERMEMORY_API_KEY
     SUPERMEMORY_BASE_URL
+    TAVILY_API_KEY
+    RADARR_API_KEY
+    RADARR_BASE_URL
+    SONARR_API_KEY
+    SONARR_BASE_URL
+    CHAPTARR_API_KEY
+    CHAPTARR_BASE_URL
+    VICUNA_OPENCLAW_NODE_BIN
+    VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH
+    VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH
     VICUNA_API_KEY
 )
 
@@ -35,10 +46,8 @@ for var_name in "${preserved_env_vars[@]}"; do
     printf -v "$saved_var" '%s' "${!var_name-__unset__}"
 done
 
-if [[ -f "$REPO_ROOT/.envrc" ]]; then
-    # shellcheck disable=SC1091
-    source "$REPO_ROOT/.envrc"
-fi
+# shellcheck disable=SC1091
+source "$REPO_ROOT/tools/ops/runtime-env.sh"
 
 for var_name in "${preserved_env_vars[@]}"; do
     restore_preserved_env "$var_name"
@@ -95,5 +104,6 @@ resolve_node_bin() {
 }
 
 NODE_BIN="$(resolve_node_bin)"
+"$REPO_ROOT/tools/ops/sync-openclaw-runtime-state.sh"
 
 exec "$NODE_BIN" "$REPO_ROOT/tools/telegram-bridge/index.mjs"

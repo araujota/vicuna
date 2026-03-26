@@ -347,7 +347,7 @@ def test_provider_mode_responses_route_emits_reasoning_item():
             assert response.body["output"][1]["content"][0]["text"] == "Hello from DeepSeek."
             assert response.body["vicuna_emotive_trace"]["blocks"][0]["source"]["kind"] == "user_message"
             assert response.body["vicuna_emotive_trace"]["final_vad"]["style_guide"]["tone_label"]
-            assert state["requests"][0]["body"]["max_tokens"] == 256
+            assert state["requests"][0]["body"]["max_tokens"] == 768
             assert state["requests"][0]["body"]["temperature"] == 0.2
         finally:
             server.stop()
@@ -416,16 +416,22 @@ def test_provider_mode_request_trace_endpoint_returns_correlated_foreground_even
             events = [item["event"] for item in traces.body["items"]]
             assert events == [
                 "request_received",
+                "guidance_evaluated",
                 "provider_request_started",
                 "provider_request_finished",
                 "request_completed",
             ]
             assert all(item["request_id"] == "trace_fg_1" for item in traces.body["items"])
             assert traces.body["items"][0]["component"] == "runtime"
-            assert traces.body["items"][1]["component"] == "provider"
-            assert traces.body["items"][1]["data"]["max_tokens"] == 256
-            assert traces.body["items"][1]["data"]["temperature"] == 0.2
-            assert traces.body["items"][2]["data"]["finish_reason"] == "stop"
+            assert traces.body["items"][1]["component"] == "runtime_guidance"
+            assert traces.body["items"][1]["data"]["vad_skip_reason"] == "no_active_tool_continuation_span"
+            assert traces.body["items"][2]["component"] == "provider"
+            assert traces.body["items"][2]["data"]["max_tokens"] == 768
+            assert traces.body["items"][2]["data"]["temperature"] == 0.2
+            assert traces.body["items"][2]["data"]["system_messages"] == []
+            assert traces.body["items"][3]["data"]["finish_reason"] == "stop"
+            assert traces.body["items"][3]["data"]["reasoning_content"] == "I should greet the user and keep the reply brief."
+            assert traces.body["items"][3]["data"]["content"] == "Hello from DeepSeek."
 
             health = server.make_request("GET", "/health")
             assert health.body["request_traces"]["stored_events"] >= 4
@@ -439,7 +445,7 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
     global server
 
     def tool_response(payload):
-        stage_prompt = payload["messages"][-1]["content"]
+        stage_prompt = payload["messages"][0]["content"]
         if "choosing one tool family" in stage_prompt.lower():
             return {
                 "id": "chatcmpl-stage-family",
@@ -600,30 +606,56 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
             payload_request = state["requests"][2]["body"]
 
             assert "tools" not in family_request
-            assert family_request["max_tokens"] == 256
+            assert family_request["max_tokens"] == 768
             assert family_request["thinking"] == {"type": "enabled"}
             assert family_request["response_format"] == {"type": "json_object"}
             assert family_request["messages"][2]["reasoning_content"] == request["messages"][1]["reasoning_content"]
             assert family_request["messages"][2]["tool_calls"] == request["messages"][1]["tool_calls"]
             assert family_request["messages"][3]["tool_call_id"] == "call_due_1"
             assert family_request["messages"][3]["content"] == "{\"tasks\":[]}"
-            assert family_request["messages"][4]["role"] == "system"
-            assert family_request["messages"][4]["content"].startswith("Current emotive guidance: valence=")
-            assert "tone=" in family_request["messages"][4]["content"]
-            assert family_request["messages"][-1]["role"] == "system"
-            assert "choosing one tool family" in family_request["messages"][-1]["content"].lower()
+            assert family_request["messages"][0]["role"] == "system"
+            assert "choosing one tool family" in family_request["messages"][0]["content"].lower()
+            assert "respond promptly with exactly one non-empty json object and nothing else" in family_request["messages"][0]["content"].lower()
+            assert any(
+                message["role"] == "system" and message["content"].startswith("Current emotive guidance: valence=")
+                for message in family_request["messages"]
+            )
 
-            assert method_request["max_tokens"] == 256
+            assert method_request["max_tokens"] == 768
             assert method_request["thinking"] == {"type": "enabled"}
             assert method_request["response_format"] == {"type": "json_object"}
-            assert method_request["messages"][-1]["role"] == "system"
-            assert "choosing a method of the ongoing tasks" in method_request["messages"][-1]["content"].lower()
+            assert method_request["messages"][0]["role"] == "system"
+            assert "choosing a method of the ongoing tasks" in method_request["messages"][0]["content"].lower()
+            assert "respond promptly with exactly one non-empty json object and nothing else" in method_request["messages"][0]["content"].lower()
 
-            assert payload_request["max_tokens"] == 256
+            assert payload_request["max_tokens"] == 768
             assert payload_request["thinking"] == {"type": "enabled"}
             assert payload_request["response_format"] == {"type": "json_object"}
-            assert payload_request["messages"][-1]["role"] == "system"
-            assert "constructing a payload for the get_due" in payload_request["messages"][-1]["content"].lower()
+            assert payload_request["messages"][0]["role"] == "system"
+            assert "constructing a payload for the get_due" in payload_request["messages"][0]["content"].lower()
+            assert "respond promptly with exactly one non-empty json object and nothing else" in payload_request["messages"][0]["content"].lower()
+
+            traced = server.make_request("GET", "/v1/debug/request-traces?limit=100")
+            assert traced.status_code == 200
+            guidance_events = [
+                item for item in traced.body["items"]
+                if item["component"] == "runtime_guidance" and item["event"] == "guidance_evaluated"
+            ]
+            assert guidance_events
+            assert any(event["data"]["vad_injected"] is True for event in guidance_events)
+            assert any(
+                (event["data"]["vad_guidance"] or "").startswith("Current emotive guidance: valence=")
+                for event in guidance_events
+            )
+            provider_finished = [
+                item for item in traced.body["items"]
+                if item["component"] == "provider" and item["event"] == "provider_request_finished"
+            ]
+            assert [item["data"]["reasoning_content"] for item in provider_finished[-3:]] == [
+                "The ongoing task family is the right place to inspect what is due.",
+                "The due-task getter will fetch the exact recurring task state I need.",
+                "Constrain the due-task lookup to the one task that matters.",
+            ]
         finally:
             server.stop()
 
@@ -733,8 +765,8 @@ def test_provider_mode_interleaved_guidance_is_request_scoped_and_forwards_think
 
             first_outbound = state["requests"][0]["body"]
             second_outbound = state["requests"][1]["body"]
-            assert first_outbound["max_tokens"] == 256
-            assert second_outbound["max_tokens"] == 256
+            assert first_outbound["max_tokens"] == 768
+            assert second_outbound["max_tokens"] == 768
             assert first_outbound["thinking"] == {"type": "enabled"}
             assert second_outbound["thinking"] == {"type": "enabled"}
             assert first_outbound["messages"][3]["role"] == "system"
@@ -748,7 +780,7 @@ def test_provider_mode_responses_route_emits_function_call_items():
     global server
 
     def tool_response(payload):
-        stage_prompt = payload["messages"][-1]["content"]
+        stage_prompt = payload["messages"][0]["content"]
         if "choosing one tool family" in stage_prompt.lower():
             return {
                 "id": "resp-stage-family",
@@ -868,7 +900,7 @@ def test_provider_mode_staged_tool_loop_supports_back_navigation_and_completion(
     stage_counter = {"family": 0}
 
     def staged_response(payload):
-        stage_prompt = payload["messages"][-1]["content"]
+        stage_prompt = payload["messages"][0]["content"]
         if "choosing one tool family" in stage_prompt.lower():
             stage_counter["family"] += 1
             family = "Ongoing Tasks" if stage_counter["family"] == 1 else "Telegram"
@@ -1001,12 +1033,12 @@ def test_provider_mode_staged_tool_loop_supports_back_navigation_and_completion(
             assert response.body["choices"][0]["finish_reason"] == "stop"
             assert response.body["choices"][0]["message"]["content"] == "All set."
             assert len(state["requests"]) == 5
-            assert all(request["body"]["max_tokens"] == 256 for request in state["requests"])
-            assert "choosing one tool family" in state["requests"][0]["body"]["messages"][-1]["content"].lower()
-            assert "choosing a method of the ongoing tasks" in state["requests"][1]["body"]["messages"][-1]["content"].lower()
-            assert "choosing one tool family" in state["requests"][2]["body"]["messages"][-1]["content"].lower()
-            assert "choosing a method of the telegram" in state["requests"][3]["body"]["messages"][-1]["content"].lower()
-            assert "tool loop is complete" in state["requests"][4]["body"]["messages"][-1]["content"].lower()
+            assert all(request["body"]["max_tokens"] == 768 for request in state["requests"])
+            assert "choosing one tool family" in state["requests"][0]["body"]["messages"][0]["content"].lower()
+            assert "choosing a method of the ongoing tasks" in state["requests"][1]["body"]["messages"][0]["content"].lower()
+            assert "choosing one tool family" in state["requests"][2]["body"]["messages"][0]["content"].lower()
+            assert "choosing a method of the telegram" in state["requests"][3]["body"]["messages"][0]["content"].lower()
+            assert "tool loop is complete" in state["requests"][4]["body"]["messages"][0]["content"].lower()
         finally:
             server.stop()
 
@@ -1016,7 +1048,7 @@ def test_provider_mode_retries_invalid_staged_family_selection_once():
     family_attempts = {"count": 0}
 
     def staged_response(payload):
-        stage_prompt = payload["messages"][-1]["content"]
+        stage_prompt = payload["messages"][0]["content"]
         if "choosing one tool family" in stage_prompt.lower():
             family_attempts["count"] += 1
             content = "" if family_attempts["count"] == 1 else json.dumps({"family": "Ongoing Tasks"})
@@ -1110,9 +1142,9 @@ def test_provider_mode_retries_invalid_staged_family_selection_once():
             assert response.body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "ongoing_tasks_get_due"
             assert response.body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] == "{}"
             assert len(state["requests"]) == 4
-            assert "Previous response error:" not in state["requests"][0]["body"]["messages"][-1]["content"]
-            assert "Previous response error:" in state["requests"][1]["body"]["messages"][-1]["content"]
-            assert "non-empty JSON object" in state["requests"][1]["body"]["messages"][-1]["content"]
+            assert "Previous response error:" not in state["requests"][0]["body"]["messages"][0]["content"]
+            assert "Previous response error:" in state["requests"][1]["body"]["messages"][0]["content"]
+            assert "non-empty JSON object" in state["requests"][1]["body"]["messages"][0]["content"]
         finally:
             server.stop()
 
@@ -1122,7 +1154,7 @@ def test_provider_mode_retries_invalid_staged_method_selection_once():
     method_attempts = {"count": 0}
 
     def staged_response(payload):
-        stage_prompt = payload["messages"][-1]["content"]
+        stage_prompt = payload["messages"][0]["content"]
         if "choosing one tool family" in stage_prompt.lower():
             return {
                 "id": "retry-method-family",
@@ -1216,9 +1248,9 @@ def test_provider_mode_retries_invalid_staged_method_selection_once():
             assert response.body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "ongoing_tasks_get_due"
             assert response.body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] == "{}"
             assert len(state["requests"]) == 4
-            assert "Previous response error:" not in state["requests"][1]["body"]["messages"][-1]["content"]
-            assert "Previous response error:" in state["requests"][2]["body"]["messages"][-1]["content"]
-            assert "non-empty JSON object" in state["requests"][2]["body"]["messages"][-1]["content"]
+            assert "Previous response error:" not in state["requests"][1]["body"]["messages"][0]["content"]
+            assert "Previous response error:" in state["requests"][2]["body"]["messages"][0]["content"]
+            assert "non-empty JSON object" in state["requests"][2]["body"]["messages"][0]["content"]
         finally:
             server.stop()
 
@@ -1375,7 +1407,7 @@ def test_provider_mode_normalizes_plain_text_bridge_completion_into_telegram_out
     global server
 
     def staged_complete_response(payload):
-        stage_prompt = payload["messages"][-1]["content"].lower()
+        stage_prompt = payload["messages"][0]["content"].lower()
         if "choosing one tool family" in stage_prompt:
             return {
                 "id": "bridge-family-telegram",
@@ -1482,7 +1514,7 @@ def test_provider_mode_request_trace_endpoint_records_bridge_events():
     global server
 
     def staged_complete_response(payload):
-        stage_prompt = payload["messages"][-1]["content"].lower()
+        stage_prompt = payload["messages"][0]["content"].lower()
         if "choosing one tool family" in stage_prompt:
             return {
                 "id": "bridge-trace-family",
@@ -1597,7 +1629,7 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
     }]
 
     def staged_telegram_response(payload):
-        stage_prompt = payload["messages"][-1]["content"].lower()
+        stage_prompt = payload["messages"][0]["content"].lower()
         saw_runtime_observation = any(
             message.get("role") == "tool" and "downloaded_movie_count" in str(message.get("content", ""))
             for message in payload["messages"]
@@ -1754,10 +1786,12 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
             assert all(request["body"]["temperature"] == 0.2 for request in state["requests"])
             assert first_request["messages"][0]["role"] == "system"
             assert first_request["messages"][1]["role"] == "user"
-            assert "helpful personal concierge with access to tool families" in first_request["messages"][0]["content"]
-            assert "Available families:" in first_request["messages"][-1]["content"]
-            assert "Radarr: Inspect and manage the Radarr movie library on the media server." in first_request["messages"][-1]["content"]
-            assert "Telegram: Send direct user-facing follow-up messages through the Telegram bridge outbox." in first_request["messages"][-1]["content"]
+            assert "You are Vicuña, a helpful personal concierge." in first_request["messages"][0]["content"]
+            assert "Respond promptly with exactly one non-empty JSON object and nothing else." in first_request["messages"][0]["content"]
+            assert "Families:" in first_request["messages"][0]["content"]
+            assert "Radarr: Inspect and manage the Radarr movie library on the media server." in first_request["messages"][0]["content"]
+            assert "Telegram: Send direct user-facing follow-up messages through the Telegram bridge outbox." in first_request["messages"][0]["content"]
+            assert "Respond promptly with exactly one non-empty JSON object and nothing else." in first_request["messages"][0]["content"]
             assert any(
                 message.get("role") == "assistant" and
                 message.get("tool_calls") and
@@ -1768,10 +1802,10 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
                 message.get("role") == "tool" and "downloaded_movie_count" in str(message.get("content", ""))
                 for message in follow_up_family_request["messages"]
             )
-            assert "send_formatted_text" in telegram_method_request["messages"][-1]["content"]
-            assert "send_plain_text" in telegram_method_request["messages"][-1]["content"]
-            assert "send_photo" in telegram_method_request["messages"][-1]["content"]
-            assert "relay" not in telegram_method_request["messages"][-1]["content"]
+            assert "send_formatted_text" in telegram_method_request["messages"][0]["content"]
+            assert "send_plain_text" in telegram_method_request["messages"][0]["content"]
+            assert "send_photo" in telegram_method_request["messages"][0]["content"]
+            assert "relay" not in telegram_method_request["messages"][0]["content"]
 
             outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
             assert outbox.status_code == 200
@@ -1796,7 +1830,7 @@ def test_provider_mode_bridge_request_reuses_runtime_tool_and_staged_prompt_cach
     global server
 
     def staged_response(payload):
-        stage_prompt = payload["messages"][-1]["content"].lower()
+        stage_prompt = payload["messages"][0]["content"].lower()
         if "choosing one tool family" in stage_prompt:
             return {
                 "id": "cache-family",
@@ -1918,7 +1952,7 @@ def test_provider_mode_retries_invalid_bridge_scoped_family_selection_once():
     family_attempts = {"count": 0}
 
     def staged_response(payload):
-        stage_prompt = payload["messages"][-1]["content"]
+        stage_prompt = payload["messages"][0]["content"]
         if "choosing one tool family" in stage_prompt.lower():
             family_attempts["count"] += 1
             content = "{}" if family_attempts["count"] == 1 else json.dumps({"family": "Telegram"})
@@ -1989,9 +2023,9 @@ def test_provider_mode_retries_invalid_bridge_scoped_family_selection_once():
             assert response.status_code == 200
             assert response.body["vicuna_telegram_delivery"]["source"] == "compat_plain_text"
             assert len(state["requests"]) == 4
-            assert "Previous response error:" not in state["requests"][0]["body"]["messages"][-1]["content"]
-            assert "Previous response error:" in state["requests"][1]["body"]["messages"][-1]["content"]
-            assert "did not include family" in state["requests"][1]["body"]["messages"][-1]["content"]
+            assert "Previous response error:" not in state["requests"][0]["body"]["messages"][0]["content"]
+            assert "Previous response error:" in state["requests"][1]["body"]["messages"][0]["content"]
+            assert "did not include family" in state["requests"][1]["body"]["messages"][0]["content"]
         finally:
             server.stop()
 

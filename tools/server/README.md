@@ -22,7 +22,7 @@ provider-native `thinking` object, the server forwards it unchanged instead of
 rewriting it.
 
 All outbound DeepSeek turns, including staged family/method/payload turns and
-background/internal provider passes, are capped at `max_tokens: 256`. The
+background/internal provider passes, are capped at `max_tokens: 768`. The
 server enforces that ceiling even if the caller supplies a different output
 token field, and it does so without disabling reasoning traces.
 Every outbound DeepSeek turn also uses `temperature: 0.2`. The runtime stamps
@@ -39,6 +39,9 @@ foreground or background pass emits labeled JSON events with a shared
 runtime tool execution, and Telegram outbox queueing. Inspect the summary at
 `/health -> request_traces` and the retained event stream at
 `GET /v1/debug/request-traces`.
+Completed provider events retain the exact returned `reasoning_content` and
+visible `content`, and runtime-guidance events retain the exact additive VAD or
+heuristic text that was injected or skipped.
 
 ## Staged tool loop
 
@@ -54,6 +57,11 @@ provider. Instead it runs an explicit staged loop:
 - payload construction: the provider sees the chosen method's typed contract
   and must return `{"action":"submit","payload":{...}}` or
   `{"action":"back"}`
+
+Each staged selector prompt now explicitly says to respond promptly with
+exactly one non-empty JSON object and nothing else, and the runtime collapses
+the staged core prompt plus stage-specific instructions into one system
+message to reduce selector overhead.
 
 After a valid payload is produced, the server emits one normal OpenAI tool call
 back to the caller. After the caller returns a real tool result on the next
@@ -206,6 +214,9 @@ cmake --build build --target llama-server -j8
 export VICUNA_DEEPSEEK_API_KEY="your-key"
 export VICUNA_DEEPSEEK_MODEL="deepseek-chat"
 export VICUNA_DEEPSEEK_BASE_URL="https://api.deepseek.com"
+export VICUNA_SYSTEM_ENV_FILE="/etc/vicuna/vicuna.env"
+export VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH="/etc/vicuna/openclaw-tool-secrets.json"
+export VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH="/var/lib/vicuna/openclaw-catalog.json"
 export VICUNA_EMOTIVE_EMBED_MODEL="/absolute/path/to/Qwen3-Embedding-0.6B-Q8_0.gguf"
 export VICUNA_EMOTIVE_EMBED_POOLING="last"
 export VICUNA_OPENCLAW_NODE_BIN="node"
@@ -216,6 +227,26 @@ export VICUNA_ONGOING_TASKS_AUTH_TOKEN="your-supermemory-key"
 
 ./build/bin/llama-server --host 127.0.0.1 --port 8080 --api-surface openai --no-webui
 ```
+
+For rebuild-safe host deployments, the runtime and bridge scripts now source
+`VICUNA_SYSTEM_ENV_FILE` or `/etc/vicuna/vicuna.env` automatically. That host
+env file should hold the durable values for:
+
+- `TELEGRAM_BOT_TOKEN`
+- `VICUNA_DEEPSEEK_API_KEY`
+- `RADARR_API_KEY`
+- `SONARR_API_KEY`
+- `CHAPTARR_API_KEY`
+- `TAVILY_API_KEY`
+- `SUPERMEMORY_API_KEY`
+- `SUPERMEMORY_BASE_URL`
+- `VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH`
+- `VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH`
+
+At startup, `tools/ops/sync-openclaw-runtime-state.sh` rehydrates the OpenClaw
+tool secrets and runtime catalog from that env file into the stable secrets and
+catalog paths outside the checkout. That keeps media-tool and Tavily
+credentials alive across rebuilds and branch changes.
 
 Ongoing-task env vars:
 

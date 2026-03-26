@@ -3,16 +3,29 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
-if [[ -f "$REPO_ROOT/.envrc" ]]; then
+VICUNA_SYSTEM_ENV_FILE="${VICUNA_SYSTEM_ENV_FILE:-/etc/vicuna/vicuna.env}"
+
+if [[ -r "$REPO_ROOT/.envrc" ]]; then
     # shellcheck disable=SC1091
     source "$REPO_ROOT/.envrc"
+fi
+
+if [[ -r "$VICUNA_SYSTEM_ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$VICUNA_SYSTEM_ENV_FILE"
+elif [[ -f "$VICUNA_SYSTEM_ENV_FILE" ]]; then
+    printf '[vicuna-runtime-env] warning: %s exists but is not readable\n' "$VICUNA_SYSTEM_ENV_FILE" >&2
 fi
 
 export PATH="/usr/local/cuda-12.8/bin:$PATH"
 export CUDACXX="${CUDACXX:-/usr/local/cuda-12.8/bin/nvcc}"
 export LD_LIBRARY_PATH="/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-}"
 
+export VICUNA_SYSTEM_ENV_FILE
 export VICUNA_DEEPSEEK_BASE_URL="${VICUNA_DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
 export VICUNA_DEEPSEEK_MODEL="${VICUNA_DEEPSEEK_MODEL:-deepseek-chat}"
 export VICUNA_DEEPSEEK_TIMEOUT_MS="${VICUNA_DEEPSEEK_TIMEOUT_MS:-60000}"
 export TELEGRAM_BRIDGE_MODEL="${TELEGRAM_BRIDGE_MODEL:-$VICUNA_DEEPSEEK_MODEL}"
+export VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH="${VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH:-/etc/vicuna/openclaw-tool-secrets.json}"
+export VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH="${VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH:-/var/lib/vicuna/openclaw-catalog.json}"
+export VICUNA_OPENCLAW_NODE_BIN="${VICUNA_OPENCLAW_NODE_BIN:-${TELEGRAM_BRIDGE_NODE_BIN:-}}"

@@ -1324,17 +1324,15 @@ static const staged_tool_method * staged_tool_find_method(
 
 static std::string build_staged_tool_core_system_prompt() {
     return
-            "You are Vicuña, a helpful personal concierge with access to tool families. "
-            "Choose deliberately, stay grounded in the conversation, and use tools when they let "
-            "you help the user more directly or safely.";
+            "You are Vicuña, a helpful personal concierge. Choose the next tool step that best helps the user.";
 }
 
 static std::string build_staged_family_selection_prompt(const staged_tool_catalog & catalog) {
     std::ostringstream out;
     out << "You are choosing one tool family.\n";
-    out << "Return exactly one JSON object with this shape: {\"family\":\"<exact family name>\"}.\n";
-    out << "Do not add any keys, markdown, or explanation.\n";
-    out << "Available families:\n";
+    out << "Respond promptly with exactly one non-empty JSON object and nothing else.\n";
+    out << "Use this shape: {\"family\":\"<exact family name>\"}.\n";
+    out << "Families:\n";
     for (const auto & family : catalog.families) {
         out << "- " << family.family_name << ": " << family.family_description << "\n";
     }
@@ -1346,13 +1344,14 @@ static std::string build_staged_method_selection_prompt(
         bool allow_completion) {
     std::ostringstream out;
     out << "You are choosing a method of the " << family.family_name << " tool family.\n";
-    out << "Return exactly one JSON object with this shape: {\"method\":\"<exact method name>\"}.\n";
-    out << "Allowed sentinels:\n";
+    out << "Respond promptly with exactly one non-empty JSON object and nothing else.\n";
+    out << "Use {\"method\":\"<exact method name>\"}.\n";
+    out << "Sentinels:\n";
     out << "- {\"method\":\"back\"} to go back to tool-family selection.\n";
     if (allow_completion) {
-        out << "- {\"method\":\"complete\"} if the active tool loop is finished and you should stop selecting tools.\n";
+        out << "- {\"method\":\"complete\"} if the active tool loop is finished.\n";
     }
-    out << "Available methods:\n";
+    out << "Methods:\n";
     for (const auto & method : family.methods) {
         out << "- " << method.method_name << ": " << method.method_description << "\n";
     }
@@ -1411,16 +1410,15 @@ static std::string build_staged_payload_prompt(
     std::ostringstream out;
     out << "You are constructing a payload for the " << method.method_name
         << " method of the " << family.family_name << " tool family.\n";
-    out << "Return exactly one JSON object.\n";
+    out << "Respond promptly with exactly one non-empty JSON object and nothing else.\n";
     out << "Use {\"action\":\"back\"} to go back to method selection.\n";
-    out << "Otherwise use {\"action\":\"submit\",\"payload\":{...}} with a payload that satisfies the typed contract.\n";
+    out << "Otherwise use {\"action\":\"submit\",\"payload\":{...}}.\n";
     if (!validation_error.empty()) {
         out << "Previous payload error: " << validation_error << "\n";
     }
-    out << "Method description: " << method.method_description << "\n";
-    out << "Typed contract:\n";
+    out << "Method: " << method.method_description << "\n";
+    out << "Contract:\n";
     append_staged_contract_lines(out, "payload", method.parameters);
-    out << "Return JSON only.\n";
     return out.str();
 }
 
@@ -1481,22 +1479,18 @@ static json build_staged_messages(
     json messages = json::array();
     messages.push_back({
         {"role", "system"},
-        {"content", build_staged_tool_core_system_prompt()},
+        {"content", build_staged_tool_core_system_prompt() + "\n" + stage_prompt},
     });
     if (original_messages.is_array()) {
         for (const auto & item : original_messages) {
             messages.push_back(item);
         }
     }
-    messages.push_back({
-        {"role", "system"},
-        {"content", stage_prompt},
-    });
     return messages;
 }
 
 static json build_staged_provider_body(const json & base_body, const json & messages) {
-    static constexpr int64_t staged_max_tokens = 256;
+    static constexpr int64_t staged_max_tokens = 768;
     json staged = base_body;
     staged.erase("tools");
     staged.erase("tool_choice");
@@ -1519,7 +1513,7 @@ static std::string build_staged_retry_prompt(
     std::ostringstream out;
     out << stage_prompt;
     out << "Previous response error: " << validation_error << "\n";
-    out << "Return exactly one non-empty JSON object with no prose, markdown, or code fences.\n";
+    out << "Respond promptly with exactly one non-empty JSON object and nothing else.\n";
     return out.str();
 }
 
@@ -3787,7 +3781,8 @@ static json inject_additive_runtime_guidance(
         const json & body,
         const server_emotive_turn_builder * builder,
         server_emotive_runtime * emotive_runtime,
-        bool enable_heuristic_guidance) {
+        bool enable_heuristic_guidance,
+        const runtime_request_trace_context * trace_context = nullptr) {
     if ((!builder || !builder->has_current_state()) && !emotive_runtime) {
         return body;
     }
@@ -3800,12 +3795,19 @@ static json inject_additive_runtime_guidance(
     const size_t insertion_index = span.valid ? span.last_tool_index + 1 : messages.size();
 
     std::string vad_guidance;
+    std::string vad_skip_reason;
     if (builder && builder->has_current_state() && span.valid) {
         const auto & assistant = messages.at(span.assistant_index);
         const std::string reasoning = json_value(assistant, "reasoning_content", std::string());
         if (!reasoning.empty()) {
             vad_guidance = format_interleaved_vad_guidance(builder->current_vad());
+        } else {
+            vad_skip_reason = "assistant_reasoning_missing";
         }
+    } else if (!builder || !builder->has_current_state()) {
+        vad_skip_reason = "builder_state_missing";
+    } else if (!span.valid) {
+        vad_skip_reason = "no_active_tool_continuation_span";
     }
 
     std::future<std::string> heuristic_guidance_future;
@@ -3836,6 +3838,29 @@ static json inject_additive_runtime_guidance(
     std::string heuristic_guidance;
     if (launched_heuristic_search) {
         heuristic_guidance = heuristic_guidance_future.get();
+    }
+    if (trace_context) {
+        json data = {
+            {"insertion_index", static_cast<int64_t>(insertion_index)},
+            {"span_valid", span.valid},
+            {"builder_has_state", builder && builder->has_current_state()},
+            {"heuristic_search_launched", launched_heuristic_search},
+            {"vad_guidance", vad_guidance.empty() ? json(nullptr) : json(vad_guidance)},
+            {"heuristic_guidance", heuristic_guidance.empty() ? json(nullptr) : json(heuristic_guidance)},
+            {"vad_injected", !vad_guidance.empty()},
+            {"heuristic_injected", !heuristic_guidance.empty()},
+            {"vad_skip_reason", vad_skip_reason.empty() ? json(nullptr) : json(vad_skip_reason)},
+        };
+        if (builder && builder->has_current_state()) {
+            const server_emotive_vad current_vad = builder->current_vad();
+            data["current_vad"] = {
+                {"valence", current_vad.valence},
+                {"arousal", current_vad.arousal},
+                {"dominance", current_vad.dominance},
+                {"tone_label", current_vad.style_guide.tone_label},
+            };
+        }
+        runtime_request_trace_log(*trace_context, "runtime_guidance", "guidance_evaluated", std::move(data));
     }
     if (heuristic_guidance.empty() && vad_guidance.empty()) {
         return body;
@@ -3915,7 +3940,8 @@ static bool execute_deepseek_chat_with_emotive(
             body,
             turn_builder.get(),
             &emotive_runtime,
-            enable_heuristic_guidance && !cognitive_replay);
+            enable_heuristic_guidance && !cognitive_replay,
+            trace_context);
     deepseek_request_trace provider_trace;
     if (trace_context) {
         provider_trace.request_id = trace_context->request_id;

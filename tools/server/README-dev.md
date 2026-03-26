@@ -66,7 +66,7 @@ Interleaved-thinking policy:
 - preserve `reasoning_content` exactly while adding any VAD or heuristic guidance messages
 - default DeepSeek provider requests to `deepseek-chat` with `thinking={"type":"enabled"}`
 - pass through DeepSeek's top-level `thinking` field unchanged when callers provide it
-- force every outbound DeepSeek request, including staged and background turns, to use `max_tokens: 256`
+- force every outbound DeepSeek request, including staged and background turns, to use `max_tokens: 768`
 - force every outbound DeepSeek request, including staged and background turns, to use `temperature: 0.2`
 - ignore caller-supplied `max_tokens`, `max_completion_tokens`, and `max_output_tokens` values that differ from the fixed runtime cap
 - reuse one configured `cpp-httplib` client per DeepSeek authority and expose
@@ -76,12 +76,18 @@ Interleaved-thinking policy:
   execution, Telegram delivery, and background replay/task flows
 - inspect request-trace summary counters at `/health -> request_traces`
 - inspect retained request-trace events at `GET /v1/debug/request-traces`
+- retain exact `reasoning_content` and visible `content` strings on completed
+  provider events so failed staged turns can be inspected verbatim
+- emit an explicit `runtime_guidance/guidance_evaluated` trace event that
+  records injected VAD/heuristic guidance text or the skip reason
 
 Staged tool-loop policy:
 
 - intercept OpenAI-compatible requests that include `tools` and auto tool choice
 - normalize those flat tools into family, method, and typed-contract layers
 - ask the provider for one JSON family choice, then one JSON method choice, then one JSON payload
+- keep selector prompts minimal and require: "Respond promptly with exactly one non-empty JSON object and nothing else."
+- collapse the staged core prompt and stage-specific instructions into one system message
 - allow `back` from method and payload stages and `complete` from method selection
 - after payload validation, emit one normal OpenAI tool call back to the caller
 - when `complete` is chosen, run one final direct-response turn without tools
@@ -102,6 +108,12 @@ Staged tool-loop policy:
 - cache the retained bridge-scoped Telegram runtime tool catalog and the
   derived staged prompt bundle in memory; inspect both counters at
   `/health -> bridge_runtime`
+- source one durable host env file from `VICUNA_SYSTEM_ENV_FILE` or
+  `/etc/vicuna/vicuna.env` before startup
+- rehydrate stable OpenClaw secrets and runtime-catalog files outside the
+  checkout with `tools/ops/sync-openclaw-runtime-state.sh`
+- keep Radarr, Sonarr, Chaptarr, Tavily, and Supermemory configuration in that
+  host env path instead of repo-local `.envrc` only
 
 Cognitive replay policy:
 

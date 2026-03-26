@@ -178,7 +178,7 @@ static json deepseek_build_provider_messages(const json & body) {
     return messages;
 }
 
-static constexpr int64_t VICUNA_OUTBOUND_MAX_TOKENS = 256;
+static constexpr int64_t VICUNA_OUTBOUND_MAX_TOKENS = 768;
 static constexpr double VICUNA_OUTBOUND_TEMPERATURE = 0.2;
 
 struct deepseek_shared_client_state {
@@ -374,6 +374,22 @@ static json deepseek_message_json(const deepseek_chat_result & result) {
         message["tool_calls"] = std::move(tool_calls);
     }
     return message;
+}
+
+static json deepseek_collect_system_messages(const json & provider_body) {
+    json system_messages = json::array();
+    if (!provider_body.contains("messages") || !provider_body.at("messages").is_array()) {
+        return system_messages;
+    }
+    for (const auto & item : provider_body.at("messages")) {
+        if (!item.is_object() || json_value(item, "role", std::string()) != "system") {
+            continue;
+        }
+        if (item.contains("content")) {
+            system_messages.push_back(item.at("content"));
+        }
+    }
+    return system_messages;
 }
 
 static void deepseek_apply_usage(const json & response_body, deepseek_chat_result * out_result) {
@@ -674,6 +690,7 @@ bool deepseek_complete_chat(
         {"temperature", json_value(provider_body, "temperature", 0.0)},
         {"thinking", provider_body.contains("thinking") ? provider_body.at("thinking") : json(nullptr)},
         {"response_format", provider_body.contains("response_format") ? provider_body.at("response_format") : json(nullptr)},
+        {"system_messages", deepseek_collect_system_messages(provider_body)},
         {"endpoint", server_http_show_masked_url(server_http_parse_url(deepseek_chat_completions_url(config)))},
     });
 
@@ -904,6 +921,8 @@ bool deepseek_complete_chat(
             {"tool_call_count", static_cast<int64_t>(out_result->tool_calls.size())},
             {"reasoning_chars", static_cast<int64_t>(out_result->reasoning_content.size())},
             {"content_chars", static_cast<int64_t>(out_result->content.size())},
+            {"reasoning_content", out_result->reasoning_content},
+            {"content", out_result->content},
             {"saw_stream_event", saw_stream_event},
         });
         return true;

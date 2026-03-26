@@ -7,7 +7,9 @@ Current scope:
 
 - typed capability descriptors for the current provider-only tool surface
 - external runtime-catalog emission for OpenClaw-managed tools
-- file-backed OpenClaw tool secrets under `.cache/vicuna`
+- file-backed OpenClaw tool secrets under `.cache/vicuna` by default, or a
+  stable host path such as `/etc/vicuna/openclaw-tool-secrets.json` when
+  `VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH` is set
 - Tavily-backed `web_search` wrapper command
 - Radarr-backed `radarr` wrapper command for movie-library inspection and explicit download-start flows
 - Sonarr-backed `sonarr` wrapper command for series-library inspection and explicit download-start flows
@@ -64,6 +66,10 @@ Runtime catalog loading is explicit:
 When a persisted runtime catalog file exists, it is authoritative for live
 turns. This allows operators to expose a richer installed tool set than the
 repo-default narrowed fallback catalog without changing the bridge contract.
+For host deployments, pair that with a stable catalog path such as
+`/var/lib/vicuna/openclaw-catalog.json` via
+`VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH` so rebuilds and branch switches do
+not discard tool availability.
 
 For provider-backed execution, that contract primarily reaches the model as
 chat-tool JSON schema plus the staged family/method/contract surfaces used by
