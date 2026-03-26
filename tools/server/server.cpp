@@ -1792,16 +1792,7 @@ static json build_staged_provider_body(
     json staged = base_body;
     staged["parallel_tool_calls"] = false;
     staged["tools"] = tools;
-    if (tools.is_array() && tools.size() == 1 && tools.at(0).is_object() && tools.at(0).contains("function")) {
-        staged["tool_choice"] = {
-            {"type", "function"},
-            {"function", {
-                {"name", json_value(tools.at(0).at("function"), "name", std::string())},
-            }},
-        };
-    } else {
-        staged["tool_choice"] = "required";
-    }
+    staged.erase("tool_choice");
     staged["messages"] = messages;
     staged["stream"] = false;
     staged["max_tokens"] = staged_max_tokens;

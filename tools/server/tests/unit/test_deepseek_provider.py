@@ -669,7 +669,7 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
             payload_request = provider_requests[2]["body"]
 
             assert family_request["tools"][0]["function"]["name"] == "select_family"
-            assert family_request["tool_choice"]["function"]["name"] == "select_family"
+            assert "tool_choice" not in family_request
             assert family_request["max_tokens"] == 768
             assert family_request["thinking"] == {"type": "enabled"}
             assert "response_format" not in family_request
@@ -707,7 +707,7 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
             assert payload_request["max_tokens"] == 768
             assert payload_request["thinking"] == {"type": "enabled"}
             assert "response_format" not in payload_request
-            assert payload_request["tool_choice"] == "required"
+            assert "tool_choice" not in payload_request
             assert payload_request["messages"][0]["role"] == "system"
             assert "stage: construct a payload for the selected method" in payload_request["messages"][1]["content"].lower()
             assert any(
