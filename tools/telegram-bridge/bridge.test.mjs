@@ -7,14 +7,13 @@ import path from 'node:path';
 import {
   appendProactiveId,
   appendChatTranscriptMessage,
+  buildTelegramChatCompletionRequest,
   bootstrapTelegramOutboxOffset,
   buildTelegramDocumentDescriptor,
   buildTelegramDocumentLinkage,
   buildTelegramParsedChunkMemories,
   buildChatCompletionToolResultMessage,
   buildTelegramFileUrl,
-  buildTelegramRelayTool,
-  buildTelegramRelaySystemPrompt,
   createTelegramConversation,
   detectTelegramDocumentLogicalType,
   extractAssistantToolReplayMessage,
@@ -34,7 +33,6 @@ import {
   normalizeDoclingParsedDocument,
   normalizeDocumentPlainText,
   normalizeTelegramOutboxItem,
-  parseChatCompletionToolArguments,
   normalizeState,
   parseSseChunk,
   recordTelegramOutboxDeliveryReceipt,
@@ -47,7 +45,6 @@ import {
   setTelegramOutboxCheckpoint,
   shouldBootstrapTelegramOutboxOffset,
   splitSseBuffer,
-  runChatCompletionToolLoop,
   summarizeChatCompletion,
   updateTelegramOffset,
 } from './lib.mjs';
@@ -165,7 +162,7 @@ test('tool-call extraction and assistant replay preserve reasoning_content exact
   });
 });
 
-test('parseChatCompletionToolArguments decodes JSON objects and tool results serialize as tool messages', () => {
+test('buildChatCompletionToolResultMessage serializes tool observations as tool messages', () => {
   const toolCall = {
     id: 'call_1',
     type: 'function',
@@ -175,10 +172,6 @@ test('parseChatCompletionToolArguments decodes JSON objects and tool results ser
     },
   };
 
-  assert.deepEqual(parseChatCompletionToolArguments(toolCall), {
-    term: 'Arrival',
-    monitored: true,
-  });
   assert.deepEqual(buildChatCompletionToolResultMessage(toolCall, {
     ok: true,
     movie: 'Arrival',
@@ -190,74 +183,26 @@ test('parseChatCompletionToolArguments decodes JSON objects and tool results ser
   });
 });
 
-test('runChatCompletionToolLoop continues through direct runtime tool execution until final reply', async () => {
-  const requestBodies = [];
-  const invokedToolCalls = [];
-  const result = await runChatCompletionToolLoop({
-    initialMessages: [
-      { role: 'system', content: 'You are Vicuña.' },
-      { role: 'user', content: 'Check Radarr for Arrival.' },
-    ],
-    requestCompletion: async (messages, round) => {
-      requestBodies.push({ round, messages: structuredClone(messages) });
-      if (round === 0) {
-        return {
-          choices: [
-            {
-              finish_reason: 'tool_calls',
-              message: {
-                role: 'assistant',
-                content: '',
-                reasoning_content: 'Radarr is available on this turn, so I should inspect it.',
-                tool_calls: [
-                  {
-                    id: 'call_1',
-                    type: 'function',
-                    function: {
-                      name: 'radarr_list_downloaded_movies',
-                      arguments: '{}',
-                    },
-                  },
-                ],
-              },
-            },
-          ],
-        };
-      }
-      return {
-        choices: [
-          {
-            finish_reason: 'stop',
-            message: {
-              role: 'assistant',
-              content: 'Arrival is available in Radarr.',
-              reasoning_content: 'I can answer directly now.',
-            },
-          },
-        ],
-      };
-    },
-    invokeToolCall: async (toolCall) => {
-      invokedToolCalls.push(toolCall.function.name);
-      return {
-        ok: true,
-        movies: [{ title: 'Arrival' }],
-      };
-    },
+test('buildTelegramChatCompletionRequest forwards only the carried transcript and token cap', () => {
+  const transcript = [
+    { role: 'user', content: 'Earlier user turn.' },
+    { role: 'assistant', content: 'Earlier assistant turn.' },
+    { role: 'user', content: 'Check Radarr please.' },
+  ];
+
+  const payload = buildTelegramChatCompletionRequest({
+    model: 'deepseek-reasoner',
+    transcript,
+    maxTokens: 1024,
   });
 
-  assert.equal(result.kind, 'final');
-  assert.equal(invokedToolCalls.length, 1);
-  assert.deepEqual(invokedToolCalls, ['radarr_list_downloaded_movies']);
-  assert.equal(requestBodies.length, 2);
-  assert.equal(requestBodies[1].messages[2].reasoning_content, 'Radarr is available on this turn, so I should inspect it.');
-  assert.deepEqual(requestBodies[1].messages[3], {
-    role: 'tool',
-    tool_call_id: 'call_1',
-    name: 'radarr_list_downloaded_movies',
-    content: '{"ok":true,"movies":[{"title":"Arrival"}]}',
+  assert.deepEqual(payload, {
+    model: 'deepseek-reasoner',
+    temperature: 0.2,
+    messages: transcript,
+    max_tokens: 1024,
   });
-  assert.equal(extractChatCompletionText(result.body), 'Arrival is available in Radarr.');
+  assert.equal('tools' in payload, false);
 });
 
 test('summarizeChatCompletion reports non-text completion shape', () => {
@@ -382,33 +327,6 @@ test('buildTelegramFileUrl creates telegram file endpoint', () => {
     buildTelegramFileUrl('token123', '/documents/file.pdf'),
     'https://api.telegram.org/file/bottoken123/documents/file.pdf',
   );
-});
-
-test('buildTelegramRelaySystemPrompt prefers exposed media tools over stale refusals', () => {
-  const prompt = buildTelegramRelaySystemPrompt();
-
-  assert.match(prompt, /Maintain continuity from the runtime-managed Telegram dialogue state and the current user turn\./);
-  assert.match(prompt, /Sonarr, Radarr, Chaptarr, or another relevant live tool/);
-  assert.match(prompt, /use the relevant tool instead of claiming you lack access/i);
-  assert.match(prompt, /cannot interact with external systems/i);
-  assert.match(prompt, /treat that as stale and use the currently available tool on this turn/i);
-  assert.match(prompt, /Deliver user-visible Telegram replies through telegram_relay instead of plain assistant text\./);
-  assert.match(prompt, /For simple responses, call telegram_relay with text\./);
-  assert.match(prompt, /send request=\{method,payload\}/i);
-  assert.match(prompt, /prefer sendMessage plus parse_mode and reply_markup/i);
-});
-
-test('buildTelegramRelayTool exposes staged Telegram metadata and typed contract', () => {
-  const tool = buildTelegramRelayTool('7502424413', 91);
-
-  assert.equal(tool.type, 'function');
-  assert.equal(tool.function.name, 'telegram_relay');
-  assert.equal(tool.function['x-vicuna-family-id'], 'telegram');
-  assert.equal(tool.function['x-vicuna-method-name'], 'relay');
-  assert.equal(tool.function.parameters.anyOf.length, 2);
-  assert.equal(tool.function.parameters.properties.chat_scope.description.includes('"7502424413"'), true);
-  assert.equal(tool.function.parameters.properties.reply_to_message_id.description.includes('91'), true);
-  assert.match(String(tool.function.parameters.properties.request.description ?? ''), /Allowed methods:/);
 });
 
 test('hasQueuedTelegramDelivery detects runtime-owned Telegram delivery metadata', () => {

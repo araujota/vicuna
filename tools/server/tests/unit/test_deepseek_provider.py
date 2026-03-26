@@ -1262,8 +1262,62 @@ def test_provider_mode_keeps_bridge_compatibility_endpoints():
 
 def test_provider_mode_normalizes_plain_text_bridge_completion_into_telegram_outbox():
     global server
-    with run_mock_deepseek() as (base_url, _):
-        server = make_provider_server(base_url)
+
+    def staged_complete_response(payload):
+        stage_prompt = payload["messages"][-1]["content"].lower()
+        if "choosing one tool family" in stage_prompt:
+            return {
+                "id": "bridge-family-telegram",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"family": "Telegram"}),
+                        "reasoning_content": "Reply on Telegram.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "choosing a method of the telegram" in stage_prompt:
+            return {
+                "id": "bridge-method-complete",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"method": "complete"}),
+                        "reasoning_content": "I can answer directly.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        return {
+            "id": "bridge-final-answer",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello from DeepSeek.",
+                    "reasoning_content": "I should greet the user and keep the reply brief.",
+                },
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 11,
+                "total_tokens": 16,
+            },
+        }
+
+    with run_mock_deepseek(staged_complete_response) as (base_url, _):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": "[]",
+        })
         server.api_surface = "openai"
         try:
             server.start()
@@ -1316,19 +1370,89 @@ def test_provider_mode_normalizes_plain_text_bridge_completion_into_telegram_out
 def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
     global server
 
+    runtime_tools = [{
+        "type": "function",
+        "function": {
+            "name": "radarr_list_downloaded_movies",
+            "description": "List only the movies that are already fully downloaded in Radarr.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "description": "List only the movies that are already fully downloaded in Radarr.",
+            },
+            "x-vicuna-family-id": "radarr",
+            "x-vicuna-family-name": "Radarr",
+            "x-vicuna-family-description": "Inspect and manage the Radarr movie library on the media server.",
+            "x-vicuna-method-name": "list_downloaded_movies",
+            "x-vicuna-method-description": "List the movies already fully downloaded in Radarr.",
+        },
+    }]
+
     def staged_telegram_response(payload):
         stage_prompt = payload["messages"][-1]["content"].lower()
+        saw_runtime_observation = any(
+            message.get("role") == "tool" and "downloaded_movie_count" in str(message.get("content", ""))
+            for message in payload["messages"]
+        )
         if "choosing one tool family" in stage_prompt:
+            if saw_runtime_observation:
+                return {
+                    "id": "stage-family-telegram",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps({"family": "Telegram"}),
+                            "reasoning_content": "Now that I have the Radarr result, I should reply on Telegram.",
+                        },
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+                }
             return {
-                "id": "stage-family-telegram",
+                "id": "stage-family-radarr",
                 "object": "chat.completion",
                 "choices": [{
                     "index": 0,
                     "finish_reason": "stop",
                     "message": {
                         "role": "assistant",
-                        "content": json.dumps({"family": "Telegram"}),
-                        "reasoning_content": "Use telegram.",
+                        "content": json.dumps({"family": "Radarr"}),
+                        "reasoning_content": "Inspect Radarr first.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "choosing a method of the radarr" in stage_prompt:
+            return {
+                "id": "stage-method-radarr",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"method": "list_downloaded_movies"}),
+                        "reasoning_content": "List the downloaded movies.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "constructing a payload for the list_downloaded_movies method of the radarr tool family" in stage_prompt:
+            return {
+                "id": "stage-payload-radarr",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({
+                            "action": "submit",
+                            "payload": {},
+                        }),
+                        "reasoning_content": "Submit the empty Radarr payload.",
                     },
                 }],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
@@ -1379,7 +1503,16 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
         raise AssertionError(f"unexpected staged prompt: {payload['messages'][-1]['content']}")
 
     with run_mock_deepseek(staged_telegram_response) as (base_url, state):
-        server = make_provider_server(base_url)
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": json.dumps(runtime_tools),
+            "VICUNA_TELEGRAM_RUNTIME_TOOL_OBSERVATIONS_JSON": json.dumps({
+                "radarr_list_downloaded_movies": {
+                    "ok": True,
+                    "downloaded_movie_count": 51,
+                    "movies": [{"title": "Arrival"}],
+                },
+            }),
+        })
         server.api_surface = "openai"
         try:
             server.start()
@@ -1389,55 +1522,6 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
                 "messages": [
                     {"role": "user", "content": "Reply through Telegram."},
                 ],
-                "tools": [{
-                    "type": "function",
-                    "function": {
-                        "name": "telegram_relay",
-                        "description": "Queue one Telegram follow-up message through the provider-only bridge outbox.",
-                        "parameters": {
-                            "type": "object",
-                            "description": "The Telegram relay payload.",
-                            "anyOf": [
-                                {"required": ["text"]},
-                                {"required": ["request"]},
-                            ],
-                            "properties": {
-                                "text": {
-                                    "type": "string",
-                                    "description": "Optional simple plain-text Telegram reply.",
-                                },
-                                "request": {
-                                    "type": "object",
-                                    "description": "Optional structured Telegram Bot API send request.",
-                                    "required": ["method", "payload"],
-                                    "properties": {
-                                        "method": {
-                                            "type": "string",
-                                            "description": "Allowed outbound Telegram method.",
-                                        },
-                                        "payload": {
-                                            "type": "object",
-                                            "description": "Telegram Bot API payload for the selected method.",
-                                        },
-                                    },
-                                },
-                                "chat_scope": {
-                                    "type": "string",
-                                    "description": "The Telegram chat scope to route the follow-up into.",
-                                },
-                                "reply_to_message_id": {
-                                    "type": "integer",
-                                    "description": "Optional Telegram message id to use as the reply anchor.",
-                                },
-                            },
-                        },
-                        "x-vicuna-family-id": "telegram",
-                        "x-vicuna-family-name": "Telegram",
-                        "x-vicuna-family-description": "Send direct user-facing follow-up messages through the Telegram bridge outbox.",
-                        "x-vicuna-method-name": "relay",
-                        "x-vicuna-method-description": "Queue one Telegram follow-up message as plain text or a structured Bot API send request.",
-                    },
-                }],
                 "stream": False,
             }, headers={
                 "X-Vicuna-Telegram-Chat-Id": "12345",
@@ -1460,7 +1544,18 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
                 "source": "tool_call",
             }
 
-            assert len(state["requests"]) == 3
+            assert len(state["requests"]) == 6
+            first_request = state["requests"][0]["body"]
+            follow_up_family_request = state["requests"][3]["body"]
+            assert first_request["messages"][0]["role"] == "system"
+            assert "helpful personal concierge with access to tool families" in first_request["messages"][0]["content"]
+            assert "replying to a Telegram user through the retained transport bridge" in first_request["messages"][1]["content"]
+            assert "Available families:" in first_request["messages"][-1]["content"]
+            assert "Radarr: Inspect and manage the Radarr movie library on the media server." in first_request["messages"][-1]["content"]
+            assert "Telegram: Send direct user-facing follow-up messages through the Telegram bridge outbox." in first_request["messages"][-1]["content"]
+            assert follow_up_family_request["messages"][3]["tool_calls"][0]["function"]["name"] == "radarr_list_downloaded_movies"
+            assert "downloaded_movie_count" in follow_up_family_request["messages"][4]["content"]
+
             outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
             assert outbox.status_code == 200
             assert outbox.body["items"] == [{
@@ -1480,63 +1575,13 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
             server.stop()
 
 
-def test_provider_mode_allows_bridge_requests_to_receive_non_telegram_tool_calls():
+def test_provider_mode_bridge_request_fails_explicitly_when_runtime_catalog_is_unavailable():
     global server
 
-    def staged_radarr_response(payload):
-        stage_prompt = payload["messages"][-1]["content"].lower()
-        if "choosing one tool family" in stage_prompt:
-            return {
-                "id": "stage-family-radarr",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"family": "Radarr"}),
-                        "reasoning_content": "Use Radarr.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "choosing a method of the radarr" in stage_prompt:
-            return {
-                "id": "stage-method-radarr",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"method": "list_downloaded_movies"}),
-                        "reasoning_content": "Inspect the downloaded movie list.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "constructing a payload for the list_downloaded_movies method of the radarr tool family" in stage_prompt:
-            return {
-                "id": "stage-payload-radarr",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({
-                            "action": "submit",
-                            "payload": {},
-                        }),
-                        "reasoning_content": "Submit the empty payload.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        raise AssertionError(f"unexpected staged prompt: {payload['messages'][-1]['content']}")
-
-    with run_mock_deepseek(staged_radarr_response) as (base_url, state):
-        server = make_provider_server(base_url)
+    with run_mock_deepseek() as (base_url, state):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_OPENCLAW_ENTRY_PATH": "/definitely/missing/openclaw-index.js",
+        })
         server.api_surface = "openai"
         try:
             server.start()
@@ -1546,23 +1591,6 @@ def test_provider_mode_allows_bridge_requests_to_receive_non_telegram_tool_calls
                 "messages": [
                     {"role": "user", "content": "What movies do we have in Radarr?"},
                 ],
-                "tools": [{
-                    "type": "function",
-                    "function": {
-                        "name": "radarr_list_downloaded_movies",
-                        "description": "List only the movies that are already fully downloaded in Radarr.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {},
-                            "description": "List only the movies that are already fully downloaded in Radarr.",
-                        },
-                        "x-vicuna-family-id": "radarr",
-                        "x-vicuna-family-name": "Radarr",
-                        "x-vicuna-family-description": "Inspect and manage the Radarr movie library on the media server.",
-                        "x-vicuna-method-name": "list_downloaded_movies",
-                        "x-vicuna-method-description": "List the movies already fully downloaded in Radarr.",
-                    },
-                }],
                 "stream": False,
             }, headers={
                 "X-Vicuna-Telegram-Chat-Id": "12345",
@@ -1570,25 +1598,92 @@ def test_provider_mode_allows_bridge_requests_to_receive_non_telegram_tool_calls
                 "X-Vicuna-Telegram-Conversation-Id": "tc3",
             })
 
-            assert response.status_code == 200
-            choice = response.body["choices"][0]
-            assert choice["finish_reason"] == "tool_calls"
-            assert choice["message"]["content"] is None
-            assert choice["message"]["reasoning_content"] == "Submit the empty payload."
-            assert choice["message"]["tool_calls"] == [{
-                "id": choice["message"]["tool_calls"][0]["id"],
-                "type": "function",
-                "function": {
-                    "name": "radarr_list_downloaded_movies",
-                    "arguments": "{}",
-                },
-            }]
-            assert "vicuna_telegram_delivery" not in response.body
-            assert len(state["requests"]) == 3
+            assert response.status_code == 500
+            assert "unable to load Telegram runtime tool catalog" in response.body["error"]["message"]
+            assert state["requests"] == []
+        finally:
+            server.stop()
 
-            outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
-            assert outbox.status_code == 200
-            assert outbox.body["items"] == []
+
+def test_provider_mode_retries_invalid_bridge_scoped_family_selection_once():
+    global server
+    family_attempts = {"count": 0}
+
+    def staged_response(payload):
+        stage_prompt = payload["messages"][-1]["content"]
+        if "choosing one tool family" in stage_prompt.lower():
+            family_attempts["count"] += 1
+            content = "{}" if family_attempts["count"] == 1 else json.dumps({"family": "Telegram"})
+            return {
+                "id": f"bridge-retry-family-{family_attempts['count']}",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": content,
+                        "reasoning_content": "Choose Telegram once the family JSON is valid.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "choosing a method of the telegram" in stage_prompt.lower():
+            return {
+                "id": "bridge-retry-method",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"method": "complete"}),
+                        "reasoning_content": "Answer directly now.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        return {
+            "id": "bridge-retry-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Done.",
+                    "reasoning_content": "A direct answer is sufficient.",
+                },
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+        }
+
+    with run_mock_deepseek(staged_response) as (base_url, state):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": "[]",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-reasoner",
+                "messages": [
+                    {"role": "user", "content": "Reply on Telegram."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "101",
+                "X-Vicuna-Telegram-Conversation-Id": "tc4",
+            })
+
+            assert response.status_code == 200
+            assert response.body["vicuna_telegram_delivery"]["source"] == "compat_plain_text"
+            assert len(state["requests"]) == 4
+            assert "Previous response error:" not in state["requests"][0]["body"]["messages"][-1]["content"]
+            assert "Previous response error:" in state["requests"][1]["body"]["messages"][-1]["content"]
+            assert "did not include family" in state["requests"][1]["body"]["messages"][-1]["content"]
         finally:
             server.stop()
 

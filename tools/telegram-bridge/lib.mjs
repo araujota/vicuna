@@ -39,78 +39,17 @@ export const TELEGRAM_RELAY_ALLOWED_METHODS = [
   'sendDice',
 ];
 
-export function buildTelegramRelaySystemPrompt() {
-  return 'You are replying to a Telegram user through middleware. Keep responses clear and concise unless the user asks for depth. Maintain continuity from the runtime-managed Telegram dialogue state and the current user turn. When the user explicitly asks to search the web or needs fresh current information, prefer the web search tool if the runtime makes it available. Use direct command-execution tools only when appropriate instead of pretending a command ran. If the runtime exposes Sonarr, Radarr, Chaptarr, or another relevant live tool for this turn, use the relevant tool instead of claiming you lack access or cannot interact with external systems. If earlier dialogue said you could not access those systems, treat that as stale and use the currently available tool on this turn. Deliver user-visible Telegram replies through telegram_relay instead of plain assistant text. For simple responses, call telegram_relay with text. For richer Telegram-native output, send request={method,payload}, prefer sendMessage plus parse_mode and reply_markup for most rich text/button replies, and prefer parse_mode over raw Telegram entity offsets unless you intentionally provide valid UTF-16-based entities.';
-}
-
-export function buildTelegramRelayTool(chatScope, replyToMessageId = 0) {
-  const normalizedChatScope = String(chatScope ?? '').trim();
-  const normalizedReplyToMessageId = Math.max(0, Number(replyToMessageId ?? 0) || 0);
-  return {
-    type: 'function',
-    function: {
-      name: 'telegram_relay',
-      description: 'Queue one Telegram follow-up message through the provider-only bridge outbox.',
-      parameters: {
-        type: 'object',
-        description: 'The Telegram relay payload. Use text for simple replies or request={method,payload} for structured Telegram-native output.',
-        anyOf: [
-          { required: ['text'] },
-          { required: ['request'] },
-        ],
-        properties: {
-          text: {
-            type: 'string',
-            description: 'Optional simple plain-text Telegram reply.',
-          },
-          request: {
-            type: 'object',
-            description: `Optional structured Telegram Bot API send request. Allowed methods: ${TELEGRAM_RELAY_ALLOWED_METHODS.join(', ')}. Do not include chat_id; the relay fills routing.`,
-            required: ['method', 'payload'],
-            properties: {
-              method: {
-                type: 'string',
-                description: `Allowed outbound Telegram method, such as ${TELEGRAM_RELAY_ALLOWED_METHODS.join(', ')}.`,
-              },
-              payload: {
-                type: 'object',
-                description: 'Telegram Bot API payload for the selected method. Prefer sendMessage plus parse_mode, link_preview_options, and reply_markup for most rich text and button replies.',
-              },
-            },
-          },
-          chat_scope: {
-            type: 'string',
-            description: `The Telegram chat scope to route the follow-up into. Use ${JSON.stringify(normalizedChatScope)} for this turn.`,
-          },
-          reply_to_message_id: {
-            type: 'integer',
-            minimum: 1,
-            description: normalizedReplyToMessageId > 0
-              ? `Optional Telegram message id to use as the reply anchor. Use ${normalizedReplyToMessageId} to reply to the current user turn.`
-              : 'Optional Telegram message id to use as the reply anchor.',
-          },
-          intent: {
-            type: 'string',
-            description: 'Optional intent label that classifies the follow-up, such as question or conclusion.',
-          },
-          dedupe_key: {
-            type: 'string',
-            description: 'Optional dedupe key used to suppress duplicate queued follow-ups for the same chat.',
-          },
-          urgency: {
-            type: 'number',
-            minimum: 0,
-            description: 'Optional normalized urgency score for the queued follow-up.',
-          },
-        },
-      },
-      'x-vicuna-family-id': 'telegram',
-      'x-vicuna-family-name': 'Telegram',
-      'x-vicuna-family-description': 'Send direct user-facing follow-up messages through the Telegram bridge outbox.',
-      'x-vicuna-method-name': 'relay',
-      'x-vicuna-method-description': 'Queue one Telegram follow-up message as plain text or a structured Bot API send request.',
-    },
+export function buildTelegramChatCompletionRequest({ model, transcript, maxTokens = -1, temperature = 0.2 }) {
+  const messages = Array.isArray(transcript) ? structuredClone(transcript) : [];
+  const payload = {
+    model: String(model ?? '').trim(),
+    temperature,
+    messages,
   };
+  if (maxTokens >= 0) {
+    payload.max_tokens = Math.max(32, Number(maxTokens) || 32);
+  }
+  return payload;
 }
 
 export function hasQueuedTelegramDelivery(body) {
@@ -1461,24 +1400,6 @@ export function extractAssistantToolReplayMessage(body) {
   return replay;
 }
 
-export function parseChatCompletionToolArguments(toolCall) {
-  const rawArguments = toolCall?.function?.arguments;
-  if (rawArguments === undefined || rawArguments === null || rawArguments === '') {
-    return {};
-  }
-  if (typeof rawArguments === 'object' && !Array.isArray(rawArguments)) {
-    return cloneJsonValue(rawArguments);
-  }
-  if (typeof rawArguments !== 'string') {
-    throw new Error(`tool call ${String(toolCall?.function?.name ?? 'unknown')} returned non-string arguments`);
-  }
-  const parsed = JSON.parse(rawArguments);
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(`tool call ${String(toolCall?.function?.name ?? 'unknown')} arguments must decode to a JSON object`);
-  }
-  return parsed;
-}
-
 export function stringifyToolObservation(observation) {
   if (typeof observation === 'string') {
     return observation;
@@ -1493,60 +1414,6 @@ export function buildChatCompletionToolResultMessage(toolCall, observation) {
     name: String(toolCall?.function?.name ?? ''),
     content: stringifyToolObservation(observation),
   };
-}
-
-export async function runChatCompletionToolLoop(options = {}) {
-  const initialMessages = Array.isArray(options.initialMessages) ? cloneJsonValue(options.initialMessages) : [];
-  const requestCompletion = options.requestCompletion;
-  const invokeToolCall = options.invokeToolCall;
-  const maxRounds = Math.max(1, parseInteger(options.maxRounds, 8));
-
-  if (typeof requestCompletion !== 'function') {
-    throw new Error('runChatCompletionToolLoop requires requestCompletion');
-  }
-  if (typeof invokeToolCall !== 'function') {
-    throw new Error('runChatCompletionToolLoop requires invokeToolCall');
-  }
-
-  const messages = initialMessages;
-  let body = null;
-  for (let round = 0; round < maxRounds; round += 1) {
-    body = await requestCompletion(messages, round);
-    if (hasQueuedTelegramDelivery(body)) {
-      return {
-        kind: 'delivery',
-        body,
-        messages,
-        rounds: round + 1,
-      };
-    }
-
-    const toolCalls = extractChatCompletionToolCalls(body);
-    if (toolCalls.length === 0) {
-      return {
-        kind: 'final',
-        body,
-        messages,
-        rounds: round + 1,
-      };
-    }
-
-    const assistantReplay = extractAssistantToolReplayMessage(body);
-    if (assistantReplay) {
-      messages.push(assistantReplay);
-    }
-
-    for (const toolCall of toolCalls) {
-      const observation = await invokeToolCall(toolCall, {
-        round,
-        messages,
-        toolCalls,
-      });
-      messages.push(buildChatCompletionToolResultMessage(toolCall, observation));
-    }
-  }
-
-  throw new Error(`exceeded Telegram bridge tool continuation limit (${maxRounds})`);
 }
 
 export function summarizeChatCompletion(body) {

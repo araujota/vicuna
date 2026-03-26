@@ -51,6 +51,10 @@ Telegram outbox policy:
   and suppresses outward tool calls so the bridge only delivers from outbox
 - bridge-scoped plain assistant text is normalized into a `sendMessage` outbox
   item as a compatibility backstop instead of being allowed to drop
+- bridge-scoped Telegram requests also own their runtime context inside the
+  server: the server injects Telegram guidance, loads the runtime tool catalog,
+  appends `telegram_relay`, executes selected runtime tools, and continues the
+  staged loop itself until final delivery or a direct final answer
 
 Interleaved-thinking policy:
 
@@ -80,10 +84,11 @@ Staged tool-loop policy:
   - `x-vicuna-method-description`
 - require typed field descriptions throughout the method contract so payload prompts stay inspectable
 - expect live callers to inject the authoritative direct tool definitions for
-  that turn; do not reintroduce a second hidden live-tool catalog inside the
-  server
-- the Telegram bridge now follows that rule by injecting the full installed
-  OpenClaw runtime catalog directly and executing returned tool calls itself
+  that turn unless the request is the retained bridge-scoped Telegram surface
+- do not reintroduce bridge-owned prompt construction, live-tool catalogs, or
+  second-pass tool continuation loops
+- the retained Telegram bridge should forward transcript plus routing headers
+  only; the server is the sole owner of Telegram prompt and tool policy
 
 Cognitive replay policy:
 

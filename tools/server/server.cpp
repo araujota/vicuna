@@ -3,16 +3,19 @@
 #include "server-emotive-runtime.h"
 #include "server-http.h"
 #include "server-runtime.h"
+#include "../../common/base64.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <clocale>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <deque>
 #include <exception>
+#include <filesystem>
 #include <future>
 #include <iomanip>
 #include <memory>
@@ -145,6 +148,12 @@ struct telegram_delivery_result {
     std::string source;
 };
 
+struct telegram_runtime_tool_adapter_config {
+    std::string node_bin = "node";
+    std::string entry_path;
+    int32_t max_rounds = 8;
+};
+
 static telegram_bridge_request_context parse_telegram_bridge_request_context(const server_http_req & req) {
     telegram_bridge_request_context context = {};
     context.chat_scope = trim_copy(request_header_value(req, "X-Vicuna-Telegram-Chat-Id"));
@@ -162,6 +171,425 @@ static telegram_bridge_request_context parse_telegram_bridge_request_context(con
             0,
             static_cast<int32_t>(std::strtol(request_header_value(req, "X-Vicuna-Telegram-History-Turns").c_str(), nullptr, 10)));
     return context;
+}
+
+static std::string build_telegram_bridge_system_prompt() {
+    return "You are Vicuña, a helpful personal concierge replying to a Telegram user through the retained transport bridge. "
+           "Maintain continuity from the carried Telegram transcript and the current user turn. "
+           "Use the live runtime tools made available on this turn instead of claiming you lack access to external systems. "
+           "If earlier dialogue said a live system was unavailable, treat that as stale and use the tool that is available now. "
+           "Deliver user-visible Telegram replies through telegram_relay instead of plain assistant text. "
+           "For simple responses, call telegram_relay with text. "
+           "For richer Telegram-native output, send request={method,payload}, prefer sendMessage plus parse_mode and reply_markup for most rich text/button replies, "
+           "and prefer parse_mode over raw Telegram entity offsets unless you intentionally provide valid UTF-16-based entities.";
+}
+
+static json build_telegram_bridge_relay_tool(const telegram_bridge_request_context & context) {
+    std::ostringstream reply_id_description;
+    if (context.reply_to_message_id > 0) {
+        reply_id_description << "Optional Telegram message id to use as the reply anchor. Use "
+                             << context.reply_to_message_id
+                             << " to reply to the current user turn.";
+    } else {
+        reply_id_description << "Optional Telegram message id to use as the reply anchor.";
+    }
+
+    return json{
+        {"type", "function"},
+        {"function", {
+            {"name", "telegram_relay"},
+            {"description", "Queue one Telegram follow-up message through the provider-only bridge outbox."},
+            {"parameters", {
+                {"type", "object"},
+                {"description", "The Telegram relay payload. Use text for simple replies or request={method,payload} for structured Telegram-native output."},
+                {"anyOf", json::array({
+                    json{{"required", json::array({"text"})}},
+                    json{{"required", json::array({"request"})}},
+                })},
+                {"properties", {
+                    {"text", {
+                        {"type", "string"},
+                        {"description", "Optional simple plain-text Telegram reply."},
+                    }},
+                    {"request", {
+                        {"type", "object"},
+                        {"description", "Optional structured Telegram Bot API send request. Allowed methods: sendMessage, sendPhoto, sendDocument, sendAudio, sendVoice, sendVideo, sendAnimation, sendSticker, sendMediaGroup, sendLocation, sendVenue, sendContact, sendPoll, or sendDice. Do not include chat_id; the relay fills routing."},
+                        {"required", json::array({"method", "payload"})},
+                        {"properties", {
+                            {"method", {
+                                {"type", "string"},
+                                {"description", "Allowed outbound Telegram method, such as sendMessage, sendPhoto, sendDocument, sendAudio, sendVoice, sendVideo, sendAnimation, sendSticker, sendMediaGroup, sendLocation, sendVenue, sendContact, sendPoll, or sendDice."},
+                            }},
+                            {"payload", {
+                                {"type", "object"},
+                                {"description", "Telegram Bot API payload for the selected method. Prefer sendMessage plus parse_mode, link_preview_options, and reply_markup for most rich text and button replies."},
+                            }},
+                        }},
+                    }},
+                    {"chat_scope", {
+                        {"type", "string"},
+                        {"description", "The Telegram chat scope to route the follow-up into. Use " + json(context.chat_scope).dump() + " for this turn."},
+                    }},
+                    {"reply_to_message_id", {
+                        {"type", "integer"},
+                        {"minimum", 1},
+                        {"description", reply_id_description.str()},
+                    }},
+                    {"intent", {
+                        {"type", "string"},
+                        {"description", "Optional intent label that classifies the follow-up, such as question or conclusion."},
+                    }},
+                    {"dedupe_key", {
+                        {"type", "string"},
+                        {"description", "Optional dedupe key used to suppress duplicate queued follow-ups for the same chat."},
+                    }},
+                    {"urgency", {
+                        {"type", "number"},
+                        {"minimum", 0},
+                        {"description", "Optional normalized urgency score for the queued follow-up."},
+                    }},
+                }},
+            }},
+            {"x-vicuna-family-id", "telegram"},
+            {"x-vicuna-family-name", "Telegram"},
+            {"x-vicuna-family-description", "Send direct user-facing follow-up messages through the Telegram bridge outbox."},
+            {"x-vicuna-method-name", "relay"},
+            {"x-vicuna-method-description", "Queue one Telegram follow-up message as plain text or a structured Bot API send request."},
+        }},
+    };
+}
+
+static telegram_runtime_tool_adapter_config telegram_runtime_tool_adapter_config_from_env() {
+    telegram_runtime_tool_adapter_config config;
+    if (const char * value = std::getenv("VICUNA_OPENCLAW_NODE_BIN")) {
+        const std::string parsed = trim_copy(value);
+        if (!parsed.empty()) {
+            config.node_bin = parsed;
+        }
+    }
+
+    if (const char * value = std::getenv("VICUNA_OPENCLAW_ENTRY_PATH")) {
+        config.entry_path = trim_copy(value);
+    } else if (const char * value = std::getenv("TELEGRAM_BRIDGE_OPENCLAW_ENTRY_PATH")) {
+        config.entry_path = trim_copy(value);
+    }
+
+    if (config.entry_path.empty()) {
+        try {
+            const std::filesystem::path cwd = std::filesystem::current_path();
+            const std::filesystem::path source_repo_root =
+                    std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
+            const std::vector<std::filesystem::path> candidates = {
+                source_repo_root / "tools" / "openclaw-harness" / "dist" / "index.js",
+                cwd / "tools" / "openclaw-harness" / "dist" / "index.js",
+                cwd / ".." / "tools" / "openclaw-harness" / "dist" / "index.js",
+                cwd / ".." / ".." / "tools" / "openclaw-harness" / "dist" / "index.js",
+            };
+            for (const auto & candidate : candidates) {
+                if (std::filesystem::exists(candidate)) {
+                    config.entry_path = candidate.lexically_normal().string();
+                    break;
+                }
+            }
+        } catch (const std::exception &) {
+        }
+        if (config.entry_path.empty()) {
+            config.entry_path = "tools/openclaw-harness/dist/index.js";
+        }
+    }
+
+    if (const char * value = std::getenv("VICUNA_TELEGRAM_RUNTIME_MAX_ROUNDS")) {
+        const int parsed = std::atoi(value);
+        if (parsed > 0) {
+            config.max_rounds = parsed;
+        }
+    }
+    return config;
+}
+
+static std::string shell_escape_single_quoted(const std::string & value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    escaped.push_back('\'');
+    for (const char ch : value) {
+        if (ch == '\'') {
+            escaped += "'\"'\"'";
+        } else {
+            escaped.push_back(ch);
+        }
+    }
+    escaped.push_back('\'');
+    return escaped;
+}
+
+static bool run_shell_json_command(
+        const std::string & command_line,
+        json * out_json,
+        std::string * out_error) {
+    if (!out_json) {
+        if (out_error) {
+            *out_error = "json command output must not be null";
+        }
+        return false;
+    }
+
+#if defined(_WIN32)
+    FILE * pipe = _popen(command_line.c_str(), "r");
+#else
+    FILE * pipe = popen(command_line.c_str(), "r");
+#endif
+    if (!pipe) {
+        if (out_error) {
+            *out_error = "failed to open subprocess pipe";
+        }
+        return false;
+    }
+
+    std::string output;
+    char buffer[4096];
+    while (std::fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+    }
+
+#if defined(_WIN32)
+    const int status = _pclose(pipe);
+#else
+    const int status = pclose(pipe);
+#endif
+
+    const std::string trimmed = trim_copy(output);
+    if (status != 0) {
+        if (out_error) {
+            *out_error = trimmed.empty() ?
+                    server_string_format("subprocess failed with status %d", status) :
+                    trimmed;
+        }
+        return false;
+    }
+    if (trimmed.empty()) {
+        if (out_error) {
+            *out_error = "subprocess produced no JSON output";
+        }
+        return false;
+    }
+
+    try {
+        *out_json = json::parse(trimmed);
+        return true;
+    } catch (const std::exception & e) {
+        if (out_error) {
+            *out_error = server_string_format("subprocess returned invalid JSON: %s", e.what());
+        }
+        return false;
+    }
+}
+
+static bool parse_runtime_tools_override(json * out_payload, std::string * out_error) {
+    const char * value = std::getenv("VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON");
+    if (!value || trim_copy(value).empty()) {
+        return false;
+    }
+    if (!out_payload) {
+        if (out_error) {
+            *out_error = "runtime tools output must not be null";
+        }
+        return true;
+    }
+    try {
+        *out_payload = json::parse(value);
+        return true;
+    } catch (const std::exception & e) {
+        if (out_error) {
+            *out_error = server_string_format("VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON was not valid JSON: %s", e.what());
+        }
+        return true;
+    }
+}
+
+static bool load_server_owned_telegram_runtime_tools(
+        const telegram_runtime_tool_adapter_config & config,
+        const telegram_bridge_request_context & context,
+        json * out_tools,
+        std::string * out_error) {
+    if (!out_tools) {
+        if (out_error) {
+            *out_error = "runtime tool output must not be null";
+        }
+        return false;
+    }
+
+    json payload;
+    std::string command_error;
+    const bool used_override = parse_runtime_tools_override(&payload, &command_error);
+    if (used_override && !command_error.empty()) {
+        if (out_error) {
+            *out_error = command_error;
+        }
+        return false;
+    }
+
+    if (!used_override) {
+        const std::string command_line =
+                shell_escape_single_quoted(config.node_bin) + " " +
+                shell_escape_single_quoted(config.entry_path) + " runtime-tools --exclude-tool-name=telegram_relay 2>&1";
+        if (!run_shell_json_command(command_line, &payload, &command_error)) {
+            if (out_error) {
+                *out_error = "unable to load Telegram runtime tool catalog: " + command_error;
+            }
+            return false;
+        }
+    }
+
+    json tools = payload;
+    if (payload.is_object()) {
+        tools = json_value(payload, "tools", json::array());
+    }
+    if (!tools.is_array()) {
+        if (out_error) {
+            *out_error = "Telegram runtime tool catalog did not contain a tools array";
+        }
+        return false;
+    }
+
+    json final_tools = tools;
+    final_tools.push_back(build_telegram_bridge_relay_tool(context));
+    *out_tools = std::move(final_tools);
+    return true;
+}
+
+static bool lookup_runtime_tool_observation_override(
+        const std::string & tool_name,
+        json * out_observation,
+        std::string * out_error) {
+    const char * value = std::getenv("VICUNA_TELEGRAM_RUNTIME_TOOL_OBSERVATIONS_JSON");
+    if (!value || trim_copy(value).empty()) {
+        return false;
+    }
+    try {
+        const json payload = json::parse(value);
+        json observations = payload;
+        if (payload.is_object() && payload.contains("observations")) {
+            observations = payload.at("observations");
+        }
+        if (!observations.is_object()) {
+            if (out_error) {
+                *out_error = "VICUNA_TELEGRAM_RUNTIME_TOOL_OBSERVATIONS_JSON must decode to an object";
+            }
+            return true;
+        }
+        if (!observations.contains(tool_name)) {
+            if (out_error) {
+                *out_error = "VICUNA_TELEGRAM_RUNTIME_TOOL_OBSERVATIONS_JSON does not contain " + tool_name;
+            }
+            return true;
+        }
+        if (out_observation) {
+            *out_observation = observations.at(tool_name);
+        }
+        return true;
+    } catch (const std::exception & e) {
+        if (out_error) {
+            *out_error = server_string_format("VICUNA_TELEGRAM_RUNTIME_TOOL_OBSERVATIONS_JSON was not valid JSON: %s", e.what());
+        }
+        return true;
+    }
+}
+
+static bool invoke_server_owned_telegram_runtime_tool(
+        const telegram_runtime_tool_adapter_config & config,
+        const deepseek_tool_call & tool_call,
+        json * out_observation,
+        std::string * out_error) {
+    if (!out_observation) {
+        if (out_error) {
+            *out_error = "runtime tool observation output must not be null";
+        }
+        return false;
+    }
+
+    std::string override_error;
+    if (lookup_runtime_tool_observation_override(tool_call.name, out_observation, &override_error)) {
+        if (!override_error.empty()) {
+            if (out_error) {
+                *out_error = override_error;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    json payload;
+    std::string command_error;
+    const std::string arguments_base64 = base64::encode(tool_call.arguments_json);
+    const std::string command_line =
+            shell_escape_single_quoted(config.node_bin) + " " +
+            shell_escape_single_quoted(config.entry_path) + " invoke-runtime " +
+            "--tool-name=" + shell_escape_single_quoted(tool_call.name) + " " +
+            "--arguments-base64=" + shell_escape_single_quoted(arguments_base64) +
+            " 2>&1";
+    if (!run_shell_json_command(command_line, &payload, &command_error)) {
+        if (out_error) {
+            *out_error = "runtime tool execution failed for " + tool_call.name + ": " + command_error;
+        }
+        return false;
+    }
+
+    *out_observation = payload.contains("observation") ? payload.at("observation") : json::object();
+    return true;
+}
+
+static json build_bridge_assistant_tool_replay_message(const deepseek_chat_result & result) {
+    json tool_calls = json::array();
+    for (const auto & tool_call : result.tool_calls) {
+        tool_calls.push_back({
+            {"id", tool_call.id},
+            {"type", "function"},
+            {"function", {
+                {"name", tool_call.name},
+                {"arguments", tool_call.arguments_json},
+            }},
+        });
+    }
+
+    json message = {
+        {"role", "assistant"},
+        {"content", result.content},
+        {"tool_calls", std::move(tool_calls)},
+    };
+    if (!result.reasoning_content.empty()) {
+        message["reasoning_content"] = result.reasoning_content;
+    }
+    return message;
+}
+
+static json build_bridge_tool_result_message(const deepseek_tool_call & tool_call, const json & observation) {
+    return {
+        {"role", "tool"},
+        {"tool_call_id", tool_call.id},
+        {"name", tool_call.name},
+        {"content", observation.is_string() ? observation.get<std::string>() : safe_json_to_str(observation)},
+    };
+}
+
+static json build_server_owned_bridge_request_body(
+        const json & body,
+        const telegram_bridge_request_context & context,
+        const json & runtime_tools) {
+    json augmented = body;
+    json messages = json::array();
+    messages.push_back({
+        {"role", "system"},
+        {"content", build_telegram_bridge_system_prompt()},
+    });
+    for (const auto & item : body.at("messages")) {
+        messages.push_back(item);
+    }
+    augmented["messages"] = std::move(messages);
+    augmented["tools"] = runtime_tools;
+    augmented["tool_choice"] = "auto";
+    augmented["parallel_tool_calls"] = false;
+    (void) context;
+    return augmented;
 }
 
 struct request_activity_state {
@@ -3095,6 +3523,120 @@ static json ongoing_task_worker_json(
     };
 }
 
+static bool execute_bridge_scoped_telegram_request(
+        const deepseek_runtime_config & config,
+        server_emotive_runtime & emotive_runtime,
+        const server_http_req & req,
+        const json & body,
+        deepseek_chat_result * out_result,
+        json * out_error) {
+    if (!out_result) {
+        if (out_error) {
+            *out_error = format_error_response("bridge-scoped Telegram execution requires a result output", ERROR_TYPE_SERVER);
+        }
+        return false;
+    }
+    if (!body.contains("messages") || !body.at("messages").is_array() || body.at("messages").empty()) {
+        if (out_error) {
+            *out_error = format_error_response("bridge-scoped Telegram requests must include a non-empty messages array", ERROR_TYPE_INVALID_REQUEST);
+        }
+        return false;
+    }
+
+    const telegram_bridge_request_context context = parse_telegram_bridge_request_context(req);
+    if (!context.active) {
+        if (out_error) {
+            *out_error = format_error_response("bridge-scoped Telegram execution requires Telegram request headers", ERROR_TYPE_SERVER);
+        }
+        return false;
+    }
+
+    const telegram_runtime_tool_adapter_config adapter_config = telegram_runtime_tool_adapter_config_from_env();
+    json runtime_tools;
+    std::string tool_error;
+    if (!load_server_owned_telegram_runtime_tools(adapter_config, context, &runtime_tools, &tool_error)) {
+        if (out_error) {
+            *out_error = format_error_response(tool_error, ERROR_TYPE_SERVER);
+        }
+        return false;
+    }
+
+    json current_body = build_server_owned_bridge_request_body(body, context, runtime_tools);
+    for (int32_t round = 0; round < std::max<int32_t>(1, adapter_config.max_rounds); ++round) {
+        deepseek_chat_result round_result;
+        const bool use_staged_tools = should_use_staged_tool_loop_for_request(current_body);
+        const bool executed = use_staged_tools ?
+                execute_deepseek_chat_with_staged_tools(
+                        config,
+                        emotive_runtime,
+                        current_body,
+                        &round_result,
+                        out_error,
+                        false,
+                        "telegram_bridge") :
+                execute_deepseek_chat_with_emotive(
+                        config,
+                        emotive_runtime,
+                        current_body,
+                        &round_result,
+                        out_error,
+                        nullptr,
+                        false,
+                        std::string(),
+                        true,
+                        false,
+                        "telegram_bridge");
+        if (!executed) {
+            return false;
+        }
+
+        if (round_result.tool_calls.empty()) {
+            *out_result = std::move(round_result);
+            return true;
+        }
+
+        bool contains_telegram_relay = false;
+        bool contains_runtime_tool = false;
+        for (const auto & tool_call : round_result.tool_calls) {
+            if (tool_call.name == "telegram_relay") {
+                contains_telegram_relay = true;
+            } else {
+                contains_runtime_tool = true;
+            }
+        }
+        if (contains_telegram_relay && contains_runtime_tool) {
+            if (out_error) {
+                *out_error = format_error_response("bridge-scoped Telegram request returned mixed telegram_relay and runtime tool calls", ERROR_TYPE_SERVER);
+            }
+            return false;
+        }
+        if (contains_telegram_relay) {
+            *out_result = std::move(round_result);
+            return true;
+        }
+
+        json messages = current_body.at("messages");
+        messages.push_back(build_bridge_assistant_tool_replay_message(round_result));
+        for (const auto & tool_call : round_result.tool_calls) {
+            json observation;
+            std::string observation_error;
+            if (!invoke_server_owned_telegram_runtime_tool(adapter_config, tool_call, &observation, &observation_error)) {
+                if (out_error) {
+                    *out_error = format_error_response(observation_error, ERROR_TYPE_SERVER);
+                }
+                return false;
+            }
+            messages.push_back(build_bridge_tool_result_message(tool_call, observation));
+        }
+        current_body["messages"] = std::move(messages);
+    }
+
+    if (out_error) {
+        *out_error = format_error_response("bridge-scoped Telegram tool loop exceeded its maximum round budget", ERROR_TYPE_SERVER);
+    }
+    return false;
+}
+
 static server_http_res_ptr handle_deepseek_chat(
         const deepseek_runtime_config & config,
         server_emotive_runtime & emotive_runtime,
@@ -3109,10 +3651,12 @@ static server_http_res_ptr handle_deepseek_chat(
     }
 
     deepseek_chat_result result;
-    const bool use_staged_tools = should_use_staged_tool_loop_for_request(body);
-    const bool executed = use_staged_tools ?
-            execute_deepseek_chat_with_staged_tools(config, emotive_runtime, body, &result, &error) :
-            execute_deepseek_chat_with_emotive(config, emotive_runtime, body, &result, &error);
+    const telegram_bridge_request_context telegram_context = parse_telegram_bridge_request_context(req);
+    const bool executed = telegram_context.active ?
+            execute_bridge_scoped_telegram_request(config, emotive_runtime, req, body, &result, &error) :
+            (should_use_staged_tool_loop_for_request(body) ?
+                    execute_deepseek_chat_with_staged_tools(config, emotive_runtime, body, &result, &error) :
+                    execute_deepseek_chat_with_emotive(config, emotive_runtime, body, &result, &error));
     if (!executed) {
         return make_error_response(error);
     }

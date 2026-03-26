@@ -67,6 +67,15 @@ The server retains a narrow bridge compatibility surface:
 Those endpoints exist only to support the retained Telegram bridge. They are
 not a general return to the old local orchestration stack.
 
+The bridge is transport/state middleware only:
+
+- it forwards the bounded transcript plus Telegram routing headers
+- it persists transcript, option-prompt, and outbox-delivery state
+- it handles Telegram Bot API polling, callback transport, document ingestion,
+  and outbox delivery
+- it does not own Telegram prompt construction, runtime tool injection, or
+  runtime tool continuation
+
 ## Emotive Runtime
 
 The emotive runtime is intentionally bounded and inspectable.
@@ -95,6 +104,10 @@ The staged controller keeps tool policy explicit in CPU-side code:
 - `back` and `complete` are controller transitions, not real tools
 - final tool execution remains a normal tool call or runtime action after
   server-side validation
+- bridge-scoped Telegram turns are a built-in server-owned variant: the server
+  loads the installed runtime catalog, injects Telegram guidance plus
+  `telegram_relay`, and continues runtime tool execution internally until final
+  Telegram delivery or a direct final answer
 
 ## VAD Projection
 

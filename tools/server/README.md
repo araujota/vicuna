@@ -44,11 +44,11 @@ back to the caller. After the caller returns a real tool result on the next
 request, the staged loop begins again from family selection.
 
 The server now assumes callers inject the real direct tool definitions they
-want exposed for that turn. It does not maintain a second hidden live-tool
-registry for bridge requests. The retained Telegram bridge, for example,
-injects every installed OpenClaw runtime tool definition directly, then
-continues the returned tool loop itself by executing the selected tool and
-reposting the tool observation.
+want exposed for that turn, with one explicit exception: bridge-scoped
+Telegram requests. For those requests the server loads the installed runtime
+tool catalog itself, prepends Telegram-specific system guidance, injects
+`telegram_relay`, executes any selected runtime tools internally, and
+continues the staged loop until it can queue final Telegram delivery.
 
 Bridge-scoped Telegram turns are the one built-in exception: when a request
 arrives with Telegram bridge headers and resolves to `telegram_relay`, the
@@ -77,6 +77,8 @@ Tool metadata policy:
 - future tools and bridge/runtime integrations should provide those explicit
   layers at the tool-definition source rather than trying to patch them in only
   inside the server
+- bridge-scoped Telegram turns fetch those explicit layers from the installed
+  runtime catalog inside the server, not from bridge-authored request shaping
 
 ## Cognitive replay
 
@@ -153,7 +155,8 @@ Default-surface aliases remain for `/models`, `/completions`,
 - slot/router/KV orchestration as product features
 
 The Telegram bridge endpoints are intentionally retained as a narrow transport
-surface for external dialogue delivery.
+surface for external dialogue delivery. The bridge no longer owns Telegram
+prompt construction, runtime tool injection, or runtime tool continuation.
 
 ## Telegram outbox contract
 
@@ -182,6 +185,8 @@ export VICUNA_DEEPSEEK_MODEL="deepseek-reasoner"
 export VICUNA_DEEPSEEK_BASE_URL="https://api.deepseek.com"
 export VICUNA_EMOTIVE_EMBED_MODEL="/absolute/path/to/Qwen3-Embedding-0.6B-Q8_0.gguf"
 export VICUNA_EMOTIVE_EMBED_POOLING="last"
+export VICUNA_OPENCLAW_NODE_BIN="node"
+export VICUNA_OPENCLAW_ENTRY_PATH="/absolute/path/to/tools/openclaw-harness/dist/index.js"
 export VICUNA_ONGOING_TASKS_ENABLED="true"
 export VICUNA_ONGOING_TASKS_BASE_URL="https://api.supermemory.ai"
 export VICUNA_ONGOING_TASKS_AUTH_TOKEN="your-supermemory-key"
@@ -201,6 +206,14 @@ Ongoing-task env vars:
 - `VICUNA_ONGOING_TASKS_QUERY_THRESHOLD`
 - `VICUNA_ONGOING_TASKS_POLL_MS`
 - `VICUNA_ONGOING_TASKS_TIMEOUT_MS`
+
+Bridge-scoped Telegram runtime-tool env vars:
+
+- `VICUNA_OPENCLAW_NODE_BIN`
+- `VICUNA_OPENCLAW_ENTRY_PATH`
+- `VICUNA_TELEGRAM_RUNTIME_MAX_ROUNDS`
+- `VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON` for test/mocked catalog injection
+- `VICUNA_TELEGRAM_RUNTIME_TOOL_OBSERVATIONS_JSON` for test/mocked observations
 
 ## Validate staged tool-loop and VAD guidance
 
