@@ -6,18 +6,22 @@ Current retained components:
 - `server-http.cpp`: HTTP transport and middleware
 - `server-common.cpp`: JSON/error/SSE helpers
 - `server-deepseek.cpp`: DeepSeek request and response mapping
-- `server-emotive-runtime.cpp`: block-wise emotive moment and VAD projection
+- `server-emotive-runtime.cpp`: block-wise emotive moment, VAD projection, and
+  metacognitive control policy
 - `server-embedding-backend.cpp`: optional `Qwen3-Embedding-0.6B-GGUF` backend
 
 Current direction:
 
 - provider-first request handling only
 - internal streaming for block-wise emotive capture
-- staged family -> method -> payload tool orchestration for auto-tool requests
+- flattened runtime tool exposure for media, hard memory, web search, and
+  ongoing-task lifecycle operations
 - active tool continuations preserve assistant `reasoning_content`
-- request-scoped VAD guidance is injected additively after the newest tool-result span
+- request-scoped policy, heuristic, and VAD guidance is injected additively
+  after the newest tool-result span
 - heuristic retrieval runs in parallel with request-scoped guidance assembly
-- matching heuristics are injected as one additive critical-guidance `system` message
+- matching heuristics are injected as one additive critical-guidance `system`
+  message and may also bias the control policy
 - Telegram bridge compatibility remains intentionally narrow
 - no local chat inference product surface
 
@@ -46,29 +50,38 @@ Telegram outbox policy:
   queueing a message item
 - queued items keep a normalized summary `text` field for bridge transcript and
   delivery logging purposes
-- bridge-scoped Telegram requests may now resolve explicit Telegram delivery
-  methods internally, such as `send_plain_text` or `send_formatted_text`: the
-  server queues the outbox item itself, returns `vicuna_telegram_delivery`, and
-  suppresses outward tool calls so the bridge only delivers from outbox
+- bridge-scoped requests parse rich-plan assistant text into Telegram delivery
+  payloads, including optional formatting and `reply_markup`
 - bridge-scoped plain assistant text is normalized into a `sendMessage` outbox
-  item as a compatibility backstop instead of being allowed to drop
-- bridge-scoped Telegram requests also own their runtime context inside the
-  server: the server loads the runtime tool catalog, appends explicit Telegram
-  delivery methods, executes selected runtime tools, and continues the staged
-  loop itself until final delivery or a direct final answer
+  item as the compatibility backstop
+- bridge-scoped traces now persist `live_generation_start_block_index` so the
+  bridge can render only the keyframes generated for the current user-facing
+  reply
+- queued bridge-scoped `kind=message` items may include an additive
+  `emotive_animation` bundle with stable dimension labels, Fibonacci-sphere
+  directions, and live-only keyframes
+- the bridge owns deterministic render, `ffmpeg` encode, and `sendVideo`
+  follow-up delivery for that bundle; text delivery remains canonical and must
+  survive animation failures
+- invalid rich-plan metadata is stripped server-side while preserving the
+  message body and trace visibility
+- bridge-scoped requests own their runtime context inside the server; the
+  bridge remains transport and state middleware only
 
 Interleaved-thinking policy:
 
 - replay assistant `reasoning_content` only for active assistant messages that also carry `tool_calls`
 - seed the emotive runtime from ordered request history, not just user text
-- derive the continuation VAD from that request-scoped replay state
-- inject the VAD sentence as a separate `system` message so tool payloads stay unchanged
+- derive the continuation VAD and metacognitive policy from that request-scoped
+  replay state
+- inject the policy, heuristic, and VAD sentences as separate `system`
+  messages so tool payloads stay unchanged
 - preserve `reasoning_content` exactly while adding any VAD or heuristic guidance messages
 - default DeepSeek provider requests to `deepseek-chat` with `thinking={"type":"enabled"}`
 - pass through DeepSeek's top-level `thinking` field unchanged when callers provide it
-- force every outbound DeepSeek request, including staged and background turns, to use `max_tokens: 768`
+- derive the default outbound token budget from the control-policy reasoning
+  depth unless the caller already supplied an explicit cap
 - force every outbound DeepSeek request, including staged and background turns, to use `temperature: 0.2`
-- ignore caller-supplied `max_tokens`, `max_completion_tokens`, and `max_output_tokens` values that differ from the fixed runtime cap
 - reuse one configured `cpp-httplib` client per DeepSeek authority and expose
   its build/reuse counters at `/health -> provider -> transport`
 - retain a bounded structured request-trace registry with labeled JSON events
@@ -79,48 +92,49 @@ Interleaved-thinking policy:
 - retain exact `reasoning_content` and visible `content` strings on completed
   provider events so failed staged turns can be inspected verbatim
 - emit an explicit `runtime_guidance/guidance_evaluated` trace event that
-  records injected VAD/heuristic guidance text or the skip reason
+  records injected policy/VAD/heuristic guidance text or the skip reason
+- emit an explicit `control_policy/policy_computed` trace event for each
+  provider pass
+- persist `final_policy` and `heuristic_retrieval` into each retained emotive
+  trace
 
-Staged tool-loop policy:
+Flattened runtime-tool policy:
 
-- intercept OpenAI-compatible requests that include `tools` and auto tool choice
-- normalize those flat tools into family, method, and typed-contract layers
-- ask the provider for one strict selector tool call for family, then one for method, then one strict payload submission or `go_back` tool call
-- route staged selector turns through DeepSeek beta strict-tool mode instead of `response_format=json_object`
-- keep selector prompts minimal, prefix-stable, and explicit about calling exactly one selector tool immediately
-- split selector assembly into a stable instruction prefix plus dynamic catalog/contract context so repeated staged turns reuse a common prompt prefix
-- allow `back` from method and payload stages and `complete` from method selection
-- after payload validation, emit one normal OpenAI tool call back to the caller
-- when `complete` is chosen, run one final direct-response turn without tools
-- if a staged selector returns malformed tool arguments or falls back to empty/malformed content, retry that staged selector once with the validation error injected back into the prompt
-- prefer explicit request-tool metadata:
-  - `x-vicuna-family-id`
-  - `x-vicuna-family-name`
-  - `x-vicuna-family-description`
-  - `x-vicuna-method-name`
-  - `x-vicuna-method-description`
-- require typed field descriptions throughout the method contract so payload prompts stay inspectable
-- strict payload selector schemas require every field at the API layer; optional contract fields are wrapped with `anyOf` and may use `__VICUNA_OMIT__`, which the server strips before validating against the original contract
+- expose the flattened runtime tool catalog directly to the provider
+- keep backend dispatch explicit in CPU-side runtime code
+- map flattened provider-visible tools onto the existing runtime wrappers
+- support `media_read`, `media_download`, `media_delete`,
+  `hard_memory_read`, `hard_memory_write`, `web_search`,
+  `ongoing_task_create`, and `ongoing_task_delete`
+- allow metacognitive policy to decide whether direct tool use should be light,
+  heavy, sequential, or parallel
 - expect live callers to inject the authoritative direct tool definitions for
-  that turn unless the request is the retained bridge-scoped Telegram surface
+  that turn unless the request is the retained bridge-scoped surface
 - do not reintroduce bridge-owned prompt construction, live-tool catalogs, or
   second-pass tool continuation loops
 - the retained Telegram bridge should forward transcript plus routing headers
   only; the server is the sole owner of Telegram prompt and tool policy
-- cache the retained bridge-scoped Telegram runtime tool catalog and the
-  derived staged prompt bundle in memory; inspect both counters at
+- cache the retained bridge-scoped runtime tool catalog in memory; inspect its
+  counters at
   `/health -> bridge_runtime`
-- treat staged selector turns after the first family attempt as VAD-eligible follow-up turns even when there is no classic assistant/tool continuation span
 - source one durable host env file from `VICUNA_SYSTEM_ENV_FILE` or
   `/etc/vicuna/vicuna.env` before startup
 - rehydrate stable OpenClaw secrets and runtime-catalog files outside the
   checkout with `tools/ops/sync-openclaw-runtime-state.sh`
 - keep Radarr, Sonarr, Chaptarr, Tavily, and Supermemory configuration in that
   host env path instead of repo-local `.envrc` only
+- when probing runtime tools manually, export
+  `VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH` and
+  `VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH` to match the running service or
+  the harness may fall back to the checkout-local `.cache` path and report
+  false missing-key errors
+- retain `VICUNA_ENABLE_STAGED_TOOL_FALLBACK` only for compatibility coverage;
+  the staged selector path is no longer the default runtime
 
 Cognitive replay policy:
 
-- admit bounded replay entries only from non-replay traces with explicit negative-mass, VAD-drop, and persistence gates
+- admit bounded replay entries only from non-replay traces with explicit
+  negative-mass, VAD-drop, persistence, and control-failure gates
 - start replay only after foreground idleness and only one replay job at a time
 - run replay through the existing provider/emotive path so interleaved VAD/tool handling still applies
 - mark replay traces as `cognitive_replay` and suppress recursive replay admission
@@ -135,6 +149,9 @@ Heuristic-memory policy:
 - use exact cosine or lexical fallback over the bounded record set instead of ANN indexing
 - rerank semantic candidates with structural-tag overlap and emotive-signature similarity
 - inject only the matched heuristic, never the full stored replay narrative
+- derive bounded control biases from the matched heuristic so prior failures can
+  shift routing, reasoning depth, tool aggression, or stop thresholds without
+  bypassing live recomputation
 - inspect persisted records and the latest retrieval decision at `GET /v1/emotive/heuristics`
 
 Pre-idle ongoing-task policy:

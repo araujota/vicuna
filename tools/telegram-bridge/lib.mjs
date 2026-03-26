@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 export const DEFAULT_STATE = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   telegramOffset: 0,
   telegramOutboxOffset: 0,
   telegramOutboxCheckpointInitialized: false,
@@ -22,7 +22,7 @@ export const DEFAULT_MAX_DOCUMENT_CHUNKS = 128;
 export const DEFAULT_MAX_PENDING_OPTION_PROMPTS = 32;
 export const DEFAULT_MAX_CONVERSATION_MESSAGE_LINKS = 64;
 export const DEFAULT_PROVIDER_MAX_TOKENS = 256;
-export const TELEGRAM_BRIDGE_STATE_SCHEMA_VERSION = 2;
+export const TELEGRAM_BRIDGE_STATE_SCHEMA_VERSION = 3;
 export const TELEGRAM_BRIDGE_ASK_OUTBOX_POLL_IDLE_MS = 200;
 export const TELEGRAM_BRIDGE_SELF_EMIT_ACTIVE_DELAY_MS = 250;
 export const TELEGRAM_BRIDGE_SELF_EMIT_ERROR_DELAY_MS = 250;
@@ -777,6 +777,7 @@ function normalizeTelegramOutboxDeliveryReceipt(raw) {
     : deliveryModeRaw === 'reply'
       ? 'reply'
       : '';
+  const animation = normalizeTelegramOutboxDeliveryAnimation(raw.animation);
   if (sequenceNumber <= 0 || !chatId || telegramMessageId <= 0 || !deliveryMode) {
     return null;
   }
@@ -787,7 +788,41 @@ function normalizeTelegramOutboxDeliveryReceipt(raw) {
     deliveryMode,
     telegramMessageId,
     deliveredAtMs,
+    ...(animation ? { animation } : {}),
   };
+}
+
+function normalizeTelegramOutboxDeliveryAnimation(raw) {
+  if (raw == null) {
+    return null;
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+  const requested = Boolean(raw.requested);
+  const status = String(raw.status ?? '').trim().toLowerCase();
+  const stage = String(raw.stage ?? '').trim().toLowerCase();
+  const normalizedStatus = ['sent', 'skipped', 'failed'].includes(status) ? status : '';
+  const normalizedStage = ['not_requested', 'render', 'encode', 'upload', 'complete'].includes(stage) ? stage : '';
+  if (!normalizedStatus || !normalizedStage) {
+    return null;
+  }
+  const animation = {
+    requested,
+    status: normalizedStatus,
+    stage: normalizedStage,
+    keyframeCount: Math.max(0, Number(raw.keyframeCount ?? 0) || 0),
+    durationSeconds: Math.max(0, Number(raw.durationSeconds ?? 0) || 0),
+  };
+  const animationMessageId = Math.max(0, Number(raw.telegramMessageId ?? 0) || 0);
+  const failureReason = String(raw.failureReason ?? '').trim();
+  if (animationMessageId > 0) {
+    animation.telegramMessageId = animationMessageId;
+  }
+  if (failureReason) {
+    animation.failureReason = failureReason;
+  }
+  return animation;
 }
 
 export function normalizeState(raw, options = {}) {
@@ -858,10 +893,17 @@ export function normalizeTelegramOutboxItem(item) {
     const chatId = String(item?.chat_scope ?? '').trim();
     const telegramMethod = String(item?.telegram_method ?? '').trim() || 'sendMessage';
     const hasStructuredPayload = Boolean(item && typeof item === 'object' && Object.prototype.hasOwnProperty.call(item, 'telegram_payload'));
+    const hasEmotiveAnimation = Boolean(item && typeof item === 'object' && Object.prototype.hasOwnProperty.call(item, 'emotive_animation'));
     if (hasStructuredPayload && (!item?.telegram_payload || typeof item.telegram_payload !== 'object' || Array.isArray(item.telegram_payload))) {
       return {
         ...base,
         error: 'runtime telegram outbox message item had invalid telegram_payload',
+      };
+    }
+    if (hasEmotiveAnimation && (!item?.emotive_animation || typeof item.emotive_animation !== 'object' || Array.isArray(item.emotive_animation))) {
+      return {
+        ...base,
+        error: 'runtime telegram outbox message item had invalid emotive_animation',
       };
     }
     const telegramPayload = hasStructuredPayload
@@ -885,6 +927,7 @@ export function normalizeTelegramOutboxItem(item) {
       telegramMethod,
       telegramPayload,
       replyToMessageId,
+      emotiveAnimation: hasEmotiveAnimation ? structuredClone(item.emotive_animation) : null,
     };
   }
 

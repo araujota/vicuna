@@ -1,8 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import {
+  buildEmotiveAnimationRenderPlan,
+  normalizeEmotiveAnimationBundle,
+  renderEmotiveAnimationFrames,
+} from './emotive-animation-render.mjs';
 
 import {
   appendProactiveId,
@@ -52,6 +57,39 @@ import {
   TELEGRAM_BRIDGE_WATCHDOG_DELAY_MS,
   updateTelegramOffset,
 } from './lib.mjs';
+
+function sampleEmotiveAnimationBundle() {
+  return {
+    bundle_version: 1,
+    trace_id: 'emo_test',
+    generation_start_block_index: 3,
+    seconds_per_keyframe: 0.5,
+    fps: 24,
+    viewport_width: 720,
+    viewport_height: 720,
+    rotation_period_seconds: 12,
+    dimensions: [
+      { id: 'confidence', label: 'Confidence', direction_index: 0, direction_xyz: [1, 0, 0] },
+      { id: 'caution', label: 'Caution', direction_index: 1, direction_xyz: [0, 1, 0] },
+    ],
+    keyframes: [
+      {
+        ordinal: 0,
+        trace_block_index: 3,
+        source_kind: 'assistant_reasoning',
+        moment: { confidence: 0.2, caution: 0.7 },
+        dominant_dimensions: ['caution'],
+      },
+      {
+        ordinal: 1,
+        trace_block_index: 4,
+        source_kind: 'assistant_content',
+        moment: { confidence: 0.85, caution: 0.25 },
+        dominant_dimensions: ['confidence'],
+      },
+    ],
+  };
+}
 
 test('extractResponseText returns assistant output text', () => {
   const text = extractResponseText({
@@ -952,6 +990,14 @@ test('saveState persists chatSessions transcript history', async () => {
     deliveryMode: 'reply',
     telegramMessageId: 102,
     deliveredAtMs: 123456,
+    animation: {
+      requested: true,
+      status: 'sent',
+      stage: 'complete',
+      keyframeCount: 2,
+      durationSeconds: 1,
+      telegramMessageId: 103,
+    },
   });
 
   await saveState(statePath, state, { maxHistoryMessages: 4 });
@@ -971,6 +1017,14 @@ test('saveState persists chatSessions transcript history', async () => {
     deliveryMode: 'reply',
     telegramMessageId: 102,
     deliveredAtMs: 123456,
+    animation: {
+      requested: true,
+      status: 'sent',
+      stage: 'complete',
+      keyframeCount: 2,
+      durationSeconds: 1,
+      telegramMessageId: 103,
+    },
   });
   assert.deepEqual(persisted.chatConversationState['7502424413'], {
     latestConversationId: 'tc1',
@@ -1101,6 +1155,7 @@ test('normalizeTelegramOutboxItem validates message follow-ups', () => {
       text: 'done',
     },
     replyToMessageId: 91,
+    emotiveAnimation: null,
   });
 });
 
@@ -1129,7 +1184,54 @@ test('normalizeTelegramOutboxItem derives structured message summaries and prese
       parse_mode: 'HTML',
     },
     replyToMessageId: 0,
+    emotiveAnimation: null,
   });
+});
+
+test('normalizeTelegramOutboxItem preserves emotive animation bundles for message follow-ups', () => {
+  const item = normalizeTelegramOutboxItem({
+    sequence_number: 33,
+    kind: 'message',
+    chat_scope: '7502424413',
+    text: 'done',
+    telegram_method: 'sendMessage',
+    telegram_payload: {
+      text: 'done',
+    },
+    emotive_animation: sampleEmotiveAnimationBundle(),
+  });
+
+  assert.equal(item.ok, true);
+  assert.equal(item.emotiveAnimation.trace_id, 'emo_test');
+  assert.equal(item.emotiveAnimation.keyframes.length, 2);
+});
+
+test('normalizeEmotiveAnimationBundle and render plan keep timing explicit', () => {
+  const bundle = normalizeEmotiveAnimationBundle(sampleEmotiveAnimationBundle());
+  const plan = buildEmotiveAnimationRenderPlan(sampleEmotiveAnimationBundle());
+
+  assert.equal(bundle.traceId, 'emo_test');
+  assert.equal(bundle.dimensions.length, 2);
+  assert.equal(bundle.keyframes.length, 2);
+  assert.equal(bundle.durationSeconds, 1);
+  assert.equal(plan.keyframeCount, 2);
+  assert.equal(plan.totalFrames, 24);
+  assert.equal(plan.durationSeconds, 1);
+});
+
+test('renderEmotiveAnimationFrames writes one PNG per planned frame', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'vicuna-emotive-render-test-'));
+  try {
+    const result = await renderEmotiveAnimationFrames(sampleEmotiveAnimationBundle(), dir);
+    const files = await readdir(dir);
+
+    assert.equal(result.totalFrames, 24);
+    assert.equal(files.length, 24);
+    assert.equal(files[0], 'frame-0000.png');
+    assert.equal(files.at(-1), 'frame-0023.png');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('normalizeTelegramOutboxItem marks malformed sequenced items as skippable faults', () => {

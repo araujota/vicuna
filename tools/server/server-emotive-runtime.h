@@ -96,6 +96,7 @@ struct server_emotive_trace {
     std::string trace_id;
     std::string model;
     std::vector<server_emotive_block_record> blocks;
+    int32_t live_generation_start_block_index = 0;
     server_emotive_vector final_moment;
     server_emotive_vad final_vad;
     std::string embedding_mode;
@@ -106,6 +107,8 @@ struct server_emotive_trace {
     std::string cognitive_replay_entry_id;
     bool suppress_replay_admission = false;
     std::string mode_label;
+    json final_policy = nullptr;
+    json heuristic_retrieval = nullptr;
 };
 
 struct server_cognitive_replay_config {
@@ -249,6 +252,39 @@ struct server_heuristic_retrieval_decision {
     float total_score = 0.0f;
     float threshold = 0.0f;
     int64_t created_at_ms = 0;
+    std::vector<json> control_biases;
+};
+
+struct server_metacognitive_control_state {
+    server_emotive_vector moment;
+    server_emotive_vad vad;
+    float ongoing_task_due = 0.0f;
+    bool bridge_scoped = false;
+    bool cognitive_replay = false;
+    bool suppress_replay_admission = false;
+    server_heuristic_retrieval_decision heuristic;
+};
+
+struct server_metacognitive_policy_decision {
+    bool valid = false;
+    std::string policy_version = "control_surface_v1";
+    std::string selected_mode = "direct";
+    std::string reasoning_depth = "short";
+    float direct_score = 0.0f;
+    float reflective_score = 0.0f;
+    float tool_light_score = 0.0f;
+    float tool_heavy_score = 0.0f;
+    float background_defer_score = 0.0f;
+    float reasoning_score = 0.0f;
+    float tool_aggression = 0.0f;
+    float interrupt_score = 0.0f;
+    int32_t tool_parallelism_cap = 0;
+    bool interrupt_allowed = false;
+    bool replan_required = false;
+    bool early_stop_ok = false;
+    bool force_synthesis = false;
+    std::vector<json> heuristic_biases;
+    std::vector<std::string> prompt_hints;
 };
 
 struct server_emotive_runtime_config {
@@ -285,6 +321,9 @@ public:
     void observe_reasoning_delta(const std::string & text);
     void observe_content_delta(const std::string & text);
     void observe_runtime_event(const std::string & text);
+    void mark_live_generation_start();
+    void set_final_policy(json final_policy);
+    void set_heuristic_retrieval(json heuristic_retrieval);
     bool has_current_state() const;
     server_emotive_vector current_moment() const;
     server_emotive_vad current_vad() const;
@@ -307,10 +346,14 @@ private:
     server_emotive_vad previous_vad_;
     bool have_previous_vad_;
     std::vector<server_emotive_block_record> blocks_;
+    int32_t live_generation_start_block_index_;
+    bool live_generation_start_marked_;
     bool cognitive_replay_;
     std::string cognitive_replay_entry_id_;
     bool suppress_replay_admission_;
     std::string mode_label_;
+    json final_policy_ = nullptr;
+    json heuristic_retrieval_ = nullptr;
 };
 
 class server_emotive_runtime {
@@ -356,6 +399,8 @@ public:
             const server_emotive_vector * current_moment,
             const server_emotive_vad * current_vad,
             std::string * out_guidance = nullptr);
+    server_metacognitive_policy_decision compute_control_policy(
+            const server_metacognitive_control_state & state) const;
 
 private:
     void load_heuristic_memory();

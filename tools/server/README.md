@@ -5,26 +5,36 @@
 It is a DeepSeek-backed HTTP server with an optional local
 `Qwen3-Embedding-0.6B-GGUF` backend for emotive-trace enrichment.
 
-## Interleaved tool continuations
+## Metacognitive control loop
 
-When a request resumes an active DeepSeek tool loop, the server now:
+All provider passes, including foreground turns, cognitive replay, and
+ongoing-task execution, run through the same bounded control path:
 
-- preserves the assistant tool-call step's `reasoning_content` for replay
-- reconstructs the current emotive/VAD state from the replayed request history
-- injects one additive VAD guidance `system` message after the newest tool-result span
-- runs bounded heuristic retrieval in parallel against persisted bad-path memory
-- injects at most one brief critical-guidance heuristic when the current trace matches a stored bad path
-- keeps the original tool payload unchanged
+- preserves replayed assistant `reasoning_content` for state reconstruction
+- recomputes the current emotive moment and VAD state from replayed request
+  history, not just the newest user text
+- retrieves at most one matching heuristic from persisted bad-path memory
+- converts the live state plus any retrieved heuristic into an explicit control
+  policy that scores direct, reflective, tool-light, tool-heavy, and
+  background-defer modes
+- injects additive system guidance for policy, heuristic, and VAD without
+  mutating the user-visible task payload
+- persists the turn-local `final_policy` and `heuristic_retrieval` objects in
+  `vicuna_emotive_trace`
 
 By default the server targets `deepseek-chat` and injects
 `thinking: {"type":"enabled"}` on outbound DeepSeek requests. If you send a
 provider-native `thinking` object, the server forwards it unchanged instead of
 rewriting it.
 
-All outbound DeepSeek turns, including staged family/method/payload turns and
-background/internal provider passes, are capped at `max_tokens: 768`. The
-server enforces that ceiling even if the caller supplies a different output
-token field, and it does so without disabling reasoning traces.
+If the caller does not provide an explicit output-token cap, the server derives
+one from the metacognitive reasoning depth:
+
+- `none -> 256`
+- `short -> 512`
+- `medium -> 1024`
+- `deep -> 2048`
+
 Every outbound DeepSeek turn also uses `temperature: 0.2`. The runtime stamps
 that value onto direct, staged, bridge-scoped, and background turns instead of
 leaving temperature implicit or caller-controlled.
@@ -43,53 +53,38 @@ Completed provider events retain the exact returned `reasoning_content` and
 visible `content`, and runtime-guidance events retain the exact additive VAD or
 heuristic text that was injected or skipped.
 
-## Staged tool loop
+## Flattened runtime tools
 
-When an incoming OpenAI-compatible request includes `tools` with automatic tool
-selection, the server no longer exposes the flat tool list directly to the
-provider. Instead it runs an explicit staged loop:
+The active runtime tool surface is flattened and provider-visible. The
+installed runtime catalog exposes:
 
-- family selection: the provider sees only high-level tool families and must
-  call one strict selector tool with `family: enum[...]`
-- method selection: the provider sees only methods for the chosen family and
-  must call one strict selector tool with `method: enum[...]`, including
-  `back` and `complete`
-- payload construction: the provider sees the chosen method's typed contract
-  and must call either a strict `submit_payload` tool whose arguments mirror
-  the contract schema or a strict `go_back` tool
+- `media_read`
+- `media_download`
+- `media_delete`
+- `hard_memory_read`
+- `hard_memory_write`
+- `web_search`
+- `ongoing_task_create`
+- `ongoing_task_delete`
 
-Staged selector turns run through DeepSeek beta strict-tool mode instead of
-`response_format={"type":"json_object"}`. The runtime now splits selector
-assembly into a stable instruction prefix plus a dynamic family/method/contract
-context so repeated staged turns keep a prefix-stable prompt shape. Optional
-payload fields are strictified with `anyOf` wrappers and may use the sentinel
-`__VICUNA_OMIT__`, which the server strips before validating against the
-original tool contract.
+These flattened capabilities map onto the existing runtime backends and keep
+tool policy explicit in CPU-side control code. The default path no longer
+requires a family -> method -> payload staging waterfall.
 
-After a valid payload is produced, the server emits one normal OpenAI tool call
-back to the caller. After the caller returns a real tool result on the next
-request, the staged loop begins again from family selection.
-
-The server now assumes callers inject the real direct tool definitions they
-want exposed for that turn, with one explicit exception: bridge-scoped
-Telegram requests. For those requests the server loads the installed runtime
-tool catalog itself, appends explicit Telegram delivery methods, executes any
-selected runtime tools internally, and continues the staged loop until it can
-queue final Telegram delivery.
+Legacy staged family or method selection remains available only as a fallback
+for compatibility testing behind `VICUNA_ENABLE_STAGED_TOOL_FALLBACK=1`.
 
 For retained bridge-scoped Telegram turns, the server also caches the loaded
-runtime tool catalog plus the derived staged family/method/payload prompt
-bundle in memory. Inspect those bounded cache counters at
+runtime tool catalog in memory. Inspect those bounded cache counters at
 `/health -> bridge_runtime`.
 
-Bridge-scoped Telegram turns are the one built-in exception: when a request
-arrives with Telegram bridge headers and resolves to an explicit Telegram
-delivery method, the server enqueues the Telegram outbox item itself, clears
-the outward tool call, and returns additive `vicuna_telegram_delivery` metadata
-so the bridge can wait for outbox delivery instead of trying to relay
-assistant text directly.
+Bridge-scoped turns no longer depend on a provider-visible Telegram tool
+family. The server parses assistant rich-plan text, validates optional delivery
+metadata, enqueues the outbox item itself, and returns additive
+`vicuna_telegram_delivery` metadata so the bridge waits for outbox delivery
+instead of relaying assistant text directly.
 
-The staged prompts are additive and keep:
+Tool-continuation guidance remains additive and keeps:
 
 - replayed assistant `reasoning_content` unchanged
 - request-scoped VAD guidance unchanged
@@ -97,10 +92,37 @@ The staged prompts are additive and keep:
 - staged follow-up turns receive renewed additive VAD guidance even without a
   classic assistant/tool continuation span
 
+## Rich-plan bridge delivery
+
+Bridge-scoped responses may be returned as plain text or as a rich-plan body:
+
+- front matter delimited by `---`
+- optional `format`, `title`, `disable_web_page_preview`, `delivery_hint`
+- optional `reply_markup`
+- message body after the closing delimiter
+
+The runtime parses this structure into a Telegram `sendMessage` outbox payload.
+Invalid metadata is stripped server-side, the message body is preserved, and
+the trace records the strip event.
+
+Bridge-scoped message items may also carry an additive `emotive_animation`
+bundle:
+
+- every post-seed emotive recomputation is exported as one keyframe candidate
+- `vicuna_emotive_trace.live_generation_start_block_index` marks the explicit
+  boundary between seeded transcript replay and live reply generation
+- queued Telegram message items retain `text` as the canonical reply body and
+  add `emotive_animation` only as render metadata for the bridge
+- the retained Telegram bridge renders that bundle into a fixed-topology MP4,
+  uploads it as a follow-up `sendVideo`, and keeps text delivery even when
+  render, encode, or upload fails
+- the bridge host must provide `ffmpeg` or the animation path falls back to
+  text-only delivery with an inspectable failure reason
+
 Tool metadata policy:
 
-- every staged-exposed tool should provide a clear family, method, and contract
-  layer
+- runtime tools should still provide a clear family, method, and contract layer
+  when available, even though the default provider surface is now flat
 - request tools may optionally provide:
   - `x-vicuna-family-id`
   - `x-vicuna-family-name`
@@ -112,7 +134,7 @@ Tool metadata policy:
 - future tools and bridge/runtime integrations should provide those explicit
   layers at the tool-definition source rather than trying to patch them in only
   inside the server
-- bridge-scoped Telegram turns fetch those explicit layers from the installed
+- bridge-scoped runtime turns fetch those explicit layers from the installed
   runtime catalog inside the server, not from bridge-authored request shaping
 
 ## Cognitive replay
@@ -142,6 +164,8 @@ stored in bounded hard memory. Live request assembly then:
 - reranks with structural and emotive similarity
 - injects only the matching heuristic as brief critical guidance when the
   bounded threshold is met
+- derives bounded control biases from the matched heuristic so prior failures
+  can shift routing and reasoning policy without bypassing live recomputation
 
 Inspect persisted heuristic records and the latest retrieval decision with
 `GET /v1/emotive/heuristics`.
@@ -205,6 +229,11 @@ message items may now carry either:
 
 The server keeps a normalized summary `text` field on each queued item so the
 bridge can preserve transcript continuity and readable delivery logs.
+For bridge-scoped Telegram turns, the runtime derives the final outbox payload
+from plain assistant text or parsed rich-plan metadata and injects chat scope,
+reply anchor, dedupe, and urgency metadata itself.
+When present, `emotive_animation` is already fully materialized server-side;
+the bridge must not reconstruct keyframes by polling other runtime endpoints.
 
 ## Build
 
@@ -253,6 +282,18 @@ tool secrets and runtime catalog from that env file into the stable secrets and
 catalog paths outside the checkout. That keeps media-tool and Tavily
 credentials alive across rebuilds and branch changes.
 
+When probing runtime tools manually on the host, export the same synced paths
+the running service uses or the harness may fall back to the checkout-local
+`.cache` path and report false missing-key errors:
+
+```bash
+VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH=/home/tyler-araujo/.config/vicuna/openclaw-tool-secrets.json \
+VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH=/home/tyler-araujo/.local/state/vicuna/openclaw-catalog.json \
+/home/tyler-araujo/.nvm/versions/node/v20.19.5/bin/node \
+  /home/tyler-araujo/Projects/vicuna-codex-130-strict-selector-tools/tools/openclaw-harness/dist/index.js \
+  invoke-runtime --tool-name=sonarr_list_downloaded_series --arguments-base64=e30=
+```
+
 Ongoing-task env vars:
 
 - `VICUNA_ONGOING_TASKS_ENABLED`
@@ -266,7 +307,7 @@ Ongoing-task env vars:
 - `VICUNA_ONGOING_TASKS_POLL_MS`
 - `VICUNA_ONGOING_TASKS_TIMEOUT_MS`
 
-Bridge-scoped Telegram runtime-tool env vars:
+Bridge-scoped runtime env vars:
 
 - `VICUNA_OPENCLAW_NODE_BIN`
 - `VICUNA_OPENCLAW_ENTRY_PATH`
@@ -274,17 +315,16 @@ Bridge-scoped Telegram runtime-tool env vars:
 - `VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON` for test/mocked catalog injection
 - `VICUNA_TELEGRAM_RUNTIME_TOOL_OBSERVATIONS_JSON` for test/mocked observations
 
-## Validate staged tool-loop and VAD guidance
+## Validate control policy and bridge delivery
 
 Run the focused provider tests:
 
 ```bash
-LLAMA_SERVER_BIN_PATH=./build/bin/llama-server pytest tools/server/tests/unit/test_deepseek_provider.py -q -k "tool or interleaved or staged"
+LLAMA_SERVER_BIN_PATH=./build/bin/llama-server pytest tools/server/tests/unit/test_deepseek_provider.py -q -k "tool or interleaved or control_policy or bridge"
 ```
 
-The staged family/method selectors retry one corrective JSON turn if DeepSeek
-returns empty or malformed JSON, which matches DeepSeek's documented occasional
-JSON-mode empty-content behavior.
+Legacy staged fallback coverage remains available behind
+`VICUNA_ENABLE_STAGED_TOOL_FALLBACK=1`.
 
 Run the cognitive replay coverage:
 

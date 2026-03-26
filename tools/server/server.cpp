@@ -6,10 +6,12 @@
 #include "../../common/base64.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <clocale>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -44,6 +46,7 @@ static bool execute_deepseek_chat_with_emotive(
         const std::string & cognitive_replay_entry_id = std::string(),
         bool enable_heuristic_guidance = true,
         bool suppress_replay_admission = false,
+        float ongoing_task_due = 0.0f,
         const std::string & mode_label = std::string(),
         const runtime_request_trace_context * trace_context = nullptr);
 
@@ -65,6 +68,122 @@ static std::string to_lower_copy(std::string value) {
         return static_cast<char>(std::tolower(ch));
     });
     return value;
+}
+
+struct telegram_emotive_dimension_spec {
+    const char * id;
+    const char * label;
+};
+
+static const std::array<telegram_emotive_dimension_spec, 14> k_telegram_emotive_dimensions = {{
+    {"epistemic_pressure", "Epistemic Pressure"},
+    {"confidence", "Confidence"},
+    {"contradiction_pressure", "Contradiction Pressure"},
+    {"planning_clarity", "Planning Clarity"},
+    {"curiosity", "Curiosity"},
+    {"caution", "Caution"},
+    {"frustration", "Frustration"},
+    {"satisfaction", "Satisfaction"},
+    {"momentum", "Momentum"},
+    {"stall", "Stall"},
+    {"semantic_novelty", "Semantic Novelty"},
+    {"user_alignment", "User Alignment"},
+    {"runtime_trust", "Runtime Trust"},
+    {"runtime_failure_pressure", "Runtime Failure Pressure"},
+}};
+
+static json telegram_emotive_dimension_direction_json(size_t index, size_t total) {
+    if (total == 0) {
+        return json::array({0.0, 1.0, 0.0});
+    }
+    static const double pi = 3.14159265358979323846;
+    const double golden_angle = pi * (3.0 - std::sqrt(5.0));
+    const double y = 1.0 - (2.0 * (static_cast<double>(index) + 0.5) / static_cast<double>(total));
+    const double radius = std::sqrt(std::max(0.0, 1.0 - y * y));
+    const double theta = golden_angle * static_cast<double>(index);
+    return json::array({
+        std::cos(theta) * radius,
+        y,
+        std::sin(theta) * radius,
+    });
+}
+
+static json build_telegram_emotive_moment_json(const json & raw_moment) {
+    if (!raw_moment.is_object()) {
+        return nullptr;
+    }
+
+    json moment = json::object();
+    for (const auto & dimension : k_telegram_emotive_dimensions) {
+        moment[dimension.id] = json_value(raw_moment, dimension.id, 0.0f);
+    }
+    return moment;
+}
+
+static json build_telegram_emotive_animation_bundle(const json & trace) {
+    if (!trace.is_object()) {
+        return nullptr;
+    }
+
+    const json blocks = trace.value("blocks", json::array());
+    if (!blocks.is_array() || blocks.empty()) {
+        return nullptr;
+    }
+
+    const int32_t total_blocks = static_cast<int32_t>(blocks.size());
+    const int32_t requested_start = std::max<int32_t>(0, json_value(trace, "live_generation_start_block_index", int32_t(0)));
+    const int32_t live_start = std::min<int32_t>(requested_start, total_blocks);
+
+    json dimensions = json::array();
+    for (size_t index = 0; index < k_telegram_emotive_dimensions.size(); ++index) {
+        const auto & dimension = k_telegram_emotive_dimensions[index];
+        dimensions.push_back({
+            {"id", dimension.id},
+            {"label", dimension.label},
+            {"direction_index", static_cast<int32_t>(index)},
+            {"direction_xyz", telegram_emotive_dimension_direction_json(index, k_telegram_emotive_dimensions.size())},
+        });
+    }
+
+    json keyframes = json::array();
+    for (int32_t block_index = live_start; block_index < total_blocks; ++block_index) {
+        const json & block = blocks.at(static_cast<size_t>(block_index));
+        if (!block.is_object()) {
+            continue;
+        }
+
+        const json moment = build_telegram_emotive_moment_json(block.value("moment", json::object()));
+        if (moment.is_null()) {
+            continue;
+        }
+
+        keyframes.push_back({
+            {"ordinal", static_cast<int32_t>(keyframes.size())},
+            {"trace_block_index", json_value(block, "block_index", block_index)},
+            {"source_kind", json_value(block.value("source", json::object()), "kind", std::string("runtime_event"))},
+            {"moment", moment},
+            {"dominant_dimensions", block.value("vad", json::object()).value("dominant_dimensions", json::array())},
+        });
+    }
+
+    if (keyframes.empty()) {
+        return nullptr;
+    }
+
+    const double seconds_per_keyframe = 0.5;
+    return {
+        {"bundle_version", 1},
+        {"trace_id", json_value(trace, "trace_id", std::string())},
+        {"generation_start_block_index", live_start},
+        {"seconds_per_keyframe", seconds_per_keyframe},
+        {"fps", 24},
+        {"viewport_width", 720},
+        {"viewport_height", 720},
+        {"rotation_period_seconds", 12.0},
+        {"duration_seconds", seconds_per_keyframe * static_cast<double>(keyframes.size())},
+        {"dimensions", std::move(dimensions)},
+        {"keyframes", std::move(keyframes)},
+    };
 }
 
 static std::string request_header_value(const server_http_req & req, const std::string & key) {
@@ -237,6 +356,7 @@ struct telegram_outbox_item {
     std::string chat_scope;
     std::string telegram_method = "sendMessage";
     json telegram_payload = json::object();
+    json emotive_animation = nullptr;
     std::string text;
     int64_t reply_to_message_id = 0;
     std::string intent;
@@ -331,30 +451,46 @@ static telegram_bridge_request_context parse_telegram_bridge_request_context(con
     return context;
 }
 
-static json build_telegram_bridge_common_properties() {
+static json build_telegram_inline_button_schema() {
     return json{
-        {"chat_scope", {
-            {"type", "string"},
-            {"description", "Optional Telegram chat scope override. Leave unset on bridge-scoped turns to reply into the current chat."},
+        {"type", "object"},
+        {"description", "One inline keyboard button. Set text plus either url or callback_data when needed."},
+        {"properties", {
+            {"text", {
+                {"type", "string"},
+                {"description", "Visible button label shown to the user."},
+            }},
+            {"url", {
+                {"type", "string"},
+                {"description", "Optional HTTPS URL to open when the user taps the button."},
+            }},
+            {"callback_data", {
+                {"type", "string"},
+                {"description", "Optional callback payload to send back to the bot when the button is tapped."},
+            }},
         }},
-        {"reply_to_message_id", {
-            {"type", "integer"},
-            {"minimum", 1},
-            {"description", "Optional Telegram message id to use as the reply anchor. Leave unset to default to the current user turn on bridge-scoped requests."},
+        {"required", json::array({"text"})},
+        {"additionalProperties", false},
+    };
+}
+
+static json build_telegram_reply_markup_schema() {
+    return json{
+        {"type", "object"},
+        {"description", "Optional Telegram reply markup. Use inline_keyboard for button rows."},
+        {"properties", {
+            {"inline_keyboard", {
+                {"type", "array"},
+                {"description", "Optional inline keyboard rows. Each row is an array of buttons."},
+                {"items", {
+                    {"type", "array"},
+                    {"description", "One inline keyboard row."},
+                    {"minItems", 1},
+                    {"items", build_telegram_inline_button_schema()},
+                }},
+            }},
         }},
-        {"intent", {
-            {"type", "string"},
-            {"description", "Optional intent label that classifies the follow-up, such as question or conclusion."},
-        }},
-        {"dedupe_key", {
-            {"type", "string"},
-            {"description", "Optional dedupe key used to suppress duplicate queued follow-ups for the same chat."},
-        }},
-        {"urgency", {
-            {"type", "number"},
-            {"minimum", 0},
-            {"description", "Optional normalized urgency score for the queued follow-up."},
-        }},
+        {"additionalProperties", false},
     };
 }
 
@@ -371,7 +507,7 @@ static json build_telegram_bridge_tool(
             {"parameters", std::move(parameters)},
             {"x-vicuna-family-id", "telegram"},
             {"x-vicuna-family-name", "Telegram"},
-            {"x-vicuna-family-description", "Send direct user-facing follow-up messages through the Telegram bridge outbox."},
+            {"x-vicuna-family-description", "MANDATORY: THIS IS THE ONLY WAY TO COMMUNICATE WITH THE USER on bridge-scoped Telegram requests. Send direct user-facing follow-up messages through the Telegram bridge outbox."},
             {"x-vicuna-method-name", method_name},
             {"x-vicuna-method-description", method_description},
         }},
@@ -379,11 +515,11 @@ static json build_telegram_bridge_tool(
 }
 
 static json build_telegram_bridge_tools() {
-    const json common = build_telegram_bridge_common_properties();
+    const json reply_markup = build_telegram_reply_markup_schema();
 
     json tools = json::array();
 
-    json plain_props = common;
+    json plain_props = json::object();
     plain_props["text"] = {
         {"type", "string"},
         {"description", "Plain Telegram text to send to the user."},
@@ -391,44 +527,43 @@ static json build_telegram_bridge_tools() {
     tools.push_back(build_telegram_bridge_tool(
             "telegram_send_plain_text",
             "send_plain_text",
-            "Send a simple plain-text Telegram reply.",
+            "Send a simple plain-text Telegram reply. Do not include Markdown or HTML formatting markers.",
             {
                 {"type", "object"},
                 {"description", "Payload for a simple Telegram plain-text reply."},
                 {"required", json::array({"text"})},
                 {"properties", std::move(plain_props)},
+                {"additionalProperties", false},
             }));
 
-    json rich_props = common;
+    json rich_props = json::object();
     rich_props["text"] = {
         {"type", "string"},
         {"description", "Telegram message text with formatting markup."},
     };
     rich_props["parse_mode"] = {
         {"type", "string"},
-        {"enum", json::array({"HTML", "MarkdownV2"})},
-        {"description", "Formatting mode for the message text."},
+        {"enum", json::array({"HTML"})},
+        {"description", "Formatting mode for the message text. Prefer HTML tags for Telegram-rich text."},
     };
     rich_props["disable_web_page_preview"] = {
         {"type", "boolean"},
         {"description", "Set true to disable link previews for the message."},
     };
-    rich_props["reply_markup"] = {
-        {"type", "object"},
-        {"description", "Optional Telegram reply markup, such as an inline keyboard."},
-    };
+    rich_props["reply_markup"] = reply_markup;
     tools.push_back(build_telegram_bridge_tool(
             "telegram_send_formatted_text",
             "send_formatted_text",
-            "Send a formatted Telegram text reply with parse_mode and optional reply markup.",
+            "Send a formatted Telegram text reply with HTML parse_mode and optional reply markup.",
             {
                 {"type", "object"},
                 {"description", "Payload for a formatted Telegram text reply."},
                 {"required", json::array({"text"})},
                 {"properties", std::move(rich_props)},
+                {"additionalProperties", false},
             }));
 
-    json photo_props = common;
+    json photo_props = json::object();
     photo_props["photo"] = {
         {"type", "string"},
         {"description", "Telegram file_id, URL, or attachable reference for the photo."},
@@ -439,13 +574,10 @@ static json build_telegram_bridge_tools() {
     };
     photo_props["parse_mode"] = {
         {"type", "string"},
-        {"enum", json::array({"HTML", "MarkdownV2"})},
-        {"description", "Formatting mode for the photo caption."},
+        {"enum", json::array({"HTML"})},
+        {"description", "Formatting mode for the photo caption. Prefer HTML tags for Telegram-rich text."},
     };
-    photo_props["reply_markup"] = {
-        {"type", "object"},
-        {"description", "Optional Telegram reply markup, such as an inline keyboard."},
-    };
+    photo_props["reply_markup"] = reply_markup;
     tools.push_back(build_telegram_bridge_tool(
             "telegram_send_photo",
             "send_photo",
@@ -455,9 +587,10 @@ static json build_telegram_bridge_tools() {
                 {"description", "Payload for a Telegram photo reply."},
                 {"required", json::array({"photo"})},
                 {"properties", std::move(photo_props)},
+                {"additionalProperties", false},
             }));
 
-    json document_props = common;
+    json document_props = json::object();
     document_props["document"] = {
         {"type", "string"},
         {"description", "Telegram file_id, URL, or attachable reference for the document."},
@@ -468,13 +601,10 @@ static json build_telegram_bridge_tools() {
     };
     document_props["parse_mode"] = {
         {"type", "string"},
-        {"enum", json::array({"HTML", "MarkdownV2"})},
-        {"description", "Formatting mode for the document caption."},
+        {"enum", json::array({"HTML"})},
+        {"description", "Formatting mode for the document caption. Prefer HTML tags for Telegram-rich text."},
     };
-    document_props["reply_markup"] = {
-        {"type", "object"},
-        {"description", "Optional Telegram reply markup, such as an inline keyboard."},
-    };
+    document_props["reply_markup"] = reply_markup;
     tools.push_back(build_telegram_bridge_tool(
             "telegram_send_document",
             "send_document",
@@ -484,9 +614,10 @@ static json build_telegram_bridge_tools() {
                 {"description", "Payload for a Telegram document reply."},
                 {"required", json::array({"document"})},
                 {"properties", std::move(document_props)},
+                {"additionalProperties", false},
             }));
 
-    json poll_props = common;
+    json poll_props = json::object();
     poll_props["question"] = {
         {"type", "string"},
         {"description", "Poll question to show to the user."},
@@ -516,9 +647,10 @@ static json build_telegram_bridge_tools() {
                 {"description", "Payload for a Telegram poll reply."},
                 {"required", json::array({"question", "options"})},
                 {"properties", std::move(poll_props)},
+                {"additionalProperties", false},
             }));
 
-    json dice_props = common;
+    json dice_props = json::object();
     dice_props["emoji"] = {
         {"type", "string"},
         {"enum", json::array({"🎲", "🎯", "🏀", "⚽", "🎳", "🎰"})},
@@ -532,6 +664,7 @@ static json build_telegram_bridge_tools() {
                 {"type", "object"},
                 {"description", "Payload for a Telegram dice reply."},
                 {"properties", std::move(dice_props)},
+                {"additionalProperties", false},
             }));
 
     return tools;
@@ -774,9 +907,17 @@ static bool load_server_owned_telegram_runtime_tools(
         return false;
     }
 
-    json final_tools = tools;
-    for (const auto & telegram_tool : build_telegram_bridge_tools()) {
-        final_tools.push_back(telegram_tool);
+    json final_tools = json::array();
+    for (const auto & runtime_tool : tools) {
+        if (runtime_tool.is_object() && json_value(runtime_tool, "type", std::string()) == "function") {
+            const json function = runtime_tool.value("function", json::object());
+            const std::string tool_name = trim_copy(json_value(function, "name", std::string()));
+            const std::string family_id = trim_copy(json_value(function, "x-vicuna-family-id", std::string()));
+            if (tool_name == "telegram_relay" || family_id == "telegram") {
+                continue;
+            }
+        }
+        final_tools.push_back(runtime_tool);
     }
 
     {
@@ -923,6 +1064,14 @@ static json build_server_owned_bridge_request_body(
         const json & runtime_tools) {
     json augmented = body;
     json messages = json::array();
+    messages.push_back({
+        {"role", "system"},
+        {"content",
+                "Bridge-scoped delivery contract: when you are ready to respond to the user, do not call a Telegram tool. "
+                "Return normal assistant content instead. You may optionally start with YAML front matter delimited by --- lines. "
+                "Supported fields are format (plain_text|markdown|html), title, disable_web_page_preview, delivery_hint (reply|replace_prompt|silent), "
+                "and reply_markup. After the closing --- line, include the user-facing rich text body."},
+    });
     for (const auto & item : body.at("messages")) {
         messages.push_back(item);
     }
@@ -930,6 +1079,7 @@ static json build_server_owned_bridge_request_body(
     augmented["tools"] = runtime_tools;
     augmented["tool_choice"] = "auto";
     augmented["parallel_tool_calls"] = false;
+    augmented["x-vicuna-bridge-scoped"] = true;
     return augmented;
 }
 
@@ -1107,7 +1257,6 @@ struct staged_tool_payload_choice {
     json payload = json::object();
 };
 
-static constexpr const char * STAGED_SELECTOR_OPTIONAL_OMIT = "__VICUNA_OMIT__";
 static constexpr const char * STAGED_SELECTOR_TOOL_FAMILY = "select_family";
 static constexpr const char * STAGED_SELECTOR_TOOL_METHOD = "select_method";
 static constexpr const char * STAGED_SELECTOR_TOOL_SUBMIT_PAYLOAD = "submit_payload";
@@ -1339,7 +1488,8 @@ static const staged_tool_method * staged_tool_find_method(
 static std::string build_staged_tool_core_system_prompt() {
     return
             "You are Vicuña, a helpful personal concierge. Select the next tool step that best helps the user. "
-            "When a selector tool is available, call exactly one selector tool immediately and do not answer in plain text.";
+            "When a selector tool is available, call exactly one selector tool immediately and do not answer in plain text. "
+            "Plain assistant text is invalid while a staged tool turn is active.";
 }
 
 static json build_staged_selector_tool(
@@ -1407,27 +1557,7 @@ static bool staged_schema_property_is_required(const json & schema, const std::s
     return false;
 }
 
-static json strictify_staged_selector_schema(const json & schema);
-
-static json staged_optional_wrapper_schema(const json & schema) {
-    json wrapped = {
-        {"anyOf", json::array({
-            strictify_staged_selector_schema(schema),
-            {
-                {"type", "string"},
-                {"description", "Use this sentinel string when leaving an optional field unused."},
-                {"enum", json::array({STAGED_SELECTOR_OPTIONAL_OMIT})},
-            },
-        })},
-    };
-    const std::string description = trim_copy(json_value(schema, "description", std::string()));
-    if (!description.empty()) {
-        wrapped["description"] = description + " Use " + STAGED_SELECTOR_OPTIONAL_OMIT + " when this optional field is not needed.";
-    }
-    return wrapped;
-}
-
-static json strictify_staged_selector_schema(const json & schema) {
+static json build_staged_payload_provider_schema(const json & schema) {
     if (!schema.is_object()) {
         return json::object();
     }
@@ -1435,7 +1565,7 @@ static json strictify_staged_selector_schema(const json & schema) {
     if (schema.contains("anyOf") && schema.at("anyOf").is_array()) {
         json strict_any_of = json::array();
         for (const auto & item : schema.at("anyOf")) {
-            strict_any_of.push_back(strictify_staged_selector_schema(item));
+            strict_any_of.push_back(build_staged_payload_provider_schema(item));
         }
         json result = {
             {"anyOf", std::move(strict_any_of)},
@@ -1454,12 +1584,15 @@ static json strictify_staged_selector_schema(const json & schema) {
         if (schema.contains("properties") && schema.at("properties").is_object()) {
             for (const auto & item : schema.at("properties").items()) {
                 const bool is_required = staged_schema_property_is_required(schema, item.key());
-                properties[item.key()] = is_required ?
-                        strictify_staged_selector_schema(item.value()) :
-                        staged_optional_wrapper_schema(item.value());
-                required.push_back(item.key());
+                if (is_required) {
+                    properties[item.key()] = build_staged_payload_provider_schema(item.value());
+                    required.push_back(item.key());
+                }
             }
         }
+        // DeepSeek strict mode requires every exposed object property to also
+        // appear in `required`, so the provider-facing payload contract is a
+        // projection to the original required subset only.
         json result = {
             {"type", "object"},
             {"properties", std::move(properties)},
@@ -1476,14 +1609,8 @@ static json strictify_staged_selector_schema(const json & schema) {
     if (type == "array") {
         json result = {
             {"type", "array"},
-            {"items", strictify_staged_selector_schema(schema.value("items", json::object()))},
+            {"items", build_staged_payload_provider_schema(schema.value("items", json::object()))},
         };
-        if (schema.contains("minItems")) {
-            result["minItems"] = schema.at("minItems");
-        }
-        if (schema.contains("maxItems")) {
-            result["maxItems"] = schema.at("maxItems");
-        }
         const std::string description = trim_copy(json_value(schema, "description", std::string()));
         if (!description.empty()) {
             result["description"] = description;
@@ -1492,7 +1619,20 @@ static json strictify_staged_selector_schema(const json & schema) {
     }
 
     json result = json::object();
-    for (const char * key : {"type", "description", "enum", "minimum", "maximum", "minLength", "maxLength", "pattern"}) {
+    for (const char * key : {
+                 "type",
+                 "description",
+                 "enum",
+                 "const",
+                 "default",
+                 "minimum",
+                 "maximum",
+                 "exclusiveMinimum",
+                 "exclusiveMaximum",
+                 "multipleOf",
+                 "pattern",
+                 "format",
+             }) {
         if (schema.contains(key)) {
             result[key] = schema.at(key);
         }
@@ -1500,7 +1640,7 @@ static json strictify_staged_selector_schema(const json & schema) {
     return result;
 }
 
-static void strip_staged_optional_omit_sentinels(
+static void strip_staged_optional_nulls(
         json * value,
         const json & schema) {
     if (!value) {
@@ -1519,11 +1659,11 @@ static void strip_staged_optional_omit_sentinels(
             }
             json & child = (*value)[item.key()];
             if (!staged_schema_property_is_required(schema, item.key()) &&
-                    child.is_string() && child.get<std::string>() == STAGED_SELECTOR_OPTIONAL_OMIT) {
+                    child.is_null()) {
                 keys_to_erase.push_back(item.key());
                 continue;
             }
-            strip_staged_optional_omit_sentinels(&child, item.value());
+            strip_staged_optional_nulls(&child, item.value());
         }
         for (const auto & key : keys_to_erase) {
             value->erase(key);
@@ -1532,7 +1672,7 @@ static void strip_staged_optional_omit_sentinels(
     }
     if (type == "array" && value->is_array() && schema.contains("items")) {
         for (auto & item : *value) {
-            strip_staged_optional_omit_sentinels(&item, schema.at("items"));
+            strip_staged_optional_nulls(&item, schema.at("items"));
         }
     }
 }
@@ -1658,14 +1798,15 @@ static void append_staged_contract_lines(
 static staged_tool_prompt_spec build_staged_payload_prompt(
         const staged_tool_family & family,
         const staged_tool_method & method,
+        const json & provider_schema,
         const std::string & validation_error = std::string()) {
     staged_tool_prompt_spec prompt = {};
     prompt.stable_prefix =
             "Stage: construct a payload for the selected method.\n"
             "Call exactly one payload tool immediately.\n"
             "Call go_back to return to method selection.\n"
-            "Every payload field is required by the strict schema. When an optional field is not needed, set it to "
-            + std::string(STAGED_SELECTOR_OPTIONAL_OMIT) + ".";
+            "Only provide the fields shown in this contract. "
+            "The runtime keeps all other method parameters absent or fills transport defaults itself.";
     std::ostringstream out;
     out << "Chosen family: " << family.family_name << "\n";
     out << "Chosen method: " << method.method_name << "\n";
@@ -1674,18 +1815,18 @@ static staged_tool_prompt_spec build_staged_payload_prompt(
         out << "Previous payload error: " << validation_error << "\n";
     }
     out << "Contract:\n";
-    append_staged_contract_lines(out, "payload", method.parameters);
+    append_staged_contract_lines(out, "payload", provider_schema);
     prompt.dynamic_suffix = out.str();
     return prompt;
 }
 
 static json build_staged_payload_tools(
-        const staged_tool_method & method) {
+        const json & provider_schema) {
     return json::array({
         build_staged_selector_tool(
                 STAGED_SELECTOR_TOOL_SUBMIT_PAYLOAD,
                 "Submit the payload for the selected method.",
-                strictify_staged_selector_schema(method.parameters)),
+                provider_schema),
         build_staged_back_selector_tool(),
     });
 }
@@ -1707,8 +1848,9 @@ static staged_tool_prompt_bundle build_staged_tool_prompt_bundle(const json & to
         auto & payload_by_method = bundle.payload_prompts[family.family_name];
         auto & payload_tools_by_method = bundle.payload_tools[family.family_name];
         for (const auto & method : family.methods) {
-            payload_by_method[method.method_name] = build_staged_payload_prompt(family, method);
-            payload_tools_by_method[method.method_name] = build_staged_payload_tools(method);
+            const json provider_schema = build_staged_payload_provider_schema(method.parameters);
+            payload_by_method[method.method_name] = build_staged_payload_prompt(family, method, provider_schema);
+            payload_tools_by_method[method.method_name] = build_staged_payload_tools(provider_schema);
         }
     }
     return bundle;
@@ -1748,6 +1890,7 @@ static json staged_tool_prompt_cache_health_json() {
 
 static json build_staged_messages(
         const json & original_messages,
+        const json & base_body,
         const staged_tool_prompt_spec & stage_prompt,
         const std::string & validation_error = std::string()) {
     json messages = json::array();
@@ -1755,6 +1898,14 @@ static json build_staged_messages(
         {"role", "system"},
         {"content", build_staged_tool_core_system_prompt()},
     });
+    if (json_value(base_body, "x-vicuna-bridge-scoped", false)) {
+        messages.push_back({
+            {"role", "system"},
+            {"content",
+                    "Bridge-scoped note: plain assistant text is never delivered to the user from a staged turn. "
+                    "MANDATORY: use the Telegram family for every user-facing reply."},
+        });
+    }
     if (!stage_prompt.stable_prefix.empty()) {
         messages.push_back({
             {"role", "system"},
@@ -1772,7 +1923,8 @@ static json build_staged_messages(
             {"role", "system"},
             {"content",
                     "Previous response error: " + validation_error + "\n"
-                    "Call exactly one selector tool immediately and do not answer in plain text."},
+                    "MANDATORY: call exactly one selector tool immediately. "
+                    "Do not answer in plain text."},
         });
     }
     if (original_messages.is_array()) {
@@ -1787,21 +1939,145 @@ static json build_staged_provider_body(
         const json & base_body,
         const json & messages,
         const json & tools,
-        bool stage_followup_guidance) {
-    static constexpr int64_t staged_max_tokens = 768;
+        bool stage_followup_guidance,
+        int64_t stage_max_tokens = 768) {
     json staged = base_body;
     staged["parallel_tool_calls"] = false;
     staged["tools"] = tools;
     staged.erase("tool_choice");
     staged["messages"] = messages;
     staged["stream"] = false;
-    staged["max_tokens"] = staged_max_tokens;
+    staged["max_tokens"] = stage_max_tokens;
+    staged["x-vicuna-provider-max-tokens-override"] = stage_max_tokens;
     staged.erase("response_format");
     staged["x-vicuna-stage-followup-guidance"] = stage_followup_guidance;
     return staged;
 }
 
+static bool staged_body_is_bridge_scoped(const json & body) {
+    return json_value(body, "x-vicuna-bridge-scoped", false);
+}
+
+struct staged_utf8_parse_result {
+    enum status_t { success, incomplete, invalid } status = invalid;
+    size_t bytes_consumed = 0;
+};
+
+static staged_utf8_parse_result staged_parse_utf8_codepoint(
+        std::string_view input,
+        size_t offset) {
+    staged_utf8_parse_result result = {};
+    if (offset >= input.size()) {
+        result.status = staged_utf8_parse_result::incomplete;
+        return result;
+    }
+
+    const unsigned char first = static_cast<unsigned char>(input[offset]);
+    if ((first & 0x80u) == 0) {
+        result.status = staged_utf8_parse_result::success;
+        result.bytes_consumed = 1;
+        return result;
+    }
+    if ((first & 0x40u) == 0) {
+        result.status = staged_utf8_parse_result::invalid;
+        return result;
+    }
+
+    size_t expected = 0;
+    if ((first & 0x20u) == 0) {
+        expected = 2;
+    } else if ((first & 0x10u) == 0) {
+        expected = 3;
+    } else if ((first & 0x08u) == 0) {
+        expected = 4;
+    } else {
+        result.status = staged_utf8_parse_result::invalid;
+        return result;
+    }
+
+    if (offset + expected > input.size()) {
+        result.status = staged_utf8_parse_result::incomplete;
+        return result;
+    }
+    for (size_t i = 1; i < expected; ++i) {
+        const unsigned char continuation = static_cast<unsigned char>(input[offset + i]);
+        if ((continuation & 0xc0u) != 0x80u) {
+            result.status = staged_utf8_parse_result::invalid;
+            return result;
+        }
+    }
+
+    result.status = staged_utf8_parse_result::success;
+    result.bytes_consumed = expected;
+    return result;
+}
+
+static std::string make_compact_utf8_preview(
+        const std::string & raw_text,
+        size_t max_bytes) {
+    const std::string trimmed = trim_copy(raw_text);
+    std::string compact;
+    compact.reserve(std::min(max_bytes, trimmed.size()));
+
+    bool pending_space = false;
+    size_t offset = 0;
+    while (offset < trimmed.size()) {
+        const auto parsed = staged_parse_utf8_codepoint(trimmed, offset);
+        if (parsed.status == staged_utf8_parse_result::incomplete) {
+            break;
+        }
+        if (parsed.status == staged_utf8_parse_result::invalid) {
+            ++offset;
+            continue;
+        }
+
+        const std::string_view encoded(trimmed.data() + offset, parsed.bytes_consumed);
+        offset += parsed.bytes_consumed;
+
+        const bool is_space = encoded.size() == 1 && std::isspace(static_cast<unsigned char>(encoded.front())) != 0;
+        if (is_space) {
+            pending_space = !compact.empty();
+            continue;
+        }
+
+        if (pending_space) {
+            if (compact.size() + 1 > max_bytes) {
+                break;
+            }
+            compact.push_back(' ');
+            pending_space = false;
+        }
+        if (compact.size() + encoded.size() > max_bytes) {
+            break;
+        }
+        compact.append(encoded.data(), encoded.size());
+    }
+
+    return trim_copy(compact);
+}
+
+static std::string staged_plain_text_retry_error(
+        const json & base_body,
+        const std::string & stage_label,
+        const std::string & raw_content,
+        bool telegram_available) {
+    std::string message = "staged " + stage_label + " returned plain assistant text instead of a selector tool call";
+    if (staged_body_is_bridge_scoped(base_body)) {
+        message += "; bridge-scoped staged turns cannot communicate with the user via plain text";
+        if (telegram_available) {
+            message += "; Telegram is the only valid user-communication path";
+        }
+    }
+    const std::string preview = make_compact_utf8_preview(raw_content, 160);
+    if (!preview.empty()) {
+        message += ": ";
+        message += preview;
+    }
+    return message;
+}
+
 static bool parse_staged_family_selection_response(
+        const json & base_body,
         const deepseek_chat_result & result,
         const staged_tool_catalog & catalog,
         std::string * out_family_name,
@@ -1840,6 +2116,16 @@ static bool parse_staged_family_selection_response(
             return false;
         }
     }
+    if (!trim_copy(result.content).empty()) {
+        if (out_error) {
+            *out_error = staged_plain_text_retry_error(
+                    base_body,
+                    "family selection",
+                    result.content,
+                    staged_tool_find_family(catalog, "Telegram") != nullptr);
+        }
+        return false;
+    }
     try {
         const json payload = json::parse(extract_json_object_payload(result.content));
         const std::string family_name = trim_copy(json_value(payload, "family", std::string()));
@@ -1868,6 +2154,7 @@ static bool parse_staged_family_selection_response(
 }
 
 static bool parse_staged_method_selection_response(
+        const json & base_body,
         const deepseek_chat_result & result,
         const staged_tool_family & family,
         bool allow_completion,
@@ -1891,6 +2178,16 @@ static bool parse_staged_method_selection_response(
             }
             payload = json::parse(tool_call.arguments_json);
         } else {
+            if (!trim_copy(result.content).empty()) {
+                if (out_error) {
+                    *out_error = staged_plain_text_retry_error(
+                            base_body,
+                            "method selection",
+                            result.content,
+                            family.family_name == "Telegram");
+                }
+                return false;
+            }
             payload = json::parse(extract_json_object_payload(result.content));
         }
         const std::string method_name = trim_copy(json_value(payload, "method", std::string()));
@@ -2029,7 +2326,9 @@ static bool validate_payload_against_schema(
 }
 
 static bool parse_staged_payload_response(
+        const json & base_body,
         const deepseek_chat_result & result,
+        const staged_tool_family & family,
         const staged_tool_method & method,
         staged_tool_payload_choice * out_choice,
         std::string * out_error) {
@@ -2054,7 +2353,7 @@ static bool parse_staged_payload_response(
                 return false;
             }
             json payload = json::parse(tool_call.arguments_json);
-            strip_staged_optional_omit_sentinels(&payload, method.parameters);
+            strip_staged_optional_nulls(&payload, method.parameters);
             std::string validation_error;
             if (!validate_payload_against_schema(payload, method.parameters, &validation_error)) {
                 if (out_error) {
@@ -2066,6 +2365,16 @@ static bool parse_staged_payload_response(
             out_choice->payload = std::move(payload);
             return true;
         }
+        if (!trim_copy(result.content).empty()) {
+                if (out_error) {
+                    *out_error = staged_plain_text_retry_error(
+                            base_body,
+                            "payload construction",
+                            result.content,
+                            family.family_name == "Telegram");
+                }
+                return false;
+            }
         const json payload = json::parse(extract_json_object_payload(result.content));
         const std::string action = trim_copy(json_value(payload, "action", std::string()));
         if (action == "back") {
@@ -2105,13 +2414,14 @@ static bool execute_staged_selection_turn(
         const json & stage_tools,
         const std::string & validation_error,
         bool stage_followup_guidance,
+        int64_t stage_max_tokens,
         deepseek_chat_result * out_result,
         json * out_error,
         bool suppress_replay_admission = false,
         const std::string & mode_label = std::string(),
         const runtime_request_trace_context * trace_context = nullptr) {
-    const json messages = build_staged_messages(base_body.at("messages"), stage_prompt, validation_error);
-    const json staged_body = build_staged_provider_body(base_body, messages, stage_tools, stage_followup_guidance);
+    const json messages = build_staged_messages(base_body.at("messages"), base_body, stage_prompt, validation_error);
+    const json staged_body = build_staged_provider_body(base_body, messages, stage_tools, stage_followup_guidance, stage_max_tokens);
     return execute_deepseek_chat_with_emotive(
             config,
             emotive_runtime,
@@ -2123,6 +2433,7 @@ static bool execute_staged_selection_turn(
             std::string(),
             true,
             suppress_replay_admission,
+            0.0f,
             mode_label,
             trace_context);
 }
@@ -2167,11 +2478,16 @@ static bool execute_final_completion_after_staged_loop(
             std::string(),
             true,
             suppress_replay_admission,
+            0.0f,
             mode_label,
             trace_context);
 }
 
 static bool should_use_staged_tool_loop_for_request(const json & body) {
+    const char * staged_fallback_env = std::getenv("VICUNA_ENABLE_STAGED_TOOL_FALLBACK");
+    if (!staged_fallback_env || !parse_truthy_header(staged_fallback_env)) {
+        return false;
+    }
     if (!body.contains("tools") || !body.at("tools").is_array() || body.at("tools").empty()) {
         return false;
     }
@@ -2204,19 +2520,19 @@ static bool execute_deepseek_chat_with_staged_tools(
 
     const auto prompt_bundle = get_cached_staged_tool_prompt_bundle(body.at("tools"));
     if (!prompt_bundle || prompt_bundle->catalog.families.empty()) {
-        return execute_deepseek_chat_with_emotive(
-                config,
-                emotive_runtime,
-                body,
-                out_result,
-                out_error,
-                nullptr,
-                false,
-                std::string(),
-                true,
-                suppress_replay_admission,
-                mode_label,
-                trace_context);
+        if (trace_context) {
+            runtime_request_trace_log(*trace_context, "staged_tool_loop", "staged_prompt_bundle_missing", {
+                {"tool_count", body.contains("tools") && body.at("tools").is_array() ?
+                        static_cast<int64_t>(body.at("tools").size()) : 0},
+                {"message", "strict staged tool mode requires describable family, method, and parameter metadata for every tool-bearing request"},
+            });
+        }
+        if (out_error) {
+            *out_error = format_error_response(
+                    "strict staged tool mode requires describable family, method, and parameter metadata for every tool-bearing request",
+                    ERROR_TYPE_INVALID_REQUEST);
+        }
+        return false;
     }
     const staged_tool_catalog & catalog = prompt_bundle->catalog;
 
@@ -2246,6 +2562,7 @@ static bool execute_deepseek_chat_with_staged_tools(
                         prompt_bundle->family_selection_tools,
                         family_validation_error,
                         stage_turn > 1 || family_attempt > 0,
+                        768,
                         &family_result,
                         out_error,
                         suppress_replay_admission,
@@ -2255,7 +2572,7 @@ static bool execute_deepseek_chat_with_staged_tools(
             }
 
             std::string parse_error;
-            if (parse_staged_family_selection_response(family_result, catalog, &selected_family_name, &parse_error)) {
+            if (parse_staged_family_selection_response(body, family_result, catalog, &selected_family_name, &parse_error)) {
                 if (trace_context) {
                     runtime_request_trace_log(*trace_context, "staged_tool_loop", "family_selection_attempt_succeeded", {
                         {"stage_turn", stage_turn},
@@ -2293,6 +2610,13 @@ static bool execute_deepseek_chat_with_staged_tools(
             staged_tool_method_choice method_choice = {};
             bool method_valid = false;
             std::string method_validation_error;
+            const bool allow_completion = !staged_body_is_bridge_scoped(body);
+            const staged_tool_prompt_spec method_prompt = allow_completion ?
+                    prompt_bundle->method_selection_prompts.at(family->family_name) :
+                    build_staged_method_selection_prompt(*family, false);
+            const json method_tools = allow_completion ?
+                    prompt_bundle->method_selection_tools.at(family->family_name) :
+                    build_staged_method_selection_tools(*family, false);
             for (int method_attempt = 0; method_attempt < max_stage_selector_attempts && stage_turn < max_stage_turns; ++method_attempt) {
                 ++stage_turn;
                 if (trace_context) {
@@ -2308,10 +2632,11 @@ static bool execute_deepseek_chat_with_staged_tools(
                             config,
                             emotive_runtime,
                             body,
-                            prompt_bundle->method_selection_prompts.at(family->family_name),
-                            prompt_bundle->method_selection_tools.at(family->family_name),
+                            method_prompt,
+                            method_tools,
                             method_validation_error,
                             true,
+                            768,
                             &method_result,
                             out_error,
                             suppress_replay_admission,
@@ -2321,7 +2646,7 @@ static bool execute_deepseek_chat_with_staged_tools(
                 }
 
                 std::string method_error;
-                if (parse_staged_method_selection_response(method_result, *family, true, &method_choice, &method_error)) {
+                if (parse_staged_method_selection_response(body, method_result, *family, allow_completion, &method_choice, &method_error)) {
                     if (trace_context) {
                         runtime_request_trace_log(*trace_context, "staged_tool_loop", "method_selection_attempt_succeeded", {
                             {"stage_turn", stage_turn},
@@ -2398,16 +2723,18 @@ static bool execute_deepseek_chat_with_staged_tools(
                     });
                 }
                 deepseek_chat_result payload_result;
+                const int64_t payload_stage_max_tokens = family->family_name == "Telegram" ? 1024 : 768;
                 if (!execute_staged_selection_turn(
                             config,
                             emotive_runtime,
                             body,
                             payload_validation_error.empty() ?
                                     prompt_bundle->payload_prompts.at(family->family_name).at(method->method_name) :
-                                    build_staged_payload_prompt(*family, *method, payload_validation_error),
+                                    build_staged_payload_prompt(*family, *method, build_staged_payload_provider_schema(method->parameters), payload_validation_error),
                             prompt_bundle->payload_tools.at(family->family_name).at(method->method_name),
                             payload_validation_error,
                             true,
+                            payload_stage_max_tokens,
                             &payload_result,
                             out_error,
                             suppress_replay_admission,
@@ -2418,7 +2745,7 @@ static bool execute_deepseek_chat_with_staged_tools(
 
                 staged_tool_payload_choice payload_choice = {};
                 std::string payload_error;
-                if (!parse_staged_payload_response(payload_result, *method, &payload_choice, &payload_error)) {
+                if (!parse_staged_payload_response(body, payload_result, *family, *method, &payload_choice, &payload_error)) {
                     if (trace_context) {
                         runtime_request_trace_log(*trace_context, "staged_tool_loop", "payload_attempt_failed", {
                             {"stage_turn", stage_turn},
@@ -2622,6 +2949,9 @@ static json ongoing_task_decision_to_json(const server_ongoing_task_decision & d
 
 static int64_t ongoing_task_frequency_window_ms(const server_ongoing_task_frequency & frequency) {
     const int64_t interval = std::max<int32_t>(1, frequency.interval);
+    if (frequency.unit == "minutes") {
+        return interval * 60LL * 1000LL;
+    }
     if (frequency.unit == "hours") {
         return interval * 60LL * 60LL * 1000LL;
     }
@@ -2685,9 +3015,9 @@ static bool parse_ongoing_task_frequency(
         }
         return false;
     }
-    if (unit != "hours" && unit != "days" && unit != "weeks") {
+    if (unit != "minutes" && unit != "hours" && unit != "days" && unit != "weeks") {
         if (out_error) {
-            *out_error = "ongoing-task frequency unit must be one of hours, days, or weeks";
+            *out_error = "ongoing-task frequency unit must be one of minutes, hours, days, or weeks";
         }
         return false;
     }
@@ -3410,6 +3740,9 @@ static telegram_outbox_item telegram_outbox_item_from_json(const json & body) {
             {"text", request.text},
         };
     }
+    if (body.contains("emotive_animation")) {
+        request.emotive_animation = body.at("emotive_animation");
+    }
     request.reply_to_message_id = std::max<int64_t>(0, json_value(body, "reply_to_message_id", int64_t(0)));
     request.intent = trim_copy(json_value(body, "intent", std::string()));
     request.dedupe_key = trim_copy(json_value(body, "dedupe_key", std::string()));
@@ -3455,13 +3788,11 @@ static bool parse_server_owned_telegram_delivery_tool_call(
     }
 
     telegram_outbox_item item = {};
-    item.chat_scope = trim_copy(json_value(arguments, "chat_scope", context.chat_scope));
-    item.reply_to_message_id = std::max<int64_t>(
-            0,
-            json_value(arguments, "reply_to_message_id", context.reply_to_message_id));
-    item.intent = trim_copy(json_value(arguments, "intent", std::string()));
-    item.dedupe_key = trim_copy(json_value(arguments, "dedupe_key", std::string()));
-    item.urgency = std::max(0.0, json_value(arguments, "urgency", 0.0));
+    item.chat_scope = context.chat_scope;
+    item.reply_to_message_id = std::max<int64_t>(0, context.reply_to_message_id);
+    item.intent.clear();
+    item.dedupe_key.clear();
+    item.urgency = 0.0;
 
     if (item.chat_scope.empty()) {
         if (out_error) {
@@ -3481,9 +3812,7 @@ static bool parse_server_owned_telegram_delivery_tool_call(
         item.telegram_payload = json{
             {"text", trim_copy(json_value(arguments, "text", std::string()))},
         };
-        if (arguments.contains("parse_mode")) {
-            item.telegram_payload["parse_mode"] = arguments.at("parse_mode");
-        }
+        item.telegram_payload["parse_mode"] = arguments.contains("parse_mode") ? arguments.at("parse_mode") : json("HTML");
         if (arguments.contains("disable_web_page_preview")) {
             item.telegram_payload["disable_web_page_preview"] = arguments.at("disable_web_page_preview");
         }
@@ -3580,6 +3909,9 @@ static json telegram_outbox_item_to_json(const telegram_outbox_item & item) {
     if (item.reply_to_message_id > 0) {
         payload["reply_to_message_id"] = item.reply_to_message_id;
     }
+    if (!item.emotive_animation.is_null()) {
+        payload["emotive_animation"] = item.emotive_animation;
+    }
     if (!item.intent.empty()) {
         payload["intent"] = item.intent;
     }
@@ -3662,6 +3994,191 @@ static json telegram_delivery_result_to_json(const telegram_delivery_result & de
     };
 }
 
+struct server_rich_plan_response {
+    bool valid = false;
+    std::string format = "markdown";
+    std::string title;
+    std::string body;
+    bool disable_web_page_preview = false;
+    json reply_markup = nullptr;
+    std::string delivery_hint = "reply";
+    std::vector<std::string> stripped_fields;
+};
+
+static std::string trim_quotes_copy(const std::string & value) {
+    std::string trimmed = trim_copy(value);
+    if (trimmed.size() >= 2 &&
+            ((trimmed.front() == '"' && trimmed.back() == '"') ||
+             (trimmed.front() == '\'' && trimmed.back() == '\''))) {
+        return trimmed.substr(1, trimmed.size() - 2);
+    }
+    return trimmed;
+}
+
+static json parse_rich_plan_reply_markup_block(const std::vector<std::string> & lines) {
+    json rows = json::array();
+    json current_row = json::array();
+    json current_button = json::object();
+
+    const auto flush_button = [&]() {
+        if (!current_button.is_object() || current_button.empty()) {
+            return;
+        }
+        if (!current_button.contains("text") || trim_copy(json_value(current_button, "text", std::string())).empty()) {
+            current_button = json::object();
+            return;
+        }
+        current_row.push_back(current_button);
+        current_button = json::object();
+    };
+    const auto flush_row = [&]() {
+        flush_button();
+        if (!current_row.empty()) {
+            rows.push_back(current_row);
+            current_row = json::array();
+        }
+    };
+
+    for (const std::string & raw_line : lines) {
+        const std::string line = trim_copy(raw_line);
+        if (line.empty() || line == "reply_markup:" || line == "inline_keyboard:") {
+            continue;
+        }
+        if (line.rfind("- - ", 0) == 0) {
+            flush_row();
+            const std::string remainder = trim_copy(line.substr(4));
+            const size_t separator = remainder.find(':');
+            if (separator != std::string::npos) {
+                current_button[trim_copy(remainder.substr(0, separator))] =
+                        trim_quotes_copy(remainder.substr(separator + 1));
+            }
+            continue;
+        }
+        if (line.rfind("- ", 0) == 0) {
+            flush_button();
+            const std::string remainder = trim_copy(line.substr(2));
+            const size_t separator = remainder.find(':');
+            if (separator != std::string::npos) {
+                current_button[trim_copy(remainder.substr(0, separator))] =
+                        trim_quotes_copy(remainder.substr(separator + 1));
+            }
+            continue;
+        }
+        const size_t separator = line.find(':');
+        if (separator == std::string::npos) {
+            continue;
+        }
+        current_button[trim_copy(line.substr(0, separator))] =
+                trim_quotes_copy(line.substr(separator + 1));
+    }
+    flush_row();
+    if (rows.empty()) {
+        return nullptr;
+    }
+    return json{{"inline_keyboard", rows}};
+}
+
+static server_rich_plan_response parse_rich_plan_response(const std::string & raw_text) {
+    server_rich_plan_response response = {};
+    const std::string text = trim_copy(raw_text);
+    if (text.empty()) {
+        return response;
+    }
+
+    response.valid = true;
+    response.body = text;
+    if (text.rfind("---\n", 0) != 0) {
+        return response;
+    }
+
+    const size_t closing = text.find("\n---\n", 4);
+    if (closing == std::string::npos) {
+        return response;
+    }
+
+    std::istringstream meta(text.substr(4, closing - 4));
+    std::string line;
+    std::vector<std::string> reply_markup_lines;
+    bool collecting_reply_markup = false;
+    while (std::getline(meta, line)) {
+        const std::string trimmed = trim_copy(line);
+        if (trimmed.empty()) {
+            continue;
+        }
+        if (collecting_reply_markup && (line.rfind(" ", 0) == 0 || line.rfind("\t", 0) == 0 || trimmed.rfind("- ", 0) == 0)) {
+            reply_markup_lines.push_back(line);
+            continue;
+        }
+        collecting_reply_markup = false;
+        const size_t separator = line.find(':');
+        if (separator == std::string::npos) {
+            continue;
+        }
+        const std::string key = trim_copy(line.substr(0, separator));
+        const std::string value = trim_copy(line.substr(separator + 1));
+        if (key == "format") {
+            const std::string parsed = trim_quotes_copy(value);
+            if (parsed == "plain_text" || parsed == "markdown" || parsed == "html") {
+                response.format = parsed;
+            } else {
+                response.stripped_fields.push_back("format");
+            }
+        } else if (key == "title") {
+            response.title = trim_quotes_copy(value);
+        } else if (key == "disable_web_page_preview") {
+            response.disable_web_page_preview = parse_truthy_header(value);
+        } else if (key == "delivery_hint") {
+            const std::string parsed = trim_quotes_copy(value);
+            if (parsed == "reply" || parsed == "replace_prompt" || parsed == "silent") {
+                response.delivery_hint = parsed;
+            } else {
+                response.stripped_fields.push_back("delivery_hint");
+            }
+        } else if (key == "reply_markup") {
+            if (!value.empty()) {
+                try {
+                    response.reply_markup = json::parse(value);
+                } catch (...) {
+                    response.stripped_fields.push_back("reply_markup");
+                }
+            } else {
+                collecting_reply_markup = true;
+                reply_markup_lines.push_back("reply_markup:");
+            }
+        }
+    }
+    if (response.reply_markup.is_null() && !reply_markup_lines.empty()) {
+        response.reply_markup = parse_rich_plan_reply_markup_block(reply_markup_lines);
+        if (response.reply_markup.is_null()) {
+            response.stripped_fields.push_back("reply_markup");
+        }
+    }
+
+    response.body = trim_copy(text.substr(closing + 5));
+    if (response.body.empty()) {
+        response.valid = false;
+    }
+    return response;
+}
+
+static json rich_plan_response_to_json(const server_rich_plan_response & response) {
+    if (!response.valid) {
+        return nullptr;
+    }
+    json payload = {
+        {"format", response.format},
+        {"title", response.title.empty() ? json(nullptr) : json(response.title)},
+        {"body", response.body},
+        {"disable_web_page_preview", response.disable_web_page_preview},
+        {"delivery_hint", response.delivery_hint},
+        {"stripped_fields", response.stripped_fields},
+    };
+    if (!response.reply_markup.is_null()) {
+        payload["reply_markup"] = response.reply_markup;
+    }
+    return payload;
+}
+
 static bool execute_telegram_delivery_for_bridge_request(
         const server_http_req & req,
         telegram_outbox_state * outbox,
@@ -3706,25 +4223,53 @@ static bool execute_telegram_delivery_for_bridge_request(
         delivery_source = "tool_call";
     } else {
         if (!result->tool_calls.empty()) {
-            // Bridge-scoped requests may now continue through direct runtime tool calls.
-            // Only intercept the server-owned Telegram delivery tools here; leave other tool
-            // calls intact so the bridge can execute them and continue the loop client-side.
             return true;
         }
-        const std::string text = trim_copy(result->content);
-        if (text.empty()) {
+        const server_rich_plan_response rich_response = parse_rich_plan_response(result->content);
+        if (!rich_response.valid) {
             return true;
         }
+        result->rich_response = rich_plan_response_to_json(rich_response);
         item.chat_scope = context.chat_scope;
         item.reply_to_message_id = context.reply_to_message_id;
-        item.text = text;
+        item.text = rich_response.body;
         item.telegram_method = "sendMessage";
-        item.telegram_payload = json{
-            {"text", text},
-        };
+        item.telegram_payload = json{{"text", rich_response.body}};
+        if (rich_response.format == "html") {
+            item.telegram_payload["parse_mode"] = "HTML";
+        } else if (rich_response.format == "markdown") {
+            item.telegram_payload["parse_mode"] = "MarkdownV2";
+        }
+        if (rich_response.disable_web_page_preview) {
+            item.telegram_payload["disable_web_page_preview"] = true;
+        }
+        if (!rich_response.reply_markup.is_null()) {
+            item.telegram_payload["reply_markup"] = rich_response.reply_markup;
+        }
         item.dedupe_key = build_telegram_bridge_dedupe_key(context, item.telegram_method);
-        delivery_source = "compat_plain_text";
+        delivery_source = "rich_plan";
     }
+
+    if (delivery_source == "rich_plan") {
+        try {
+            validate_telegram_payload_fields(item.telegram_method, item.telegram_payload);
+        } catch (const std::exception & e) {
+            if (item.telegram_payload.contains("reply_markup")) {
+                item.telegram_payload.erase("reply_markup");
+                item.text += "\n\n[reply markup omitted: invalid metadata]";
+            } else {
+                item.text += "\n\n[delivery metadata omitted]";
+            }
+            item.telegram_payload["text"] = item.text;
+            if (trace_context) {
+                runtime_request_trace_log(*trace_context, "telegram_delivery", "rich_plan_metadata_stripped", {
+                    {"message", e.what()},
+                });
+            }
+        }
+    }
+
+    item.emotive_animation = build_telegram_emotive_animation_bundle(result->emotive_trace);
 
     telegram_outbox_enqueue_result enqueue = {};
     try {
@@ -4130,6 +4675,46 @@ static std::string format_interleaved_vad_guidance(const server_emotive_vad & va
     return out.str();
 }
 
+static std::string build_metacognitive_control_guidance(const server_metacognitive_policy_decision & policy) {
+    if (!policy.valid) {
+        return std::string();
+    }
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2);
+    out << "Metacognitive control policy: mode=" << policy.selected_mode
+        << "; reasoning_depth=" << policy.reasoning_depth
+        << "; tool_aggression=" << policy.tool_aggression
+        << "; tool_parallelism_cap=" << policy.tool_parallelism_cap
+        << "; interrupt_allowed=" << (policy.interrupt_allowed ? "true" : "false")
+        << "; replan_required=" << (policy.replan_required ? "true" : "false")
+        << "; early_stop_ok=" << (policy.early_stop_ok ? "true" : "false")
+        << "; force_synthesis=" << (policy.force_synthesis ? "true" : "false")
+        << ".";
+    if (!policy.prompt_hints.empty()) {
+        out << " Guidance: ";
+        for (size_t i = 0; i < policy.prompt_hints.size(); ++i) {
+            if (i > 0) {
+                out << " ";
+            }
+            out << policy.prompt_hints[i];
+        }
+    }
+    return out.str();
+}
+
+static int64_t metacognitive_token_budget_for_depth(const std::string & reasoning_depth) {
+    if (reasoning_depth == "none") {
+        return 256;
+    }
+    if (reasoning_depth == "short") {
+        return 512;
+    }
+    if (reasoning_depth == "medium") {
+        return 1024;
+    }
+    return 2048;
+}
+
 static std::string extract_json_object_payload(const std::string & text) {
     const std::string trimmed = trim_copy(text);
     const size_t json_start = trimmed.find('{');
@@ -4173,6 +4758,9 @@ static json inject_additive_runtime_guidance(
         const json & body,
         const server_emotive_turn_builder * builder,
         server_emotive_runtime * emotive_runtime,
+        const server_metacognitive_policy_decision * policy_decision,
+        const server_heuristic_retrieval_decision * heuristic_decision,
+        const std::string * heuristic_guidance_override,
         bool enable_heuristic_guidance,
         const runtime_request_trace_context * trace_context = nullptr) {
     if ((!builder || !builder->has_current_state()) && !emotive_runtime) {
@@ -4216,7 +4804,9 @@ static json inject_additive_runtime_guidance(
 
     std::future<std::string> heuristic_guidance_future;
     bool launched_heuristic_search = false;
-    if (enable_heuristic_guidance && emotive_runtime) {
+    if (heuristic_guidance_override && !heuristic_guidance_override->empty()) {
+        launched_heuristic_search = false;
+    } else if (enable_heuristic_guidance && emotive_runtime) {
         std::vector<std::string> struct_tags;
         const std::string query_text = build_live_heuristic_query_text(messages, &struct_tags);
         if (!query_text.empty()) {
@@ -4239,10 +4829,11 @@ static json inject_additive_runtime_guidance(
         }
     }
 
-    std::string heuristic_guidance;
+    std::string heuristic_guidance = heuristic_guidance_override ? *heuristic_guidance_override : std::string();
     if (launched_heuristic_search) {
         heuristic_guidance = heuristic_guidance_future.get();
     }
+    const std::string policy_guidance = policy_decision ? build_metacognitive_control_guidance(*policy_decision) : std::string();
     if (trace_context) {
         json data = {
             {"insertion_index", static_cast<int64_t>(insertion_index)},
@@ -4250,8 +4841,33 @@ static json inject_additive_runtime_guidance(
             {"stage_followup_guidance", stage_followup_guidance},
             {"builder_has_state", builder && builder->has_current_state()},
             {"heuristic_search_launched", launched_heuristic_search},
+            {"heuristic_decision", heuristic_decision ? json{
+                {"matched", heuristic_decision->matched},
+                {"record_id", heuristic_decision->record_id},
+                {"heuristic_id", heuristic_decision->heuristic_id},
+                {"semantic_score", heuristic_decision->semantic_score},
+                {"struct_score", heuristic_decision->struct_score},
+                {"emotive_score", heuristic_decision->emotive_score},
+                {"total_score", heuristic_decision->total_score},
+                {"threshold", heuristic_decision->threshold},
+                {"control_biases", heuristic_decision->control_biases},
+            } : json(nullptr)},
+            {"policy", policy_decision ? json{
+                {"policy_version", policy_decision->policy_version},
+                {"selected_mode", policy_decision->selected_mode},
+                {"reasoning_depth", policy_decision->reasoning_depth},
+                {"tool_aggression", policy_decision->tool_aggression},
+                {"tool_parallelism_cap", policy_decision->tool_parallelism_cap},
+                {"interrupt_allowed", policy_decision->interrupt_allowed},
+                {"replan_required", policy_decision->replan_required},
+                {"early_stop_ok", policy_decision->early_stop_ok},
+                {"force_synthesis", policy_decision->force_synthesis},
+                {"heuristic_biases", policy_decision->heuristic_biases},
+            } : json(nullptr)},
+            {"policy_guidance", policy_guidance.empty() ? json(nullptr) : json(policy_guidance)},
             {"vad_guidance", vad_guidance.empty() ? json(nullptr) : json(vad_guidance)},
             {"heuristic_guidance", heuristic_guidance.empty() ? json(nullptr) : json(heuristic_guidance)},
+            {"policy_injected", !policy_guidance.empty()},
             {"vad_injected", !vad_guidance.empty()},
             {"heuristic_injected", !heuristic_guidance.empty()},
             {"vad_skip_reason", vad_skip_reason.empty() ? json(nullptr) : json(vad_skip_reason)},
@@ -4267,11 +4883,18 @@ static json inject_additive_runtime_guidance(
         }
         runtime_request_trace_log(*trace_context, "runtime_guidance", "guidance_evaluated", std::move(data));
     }
-    if (heuristic_guidance.empty() && vad_guidance.empty()) {
+    if (heuristic_guidance.empty() && vad_guidance.empty() && policy_guidance.empty()) {
         return body;
     }
 
     auto insert_it = messages.begin() + static_cast<json::difference_type>(insertion_index);
+    if (!policy_guidance.empty()) {
+        insert_it = messages.insert(insert_it, json{
+            {"role", "system"},
+            {"content", policy_guidance},
+        });
+        ++insert_it;
+    }
     if (!heuristic_guidance.empty()) {
         insert_it = messages.insert(insert_it, json{
             {"role", "system"},
@@ -4302,6 +4925,7 @@ static bool execute_deepseek_chat_with_emotive(
         const std::string & cognitive_replay_entry_id,
         bool enable_heuristic_guidance,
         bool suppress_replay_admission,
+        float ongoing_task_due,
         const std::string & mode_label,
         const runtime_request_trace_context * trace_context) {
     if (!out_result) {
@@ -4326,6 +4950,7 @@ static bool execute_deepseek_chat_with_emotive(
                 suppress_replay_admission,
                 mode_label);
         seed_emotive_turn_from_request(body, turn_builder.get());
+        turn_builder->mark_live_generation_start();
     }
 
     deepseek_stream_observer observer;
@@ -4341,12 +4966,118 @@ static bool execute_deepseek_chat_with_emotive(
         };
     }
 
+    server_heuristic_retrieval_decision heuristic_decision = {};
+    std::string heuristic_guidance;
+    if (enable_heuristic_guidance && !cognitive_replay && body.contains("messages") && body.at("messages").is_array()) {
+        std::vector<std::string> struct_tags;
+        const std::string query_text = build_live_heuristic_query_text(body.at("messages"), &struct_tags);
+        if (!query_text.empty()) {
+            const bool have_state = turn_builder && turn_builder->has_current_state();
+            const server_emotive_vector heuristic_moment = have_state ? turn_builder->current_moment() : server_emotive_vector();
+            const server_emotive_vad heuristic_vad = have_state ? turn_builder->current_vad() : server_emotive_vad();
+            heuristic_decision = emotive_runtime.retrieve_matching_heuristic(
+                    query_text,
+                    struct_tags,
+                    have_state ? &heuristic_moment : nullptr,
+                    have_state ? &heuristic_vad : nullptr,
+                    &heuristic_guidance);
+        }
+    }
+
+    server_metacognitive_control_state control_state = {};
+    if (turn_builder && turn_builder->has_current_state()) {
+        control_state.moment = turn_builder->current_moment();
+        control_state.vad = turn_builder->current_vad();
+    }
+    control_state.ongoing_task_due = ongoing_task_due;
+    control_state.bridge_scoped = json_value(body, "x-vicuna-bridge-scoped", false);
+    control_state.cognitive_replay = cognitive_replay;
+    control_state.suppress_replay_admission = suppress_replay_admission;
+    control_state.heuristic = heuristic_decision;
+    const server_metacognitive_policy_decision policy_decision =
+            emotive_runtime.compute_control_policy(control_state);
+    if (trace_context) {
+        runtime_request_trace_log(*trace_context, "control_policy", "policy_computed", {
+            {"policy_version", policy_decision.policy_version},
+            {"selected_mode", policy_decision.selected_mode},
+            {"reasoning_depth", policy_decision.reasoning_depth},
+            {"score_breakdown", {
+                {"direct", policy_decision.direct_score},
+                {"reflective", policy_decision.reflective_score},
+                {"tool_light", policy_decision.tool_light_score},
+                {"tool_heavy", policy_decision.tool_heavy_score},
+                {"background_defer", policy_decision.background_defer_score},
+            }},
+            {"reasoning_score", policy_decision.reasoning_score},
+            {"tool_aggression", policy_decision.tool_aggression},
+            {"interrupt_score", policy_decision.interrupt_score},
+            {"tool_parallelism_cap", policy_decision.tool_parallelism_cap},
+            {"interrupt_allowed", policy_decision.interrupt_allowed},
+            {"replan_required", policy_decision.replan_required},
+            {"early_stop_ok", policy_decision.early_stop_ok},
+            {"force_synthesis", policy_decision.force_synthesis},
+            {"heuristic_biases", policy_decision.heuristic_biases},
+            {"heuristic_matched", heuristic_decision.matched},
+            {"heuristic_id", heuristic_decision.heuristic_id.empty() ? json(nullptr) : json(heuristic_decision.heuristic_id)},
+        });
+    }
+
+    json adjusted_body = body;
+    if (!adjusted_body.contains("parallel_tool_calls")) {
+        adjusted_body["parallel_tool_calls"] = policy_decision.tool_parallelism_cap > 1;
+    }
+    if (!adjusted_body.contains("x-vicuna-provider-max-tokens-override") &&
+            !adjusted_body.contains("max_tokens") &&
+            !adjusted_body.contains("max_output_tokens") &&
+            !adjusted_body.contains("max_completion_tokens")) {
+        adjusted_body["x-vicuna-provider-max-tokens-override"] =
+                metacognitive_token_budget_for_depth(policy_decision.reasoning_depth);
+    }
+
     const json provider_body = inject_additive_runtime_guidance(
-            body,
+            adjusted_body,
             turn_builder.get(),
             &emotive_runtime,
+            &policy_decision,
+            &heuristic_decision,
+            heuristic_guidance.empty() ? nullptr : &heuristic_guidance,
             enable_heuristic_guidance && !cognitive_replay,
             trace_context);
+    if (turn_builder) {
+        turn_builder->set_final_policy({
+            {"policy_version", policy_decision.policy_version},
+            {"selected_mode", policy_decision.selected_mode},
+            {"reasoning_depth", policy_decision.reasoning_depth},
+            {"score_breakdown", {
+                {"direct", policy_decision.direct_score},
+                {"reflective", policy_decision.reflective_score},
+                {"tool_light", policy_decision.tool_light_score},
+                {"tool_heavy", policy_decision.tool_heavy_score},
+                {"background_defer", policy_decision.background_defer_score},
+            }},
+            {"reasoning_score", policy_decision.reasoning_score},
+            {"tool_aggression", policy_decision.tool_aggression},
+            {"interrupt_score", policy_decision.interrupt_score},
+            {"tool_parallelism_cap", policy_decision.tool_parallelism_cap},
+            {"interrupt_allowed", policy_decision.interrupt_allowed},
+            {"replan_required", policy_decision.replan_required},
+            {"early_stop_ok", policy_decision.early_stop_ok},
+            {"force_synthesis", policy_decision.force_synthesis},
+            {"heuristic_biases", policy_decision.heuristic_biases},
+            {"prompt_hints", policy_decision.prompt_hints},
+        });
+        turn_builder->set_heuristic_retrieval({
+            {"matched", heuristic_decision.matched},
+            {"record_id", heuristic_decision.record_id},
+            {"heuristic_id", heuristic_decision.heuristic_id},
+            {"semantic_score", heuristic_decision.semantic_score},
+            {"struct_score", heuristic_decision.struct_score},
+            {"emotive_score", heuristic_decision.emotive_score},
+            {"total_score", heuristic_decision.total_score},
+            {"threshold", heuristic_decision.threshold},
+            {"control_biases", heuristic_decision.control_biases},
+        });
+    }
     deepseek_request_trace provider_trace;
     if (trace_context) {
         provider_trace.request_id = trace_context->request_id;
@@ -4368,7 +5099,40 @@ static bool execute_deepseek_chat_with_emotive(
     if (turn_builder) {
         turn_builder->observe_runtime_event(
                 "provider_finish:" + (out_result->finish_reason.empty() ? std::string("stop") : out_result->finish_reason));
-        const server_emotive_trace trace = turn_builder->finalize();
+        server_emotive_trace trace = turn_builder->finalize();
+        trace.final_policy = {
+            {"policy_version", policy_decision.policy_version},
+            {"selected_mode", policy_decision.selected_mode},
+            {"reasoning_depth", policy_decision.reasoning_depth},
+            {"score_breakdown", {
+                {"direct", policy_decision.direct_score},
+                {"reflective", policy_decision.reflective_score},
+                {"tool_light", policy_decision.tool_light_score},
+                {"tool_heavy", policy_decision.tool_heavy_score},
+                {"background_defer", policy_decision.background_defer_score},
+            }},
+            {"reasoning_score", policy_decision.reasoning_score},
+            {"tool_aggression", policy_decision.tool_aggression},
+            {"interrupt_score", policy_decision.interrupt_score},
+            {"tool_parallelism_cap", policy_decision.tool_parallelism_cap},
+            {"interrupt_allowed", policy_decision.interrupt_allowed},
+            {"replan_required", policy_decision.replan_required},
+            {"early_stop_ok", policy_decision.early_stop_ok},
+            {"force_synthesis", policy_decision.force_synthesis},
+            {"heuristic_biases", policy_decision.heuristic_biases},
+            {"prompt_hints", policy_decision.prompt_hints},
+        };
+        trace.heuristic_retrieval = {
+            {"matched", heuristic_decision.matched},
+            {"record_id", heuristic_decision.record_id},
+            {"heuristic_id", heuristic_decision.heuristic_id},
+            {"semantic_score", heuristic_decision.semantic_score},
+            {"struct_score", heuristic_decision.struct_score},
+            {"emotive_score", heuristic_decision.emotive_score},
+            {"total_score", heuristic_decision.total_score},
+            {"threshold", heuristic_decision.threshold},
+            {"control_biases", heuristic_decision.control_biases},
+        };
         out_result->emotive_trace = server_emotive_trace_to_json(trace);
         if (out_trace) {
             *out_trace = trace;
@@ -4640,6 +5404,7 @@ static bool execute_bridge_scoped_telegram_request(
                         std::string(),
                         true,
                         false,
+                        0.0f,
                         "telegram_bridge",
                         trace_context);
         if (!executed) {
@@ -4760,7 +5525,7 @@ static server_http_res_ptr handle_deepseek_chat(
             execute_bridge_scoped_telegram_request(config, emotive_runtime, req, body, &result, &error, &trace_context) :
             (should_use_staged_tool_loop_for_request(body) ?
                     execute_deepseek_chat_with_staged_tools(config, emotive_runtime, body, &result, &error, false, "foreground", &trace_context) :
-                    execute_deepseek_chat_with_emotive(config, emotive_runtime, body, &result, &error, nullptr, false, std::string(), true, false, "foreground", &trace_context));
+                    execute_deepseek_chat_with_emotive(config, emotive_runtime, body, &result, &error, nullptr, false, std::string(), true, false, 0.0f, "foreground", &trace_context));
     if (!executed) {
         runtime_request_trace_log(trace_context, "runtime", "request_failed", {
             {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
@@ -4781,6 +5546,9 @@ static server_http_res_ptr handle_deepseek_chat(
     const std::string completion_id = gen_chatcmplid();
     if (responses_api) {
         json response = deepseek_format_responses_response(config, result);
+        if (!result.rich_response.is_null()) {
+            response["vicuna_rich_response"] = result.rich_response;
+        }
         const json delivery_json = telegram_delivery_result_to_json(telegram_delivery);
         if (!delivery_json.is_null()) {
             response["vicuna_telegram_delivery"] = delivery_json;
@@ -4789,6 +5557,9 @@ static server_http_res_ptr handle_deepseek_chat(
     }
     if (text_completion_api) {
         json response = deepseek_format_text_completion_response(config, result, completion_id);
+        if (!result.rich_response.is_null()) {
+            response["vicuna_rich_response"] = result.rich_response;
+        }
         const json delivery_json = telegram_delivery_result_to_json(telegram_delivery);
         if (!delivery_json.is_null()) {
             response["vicuna_telegram_delivery"] = delivery_json;
@@ -4817,6 +5588,9 @@ static server_http_res_ptr handle_deepseek_chat(
     }
 
     json response = deepseek_format_chat_completion_response(config, result, completion_id);
+    if (!result.rich_response.is_null()) {
+        response["vicuna_rich_response"] = result.rich_response;
+    }
     const json delivery_json = telegram_delivery_result_to_json(telegram_delivery);
     if (!delivery_json.is_null()) {
         response["vicuna_telegram_delivery"] = delivery_json;
@@ -5003,6 +5777,7 @@ static bool decide_due_ongoing_task(
                 std::string(),
                 true,
                 true,
+                tasks.empty() ? 0.0f : 1.0f,
                 "ongoing_task_decision",
                 &trace_context)) {
         ongoing_task_worker_set_error(
@@ -5099,6 +5874,7 @@ static bool execute_selected_ongoing_task(
                 std::string(),
                 true,
                 true,
+                0.8f,
                 "ongoing_task_execution",
                 &trace_context)) {
         ongoing_task_worker_set_error(
@@ -5289,6 +6065,7 @@ static void compress_resolved_replay_into_heuristic(
                 entry.entry_id,
                 false,
                 false,
+                0.0f,
                 "heuristic_compression",
                 &trace_context)) {
         if (worker_state) {
@@ -5381,6 +6158,7 @@ static void run_cognitive_replay_once(
                 entry.entry_id,
                 true,
                 false,
+                0.0f,
                 "cognitive_replay",
                 &trace_context)) {
         emotive_runtime.fail_cognitive_replay_entry(
@@ -5611,6 +6389,8 @@ int main(int argc, char ** argv) {
         payload["bridge_runtime"] = {
             {"telegram_runtime_tool_cache", telegram_runtime_tool_cache_health_json()},
             {"staged_prompt_cache", staged_tool_prompt_cache_health_json()},
+            {"staged_fallback_enabled", parse_truthy_header(std::getenv("VICUNA_ENABLE_STAGED_TOOL_FALLBACK") ? std::getenv("VICUNA_ENABLE_STAGED_TOOL_FALLBACK") : "")},
+            {"delivery_contract", "rich_plan_response_v1"},
         };
         payload["request_traces"] = runtime_request_trace_health_json();
         payload["emotive_runtime"] = emotive_runtime.health_json();

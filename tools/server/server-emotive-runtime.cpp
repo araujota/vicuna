@@ -487,6 +487,70 @@ static void sort_and_dedupe_strings(std::vector<std::string> & values) {
     values.erase(std::unique(values.begin(), values.end()), values.end());
 }
 
+static void append_control_bias(
+        std::vector<json> & biases,
+        const std::string & heuristic_id,
+        const std::string & target,
+        float value,
+        const std::string & rationale) {
+    if (target.empty() || std::fabs(value) < 0.001f) {
+        return;
+    }
+    biases.push_back({
+        {"heuristic_id", heuristic_id},
+        {"target", target},
+        {"bias", std::max(-0.25f, std::min(0.25f, value))},
+        {"rationale", rationale},
+    });
+}
+
+static std::string join_strings(const std::vector<std::string> & values, const char * separator = "\n") {
+    std::ostringstream out;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            out << separator;
+        }
+        out << values[i];
+    }
+    return out.str();
+}
+
+static std::vector<json> derive_control_biases(const server_heuristic_object & heuristic) {
+    const std::string normalized = normalize_text_copy(
+            heuristic.semantic_trigger_text + "\n" +
+            heuristic.failure_mode + "\n" +
+            join_strings(heuristic.constraints) + "\n" +
+            join_strings(heuristic.preferred_actions) + "\n" +
+            join_strings(heuristic.action_ranking_rules) + "\n" +
+            heuristic.mid_reasoning_correction + "\n" +
+            join_strings(heuristic.applies_when));
+    std::vector<json> biases;
+
+    if (contains_any(normalized, {"validate", "verification", "verify", "confirm", "schema", "contract", "check"})) {
+        append_control_bias(biases, heuristic.heuristic_id, "tool_light", 0.12f, "heuristic favors verification before committing");
+        append_control_bias(biases, heuristic.heuristic_id, "tool_heavy", 0.08f, "heuristic favors verification before committing");
+        append_control_bias(biases, heuristic.heuristic_id, "reasoning_score", 0.10f, "heuristic increases verification depth");
+        append_control_bias(biases, heuristic.heuristic_id, "interrupt_score", 0.08f, "heuristic allows interruption when validation fails");
+    }
+    if (contains_any(normalized, {"retry", "replan", "stuck", "loop", "stall", "backtrack"})) {
+        append_control_bias(biases, heuristic.heuristic_id, "reflective", 0.10f, "heuristic favors explicit replanning");
+        append_control_bias(biases, heuristic.heuristic_id, "replan_pressure", 0.14f, "heuristic raises replanning pressure");
+        append_control_bias(biases, heuristic.heuristic_id, "force_synthesis_gate", 0.08f, "heuristic forces synthesis instead of repeated looping");
+    }
+    if (contains_any(normalized, {"plan", "step", "order", "sequence", "first", "then"})) {
+        append_control_bias(biases, heuristic.heuristic_id, "tool_parallelism_gate", -0.10f, "heuristic prefers sequential execution order");
+        append_control_bias(biases, heuristic.heuristic_id, "reasoning_score", 0.06f, "heuristic emphasizes explicit planning");
+    }
+    if (contains_any(normalized, {"tool", "search", "lookup", "inspect"})) {
+        append_control_bias(biases, heuristic.heuristic_id, "tool_aggression", 0.08f, "heuristic prefers external verification tools");
+        append_control_bias(biases, heuristic.heuristic_id, "tool_light", 0.08f, "heuristic prefers tool-assisted execution");
+    }
+    if (contains_any(normalized, {"respond", "answer directly", "conclude", "finish"})) {
+        append_control_bias(biases, heuristic.heuristic_id, "direct", 0.06f, "heuristic supports direct synthesis once checks complete");
+    }
+    return biases;
+}
+
 static std::vector<std::string> extract_struct_tags(const std::string & text, const std::string & kind) {
     std::vector<std::string> tags;
     const std::string normalized = normalize_text_copy(text);
@@ -1020,6 +1084,33 @@ static json heuristic_retrieval_decision_to_json(const server_heuristic_retrieva
         {"total_score", decision.total_score},
         {"threshold", decision.threshold},
         {"created_at_ms", decision.created_at_ms},
+        {"control_biases", decision.control_biases},
+    };
+}
+
+static json metacognitive_policy_to_json(const server_metacognitive_policy_decision & decision) {
+    return {
+        {"valid", decision.valid},
+        {"policy_version", decision.policy_version},
+        {"selected_mode", decision.selected_mode},
+        {"reasoning_depth", decision.reasoning_depth},
+        {"score_breakdown", {
+            {"direct", decision.direct_score},
+            {"reflective", decision.reflective_score},
+            {"tool_light", decision.tool_light_score},
+            {"tool_heavy", decision.tool_heavy_score},
+            {"background_defer", decision.background_defer_score},
+        }},
+        {"reasoning_score", decision.reasoning_score},
+        {"tool_aggression", decision.tool_aggression},
+        {"interrupt_score", decision.interrupt_score},
+        {"tool_parallelism_cap", decision.tool_parallelism_cap},
+        {"interrupt_allowed", decision.interrupt_allowed},
+        {"replan_required", decision.replan_required},
+        {"early_stop_ok", decision.early_stop_ok},
+        {"force_synthesis", decision.force_synthesis},
+        {"heuristic_biases", decision.heuristic_biases},
+        {"prompt_hints", decision.prompt_hints},
     };
 }
 
@@ -1080,6 +1171,7 @@ json server_emotive_trace_to_json(const server_emotive_trace & trace) {
         {"trace_id", trace.trace_id},
         {"model", trace.model},
         {"blocks", blocks},
+        {"live_generation_start_block_index", trace.live_generation_start_block_index},
         {"final_moment", vector_to_json(trace.final_moment)},
         {"final_vad", vad_to_json(trace.final_vad)},
         {"embedding_mode", trace.embedding_mode},
@@ -1090,6 +1182,8 @@ json server_emotive_trace_to_json(const server_emotive_trace & trace) {
         {"cognitive_replay", trace.cognitive_replay},
         {"cognitive_replay_entry_id", trace.cognitive_replay_entry_id},
         {"suppress_replay_admission", trace.suppress_replay_admission},
+        {"final_policy", trace.final_policy},
+        {"heuristic_retrieval", trace.heuristic_retrieval},
     };
 }
 
@@ -1260,19 +1354,29 @@ struct cognitive_replay_candidate {
     float negative_mass = 0.0f;
     float valence_drop = 0.0f;
     float dominance_drop = 0.0f;
+    float control_failure_mass = 0.0f;
     server_emotive_vad baseline_vad_before;
     server_emotive_vad baseline_vad_after;
     std::vector<server_emotive_block_record> window_blocks;
 };
 
 static bool should_admit_replay_candidate(
-        const server_emotive_delta & delta,
+        const server_emotive_block_record & current,
         float valence_drop,
         float dominance_drop,
         const server_cognitive_replay_config & config) {
-    return delta.negative_mass >= config.neg_mass_threshold ||
+    const server_emotive_delta & delta = current.delta;
+    const server_emotive_vector & moment = current.moment;
+    const bool baseline_negative =
+            delta.negative_mass >= config.neg_mass_threshold ||
             (valence_drop >= config.valence_drop_threshold &&
              dominance_drop >= config.dominance_drop_threshold);
+    const bool control_failure =
+            moment.stall >= 0.70f ||
+            moment.runtime_failure_pressure >= 0.60f ||
+            (moment.contradiction_pressure >= 0.60f && moment.planning_clarity <= 0.35f) ||
+            (moment.stall >= 0.55f && moment.confidence >= 0.40f);
+    return baseline_negative || control_failure;
 }
 
 static bool has_persistent_negative_signal(
@@ -1287,11 +1391,14 @@ static bool has_persistent_negative_signal(
     const auto & previous = trace.blocks[index - 1];
     const float valence_drop = std::max(0.0f, previous.vad.valence - current.vad.valence);
     const float dominance_drop = std::max(0.0f, previous.vad.dominance - current.vad.dominance);
-    return should_admit_replay_candidate(current.delta, valence_drop, dominance_drop, config);
+    return should_admit_replay_candidate(current, valence_drop, dominance_drop, config);
 }
 
 static float replay_candidate_priority(const cognitive_replay_candidate & candidate) {
-    return candidate.negative_mass + candidate.valence_drop + candidate.dominance_drop;
+    return candidate.negative_mass +
+            candidate.valence_drop +
+            candidate.dominance_drop +
+            candidate.control_failure_mass;
 }
 
 static float replay_entry_priority(const server_cognitive_replay_entry & entry) {
@@ -1311,7 +1418,7 @@ static cognitive_replay_candidate strongest_replay_candidate(
         const auto & previous = trace.blocks[i - 1];
         const float valence_drop = std::max(0.0f, previous.vad.valence - current.vad.valence);
         const float dominance_drop = std::max(0.0f, previous.vad.dominance - current.vad.dominance);
-        if (!should_admit_replay_candidate(current.delta, valence_drop, dominance_drop, config)) {
+        if (!should_admit_replay_candidate(current, valence_drop, dominance_drop, config)) {
             continue;
         }
 
@@ -1342,6 +1449,11 @@ static cognitive_replay_candidate strongest_replay_candidate(
         candidate.negative_mass = current.delta.negative_mass;
         candidate.valence_drop = valence_drop;
         candidate.dominance_drop = dominance_drop;
+        candidate.control_failure_mass = std::max({
+                current.moment.stall,
+                current.moment.runtime_failure_pressure,
+                clamp_unit(current.moment.contradiction_pressure - current.moment.planning_clarity + 0.35f),
+        });
         candidate.baseline_vad_before = previous.vad;
         candidate.baseline_vad_after = current.vad;
         candidate.window_blocks.assign(
@@ -1470,6 +1582,7 @@ json server_emotive_runtime::health_json() const {
     }
     return {
         {"enabled", config_.enabled},
+        {"control_policy_version", "control_surface_v1"},
         {"block_max_chars", config_.block_max_chars},
         {"max_blocks_per_turn", config_.max_blocks_per_turn},
         {"max_turn_history", config_.max_turn_history},
@@ -2012,6 +2125,10 @@ server_heuristic_retrieval_decision server_emotive_runtime::retrieve_matching_he
     }
 
     decision.matched = best_record && decision.total_score >= config_.heuristic_memory.rerank_threshold;
+    if (decision.matched) {
+        const auto & heuristic = best_record->heuristic;
+        decision.control_biases = derive_control_biases(heuristic);
+    }
     if (decision.matched && out_guidance) {
         const auto & heuristic = best_record->heuristic;
         std::ostringstream guidance;
@@ -2037,10 +2154,197 @@ server_heuristic_retrieval_decision server_emotive_runtime::retrieve_matching_he
             guidance << "- " << heuristic.applies_when.front() << "\n";
         }
         *out_guidance = guidance.str();
+    } else if (!decision.matched) {
+        decision.control_biases.clear();
     }
 
     std::lock_guard<std::mutex> lock(history_mutex_);
     last_heuristic_retrieval_ = decision;
+    return decision;
+}
+
+server_metacognitive_policy_decision server_emotive_runtime::compute_control_policy(
+        const server_metacognitive_control_state & state) const {
+    const server_emotive_vector & m = state.moment;
+    const float valence_n = clamp_unit((state.vad.valence + 1.0f) * 0.5f);
+    const float dominance_n = clamp_unit((state.vad.dominance + 1.0f) * 0.5f);
+    server_metacognitive_policy_decision decision = {};
+    decision.valid = true;
+
+    std::map<std::string, float> bias_by_target;
+    for (const auto & item : state.heuristic.control_biases) {
+        if (!item.is_object()) {
+            continue;
+        }
+        const std::string target = json_value(item, "target", std::string());
+        const float bias = std::max(-0.25f, std::min(0.25f, json_value(item, "bias", 0.0f)));
+        if (target.empty()) {
+            continue;
+        }
+        bias_by_target[target] = std::max(-0.35f, std::min(0.35f, bias_by_target[target] + bias));
+        decision.heuristic_biases.push_back(item);
+    }
+
+    const auto with_bias = [&bias_by_target](const std::string & target, float value) {
+        auto it = bias_by_target.find(target);
+        if (it == bias_by_target.end()) {
+            return value;
+        }
+        return value + it->second;
+    };
+
+    decision.direct_score = with_bias(
+            "direct",
+            0.55f * m.confidence +
+                    0.45f * m.planning_clarity +
+                    0.35f * m.satisfaction +
+                    0.25f * m.user_alignment +
+                    0.15f * dominance_n -
+                    0.60f * m.epistemic_pressure -
+                    0.55f * m.contradiction_pressure -
+                    0.35f * m.runtime_failure_pressure -
+                    0.30f * m.stall);
+    decision.reflective_score = with_bias(
+            "reflective",
+            0.45f * m.user_alignment +
+                    0.40f * m.caution +
+                    0.35f * m.epistemic_pressure +
+                    0.25f * (1.0f - dominance_n) +
+                    0.20f * (1.0f - valence_n) -
+                    0.30f * m.momentum -
+                    0.25f * m.planning_clarity);
+    decision.tool_light_score = with_bias(
+            "tool_light",
+            0.55f * m.epistemic_pressure +
+                    0.35f * m.planning_clarity +
+                    0.30f * m.user_alignment +
+                    0.25f * m.confidence +
+                    0.20f * m.runtime_trust -
+                    0.30f * m.runtime_failure_pressure -
+                    0.20f * m.frustration);
+    decision.tool_heavy_score = with_bias(
+            "tool_heavy",
+            0.65f * m.epistemic_pressure +
+                    0.55f * m.contradiction_pressure +
+                    0.40f * (1.0f - m.runtime_trust) +
+                    0.35f * (1.0f - m.user_alignment) +
+                    0.25f * m.stall -
+                    0.20f * m.satisfaction -
+                    0.15f * valence_n);
+    decision.background_defer_score = with_bias(
+            "background_defer",
+            0.50f * state.ongoing_task_due +
+                    0.35f * m.satisfaction +
+                    0.30f * m.planning_clarity +
+                    0.25f * m.momentum -
+                    0.55f * m.user_alignment -
+                    0.40f * m.frustration -
+                    0.30f * m.runtime_failure_pressure);
+
+    const std::vector<std::pair<std::string, float>> mode_scores = {
+        {"direct", decision.direct_score},
+        {"reflective", decision.reflective_score},
+        {"tool_light", decision.tool_light_score},
+        {"tool_heavy", decision.tool_heavy_score},
+        {"background_defer", decision.background_defer_score},
+    };
+    decision.selected_mode = "direct";
+    float best_score = decision.direct_score;
+    for (const auto & item : mode_scores) {
+        if (item.second > best_score) {
+            best_score = item.second;
+            decision.selected_mode = item.first;
+        }
+    }
+
+    if (m.runtime_failure_pressure >= 0.75f && decision.selected_mode == "direct") {
+        decision.selected_mode = "tool_light";
+    }
+    if (m.stall >= 0.75f && m.contradiction_pressure >= 0.55f) {
+        decision.selected_mode = "reflective";
+    }
+    if (state.ongoing_task_due >= 0.80f && m.user_alignment <= 0.25f) {
+        decision.selected_mode = "background_defer";
+    }
+    if (state.cognitive_replay) {
+        decision.selected_mode = "reflective";
+    }
+    if (state.bridge_scoped && decision.selected_mode == "background_defer") {
+        decision.selected_mode = "reflective";
+    }
+
+    decision.reasoning_score = with_bias(
+            "reasoning_score",
+            0.50f * m.epistemic_pressure +
+                    0.40f * m.contradiction_pressure +
+                    0.30f * m.curiosity +
+                    0.20f * m.caution -
+                    0.45f * m.confidence -
+                    0.25f * m.planning_clarity);
+    if (decision.reasoning_score <= 0.05f) {
+        decision.reasoning_depth = "none";
+    } else if (decision.reasoning_score <= 0.30f) {
+        decision.reasoning_depth = "short";
+    } else if (decision.reasoning_score <= 0.60f) {
+        decision.reasoning_depth = "medium";
+    } else {
+        decision.reasoning_depth = "deep";
+    }
+
+    decision.tool_aggression = clamp_unit(with_bias(
+            "tool_aggression",
+            0.45f * m.epistemic_pressure +
+                    0.35f * m.contradiction_pressure +
+                    0.35f * (1.0f - m.runtime_trust) +
+                    0.20f * m.stall -
+                    0.25f * m.satisfaction));
+
+    if (decision.tool_aggression >= 0.45f &&
+            m.planning_clarity >= 0.65f &&
+            m.momentum >= 0.55f &&
+            m.runtime_trust >= 0.55f &&
+            with_bias("tool_parallelism_gate", 0.0f) >= -0.25f) {
+        decision.tool_parallelism_cap = 2;
+    } else if (decision.tool_aggression >= 0.20f) {
+        decision.tool_parallelism_cap = 1;
+    } else {
+        decision.tool_parallelism_cap = 0;
+    }
+
+    decision.interrupt_score = clamp_unit(with_bias(
+            "interrupt_score",
+            std::max(m.contradiction_pressure, std::max(m.runtime_failure_pressure, m.stall)) +
+                    0.25f * m.epistemic_pressure -
+                    0.25f * m.momentum));
+    decision.interrupt_allowed = decision.interrupt_score >= 0.70f;
+    const float replan_pressure = with_bias("replan_pressure", m.stall);
+    decision.replan_required = replan_pressure >= 0.70f && m.planning_clarity <= 0.35f;
+    decision.early_stop_ok =
+            m.satisfaction >= std::max(0.0f, 0.65f + with_bias("early_stop_gate", 0.0f)) &&
+            m.contradiction_pressure <= 0.25f &&
+            m.epistemic_pressure <= 0.35f;
+    decision.force_synthesis =
+            m.stall >= std::max(0.0f, 0.70f - with_bias("force_synthesis_gate", 0.0f)) &&
+            m.confidence >= 0.40f;
+
+    if (decision.selected_mode == "tool_heavy" || decision.selected_mode == "tool_light") {
+        decision.prompt_hints.push_back("Prefer direct tool calls over speculative free-text answers.");
+    }
+    if (decision.selected_mode == "reflective") {
+        decision.prompt_hints.push_back("Surface uncertainty and reframe the plan before committing.");
+    }
+    if (decision.replan_required) {
+        decision.prompt_hints.push_back("Explicitly replan before continuing.");
+    }
+    if (decision.force_synthesis) {
+        decision.prompt_hints.push_back("Synthesize the best bounded answer now instead of looping.");
+    }
+    if (decision.early_stop_ok) {
+        decision.prompt_hints.push_back("Conclude once the answer is sufficient; avoid gratuitous extra steps.");
+    }
+    if (state.cognitive_replay) {
+        decision.prompt_hints.push_back("Stay grounded in the replay window and prefer concrete corrective actions.");
+    }
     return decision;
 }
 
@@ -2058,6 +2362,8 @@ server_emotive_turn_builder::server_emotive_turn_builder(
         user_anchor_count_(0),
         have_previous_moment_(false),
         have_previous_vad_(false),
+        live_generation_start_block_index_(0),
+        live_generation_start_marked_(false),
         cognitive_replay_(cognitive_replay),
         cognitive_replay_entry_id_(cognitive_replay_entry_id),
         suppress_replay_admission_(suppress_replay_admission),
@@ -2088,6 +2394,20 @@ void server_emotive_turn_builder::observe_content_delta(const std::string & text
 void server_emotive_turn_builder::observe_runtime_event(const std::string & text) {
     append_text(SERVER_EMOTIVE_BLOCK_RUNTIME_EVENT, text);
     flush_pending();
+}
+
+void server_emotive_turn_builder::mark_live_generation_start() {
+    flush_pending();
+    live_generation_start_block_index_ = (int32_t) blocks_.size();
+    live_generation_start_marked_ = true;
+}
+
+void server_emotive_turn_builder::set_final_policy(json final_policy) {
+    final_policy_ = std::move(final_policy);
+}
+
+void server_emotive_turn_builder::set_heuristic_retrieval(json heuristic_retrieval) {
+    heuristic_retrieval_ = std::move(heuristic_retrieval);
 }
 
 bool server_emotive_turn_builder::has_current_state() const {
@@ -2175,6 +2495,9 @@ server_emotive_trace server_emotive_turn_builder::finalize() {
     trace.trace_id = make_trace_id();
     trace.model = model_name_;
     trace.blocks = blocks_;
+    trace.live_generation_start_block_index = live_generation_start_marked_ ?
+            live_generation_start_block_index_ :
+            0;
     trace.embedding_mode = blocks_.empty() ? "lexical_only" : blocks_.back().embedding_mode;
     trace.estimator_version = "v2_vad_projection";
     trace.provider_streamed = true;
@@ -2183,6 +2506,8 @@ server_emotive_trace server_emotive_turn_builder::finalize() {
     trace.cognitive_replay_entry_id = cognitive_replay_entry_id_;
     trace.suppress_replay_admission = suppress_replay_admission_ || cognitive_replay_;
     trace.mode_label = !mode_label_.empty() ? mode_label_ : (cognitive_replay_ ? "cognitive_replay" : "foreground");
+    trace.final_policy = final_policy_;
+    trace.heuristic_retrieval = heuristic_retrieval_;
     if (!blocks_.empty()) {
         trace.final_moment = blocks_.back().moment;
         trace.final_vad = blocks_.back().vad;

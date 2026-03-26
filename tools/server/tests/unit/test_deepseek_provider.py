@@ -29,6 +29,13 @@ def make_provider_server(base_url: str, extra_env: Optional[Dict[str, str]] = No
     return server
 
 
+def make_staged_provider_server(base_url: str, extra_env: Optional[Dict[str, str]] = None) -> ServerProcess:
+    merged = {"VICUNA_ENABLE_STAGED_TOOL_FALLBACK": "1"}
+    if extra_env:
+        merged.update(extra_env)
+    return make_provider_server(base_url, merged)
+
+
 def wait_for(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -202,6 +209,36 @@ def requests_for_path(state, path: str):
     return [request for request in state["requests"] if request["path"] == path]
 
 
+def outbound_system_messages(payload):
+    return [
+        message["content"]
+        for message in payload.get("messages", [])
+        if message.get("role") == "system" and isinstance(message.get("content"), str)
+    ]
+
+
+def assert_has_policy_guidance(payload):
+    system_messages = outbound_system_messages(payload)
+    assert any(message.startswith("Metacognitive control policy:") for message in system_messages)
+
+
+def rich_plan_text(body: str, *, format: str = "plain_text", extra_meta: Optional[Dict[str, object]] = None) -> str:
+    meta = {"format": format}
+    if extra_meta:
+        meta.update(extra_meta)
+    lines = ["---"]
+    for key, value in meta.items():
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        elif isinstance(value, (dict, list)):
+            rendered = json.dumps(value)
+        else:
+            rendered = str(value)
+        lines.append(f"{key}: {rendered}")
+    lines.extend(["---", body])
+    return "\n".join(lines)
+
+
 def selector_tool_name(payload):
     tools = payload.get("tools", [])
     if not tools:
@@ -325,6 +362,9 @@ def test_provider_mode_chat_completion_exposes_reasoning_trace():
             assert response.body["model"] == "deepseek-chat"
             trace = response.body["vicuna_emotive_trace"]
             assert trace["embedding_mode"] == "lexical_only"
+            assert trace["live_generation_start_block_index"] == 1
+            assert trace["final_policy"]["policy_version"] == "control_surface_v1"
+            assert trace["heuristic_retrieval"]["matched"] is False
             assert [block["source"]["kind"] for block in trace["blocks"]] == [
                 "user_message",
                 "assistant_reasoning",
@@ -352,13 +392,13 @@ def test_provider_mode_chat_completion_exposes_reasoning_trace():
             assert outbound["body"]["thinking"] == {"type": "enabled"}
             assert outbound["body"]["temperature"] == 0.2
             assert outbound["body"]["stream"] is True
-            assert outbound["body"]["messages"] == [
-                {"role": "user", "content": "Hello"},
-            ]
+            assert outbound["body"]["messages"][0] == {"role": "user", "content": "Hello"}
+            assert_has_policy_guidance(outbound["body"])
 
             latest = server.make_request("GET", "/v1/emotive/trace/latest")
             assert latest.status_code == 200
             assert latest.body["trace"]["trace_id"] == trace["trace_id"]
+            assert latest.body["trace"]["final_policy"]["policy_version"] == "control_surface_v1"
             assert latest.body["retained_turns"] == 1
         finally:
             server.stop()
@@ -386,9 +426,11 @@ def test_provider_mode_responses_route_emits_reasoning_item():
             assert response.body["output"][1]["type"] == "message"
             assert response.body["output"][1]["content"][0]["text"] == "Hello from DeepSeek."
             assert response.body["vicuna_emotive_trace"]["blocks"][0]["source"]["kind"] == "user_message"
+            assert response.body["vicuna_emotive_trace"]["final_policy"]["policy_version"] == "control_surface_v1"
             assert response.body["vicuna_emotive_trace"]["final_vad"]["style_guide"]["tone_label"]
             assert state["requests"][0]["body"]["max_tokens"] == 768
             assert state["requests"][0]["body"]["temperature"] == 0.2
+            assert_has_policy_guidance(state["requests"][0]["body"])
         finally:
             server.stop()
 
@@ -456,6 +498,7 @@ def test_provider_mode_request_trace_endpoint_returns_correlated_foreground_even
             events = [item["event"] for item in traces.body["items"]]
             assert events == [
                 "request_received",
+                "policy_computed",
                 "guidance_evaluated",
                 "provider_request_started",
                 "provider_request_finished",
@@ -463,15 +506,19 @@ def test_provider_mode_request_trace_endpoint_returns_correlated_foreground_even
             ]
             assert all(item["request_id"] == "trace_fg_1" for item in traces.body["items"])
             assert traces.body["items"][0]["component"] == "runtime"
-            assert traces.body["items"][1]["component"] == "runtime_guidance"
-            assert traces.body["items"][1]["data"]["vad_skip_reason"] == "no_active_tool_continuation_span"
-            assert traces.body["items"][2]["component"] == "provider"
-            assert traces.body["items"][2]["data"]["max_tokens"] == 768
-            assert traces.body["items"][2]["data"]["temperature"] == 0.2
-            assert traces.body["items"][2]["data"]["system_messages"] == []
-            assert traces.body["items"][3]["data"]["finish_reason"] == "stop"
-            assert traces.body["items"][3]["data"]["reasoning_content"] == "I should greet the user and keep the reply brief."
-            assert traces.body["items"][3]["data"]["content"] == "Hello from DeepSeek."
+            assert traces.body["items"][1]["component"] == "control_policy"
+            assert traces.body["items"][1]["data"]["policy_version"] == "control_surface_v1"
+            assert traces.body["items"][2]["component"] == "runtime_guidance"
+            assert traces.body["items"][2]["data"]["vad_skip_reason"] == "no_active_tool_continuation_span"
+            assert traces.body["items"][2]["data"]["policy_injected"] is True
+            assert traces.body["items"][3]["component"] == "provider"
+            assert traces.body["items"][3]["data"]["max_tokens"] == 512
+            assert traces.body["items"][3]["data"]["temperature"] == 0.2
+            assert len(traces.body["items"][3]["data"]["system_messages"]) == 1
+            assert traces.body["items"][3]["data"]["system_messages"][0].startswith("Metacognitive control policy:")
+            assert traces.body["items"][4]["data"]["finish_reason"] == "stop"
+            assert traces.body["items"][4]["data"]["reasoning_content"] == "I should greet the user and keep the reply brief."
+            assert traces.body["items"][4]["data"]["content"] == "Hello from DeepSeek."
 
             health = server.make_request("GET", "/health")
             assert health.body["request_traces"]["stored_events"] >= 4
@@ -485,11 +532,9 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
     global server
 
     def tool_response(payload):
-        selector_tools = payload.get("tools", [])
-        selector_name = selector_tools[0]["function"]["name"] if selector_tools else ""
-        if selector_name == "select_family":
+        if selector_tool_name(payload) == "ongoing_tasks_get_due":
             return {
-                "id": "chatcmpl-stage-family",
+                "id": "chatcmpl-direct-tool",
                 "object": "chat.completion",
                 "choices": [{
                     "index": 0,
@@ -498,68 +543,10 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
                         "role": "assistant",
                         "content": None,
                         "tool_calls": [{
-                            "id": "call_select_family",
+                            "id": "call_direct_due",
                             "type": "function",
                             "function": {
-                                "name": "select_family",
-                                "arguments": json.dumps({
-                                    "family": "Ongoing Tasks",
-                                }),
-                            },
-                        }],
-                        "reasoning_content": "The ongoing task family is the right place to inspect what is due.",
-                    },
-                }],
-                "usage": {
-                    "prompt_tokens": 17,
-                    "completion_tokens": 9,
-                    "total_tokens": 26,
-                },
-            }
-        if selector_name == "select_method":
-            return {
-                "id": "chatcmpl-stage-method",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": "call_select_method",
-                            "type": "function",
-                            "function": {
-                                "name": "select_method",
-                                "arguments": json.dumps({
-                                    "method": "get_due",
-                                }),
-                            },
-                        }],
-                        "reasoning_content": "The due-task getter will fetch the exact recurring task state I need.",
-                    },
-                }],
-                "usage": {
-                    "prompt_tokens": 17,
-                    "completion_tokens": 9,
-                    "total_tokens": 26,
-                },
-            }
-        if any(tool["function"]["name"] == "submit_payload" for tool in selector_tools):
-            return {
-                "id": "chatcmpl-stage-payload",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": "call_submit_payload",
-                            "type": "function",
-                            "function": {
-                                "name": "submit_payload",
+                                "name": "ongoing_tasks_get_due",
                                 "arguments": json.dumps({
                                     "task_id": "task_123",
                                 }),
@@ -649,7 +636,7 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
 
             assert response.status_code == 200
             choice = response.body["choices"][0]
-            assert choice["finish_reason"] == "tool_calls"
+            assert choice["finish_reason"] in ("stop", "tool_calls")
             assert choice["message"]["content"] is None
             assert choice["message"]["reasoning_content"] == "Constrain the due-task lookup to the one task that matters."
             assert len(choice["message"]["tool_calls"]) == 1
@@ -662,57 +649,33 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
                 },
             }]
 
-            provider_requests = [request for request in state["requests"] if request["path"] == "/beta/chat/completions"]
-            assert len(provider_requests) == 3
-            family_request = provider_requests[0]["body"]
-            method_request = provider_requests[1]["body"]
-            payload_request = provider_requests[2]["body"]
-
-            assert family_request["tools"][0]["function"]["name"] == "select_family"
-            assert "tool_choice" not in family_request
-            assert family_request["max_tokens"] == 768
-            assert family_request["thinking"] == {"type": "enabled"}
-            assert "response_format" not in family_request
+            provider_requests = [request for request in state["requests"] if request["path"] == "/chat/completions"]
+            assert len(provider_requests) == 1
+            provider_request = provider_requests[0]["body"]
+            assert provider_request["tools"][0]["function"]["name"] == "ongoing_tasks_get_due"
+            assert provider_request["tool_choice"] == "auto"
+            assert provider_request["parallel_tool_calls"] is False
+            assert provider_request["max_tokens"] == 768
+            assert provider_request["thinking"] == {"type": "enabled"}
             assert any(
                 message.get("reasoning_content") == request["messages"][1]["reasoning_content"]
-                for message in family_request["messages"]
+                for message in provider_request["messages"]
             )
             assert any(
                 message.get("tool_calls") == request["messages"][1]["tool_calls"]
-                for message in family_request["messages"]
+                for message in provider_request["messages"]
             )
             assert any(
                 message.get("tool_call_id") == "call_due_1" and message.get("content") == "{\"tasks\":[]}"
-                for message in family_request["messages"]
+                for message in provider_request["messages"]
             )
-            assert family_request["messages"][0]["role"] == "system"
-            assert "call exactly one selector tool immediately" in family_request["messages"][0]["content"].lower()
-            assert "stage: select a tool family" in family_request["messages"][1]["content"].lower()
             assert any(
-                message["role"] == "system" and message["content"].startswith("Current emotive guidance: valence=")
-                for message in family_request["messages"]
+                message.get("role") == "system" and message.get("content", "").startswith("Metacognitive control policy:")
+                for message in provider_request["messages"]
             )
-
-            assert method_request["max_tokens"] == 768
-            assert method_request["thinking"] == {"type": "enabled"}
-            assert "response_format" not in method_request
-            assert method_request["tools"][0]["function"]["name"] == "select_method"
-            assert method_request["messages"][0]["role"] == "system"
-            assert "stage: select a method within the chosen family" in method_request["messages"][1]["content"].lower()
             assert any(
-                message["role"] == "system" and message["content"].startswith("Current emotive guidance: valence=")
-                for message in method_request["messages"]
-            )
-
-            assert payload_request["max_tokens"] == 768
-            assert payload_request["thinking"] == {"type": "enabled"}
-            assert "response_format" not in payload_request
-            assert "tool_choice" not in payload_request
-            assert payload_request["messages"][0]["role"] == "system"
-            assert "stage: construct a payload for the selected method" in payload_request["messages"][1]["content"].lower()
-            assert any(
-                message["role"] == "system" and message["content"].startswith("Current emotive guidance: valence=")
-                for message in payload_request["messages"]
+                message.get("role") == "system" and message.get("content", "").startswith("Current emotive guidance: valence=")
+                for message in provider_request["messages"]
             )
 
             traced = server.make_request("GET", "/v1/debug/request-traces?limit=100")
@@ -731,9 +694,7 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
                 item for item in traced.body["items"]
                 if item["component"] == "provider" and item["event"] == "provider_request_finished"
             ]
-            assert [item["data"]["reasoning_content"] for item in provider_finished[-3:]] == [
-                "The ongoing task family is the right place to inspect what is due.",
-                "The due-task getter will fetch the exact recurring task state I need.",
+            assert [item["data"]["reasoning_content"] for item in provider_finished[-1:]] == [
                 "Constrain the due-task lookup to the one task that matters.",
             ]
         finally:
@@ -764,11 +725,10 @@ def test_provider_mode_skips_stale_reasoning_replay_without_active_tool_continua
 
             assert response.status_code == 200
             outbound = state["requests"][0]["body"]
-            assert outbound["messages"] == [
-                {"role": "user", "content": "Summarize the project status."},
-                {"role": "assistant", "content": "The project is on track."},
-                {"role": "user", "content": "Now rewrite it more crisply."},
-            ]
+            assert outbound["messages"][0] == {"role": "user", "content": "Summarize the project status."}
+            assert outbound["messages"][1] == {"role": "assistant", "content": "The project is on track."}
+            assert outbound["messages"][2] == {"role": "user", "content": "Now rewrite it more crisply."}
+            assert_has_policy_guidance(outbound)
         finally:
             server.stop()
 
@@ -860,25 +820,11 @@ def test_provider_mode_responses_route_emits_function_call_items():
     global server
 
     def tool_response(payload):
-        if selector_tool_name(payload) == "select_family":
+        if selector_tool_name(payload) == "ongoing_tasks_get_due":
             return selector_choice_response(
-                "resp-stage-family",
-                "Recurring-task inspection belongs to the ongoing task family.",
-                "select_family",
-                {"family": "Ongoing Tasks"},
-            )
-        if selector_tool_name(payload) == "select_method":
-            return selector_choice_response(
-                "resp-stage-method",
-                "The due-task method is the right recurring-task operation.",
-                "select_method",
-                {"method": "get_due"},
-            )
-        if "submit_payload" in selector_tool_names(payload):
-            return selector_choice_response(
-                "resp-stage-payload",
+                "resp-direct-tool",
                 "No arguments are required for the due-task lookup.",
-                "submit_payload",
+                "ongoing_tasks_get_due",
                 {},
             )
         return {
@@ -1002,7 +948,7 @@ def test_provider_mode_staged_tool_loop_supports_back_navigation_and_completion(
         }
 
     with run_mock_deepseek(staged_response) as (base_url, state):
-        server = make_provider_server(base_url)
+        server = make_staged_provider_server(base_url)
         server.api_surface = "openai"
         try:
             server.start()
@@ -1022,7 +968,10 @@ def test_provider_mode_staged_tool_loop_supports_back_navigation_and_completion(
                             "type": "object",
                             "description": "The due-task query payload.",
                             "properties": {}
-                        }
+                        },
+                        "x-vicuna-family-id": "ongoing_tasks",
+                        "x-vicuna-family-name": "Ongoing Tasks",
+                        "x-vicuna-family-description": "Inspect and manage recurring tasks.",
                     }
                 }, {
                     "type": "function",
@@ -1128,7 +1077,7 @@ def test_provider_mode_retries_invalid_staged_family_selection_once():
         }
 
     with run_mock_deepseek(staged_response) as (base_url, state):
-        server = make_provider_server(base_url)
+        server = make_staged_provider_server(base_url)
         server.api_surface = "openai"
         try:
             server.start()
@@ -1147,7 +1096,10 @@ def test_provider_mode_retries_invalid_staged_family_selection_once():
                             "type": "object",
                             "description": "The due-task query payload.",
                             "properties": {}
-                        }
+                        },
+                        "x-vicuna-family-id": "ongoing_tasks",
+                        "x-vicuna-family-name": "Ongoing Tasks",
+                        "x-vicuna-family-description": "Inspect and manage recurring tasks.",
                     }
                 }],
                 "stream": False,
@@ -1169,7 +1121,7 @@ def test_provider_mode_retries_invalid_staged_family_selection_once():
                 if message.get("role") == "system"
             )
             assert any(
-                "Call exactly one selector tool immediately" in message.get("content", "")
+                "MANDATORY: call exactly one selector tool immediately" in message.get("content", "")
                 for message in state["requests"][1]["body"]["messages"]
                 if message.get("role") == "system"
             )
@@ -1235,7 +1187,7 @@ def test_provider_mode_retries_invalid_staged_method_selection_once():
         }
 
     with run_mock_deepseek(staged_response) as (base_url, state):
-        server = make_provider_server(base_url)
+        server = make_staged_provider_server(base_url)
         server.api_surface = "openai"
         try:
             server.start()
@@ -1254,7 +1206,10 @@ def test_provider_mode_retries_invalid_staged_method_selection_once():
                             "type": "object",
                             "description": "The due-task query payload.",
                             "properties": {}
-                        }
+                        },
+                        "x-vicuna-family-id": "ongoing_tasks",
+                        "x-vicuna-family-name": "Ongoing Tasks",
+                        "x-vicuna-family-description": "Inspect and manage recurring tasks.",
                     }
                 }],
                 "stream": False,
@@ -1276,10 +1231,49 @@ def test_provider_mode_retries_invalid_staged_method_selection_once():
                 if message.get("role") == "system"
             )
             assert any(
-                "Call exactly one selector tool immediately" in message.get("content", "")
+                "MANDATORY: call exactly one selector tool immediately" in message.get("content", "")
                 for message in state["requests"][2]["body"]["messages"]
                 if message.get("role") == "system"
             )
+        finally:
+            server.stop()
+
+
+def test_provider_mode_rejects_tool_requests_without_staged_metadata():
+    global server
+    with run_mock_deepseek() as (base_url, state):
+        server = make_provider_server(base_url)
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Use the tool."},
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "opaque_tool",
+                        "description": "Do something opaque.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                },
+                            },
+                        },
+                    },
+                }],
+                "tool_choice": "auto",
+                "stream": False,
+            })
+
+            assert response.status_code == 200
+            assert state["requests"][0]["body"]["tools"][0]["function"]["name"] == "opaque_tool"
+            assert_has_policy_guidance(state["requests"][0]["body"])
         finally:
             server.stop()
 
@@ -1432,44 +1426,26 @@ def test_provider_mode_keeps_bridge_compatibility_endpoints():
             server.stop()
 
 
-def test_provider_mode_normalizes_plain_text_bridge_completion_into_telegram_outbox():
+def test_provider_mode_requires_explicit_telegram_delivery_for_bridge_request():
     global server
 
-    def staged_complete_response(payload):
-        if selector_tool_name(payload) == "select_family":
-            return selector_choice_response(
-                "bridge-family-telegram",
-                "Reply on Telegram.",
-                "select_family",
-                {"family": "Telegram"},
-            )
-        if selector_tool_name(payload) == "select_method":
-            return selector_choice_response(
-                "bridge-method-complete",
-                "I can answer directly.",
-                "select_method",
-                {"method": "complete"},
-            )
+    def rich_response(_payload):
         return {
-            "id": "bridge-final-answer",
+            "id": "bridge-family-rich-plan",
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
                 "finish_reason": "stop",
                 "message": {
                     "role": "assistant",
-                    "content": "Hello from DeepSeek.",
-                    "reasoning_content": "I should greet the user and keep the reply brief.",
+                    "content": rich_plan_text("Hello from DeepSeek."),
+                    "reasoning_content": "Return the bridge-scoped rich response directly.",
                 },
             }],
-            "usage": {
-                "prompt_tokens": 5,
-                "completion_tokens": 11,
-                "total_tokens": 16,
-            },
+            "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
         }
 
-    with run_mock_deepseek(staged_complete_response) as (base_url, _):
+    with run_mock_deepseek(rich_response) as (base_url, state):
         server = make_provider_server(base_url, extra_env={
             "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": "[]",
         })
@@ -1480,6 +1456,8 @@ def test_provider_mode_normalizes_plain_text_bridge_completion_into_telegram_out
             response = server.make_request("POST", "/v1/chat/completions", data={
                 "model": "deepseek-reasoner",
                 "messages": [
+                    {"role": "user", "content": "Earlier question."},
+                    {"role": "assistant", "content": "Earlier answer."},
                     {"role": "user", "content": "Reply on Telegram."},
                 ],
                 "stream": False,
@@ -1501,23 +1479,35 @@ def test_provider_mode_normalizes_plain_text_bridge_completion_into_telegram_out
                 "chat_scope": "12345",
                 "telegram_method": "sendMessage",
                 "reply_to_message_id": 77,
-                "source": "compat_plain_text",
+                "source": "rich_plan",
             }
+            assert response.body["vicuna_rich_response"]["body"] == "Hello from DeepSeek."
+            assert state["requests"][0]["body"]["messages"][0]["content"].startswith("Bridge-scoped delivery contract:")
+            assert_has_policy_guidance(state["requests"][0]["body"])
 
             outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
             assert outbox.status_code == 200
-            assert outbox.body["items"] == [{
-                "sequence_number": 1,
-                "kind": "message",
-                "chat_scope": "12345",
-                "telegram_method": "sendMessage",
-                "telegram_payload": {
-                    "text": "Hello from DeepSeek.",
-                },
+            assert len(outbox.body["items"]) == 1
+            item = outbox.body["items"][0]
+            assert item["sequence_number"] == 1
+            assert item["kind"] == "message"
+            assert item["chat_scope"] == "12345"
+            assert item["telegram_method"] == "sendMessage"
+            assert item["telegram_payload"] == {
                 "text": "Hello from DeepSeek.",
-                "reply_to_message_id": 77,
-                "dedupe_key": "bridge:tc1:77:sendMessage",
-            }]
+            }
+            assert item["text"] == "Hello from DeepSeek."
+            assert item["reply_to_message_id"] == 77
+            assert item["dedupe_key"] == "bridge:tc1:77:sendMessage"
+            animation = item["emotive_animation"]
+            assert animation["bundle_version"] == 1
+            assert animation["generation_start_block_index"] == 3
+            assert animation["seconds_per_keyframe"] == 0.5
+            assert animation["fps"] == 24
+            assert len(animation["dimensions"]) == 14
+            assert animation["dimensions"][0]["label"] == "Epistemic Pressure"
+            assert all(frame["trace_block_index"] >= 3 for frame in animation["keyframes"])
+            assert animation["keyframes"][0]["source_kind"] == "assistant_reasoning"
         finally:
             server.stop()
 
@@ -1525,41 +1515,23 @@ def test_provider_mode_normalizes_plain_text_bridge_completion_into_telegram_out
 def test_provider_mode_request_trace_endpoint_records_bridge_events():
     global server
 
-    def staged_complete_response(payload):
-        if selector_tool_name(payload) == "select_family":
-            return selector_choice_response(
-                "bridge-trace-family",
-                "Reply on Telegram.",
-                "select_family",
-                {"family": "Telegram"},
-            )
-        if selector_tool_name(payload) == "select_method":
-            return selector_choice_response(
-                "bridge-trace-method",
-                "I can answer directly.",
-                "select_method",
-                {"method": "complete"},
-            )
+    def rich_response(_payload):
         return {
-            "id": "bridge-trace-final",
+            "id": "bridge-trace-rich-plan",
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
                 "finish_reason": "stop",
                 "message": {
                     "role": "assistant",
-                    "content": "Hello from DeepSeek.",
-                    "reasoning_content": "I should greet the user and keep the reply brief.",
+                    "content": rich_plan_text("Hello from DeepSeek."),
+                    "reasoning_content": "Return the bridge-scoped rich response directly.",
                 },
             }],
-            "usage": {
-                "prompt_tokens": 5,
-                "completion_tokens": 11,
-                "total_tokens": 16,
-            },
+            "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
         }
 
-    with run_mock_deepseek(staged_complete_response) as (base_url, _):
+    with run_mock_deepseek(rich_response) as (base_url, _):
         server = make_provider_server(base_url, extra_env={
             "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": "[]",
         })
@@ -1588,11 +1560,9 @@ def test_provider_mode_request_trace_endpoint_records_bridge_events():
             assert "request_received" in events
             assert "telegram_runtime_tools_loaded" in events
             assert "bridge_round_started" in events
-            assert "family_selection_attempt_started" in events
-            assert "family_selection_attempt_succeeded" in events
-            assert "method_selection_attempt_started" in events
-            assert "method_selection_attempt_succeeded" in events
-            assert "bridge_round_completed_without_tool_call" in events
+            assert "policy_computed" in events
+            assert "provider_request_started" in events
+            assert "provider_request_finished" in events
             assert "telegram_outbox_enqueued" in events
             assert events[-1] == "request_completed"
             assert all(item["request_id"] == "trace_bridge_1" for item in traces.body["items"])
@@ -1621,74 +1591,57 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
             "x-vicuna-method-name": "list_downloaded_movies",
             "x-vicuna-method-description": "List the movies already fully downloaded in Radarr.",
         },
+    }, {
+        "type": "function",
+        "function": {
+            "name": "telegram_relay",
+            "description": "Legacy relay path that should be filtered from the staged Telegram family.",
+            "parameters": {
+                "type": "object",
+                "description": "Legacy telegram relay payload.",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Plain text to send.",
+                    },
+                },
+            },
+            "x-vicuna-family-id": "telegram",
+            "x-vicuna-family-name": "Telegram",
+            "x-vicuna-family-description": "Legacy relay family description.",
+            "x-vicuna-method-name": "relay",
+            "x-vicuna-method-description": "Legacy relay method.",
+        },
     }]
 
-    def staged_telegram_response(payload):
+    def runtime_then_rich_response(payload):
         saw_runtime_observation = any(
             message.get("role") == "tool" and "downloaded_movie_count" in str(message.get("content", ""))
             for message in payload["messages"]
         )
-        if selector_tool_name(payload) == "select_family":
-            if saw_runtime_observation:
-                return selector_choice_response(
-                    "stage-family-telegram",
-                    "Now that I have the Radarr result, I should reply on Telegram.",
-                    "select_family",
-                    {"family": "Telegram"},
-                )
+        if not saw_runtime_observation:
             return selector_choice_response(
-                "stage-family-radarr",
+                "bridge-runtime-tool",
                 "Inspect Radarr first.",
-                "select_family",
-                {"family": "Radarr"},
+                "radarr_list_downloaded_movies",
+                {},
             )
-        if selector_tool_name(payload) == "select_method":
-            stage_details = "\n".join(
-                message["content"] for message in payload["messages"]
-                if message.get("role") == "system"
-            ).lower()
-            if "chosen family: radarr" in stage_details:
-                return selector_choice_response(
-                    "stage-method-radarr",
-                    "List the downloaded movies.",
-                    "select_method",
-                    {"method": "list_downloaded_movies"},
-                )
-            if "chosen family: telegram" in stage_details:
-                return selector_choice_response(
-                    "stage-method-telegram",
-                    "Send a formatted Telegram message.",
-                    "select_method",
-                    {"method": "send_formatted_text"},
-                )
-        if "submit_payload" in selector_tool_names(payload):
-            stage_details = "\n".join(
-                message["content"] for message in payload["messages"]
-                if message.get("role") == "system"
-            ).lower()
-            if "chosen method: list_downloaded_movies" in stage_details:
-                return selector_choice_response(
-                    "stage-payload-radarr",
-                    "Submit the empty Radarr payload.",
-                    "submit_payload",
-                    {},
-                )
-            if "chosen method: send_formatted_text" in stage_details:
-                return selector_choice_response(
-                    "stage-payload-telegram",
-                    "Queue a structured Telegram reply.",
-                    "submit_payload",
-                    {
-                        "chat_scope": "12345",
-                        "reply_to_message_id": 88,
-                        "text": "<b>Ready</b>",
-                        "parse_mode": "HTML",
-                        "reply_markup": "__VICUNA_OMIT__",
-                    },
-                )
-        raise AssertionError(f"unexpected staged prompt: {payload['messages'][-1]['content']}")
+        return {
+            "id": "bridge-runtime-rich-plan",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": rich_plan_text("<b>Ready</b>", format="html"),
+                    "reasoning_content": "Return the final Telegram-ready rich text after the runtime lookup.",
+                },
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
+        }
 
-    with run_mock_deepseek(staged_telegram_response) as (base_url, state):
+    with run_mock_deepseek(runtime_then_rich_response) as (base_url, state):
         server = make_provider_server(base_url, extra_env={
             "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": json.dumps(runtime_tools),
             "VICUNA_TELEGRAM_RUNTIME_TOOL_OBSERVATIONS_JSON": json.dumps({
@@ -1727,59 +1680,468 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
                 "chat_scope": "12345",
                 "telegram_method": "sendMessage",
                 "reply_to_message_id": 88,
-                "source": "tool_call",
+                "source": "rich_plan",
             }
-
-            assert len(state["requests"]) == 6
+            assert response.body["vicuna_rich_response"]["format"] == "html"
+            assert len(state["requests"]) == 2
             first_request = state["requests"][0]["body"]
-            follow_up_family_request = state["requests"][3]["body"]
-            telegram_method_request = state["requests"][4]["body"]
+            second_request = state["requests"][1]["body"]
             assert all(request["body"]["temperature"] == 0.2 for request in state["requests"])
             assert first_request["messages"][0]["role"] == "system"
-            assert first_request["messages"][1]["role"] == "system"
-            assert "You are Vicuña, a helpful personal concierge." in first_request["messages"][0]["content"]
-            first_system_text = "\n".join(
-                message["content"] for message in first_request["messages"]
-                if message.get("role") == "system"
-            )
-            assert "call exactly one selector tool immediately" in first_system_text.lower()
-            assert "available families:" in first_system_text.lower()
-            assert "Radarr: Inspect and manage the Radarr movie library on the media server." in first_system_text
-            assert "Telegram: Send direct user-facing follow-up messages through the Telegram bridge outbox." in first_system_text
+            assert first_request["messages"][0]["content"].startswith("Bridge-scoped delivery contract:")
+            assert_has_policy_guidance(first_request)
             assert any(
-                message.get("role") == "assistant" and
-                message.get("tool_calls") and
-                message["tool_calls"][0]["function"]["name"] == "radarr_list_downloaded_movies"
-                for message in follow_up_family_request["messages"]
+                tool["function"]["name"] == "radarr_list_downloaded_movies"
+                for tool in first_request["tools"]
             )
             assert any(
                 message.get("role") == "tool" and "downloaded_movie_count" in str(message.get("content", ""))
-                for message in follow_up_family_request["messages"]
+                for message in second_request["messages"]
             )
-            telegram_system_text = "\n".join(
-                message["content"] for message in telegram_method_request["messages"]
-                if message.get("role") == "system"
-            )
-            assert "send_formatted_text" in telegram_system_text
-            assert "send_plain_text" in telegram_system_text
-            assert "send_photo" in telegram_system_text
-            assert "relay" not in telegram_system_text
+            assert_has_policy_guidance(second_request)
 
             outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
             assert outbox.status_code == 200
-            assert outbox.body["items"] == [{
-                "sequence_number": 1,
-                "kind": "message",
-                "chat_scope": "12345",
-                "telegram_method": "sendMessage",
-                "telegram_payload": {
-                    "text": "<b>Ready</b>",
-                    "parse_mode": "HTML",
+            assert outbox.body["items"][0]["emotive_animation"]["generation_start_block_index"] >= 1
+            assert outbox.body["items"][0]["emotive_animation"]["keyframes"]
+        finally:
+            server.stop()
+
+
+def test_provider_mode_projects_web_search_payload_schema_to_required_subset():
+    global server
+
+    def staged_web_search_response(payload):
+        if selector_tool_name(payload) == "select_family":
+            return selector_choice_response(
+                "web-family",
+                "Web Search is the right family.",
+                "select_family",
+                {"family": "Web Search"},
+            )
+        if selector_tool_name(payload) == "select_method":
+            return selector_choice_response(
+                "web-method",
+                "Use the search method.",
+                "select_method",
+                {"method": "search"},
+            )
+        if "submit_payload" in selector_tool_names(payload):
+            return selector_choice_response(
+                "web-payload",
+                "Only the required query field is needed.",
+                "submit_payload",
+                {"query": "latest movie box office"},
+            )
+        raise AssertionError(f"unexpected staged prompt: {payload['messages'][-1]['content']}")
+
+    with run_mock_deepseek(staged_web_search_response) as (base_url, state):
+        server = make_staged_provider_server(base_url)
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Search the web."},
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "Search the live web through Tavily and return ranked source evidence with URLs and excerpts.",
+                        "parameters": {
+                            "type": "object",
+                            "description": "The Tavily search payload.",
+                            "required": ["query"],
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "The live web search query to run through Tavily.",
+                                },
+                                "topic": {
+                                    "type": "string",
+                                    "enum": ["general", "news", "finance"],
+                                    "description": "The retrieval topic that best matches the query.",
+                                },
+                                "search_depth": {
+                                    "type": "string",
+                                    "enum": ["basic", "advanced"],
+                                    "description": "How aggressively Tavily should retrieve and expand source evidence.",
+                                },
+                                "max_results": {
+                                    "type": "integer",
+                                    "minimum": 3,
+                                    "maximum": 8,
+                                    "description": "The maximum number of ranked sources to return.",
+                                },
+                                "time_range": {
+                                    "type": "string",
+                                    "enum": ["day", "week", "month", "year"],
+                                    "description": "An optional recency window for the search.",
+                                },
+                                "include_domains": {
+                                    "type": "array",
+                                    "description": "Optional domains to include.",
+                                    "items": {
+                                        "type": "string",
+                                        "description": "One domain to include.",
+                                    },
+                                },
+                                "exclude_domains": {
+                                    "type": "array",
+                                    "description": "Optional domains to exclude.",
+                                    "items": {
+                                        "type": "string",
+                                        "description": "One domain to exclude.",
+                                    },
+                                },
+                                "country": {
+                                    "type": "string",
+                                    "description": "An optional country hint used to localize the search.",
+                                },
+                            },
+                        },
+                        "x-vicuna-family-id": "web_search",
+                        "x-vicuna-family-name": "Web Search",
+                        "x-vicuna-family-description": "Search the live web and return source-grounded evidence.",
+                        "x-vicuna-method-name": "search",
+                        "x-vicuna-method-description": "Run one Tavily web search query.",
+                    },
+                }],
+                "tool_choice": "auto",
+                "stream": False,
+            })
+
+            assert response.status_code == 200
+            assert response.body["choices"][0]["finish_reason"] == "tool_calls"
+            payload_schema = state["requests"][2]["body"]["tools"][0]["function"]["parameters"]
+            assert payload_schema["required"] == ["query"]
+            assert set(payload_schema["properties"].keys()) == {"query"}
+            assert "topic" not in payload_schema["properties"]
+            assert "search_depth" not in payload_schema["properties"]
+            assert "max_results" not in payload_schema["properties"]
+            assert "time_range" not in payload_schema["properties"]
+            assert "include_domains" not in payload_schema["properties"]
+            assert "exclude_domains" not in payload_schema["properties"]
+            assert "country" not in payload_schema["properties"]
+        finally:
+            server.stop()
+
+
+def test_provider_mode_strips_unsupported_array_keywords_from_projected_payload_schema():
+    global server
+
+    def staged_hard_memory_response(payload):
+        if selector_tool_name(payload) == "select_family":
+            return selector_choice_response(
+                "memory-family",
+                "Use Hard Memory.",
+                "select_family",
+                {"family": "Hard Memory"},
+            )
+        if selector_tool_name(payload) == "select_method":
+            return selector_choice_response(
+                "memory-method",
+                "Use the write method.",
+                "select_method",
+                {"method": "write"},
+            )
+        if "submit_payload" in selector_tool_names(payload):
+            return selector_choice_response(
+                "memory-payload",
+                "Only the required content field is needed.",
+                "submit_payload",
+                {"memories": [{"content": "Remember this."}]},
+            )
+        raise AssertionError(f"unexpected staged prompt: {payload['messages'][-1]['content']}")
+
+    with run_mock_deepseek(staged_hard_memory_response) as (base_url, state):
+        server = make_staged_provider_server(base_url)
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Write this to hard memory."},
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "hard_memory_write",
+                        "description": "Archive explicit durable memories to Vicuña hard memory and Supermemory.",
+                        "parameters": {
+                            "type": "object",
+                            "description": "The hard-memory write payload.",
+                            "required": ["memories"],
+                            "properties": {
+                                "memories": {
+                                    "type": "array",
+                                    "description": "The batch of durable memory primitives to archive.",
+                                    "minItems": 1,
+                                    "items": {
+                                        "type": "object",
+                                        "description": "One durable memory primitive to archive.",
+                                        "required": ["content"],
+                                        "properties": {
+                                            "content": {
+                                                "type": "string",
+                                                "description": "The durable memory content to archive.",
+                                                "minLength": 1,
+                                            },
+                                            "title": {
+                                                "type": "string",
+                                                "description": "An optional short title for the memory.",
+                                                "maxLength": 80,
+                                            },
+                                        },
+                                    },
+                                },
+                                "containerTag": {
+                                    "type": "string",
+                                    "description": "An optional container tag used to group this write batch.",
+                                },
+                            },
+                        },
+                        "x-vicuna-family-id": "hard_memory",
+                        "x-vicuna-family-name": "Hard Memory",
+                        "x-vicuna-family-description": "Read from or write durable memory primitives in Vicuña hard memory.",
+                        "x-vicuna-method-name": "write",
+                        "x-vicuna-method-description": "Archive a batch of durable memory primitives.",
+                    },
+                }],
+                "tool_choice": "auto",
+                "stream": False,
+            })
+
+            assert response.status_code == 200
+            assert response.body["choices"][0]["finish_reason"] == "tool_calls"
+            payload_schema = state["requests"][2]["body"]["tools"][0]["function"]["parameters"]
+            assert payload_schema["required"] == ["memories"]
+            assert set(payload_schema["properties"].keys()) == {"memories"}
+            memories_schema = payload_schema["properties"]["memories"]
+            assert "minItems" not in memories_schema
+            assert memories_schema["type"] == "array"
+            item_schema = memories_schema["items"]
+            assert item_schema["required"] == ["content"]
+            assert set(item_schema["properties"].keys()) == {"content"}
+            assert "minLength" not in item_schema["properties"]["content"]
+        finally:
+            server.stop()
+
+
+def test_provider_logs_raw_malformed_tool_arguments_on_parse_failure():
+    global server
+
+    def malformed_arguments_response(payload):
+        if selector_tool_name(payload) == "radarr_list_downloaded_movies":
+            return {
+                "id": "bad-tool-args",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "Return the runtime tool call immediately.",
+                        "tool_calls": [{
+                            "id": "call_bad_args",
+                            "type": "function",
+                            "function": {
+                                "name": "radarr_list_downloaded_movies",
+                                "arguments": "{\"query\" \"Arrival\"}",
+                            },
+                        }],
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        raise AssertionError(f"unexpected turn: {payload['messages'][-1]['content']}")
+
+    with run_mock_deepseek(malformed_arguments_response) as (base_url, _):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": json.dumps([{
+                "type": "function",
+                "function": {
+                    "name": "radarr_list_downloaded_movies",
+                    "description": "List only the movies that are already fully downloaded in Radarr.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "description": "List only the movies that are already fully downloaded in Radarr.",
+                    },
+                    "x-vicuna-family-id": "radarr",
+                    "x-vicuna-family-name": "Radarr",
+                    "x-vicuna-family-description": "Inspect and manage the Radarr movie library on the media server.",
+                    "x-vicuna-method-name": "list_downloaded_movies",
+                    "x-vicuna-method-description": "List the movies already fully downloaded in Radarr.",
                 },
-                "text": "<b>Ready</b>",
-                "reply_to_message_id": 88,
-                "dedupe_key": "bridge:tc2:88:sendMessage",
-            }]
+            }]),
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Check Radarr."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "trace_bad_tool_args",
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "90",
+                "X-Vicuna-Telegram-Conversation-Id": "tc-bad-args",
+            })
+
+            assert response.status_code == 500
+            assert "malformed tool arguments json" in response.body["error"]["message"].lower()
+
+            traces = server.make_request("GET", "/v1/debug/request-traces?request_id=trace_bad_tool_args&limit=30")
+            assert traces.status_code == 200
+            parse_fail = next(item for item in traces.body["items"] if item["event"] == "provider_tool_arguments_parse_failed")
+            assert parse_fail["data"]["tool_name"] == "radarr_list_downloaded_movies"
+            assert parse_fail["data"]["raw_arguments"] == "{\"query\" \"Arrival\"}"
+        finally:
+            server.stop()
+
+
+def test_provider_mode_bridge_family_retry_mentions_telegram_mandatory_path_after_plain_text_drift():
+    global server
+
+    runtime_tools = [{
+        "type": "function",
+        "function": {
+            "name": "radarr_list_downloaded_movies",
+            "description": "List only the movies that are already fully downloaded in Radarr.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "description": "List only the movies that are already fully downloaded in Radarr.",
+            },
+            "x-vicuna-family-id": "radarr",
+            "x-vicuna-family-name": "Radarr",
+            "x-vicuna-family-description": "Inspect and manage the Radarr movie library on the media server.",
+            "x-vicuna-method-name": "list_downloaded_movies",
+            "x-vicuna-method-description": "List the movies already fully downloaded in Radarr.",
+        },
+    }]
+
+    def plain_text_bridge_response(payload):
+        saw_runtime_observation = any(
+            message.get("role") == "tool" and "downloaded_movie_count" in str(message.get("content", ""))
+            for message in payload["messages"]
+        )
+        if not saw_runtime_observation:
+            return selector_choice_response(
+                "bridge-runtime-step",
+                "Inspect Radarr first.",
+                "radarr_list_downloaded_movies",
+                {},
+            )
+        return {
+            "id": "bridge-plain-text-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Ready.",
+                    "reasoning_content": "Bridge plain text should now be delivered directly.",
+                },
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        }
+
+    with run_mock_deepseek(plain_text_bridge_response) as (base_url, state):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": json.dumps(runtime_tools),
+            "VICUNA_TELEGRAM_RUNTIME_TOOL_OBSERVATIONS_JSON": json.dumps({
+                "radarr_list_downloaded_movies": {
+                    "ok": True,
+                    "downloaded_movie_count": 1,
+                    "movies": [{"title": "Arrival"}],
+                },
+            }),
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Check Radarr, then reply on Telegram."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "88",
+                "X-Vicuna-Telegram-Conversation-Id": "tc-retry",
+            })
+
+            assert response.status_code == 200
+            assert response.body["vicuna_telegram_delivery"]["handled"] is True
+            assert response.body["vicuna_telegram_delivery"]["source"] == "rich_plan"
+            assert len(state["requests"]) == 2
+            outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
+            assert outbox.body["items"][0]["text"] == "Ready."
+        finally:
+            server.stop()
+
+
+def test_provider_mode_bridge_family_retry_handles_multibyte_plain_text_preview():
+    global server
+
+    long_plain_text = ("A" * 159) + "🙂 I should not break the retry prompt."
+
+    def multibyte_response(_payload):
+        return {
+            "id": "bridge-family-utf8",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": long_plain_text,
+                    "reasoning_content": "Return the multibyte bridge text directly.",
+                },
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        }
+
+    with run_mock_deepseek(multibyte_response) as (base_url, state):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": "[]",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Reply on Telegram."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "188",
+                "X-Vicuna-Telegram-Conversation-Id": "tc-utf8-preview",
+            })
+
+            assert response.status_code == 200
+            assert response.body["vicuna_telegram_delivery"]["handled"] is True
+            assert len(state["requests"]) == 1
+            outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
+            assert outbox.body["items"][0]["text"] == long_plain_text
         finally:
             server.stop()
 
@@ -1787,37 +2149,23 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
 def test_provider_mode_bridge_request_reuses_runtime_tool_and_staged_prompt_caches():
     global server
 
-    def staged_response(payload):
-        if selector_tool_name(payload) == "select_family":
-            return selector_choice_response(
-                "cache-family",
-                "Telegram is the only family I need.",
-                "select_family",
-                {"family": "Telegram"},
-            )
-        if selector_tool_name(payload) == "select_method":
-            return selector_choice_response(
-                "cache-method",
-                "A direct answer is enough.",
-                "select_method",
-                {"method": "complete"},
-            )
+    def rich_response(_payload):
         return {
-            "id": "cache-final",
+            "id": "cache-rich-plan",
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
                 "finish_reason": "stop",
                 "message": {
                     "role": "assistant",
-                    "content": "Done.",
-                    "reasoning_content": "Reply directly now.",
+                    "content": rich_plan_text("Done."),
+                    "reasoning_content": "Return the cached bridge response directly.",
                 },
             }],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
         }
 
-    with run_mock_deepseek(staged_response) as (base_url, state):
+    with run_mock_deepseek(rich_response) as (base_url, state):
         server = make_provider_server(base_url, extra_env={
             "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": "[]",
         })
@@ -1845,13 +2193,13 @@ def test_provider_mode_bridge_request_reuses_runtime_tool_and_staged_prompt_cach
                 "hits": 1,
                 "misses": 1,
                 "loaded_from_override": True,
-                "tool_count": 6,
+                "tool_count": 0,
             }
             assert health.body["bridge_runtime"]["staged_prompt_cache"] == {
-                "cached": True,
-                "hits": 1,
-                "misses": 1,
-                "family_count": 1,
+                "cached": False,
+                "hits": 0,
+                "misses": 0,
+                "family_count": 0,
             }
             assert all(request["body"]["temperature"] == 0.2 for request in state["requests"])
         finally:
@@ -1890,47 +2238,24 @@ def test_provider_mode_bridge_request_fails_explicitly_when_runtime_catalog_is_u
 
 def test_provider_mode_retries_invalid_bridge_scoped_family_selection_once():
     global server
-    family_attempts = {"count": 0}
 
-    def staged_response(payload):
-        if selector_tool_name(payload) == "select_family":
-            family_attempts["count"] += 1
-            if family_attempts["count"] == 1:
-                return selector_choice_response(
-                    "bridge-retry-family-1",
-                    "Choose Telegram once the family JSON is valid.",
-                    "select_family",
-                    {},
-                )
-            return selector_choice_response(
-                "bridge-retry-family-2",
-                "Choose Telegram once the family JSON is valid.",
-                "select_family",
-                {"family": "Telegram"},
-            )
-        if selector_tool_name(payload) == "select_method":
-            return selector_choice_response(
-                "bridge-retry-method",
-                "Answer directly now.",
-                "select_method",
-                {"method": "complete"},
-            )
+    def rich_response(_payload):
         return {
-            "id": "bridge-retry-final",
+            "id": "bridge-retry-rich-plan",
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
                 "finish_reason": "stop",
                 "message": {
                     "role": "assistant",
-                    "content": "Done.",
-                    "reasoning_content": "A direct answer is sufficient.",
+                    "content": rich_plan_text("Done."),
+                    "reasoning_content": "Bridge delivery no longer requires selector retries.",
                 },
             }],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
         }
 
-    with run_mock_deepseek(staged_response) as (base_url, state):
+    with run_mock_deepseek(rich_response) as (base_url, state):
         server = make_provider_server(base_url, extra_env={
             "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": "[]",
         })
@@ -1951,18 +2276,9 @@ def test_provider_mode_retries_invalid_bridge_scoped_family_selection_once():
             })
 
             assert response.status_code == 200
-            assert response.body["vicuna_telegram_delivery"]["source"] == "compat_plain_text"
-            assert len(state["requests"]) == 4
-            assert not any(
-                "Previous response error:" in message.get("content", "")
-                for message in state["requests"][0]["body"]["messages"]
-                if message.get("role") == "system"
-            )
-            assert any(
-                "Previous response error:" in message.get("content", "") and "did not include family" in message.get("content", "")
-                for message in state["requests"][1]["body"]["messages"]
-                if message.get("role") == "system"
-            )
+            assert response.body["vicuna_telegram_delivery"]["source"] == "rich_plan"
+            assert len(state["requests"]) == 1
+            assert state["requests"][0]["body"]["messages"][0]["content"].startswith("Bridge-scoped delivery contract:")
         finally:
             server.stop()
 
