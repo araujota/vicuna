@@ -22,7 +22,7 @@ provider-native `thinking` object, the server forwards it unchanged instead of
 rewriting it.
 
 All outbound DeepSeek turns, including staged family/method/payload turns and
-background/internal provider passes, are capped at `max_tokens: 1024`. The
+background/internal provider passes, are capped at `max_tokens: 256`. The
 server enforces that ceiling even if the caller supplies a different output
 token field, and it does so without disabling reasoning traces.
 Every outbound DeepSeek turn also uses `temperature: 0.2`. The runtime stamps
@@ -32,6 +32,13 @@ leaving temperature implicit or caller-controlled.
 The DeepSeek adapter reuses one persistent configured HTTP client per provider
 authority instead of rebuilding transport state on every turn. Inspect the
 live transport counters at `/health -> provider -> transport`.
+
+The runtime also retains a bounded structured request-trace registry. Each
+foreground or background pass emits labeled JSON events with a shared
+`request_id` across runtime handling, staged selection, provider traffic,
+runtime tool execution, and Telegram outbox queueing. Inspect the summary at
+`/health -> request_traces` and the retained event stream at
+`GET /v1/debug/request-traces`.
 
 ## Staged tool loop
 
@@ -149,6 +156,7 @@ Inspect worker state with `GET /v1/emotive/ongoing-tasks` or under
 - `GET /v1/emotive/cognitive-replay`
 - `GET /v1/emotive/heuristics`
 - `GET /v1/emotive/ongoing-tasks`
+- `GET /v1/debug/request-traces`
 - `POST /v1/completions`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`

@@ -31,6 +31,7 @@
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+struct runtime_request_trace_context;
 static std::string extract_json_object_payload(const std::string & text);
 static bool execute_deepseek_chat_with_emotive(
         const deepseek_runtime_config & config,
@@ -43,7 +44,8 @@ static bool execute_deepseek_chat_with_emotive(
         const std::string & cognitive_replay_entry_id = std::string(),
         bool enable_heuristic_guidance = true,
         bool suppress_replay_admission = false,
-        const std::string & mode_label = std::string());
+        const std::string & mode_label = std::string(),
+        const runtime_request_trace_context * trace_context = nullptr);
 
 static std::string trim_copy(std::string value) {
     const auto is_not_space = [](unsigned char ch) {
@@ -101,6 +103,134 @@ static server_http_res_ptr make_error_response(const json & error) {
     return make_json_response({{"error", error}}, status);
 }
 
+struct runtime_request_trace_context {
+    std::string request_id;
+    std::string route;
+    std::string mode_label;
+    bool bridge_scoped = false;
+    std::string telegram_chat_scope;
+    std::string telegram_conversation_id;
+    int64_t telegram_message_id = 0;
+    int64_t started_at_ms = 0;
+};
+
+struct runtime_request_trace_state {
+    mutable std::mutex mutex;
+    std::deque<json> events;
+    size_t max_events = 512;
+    uint64_t total_events = 0;
+};
+
+static runtime_request_trace_state & runtime_request_trace_state_instance() {
+    static runtime_request_trace_state state;
+    return state;
+}
+
+static std::string generate_runtime_trace_request_id() {
+    static std::atomic<uint64_t> counter = 0;
+    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    const uint64_t seq = counter.fetch_add(1, std::memory_order_relaxed);
+    return "vicuna_req_" + std::to_string(now) + "_" + std::to_string(seq);
+}
+
+static int64_t runtime_now_epoch_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static std::string request_trace_id_from_headers(const server_http_req & req) {
+    std::string request_id = trim_copy(request_header_value(req, "X-Client-Request-Id"));
+    if (request_id.empty()) {
+        request_id = trim_copy(request_header_value(req, "X-Vicuna-Request-Id"));
+    }
+    if (request_id.empty()) {
+        request_id = generate_runtime_trace_request_id();
+    }
+    return request_id;
+}
+
+static void runtime_request_trace_log(
+        const runtime_request_trace_context & context,
+        const std::string & component,
+        const std::string & event,
+        json data = json::object()) {
+    if (!data.is_object()) {
+        data = json::object();
+    }
+    const int64_t now_ms = runtime_now_epoch_ms();
+    json payload = {
+        {"timestamp_ms", now_ms},
+        {"request_id", context.request_id},
+        {"component", component},
+        {"event", event},
+        {"route", context.route},
+        {"mode_label", context.mode_label},
+        {"bridge_scoped", context.bridge_scoped},
+        {"data", std::move(data)},
+    };
+    if (!context.telegram_chat_scope.empty()) {
+        payload["telegram_chat_scope"] = context.telegram_chat_scope;
+    }
+    if (!context.telegram_conversation_id.empty()) {
+        payload["telegram_conversation_id"] = context.telegram_conversation_id;
+    }
+    if (context.telegram_message_id > 0) {
+        payload["telegram_message_id"] = context.telegram_message_id;
+    }
+
+    auto & state = runtime_request_trace_state_instance();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.events.push_back(payload);
+        ++state.total_events;
+        while (state.events.size() > state.max_events) {
+            state.events.pop_front();
+        }
+    }
+
+    SRV_INF("request_trace: %s\n", safe_json_to_str(payload).c_str());
+}
+
+static json runtime_request_trace_read_json(const server_http_req & req) {
+    const std::string request_id = trim_copy(req.get_param("request_id", ""));
+    const int64_t limit = std::max<int64_t>(1, std::min<int64_t>(
+            512,
+            std::strtoll(req.get_param("limit", "100").c_str(), nullptr, 10)));
+
+    auto & state = runtime_request_trace_state_instance();
+    json items = json::array();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    for (auto it = state.events.rbegin(); it != state.events.rend(); ++it) {
+        if (!request_id.empty() && json_value(*it, "request_id", std::string()) != request_id) {
+            continue;
+        }
+        items.push_back(*it);
+        if ((int64_t) items.size() >= limit) {
+            break;
+        }
+    }
+    std::reverse(items.begin(), items.end());
+    return {
+        {"object", "vicuna.request_traces"},
+        {"request_id", request_id.empty() ? json(nullptr) : json(request_id)},
+        {"count", static_cast<int64_t>(items.size())},
+        {"items", std::move(items)},
+    };
+}
+
+static json runtime_request_trace_health_json() {
+    auto & state = runtime_request_trace_state_instance();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return {
+        {"stored_events", static_cast<int64_t>(state.events.size())},
+        {"max_events", static_cast<int64_t>(state.max_events)},
+        {"total_events", static_cast<int64_t>(state.total_events)},
+        {"latest_request_id", state.events.empty() ? json(nullptr) : json(json_value(state.events.back(), "request_id", std::string()))},
+        {"latest_event", state.events.empty() ? json(nullptr) : json(json_value(state.events.back(), "event", std::string()))},
+    };
+}
+
 struct telegram_outbox_item {
     uint64_t sequence_number = 0;
     std::string kind = "message";
@@ -136,6 +266,34 @@ struct telegram_bridge_request_context {
     int64_t reply_to_message_id = 0;
     int32_t history_turns = 0;
 };
+
+static runtime_request_trace_context make_runtime_request_trace_context(
+        const server_http_req & req,
+        const std::string & route,
+        const telegram_bridge_request_context & telegram_context,
+        const std::string & mode_label = std::string()) {
+    runtime_request_trace_context context;
+    context.request_id = request_trace_id_from_headers(req);
+    context.route = route;
+    context.mode_label = mode_label;
+    context.bridge_scoped = telegram_context.active;
+    context.telegram_chat_scope = telegram_context.chat_scope;
+    context.telegram_conversation_id = telegram_context.conversation_id;
+    context.telegram_message_id = telegram_context.reply_to_message_id;
+    context.started_at_ms = runtime_now_epoch_ms();
+    return context;
+}
+
+static runtime_request_trace_context make_background_trace_context(
+        const std::string & route,
+        const std::string & mode_label) {
+    runtime_request_trace_context context;
+    context.request_id = generate_runtime_trace_request_id();
+    context.route = route;
+    context.mode_label = mode_label;
+    context.started_at_ms = runtime_now_epoch_ms();
+    return context;
+}
 
 struct telegram_delivery_result {
     bool handled = false;
@@ -1217,7 +1375,7 @@ static json build_staged_messages(
 }
 
 static json build_staged_provider_body(const json & base_body, const json & messages) {
-    static constexpr int64_t staged_max_tokens = 1024;
+    static constexpr int64_t staged_max_tokens = 256;
     json staged = base_body;
     staged.erase("tools");
     staged.erase("tool_choice");
@@ -1476,7 +1634,8 @@ static bool execute_staged_selection_turn(
         deepseek_chat_result * out_result,
         json * out_error,
         bool suppress_replay_admission = false,
-        const std::string & mode_label = std::string()) {
+        const std::string & mode_label = std::string(),
+        const runtime_request_trace_context * trace_context = nullptr) {
     const json messages = build_staged_messages(base_body.at("messages"), stage_prompt);
     const json staged_body = build_staged_provider_body(base_body, messages);
     return execute_deepseek_chat_with_emotive(
@@ -1490,7 +1649,8 @@ static bool execute_staged_selection_turn(
             std::string(),
             true,
             suppress_replay_admission,
-            mode_label);
+            mode_label,
+            trace_context);
 }
 
 static bool execute_final_completion_after_staged_loop(
@@ -1500,7 +1660,8 @@ static bool execute_final_completion_after_staged_loop(
         deepseek_chat_result * out_result,
         json * out_error,
         bool suppress_replay_admission = false,
-        const std::string & mode_label = std::string()) {
+        const std::string & mode_label = std::string(),
+        const runtime_request_trace_context * trace_context = nullptr) {
     json completion_body = body;
     completion_body.erase("tools");
     completion_body.erase("tool_choice");
@@ -1519,7 +1680,8 @@ static bool execute_final_completion_after_staged_loop(
             std::string(),
             true,
             suppress_replay_admission,
-            mode_label);
+            mode_label,
+            trace_context);
 }
 
 static bool should_use_staged_tool_loop_for_request(const json & body) {
@@ -1543,7 +1705,8 @@ static bool execute_deepseek_chat_with_staged_tools(
         deepseek_chat_result * out_result,
         json * out_error,
         bool suppress_replay_admission = false,
-        const std::string & mode_label = std::string()) {
+        const std::string & mode_label = std::string(),
+        const runtime_request_trace_context * trace_context = nullptr) {
     if (!out_result) {
         if (out_error) {
             *out_error = format_error_response("staged tool loop requires a result output", ERROR_TYPE_SERVER);
@@ -1565,7 +1728,8 @@ static bool execute_deepseek_chat_with_staged_tools(
                 std::string(),
                 true,
                 suppress_replay_admission,
-                mode_label);
+                mode_label,
+                trace_context);
     }
     const staged_tool_catalog & catalog = prompt_bundle->catalog;
 
@@ -1578,6 +1742,14 @@ static bool execute_deepseek_chat_with_staged_tools(
         std::string family_validation_error;
         for (int family_attempt = 0; family_attempt < max_stage_json_attempts && stage_turn < max_stage_turns; ++family_attempt) {
             ++stage_turn;
+            if (trace_context) {
+                runtime_request_trace_log(*trace_context, "staged_tool_loop", "family_selection_attempt_started", {
+                    {"stage_turn", stage_turn},
+                    {"attempt", family_attempt + 1},
+                    {"family_count", static_cast<int64_t>(catalog.families.size())},
+                    {"previous_error", family_validation_error.empty() ? json(nullptr) : json(family_validation_error)},
+                });
+            }
             deepseek_chat_result family_result;
             if (!execute_staged_selection_turn(
                         config,
@@ -1589,14 +1761,29 @@ static bool execute_deepseek_chat_with_staged_tools(
                         &family_result,
                         out_error,
                         suppress_replay_admission,
-                        mode_label.empty() ? "staged_family_select" : mode_label + "_family_select")) {
+                        mode_label.empty() ? "staged_family_select" : mode_label + "_family_select",
+                        trace_context)) {
                 return false;
             }
 
             std::string parse_error;
             if (parse_staged_family_selection_response(family_result.content, catalog, &selected_family_name, &parse_error)) {
+                if (trace_context) {
+                    runtime_request_trace_log(*trace_context, "staged_tool_loop", "family_selection_attempt_succeeded", {
+                        {"stage_turn", stage_turn},
+                        {"attempt", family_attempt + 1},
+                        {"selected_family", selected_family_name},
+                    });
+                }
                 family_valid = true;
                 break;
+            }
+            if (trace_context) {
+                runtime_request_trace_log(*trace_context, "staged_tool_loop", "family_selection_attempt_failed", {
+                    {"stage_turn", stage_turn},
+                    {"attempt", family_attempt + 1},
+                    {"error", parse_error},
+                });
             }
             family_validation_error = parse_error;
         }
@@ -1620,6 +1807,14 @@ static bool execute_deepseek_chat_with_staged_tools(
             std::string method_validation_error;
             for (int method_attempt = 0; method_attempt < max_stage_json_attempts && stage_turn < max_stage_turns; ++method_attempt) {
                 ++stage_turn;
+                if (trace_context) {
+                    runtime_request_trace_log(*trace_context, "staged_tool_loop", "method_selection_attempt_started", {
+                        {"stage_turn", stage_turn},
+                        {"attempt", method_attempt + 1},
+                        {"selected_family", family->family_name},
+                        {"previous_error", method_validation_error.empty() ? json(nullptr) : json(method_validation_error)},
+                    });
+                }
                 deepseek_chat_result method_result;
                 if (!execute_staged_selection_turn(
                             config,
@@ -1631,14 +1826,32 @@ static bool execute_deepseek_chat_with_staged_tools(
                             &method_result,
                             out_error,
                             suppress_replay_admission,
-                            mode_label.empty() ? "staged_method_select" : mode_label + "_method_select")) {
+                            mode_label.empty() ? "staged_method_select" : mode_label + "_method_select",
+                            trace_context)) {
                     return false;
                 }
 
                 std::string method_error;
                 if (parse_staged_method_selection_response(method_result.content, *family, true, &method_choice, &method_error)) {
+                    if (trace_context) {
+                        runtime_request_trace_log(*trace_context, "staged_tool_loop", "method_selection_attempt_succeeded", {
+                            {"stage_turn", stage_turn},
+                            {"attempt", method_attempt + 1},
+                            {"selected_family", family->family_name},
+                            {"selection", method_choice.kind == STAGED_TOOL_METHOD_CHOOSE_METHOD ? json(method_choice.method_name) :
+                                    (method_choice.kind == STAGED_TOOL_METHOD_GO_BACK ? json("back") : json("complete"))},
+                        });
+                    }
                     method_valid = true;
                     break;
+                }
+                if (trace_context) {
+                    runtime_request_trace_log(*trace_context, "staged_tool_loop", "method_selection_attempt_failed", {
+                        {"stage_turn", stage_turn},
+                        {"attempt", method_attempt + 1},
+                        {"selected_family", family->family_name},
+                        {"error", method_error},
+                    });
                 }
                 method_validation_error = method_error;
             }
@@ -1650,9 +1863,21 @@ static bool execute_deepseek_chat_with_staged_tools(
             }
 
             if (method_choice.kind == STAGED_TOOL_METHOD_GO_BACK) {
+                if (trace_context) {
+                    runtime_request_trace_log(*trace_context, "staged_tool_loop", "method_selection_back", {
+                        {"stage_turn", stage_turn},
+                        {"selected_family", family->family_name},
+                    });
+                }
                 break;
             }
             if (method_choice.kind == STAGED_TOOL_METHOD_COMPLETE) {
+                if (trace_context) {
+                    runtime_request_trace_log(*trace_context, "staged_tool_loop", "method_selection_complete", {
+                        {"stage_turn", stage_turn},
+                        {"selected_family", family->family_name},
+                    });
+                }
                 return execute_final_completion_after_staged_loop(
                         config,
                         emotive_runtime,
@@ -1660,7 +1885,8 @@ static bool execute_deepseek_chat_with_staged_tools(
                         out_result,
                         out_error,
                         suppress_replay_admission,
-                        mode_label.empty() ? "staged_complete" : mode_label + "_complete");
+                        mode_label.empty() ? "staged_complete" : mode_label + "_complete",
+                        trace_context);
             }
 
             const staged_tool_method * method = staged_tool_find_method(*family, method_choice.method_name);
@@ -1674,6 +1900,14 @@ static bool execute_deepseek_chat_with_staged_tools(
             std::string payload_validation_error;
             while (stage_turn < max_stage_turns) {
                 ++stage_turn;
+                if (trace_context) {
+                    runtime_request_trace_log(*trace_context, "staged_tool_loop", "payload_attempt_started", {
+                        {"stage_turn", stage_turn},
+                        {"selected_family", family->family_name},
+                        {"selected_method", method->method_name},
+                        {"previous_error", payload_validation_error.empty() ? json(nullptr) : json(payload_validation_error)},
+                    });
+                }
                 deepseek_chat_result payload_result;
                 if (!execute_staged_selection_turn(
                             config,
@@ -1685,20 +1919,45 @@ static bool execute_deepseek_chat_with_staged_tools(
                             &payload_result,
                             out_error,
                             suppress_replay_admission,
-                            mode_label.empty() ? "staged_payload_build" : mode_label + "_payload_build")) {
+                            mode_label.empty() ? "staged_payload_build" : mode_label + "_payload_build",
+                            trace_context)) {
                     return false;
                 }
 
                 staged_tool_payload_choice payload_choice = {};
                 std::string payload_error;
                 if (!parse_staged_payload_response(payload_result.content, *method, &payload_choice, &payload_error)) {
+                    if (trace_context) {
+                        runtime_request_trace_log(*trace_context, "staged_tool_loop", "payload_attempt_failed", {
+                            {"stage_turn", stage_turn},
+                            {"selected_family", family->family_name},
+                            {"selected_method", method->method_name},
+                            {"error", payload_error},
+                        });
+                    }
                     payload_validation_error = payload_error;
                     continue;
                 }
                 if (payload_choice.kind == STAGED_TOOL_PAYLOAD_GO_BACK) {
+                    if (trace_context) {
+                        runtime_request_trace_log(*trace_context, "staged_tool_loop", "payload_back", {
+                            {"stage_turn", stage_turn},
+                            {"selected_family", family->family_name},
+                            {"selected_method", method->method_name},
+                        });
+                    }
                     break;
                 }
 
+                if (trace_context) {
+                    runtime_request_trace_log(*trace_context, "staged_tool_loop", "payload_submitted", {
+                        {"stage_turn", stage_turn},
+                        {"selected_family", family->family_name},
+                        {"selected_method", method->method_name},
+                        {"tool_name", method->tool_name},
+                        {"payload", payload_choice.payload},
+                    });
+                }
                 out_result->content.clear();
                 out_result->reasoning_content = payload_result.reasoning_content;
                 out_result->finish_reason = "tool_calls";
@@ -2862,7 +3121,8 @@ static bool execute_telegram_delivery_for_bridge_request(
         telegram_outbox_state * outbox,
         deepseek_chat_result * result,
         telegram_delivery_result * out_delivery,
-        json * out_error) {
+        json * out_error,
+        const runtime_request_trace_context * trace_context = nullptr) {
     if (!result) {
         if (out_error) {
             *out_error = format_error_response("telegram delivery execution requires a result", ERROR_TYPE_SERVER);
@@ -2886,6 +3146,11 @@ static bool execute_telegram_delivery_for_bridge_request(
     if (result->tool_calls.size() == 1 && result->tool_calls.front().name == "telegram_relay") {
         std::string parse_error;
         if (!parse_telegram_relay_tool_call(result->tool_calls.front(), context, &item, &parse_error)) {
+            if (trace_context) {
+                runtime_request_trace_log(*trace_context, "telegram_delivery", "telegram_relay_parse_failed", {
+                    {"message", parse_error},
+                });
+            }
             if (out_error) {
                 *out_error = format_error_response(parse_error, ERROR_TYPE_SERVER);
             }
@@ -2918,10 +3183,25 @@ static bool execute_telegram_delivery_for_bridge_request(
     try {
         enqueue = telegram_outbox_enqueue(outbox, item);
     } catch (const std::exception & e) {
+        if (trace_context) {
+            runtime_request_trace_log(*trace_context, "telegram_delivery", "telegram_outbox_enqueue_failed", {
+                {"telegram_method", item.telegram_method},
+                {"message", e.what()},
+            });
+        }
         if (out_error) {
             *out_error = format_error_response(e.what(), ERROR_TYPE_SERVER);
         }
         return false;
+    }
+    if (trace_context) {
+        runtime_request_trace_log(*trace_context, "telegram_delivery", "telegram_outbox_enqueued", {
+            {"telegram_method", item.telegram_method},
+            {"sequence_number", enqueue.sequence_number},
+            {"queued", enqueue.queued},
+            {"deduplicated", enqueue.deduplicated},
+            {"source", delivery_source},
+        });
     }
 
     result->content.clear();
@@ -3416,7 +3696,8 @@ static bool execute_deepseek_chat_with_emotive(
         const std::string & cognitive_replay_entry_id,
         bool enable_heuristic_guidance,
         bool suppress_replay_admission,
-        const std::string & mode_label) {
+        const std::string & mode_label,
+        const runtime_request_trace_context * trace_context) {
     if (!out_result) {
         if (out_error) {
             *out_error = format_error_response("DeepSeek result output must not be null.", ERROR_TYPE_SERVER);
@@ -3459,7 +3740,21 @@ static bool execute_deepseek_chat_with_emotive(
             turn_builder.get(),
             &emotive_runtime,
             enable_heuristic_guidance && !cognitive_replay);
-    if (!deepseek_complete_chat(config, provider_body, out_result, turn_builder ? &observer : nullptr, out_error)) {
+    deepseek_request_trace provider_trace;
+    if (trace_context) {
+        provider_trace.request_id = trace_context->request_id;
+        provider_trace.mode_label = mode_label.empty() ? trace_context->mode_label : mode_label;
+        provider_trace.emit = [trace_context](const std::string & event, const json & data) {
+            runtime_request_trace_log(*trace_context, "provider", event, data);
+        };
+    }
+    if (!deepseek_complete_chat(
+                config,
+                provider_body,
+                out_result,
+                turn_builder ? &observer : nullptr,
+                out_error,
+                trace_context ? &provider_trace : nullptr)) {
         return false;
     }
 
@@ -3665,7 +3960,8 @@ static bool execute_bridge_scoped_telegram_request(
         const server_http_req & req,
         const json & body,
         deepseek_chat_result * out_result,
-        json * out_error) {
+        json * out_error,
+        const runtime_request_trace_context * trace_context = nullptr) {
     if (!out_result) {
         if (out_error) {
             *out_error = format_error_response("bridge-scoped Telegram execution requires a result output", ERROR_TYPE_SERVER);
@@ -3691,14 +3987,29 @@ static bool execute_bridge_scoped_telegram_request(
     json runtime_tools;
     std::string tool_error;
     if (!load_server_owned_telegram_runtime_tools(adapter_config, &runtime_tools, &tool_error)) {
+        if (trace_context) {
+            runtime_request_trace_log(*trace_context, "runtime", "telegram_runtime_tools_load_failed", {
+                {"message", tool_error},
+            });
+        }
         if (out_error) {
             *out_error = format_error_response(tool_error, ERROR_TYPE_SERVER);
         }
         return false;
     }
+    if (trace_context) {
+        runtime_request_trace_log(*trace_context, "runtime", "telegram_runtime_tools_loaded", {
+            {"tool_count", runtime_tools.is_array() ? static_cast<int64_t>(runtime_tools.size()) : 0},
+        });
+    }
 
     json current_body = build_server_owned_bridge_request_body(body, context, runtime_tools);
     for (int32_t round = 0; round < std::max<int32_t>(1, adapter_config.max_rounds); ++round) {
+        if (trace_context) {
+            runtime_request_trace_log(*trace_context, "runtime", "bridge_round_started", {
+                {"round", round + 1},
+            });
+        }
         deepseek_chat_result round_result;
         const bool use_staged_tools = should_use_staged_tool_loop_for_request(current_body);
         const bool executed = use_staged_tools ?
@@ -3709,7 +4020,8 @@ static bool execute_bridge_scoped_telegram_request(
                         &round_result,
                         out_error,
                         false,
-                        "telegram_bridge") :
+                        "telegram_bridge",
+                        trace_context) :
                 execute_deepseek_chat_with_emotive(
                         config,
                         emotive_runtime,
@@ -3721,12 +4033,20 @@ static bool execute_bridge_scoped_telegram_request(
                         std::string(),
                         true,
                         false,
-                        "telegram_bridge");
+                        "telegram_bridge",
+                        trace_context);
         if (!executed) {
             return false;
         }
 
         if (round_result.tool_calls.empty()) {
+            if (trace_context) {
+                runtime_request_trace_log(*trace_context, "runtime", "bridge_round_completed_without_tool_call", {
+                    {"round", round + 1},
+                    {"finish_reason", round_result.finish_reason},
+                    {"content_chars", static_cast<int64_t>(round_result.content.size())},
+                });
+            }
             *out_result = std::move(round_result);
             return true;
         }
@@ -3747,6 +4067,12 @@ static bool execute_bridge_scoped_telegram_request(
             return false;
         }
         if (contains_telegram_relay) {
+            if (trace_context) {
+                runtime_request_trace_log(*trace_context, "runtime", "bridge_round_selected_telegram_relay", {
+                    {"round", round + 1},
+                    {"tool_call_count", static_cast<int64_t>(round_result.tool_calls.size())},
+                });
+            }
             *out_result = std::move(round_result);
             return true;
         }
@@ -3754,13 +4080,36 @@ static bool execute_bridge_scoped_telegram_request(
         json messages = current_body.at("messages");
         messages.push_back(build_bridge_assistant_tool_replay_message(round_result));
         for (const auto & tool_call : round_result.tool_calls) {
+            if (trace_context) {
+                runtime_request_trace_log(*trace_context, "runtime_tool", "tool_invocation_started", {
+                    {"round", round + 1},
+                    {"tool_name", tool_call.name},
+                    {"tool_call_id", tool_call.id},
+                });
+            }
             json observation;
             std::string observation_error;
             if (!invoke_server_owned_telegram_runtime_tool(adapter_config, tool_call, &observation, &observation_error)) {
+                if (trace_context) {
+                    runtime_request_trace_log(*trace_context, "runtime_tool", "tool_invocation_failed", {
+                        {"round", round + 1},
+                        {"tool_name", tool_call.name},
+                        {"tool_call_id", tool_call.id},
+                        {"message", observation_error},
+                    });
+                }
                 if (out_error) {
                     *out_error = format_error_response(observation_error, ERROR_TYPE_SERVER);
                 }
                 return false;
+            }
+            if (trace_context) {
+                runtime_request_trace_log(*trace_context, "runtime_tool", "tool_invocation_finished", {
+                    {"round", round + 1},
+                    {"tool_name", tool_call.name},
+                    {"tool_call_id", tool_call.id},
+                    {"observation", observation},
+                });
             }
             messages.push_back(build_bridge_tool_result_message(tool_call, observation));
         }
@@ -3788,17 +4137,37 @@ static server_http_res_ptr handle_deepseek_chat(
 
     deepseek_chat_result result;
     const telegram_bridge_request_context telegram_context = parse_telegram_bridge_request_context(req);
+    const std::string route = responses_api ? "/v1/responses" : (text_completion_api ? "/v1/completions" : "/v1/chat/completions");
+    const runtime_request_trace_context trace_context =
+            make_runtime_request_trace_context(req, route, telegram_context, telegram_context.active ? "telegram_bridge" : "foreground");
+    runtime_request_trace_log(trace_context, "runtime", "request_received", {
+        {"stream", json_value(body, "stream", false)},
+        {"responses_api", responses_api},
+        {"text_completion_api", text_completion_api},
+        {"message_count", body.contains("messages") && body.at("messages").is_array() ?
+                static_cast<int64_t>(body.at("messages").size()) : 0},
+        {"tool_count", body.contains("tools") && body.at("tools").is_array() ?
+                static_cast<int64_t>(body.at("tools").size()) : 0},
+    });
     const bool executed = telegram_context.active ?
-            execute_bridge_scoped_telegram_request(config, emotive_runtime, req, body, &result, &error) :
+            execute_bridge_scoped_telegram_request(config, emotive_runtime, req, body, &result, &error, &trace_context) :
             (should_use_staged_tool_loop_for_request(body) ?
-                    execute_deepseek_chat_with_staged_tools(config, emotive_runtime, body, &result, &error) :
-                    execute_deepseek_chat_with_emotive(config, emotive_runtime, body, &result, &error));
+                    execute_deepseek_chat_with_staged_tools(config, emotive_runtime, body, &result, &error, false, "foreground", &trace_context) :
+                    execute_deepseek_chat_with_emotive(config, emotive_runtime, body, &result, &error, nullptr, false, std::string(), true, false, "foreground", &trace_context));
     if (!executed) {
+        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"message", json_value(error, "message", std::string("request execution failed"))},
+        });
         return make_error_response(error);
     }
 
     telegram_delivery_result telegram_delivery = {};
-    if (!execute_telegram_delivery_for_bridge_request(req, telegram_outbox, &result, &telegram_delivery, &error)) {
+    if (!execute_telegram_delivery_for_bridge_request(req, telegram_outbox, &result, &telegram_delivery, &error, &trace_context)) {
+        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"message", json_value(error, "message", std::string("telegram delivery execution failed"))},
+        });
         return make_error_response(error);
     }
 
@@ -3830,6 +4199,13 @@ static server_http_res_ptr handle_deepseek_chat(
         res->content_type = "text/event-stream";
         res->data = format_oai_sse(
                 deepseek_format_chat_completion_stream(config, result, completion_id, include_usage));
+        runtime_request_trace_log(trace_context, "runtime", "request_completed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"stream", true},
+            {"finish_reason", result.finish_reason},
+            {"tool_call_count", static_cast<int64_t>(result.tool_calls.size())},
+            {"queued_telegram_delivery", telegram_delivery.queued},
+        });
         return res;
     }
 
@@ -3838,6 +4214,14 @@ static server_http_res_ptr handle_deepseek_chat(
     if (!delivery_json.is_null()) {
         response["vicuna_telegram_delivery"] = delivery_json;
     }
+    runtime_request_trace_log(trace_context, "runtime", "request_completed", {
+        {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+        {"stream", false},
+        {"finish_reason", result.finish_reason},
+        {"tool_call_count", static_cast<int64_t>(result.tool_calls.size())},
+        {"queued_telegram_delivery", telegram_delivery.queued},
+        {"content_chars", static_cast<int64_t>(result.content.size())},
+    });
     return make_json_response(response);
 }
 
@@ -3926,8 +4310,14 @@ static bool decide_due_ongoing_task(
         ongoing_task_worker_state * worker_state,
         server_ongoing_task_registry * out_registry,
         server_ongoing_task_summary * out_selected_task) {
+    const runtime_request_trace_context trace_context =
+            make_background_trace_context("/background/ongoing-task", "ongoing_task_decision");
     if (!out_registry) {
         ongoing_task_worker_set_error(worker_state, "ongoing-task registry output must not be null");
+        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"message", "ongoing-task registry output must not be null"},
+        });
         return false;
     }
     if (out_selected_task) {
@@ -3935,6 +4325,10 @@ static bool decide_due_ongoing_task(
     }
 
     const int64_t poll_ms = current_time_ms_utc();
+    runtime_request_trace_log(trace_context, "runtime", "request_received", {
+        {"current_time_ms", poll_ms},
+        {"ongoing_tasks_enabled", ongoing_config.enabled},
+    });
     ongoing_task_worker_mark_poll(worker_state, poll_ms);
     ongoing_task_worker_set_mode(worker_state, "ongoing_task_poll", true);
 
@@ -3942,6 +4336,10 @@ static bool decide_due_ongoing_task(
     std::string registry_error;
     if (!load_ongoing_task_registry(ongoing_config, &registry, &registry_error)) {
         ongoing_task_worker_set_error(worker_state, registry_error);
+        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"message", registry_error},
+        });
         ongoing_task_worker_mark_finished(worker_state);
         return false;
     }
@@ -3959,6 +4357,12 @@ static bool decide_due_ongoing_task(
         decision.rationale = "No active ongoing tasks are registered.";
         ongoing_task_worker_set_decision(worker_state, decision);
         *out_registry = std::move(registry);
+        runtime_request_trace_log(trace_context, "runtime", "request_completed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"task_count", 0},
+            {"should_run", false},
+            {"rationale", decision.rationale},
+        });
         ongoing_task_worker_mark_finished(worker_state);
         return false;
     }
@@ -3992,10 +4396,15 @@ static bool decide_due_ongoing_task(
                 std::string(),
                 true,
                 true,
-                "ongoing_task_decision")) {
+                "ongoing_task_decision",
+                &trace_context)) {
         ongoing_task_worker_set_error(
                 worker_state,
                 json_value(error, "message", std::string("ongoing-task decision request failed")));
+        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"message", json_value(error, "message", std::string("ongoing-task decision request failed"))},
+        });
         ongoing_task_worker_mark_finished(worker_state);
         return false;
     }
@@ -4003,6 +4412,10 @@ static bool decide_due_ongoing_task(
     std::string parse_error;
     if (!parse_ongoing_task_decision_response(result.content, &decision, &parse_error)) {
         ongoing_task_worker_set_error(worker_state, parse_error);
+        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"message", parse_error},
+        });
         ongoing_task_worker_mark_finished(worker_state);
         return false;
     }
@@ -4012,12 +4425,23 @@ static bool decide_due_ongoing_task(
 
     if (decision.should_run && !find_ongoing_task_summary(tasks, decision.selected_task_id)) {
         ongoing_task_worker_set_error(worker_state, "ongoing-task decision selected an unknown task_id");
+        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"message", "ongoing-task decision selected an unknown task_id"},
+        });
         ongoing_task_worker_mark_finished(worker_state);
         return false;
     }
 
     ongoing_task_worker_set_decision(worker_state, decision);
     *out_registry = std::move(registry);
+    runtime_request_trace_log(trace_context, "runtime", "request_completed", {
+        {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+        {"task_count", static_cast<int64_t>(tasks.size())},
+        {"should_run", decision.should_run},
+        {"selected_task_id", decision.should_run ? json(decision.selected_task_id) : json(nullptr)},
+        {"rationale", decision.rationale},
+    });
     if (!decision.should_run) {
         ongoing_task_worker_mark_finished(worker_state);
         return false;
@@ -4036,6 +4460,12 @@ static bool execute_selected_ongoing_task(
         const server_ongoing_task_summary & task,
         server_ongoing_task_registry registry,
         ongoing_task_worker_state * worker_state) {
+    const runtime_request_trace_context trace_context =
+            make_background_trace_context("/background/ongoing-task", "ongoing_task_execution");
+    runtime_request_trace_log(trace_context, "runtime", "request_received", {
+        {"task_id", task.task_id},
+        {"task_text", task.task_text},
+    });
     ongoing_task_worker_set_mode(worker_state, "ongoing_task_execution", true, task.task_id);
 
     json body = {
@@ -4062,10 +4492,16 @@ static bool execute_selected_ongoing_task(
                 std::string(),
                 true,
                 true,
-                "ongoing_task_execution")) {
+                "ongoing_task_execution",
+                &trace_context)) {
         ongoing_task_worker_set_error(
                 worker_state,
                 json_value(error, "message", std::string("ongoing-task execution request failed")));
+        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"message", json_value(error, "message", std::string("ongoing-task execution request failed"))},
+            {"task_id", task.task_id},
+        });
         ongoing_task_worker_mark_finished(worker_state);
         return false;
     }
@@ -4074,16 +4510,31 @@ static bool execute_selected_ongoing_task(
     std::string completion_error;
     if (!mark_ongoing_task_complete(&registry, task.task_id, completed_at_iso, &completion_error)) {
         ongoing_task_worker_set_error(worker_state, completion_error);
+        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"message", completion_error},
+            {"task_id", task.task_id},
+        });
         ongoing_task_worker_mark_finished(worker_state);
         return false;
     }
     if (!save_ongoing_task_registry(ongoing_config, std::move(registry), &completion_error)) {
         ongoing_task_worker_set_error(worker_state, completion_error);
+        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"message", completion_error},
+            {"task_id", task.task_id},
+        });
         ongoing_task_worker_mark_finished(worker_state);
         return false;
     }
 
     ongoing_task_worker_mark_completion(worker_state, task.task_id, completed_at_iso);
+    runtime_request_trace_log(trace_context, "runtime", "request_completed", {
+        {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+        {"task_id", task.task_id},
+        {"completed_at", completed_at_iso},
+    });
     ongoing_task_worker_mark_finished(worker_state);
     return true;
 }
@@ -4196,6 +4647,13 @@ static void compress_resolved_replay_into_heuristic(
         const server_cognitive_replay_entry & entry,
         const server_cognitive_replay_result & result,
         cognitive_replay_worker_state * worker_state) {
+    const runtime_request_trace_context trace_context =
+            make_background_trace_context("/background/cognitive-replay", "heuristic_compression");
+    runtime_request_trace_log(trace_context, "runtime", "request_received", {
+        {"entry_id", entry.entry_id},
+        {"baseline_negative_mass", result.comparison.baseline_negative_mass},
+        {"replay_negative_mass", result.comparison.replay_negative_mass},
+    });
     json body = {
         {"model", config.model},
         {"messages", json::array({
@@ -4222,29 +4680,55 @@ static void compress_resolved_replay_into_heuristic(
                 nullptr,
                 true,
                 entry.entry_id,
-                false)) {
+                false,
+                false,
+                "heuristic_compression",
+                &trace_context)) {
         if (worker_state) {
             std::lock_guard<std::mutex> lock(worker_state->mutex);
             worker_state->last_error = json_value(error, "message", std::string("heuristic compression request failed"));
         }
+        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"entry_id", entry.entry_id},
+            {"message", json_value(error, "message", std::string("heuristic compression request failed"))},
+        });
         return;
     }
 
     try {
         const server_heuristic_object heuristic = parse_heuristic_object_response(compression_result.content);
         std::string persistence_error;
-        if (!emotive_runtime.store_heuristic_memory_record(entry.entry_id, heuristic, &persistence_error) &&
-                worker_state) {
-            std::lock_guard<std::mutex> lock(worker_state->mutex);
-            worker_state->last_error = persistence_error.empty() ?
-                    std::string("heuristic persistence failed") :
-                    persistence_error;
+        if (!emotive_runtime.store_heuristic_memory_record(entry.entry_id, heuristic, &persistence_error)) {
+            if (worker_state) {
+                std::lock_guard<std::mutex> lock(worker_state->mutex);
+                worker_state->last_error = persistence_error.empty() ?
+                        std::string("heuristic persistence failed") :
+                        persistence_error;
+            }
+            runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+                {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+                {"entry_id", entry.entry_id},
+                {"message", persistence_error.empty() ? std::string("heuristic persistence failed") : persistence_error},
+            });
+            return;
         }
+        runtime_request_trace_log(trace_context, "runtime", "request_completed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"entry_id", entry.entry_id},
+            {"heuristic_id", heuristic.heuristic_id},
+            {"title", heuristic.title},
+        });
     } catch (const std::exception & e) {
         if (worker_state) {
             std::lock_guard<std::mutex> lock(worker_state->mutex);
             worker_state->last_error = e.what();
         }
+        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"entry_id", entry.entry_id},
+            {"message", e.what()},
+        });
     }
 }
 
@@ -4253,6 +4737,14 @@ static void run_cognitive_replay_once(
         server_emotive_runtime & emotive_runtime,
         const server_cognitive_replay_entry & entry,
         cognitive_replay_worker_state * worker_state) {
+    const runtime_request_trace_context trace_context =
+            make_background_trace_context("/background/cognitive-replay", "cognitive_replay");
+    runtime_request_trace_log(trace_context, "runtime", "request_received", {
+        {"entry_id", entry.entry_id},
+        {"negative_mass", entry.negative_mass},
+        {"valence_drop", entry.valence_drop},
+        {"dominance_drop", entry.dominance_drop},
+    });
     json body = {
         {"model", config.model},
         {"messages", json::array({
@@ -4279,7 +4771,11 @@ static void run_cognitive_replay_once(
                 &error,
                 &replay_trace,
                 true,
-                entry.entry_id)) {
+                entry.entry_id,
+                true,
+                false,
+                "cognitive_replay",
+                &trace_context)) {
         emotive_runtime.fail_cognitive_replay_entry(
                 entry.entry_id,
                 json_value(error, "message", std::string("cognitive replay request failed")));
@@ -4287,6 +4783,11 @@ static void run_cognitive_replay_once(
             std::lock_guard<std::mutex> lock(worker_state->mutex);
             worker_state->last_error = json_value(error, "message", std::string("cognitive replay request failed"));
         }
+        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
+            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+            {"entry_id", entry.entry_id},
+            {"message", json_value(error, "message", std::string("cognitive replay request failed"))},
+        });
         return;
     }
 
@@ -4303,6 +4804,12 @@ static void run_cognitive_replay_once(
             resolved_result.comparison.improved) {
         compress_resolved_replay_into_heuristic(config, emotive_runtime, resolved_entry, resolved_result, worker_state);
     }
+    runtime_request_trace_log(trace_context, "runtime", "request_completed", {
+        {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
+        {"entry_id", entry.entry_id},
+        {"resolved", resolved_entry.status == SERVER_COGNITIVE_REPLAY_RESOLVED},
+        {"improved", resolved_result.comparison.improved},
+    });
 
     if (worker_state) {
         std::lock_guard<std::mutex> lock(worker_state->mutex);
@@ -4498,6 +5005,7 @@ int main(int argc, char ** argv) {
             {"telegram_runtime_tool_cache", telegram_runtime_tool_cache_health_json()},
             {"staged_prompt_cache", staged_tool_prompt_cache_health_json()},
         };
+        payload["request_traces"] = runtime_request_trace_health_json();
         payload["emotive_runtime"] = emotive_runtime.health_json();
         payload["emotive_runtime"]["cognitive_replay"]["worker"] =
                 cognitive_replay_worker_json(replay_worker_state, request_activity);
@@ -4530,6 +5038,10 @@ int main(int argc, char ** argv) {
             {"object", "vicuna.emotive.ongoing_tasks"},
             {"worker", ongoing_task_worker_json(ongoing_worker_state, request_activity, ongoing_task_config)},
         });
+    };
+
+    const auto get_request_traces = [](const server_http_req & req) {
+        return make_json_response(runtime_request_trace_read_json(req));
     };
 
     const auto post_chat_completions = [&deepseek_config, &emotive_runtime, &telegram_outbox](const server_http_req & req) {
@@ -4609,6 +5121,7 @@ int main(int argc, char ** argv) {
     ctx_http.get("/v1/emotive/cognitive-replay", ex_wrapper(get_cognitive_replay));
     ctx_http.get("/v1/emotive/heuristics", ex_wrapper(get_heuristic_memory));
     ctx_http.get("/v1/emotive/ongoing-tasks", ex_wrapper(get_ongoing_tasks));
+    ctx_http.get("/v1/debug/request-traces", ex_wrapper(get_request_traces));
     ctx_http.post("/v1/chat/completions", ex_wrapper(post_chat_completions, &request_activity));
     ctx_http.post("/v1/completions", ex_wrapper(post_completions, &request_activity));
     ctx_http.post("/v1/responses", ex_wrapper(post_responses, &request_activity));

@@ -65,11 +65,16 @@ Interleaved-thinking policy:
 - preserve `reasoning_content` exactly while adding any VAD or heuristic guidance messages
 - default DeepSeek provider requests to `deepseek-chat` with `thinking={"type":"enabled"}`
 - pass through DeepSeek's top-level `thinking` field unchanged when callers provide it
-- force every outbound DeepSeek request, including staged and background turns, to use `max_tokens: 1024`
+- force every outbound DeepSeek request, including staged and background turns, to use `max_tokens: 256`
 - force every outbound DeepSeek request, including staged and background turns, to use `temperature: 0.2`
 - ignore caller-supplied `max_tokens`, `max_completion_tokens`, and `max_output_tokens` values that differ from the fixed runtime cap
 - reuse one configured `cpp-httplib` client per DeepSeek authority and expose
   its build/reuse counters at `/health -> provider -> transport`
+- retain a bounded structured request-trace registry with labeled JSON events
+  across runtime handling, provider traffic, staged selection, runtime tool
+  execution, Telegram delivery, and background replay/task flows
+- inspect request-trace summary counters at `/health -> request_traces`
+- inspect retained request-trace events at `GET /v1/debug/request-traces`
 
 Staged tool-loop policy:
 

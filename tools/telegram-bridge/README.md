@@ -39,7 +39,7 @@ Optional variables:
 - `TELEGRAM_BRIDGE_STATE_PATH` default: `/tmp/vicuna-telegram-bridge-state.json`
 - `TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS` default: `30`
 - `TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES` default: `12`
-- `TELEGRAM_BRIDGE_MAX_TOKENS` default: `-1` (unlimited)
+- `TELEGRAM_BRIDGE_MAX_TOKENS` default: `256`
 - `TELEGRAM_BRIDGE_MAX_DOCUMENT_CHARS` default: `12000`
 - `TELEGRAM_BRIDGE_DOCLING_PYTHON_BIN` default: `python3`
 - `TELEGRAM_BRIDGE_DOCLING_PARSER_SCRIPT_PATH` default: repo-local `tools/telegram-bridge/docling-parse.py`
@@ -169,6 +169,10 @@ The key runtime variables are:
   still includes the latest user turn
 - each forwarded Telegram turn now logs transcript length and role sequence to
   the bridge journal for continuity debugging
+- each deferred bridge-owned request now carries `X-Client-Request-Id` through
+  to the runtime and emits structured JSON log events such as
+  `vicuna_request_started`, `vicuna_request_finished`, and
+  `deferred_turn_failed`, so host-side bridge/runtime traces can be correlated
 - normal Telegram text and document turns no longer send a bridge-authored
   acknowledgement before the real work starts; the first bridge-authored reply
   for a deferred turn is now the substantive final follow-up or failure message

@@ -178,7 +178,7 @@ static json deepseek_build_provider_messages(const json & body) {
     return messages;
 }
 
-static constexpr int64_t VICUNA_OUTBOUND_MAX_TOKENS = 1024;
+static constexpr int64_t VICUNA_OUTBOUND_MAX_TOKENS = 256;
 static constexpr double VICUNA_OUTBOUND_TEMPERATURE = 0.2;
 
 struct deepseek_shared_client_state {
@@ -196,11 +196,31 @@ static deepseek_shared_client_state & deepseek_shared_client_state_instance() {
     return state;
 }
 
+static void deepseek_emit_trace_event(
+        const deepseek_request_trace * trace,
+        const std::string & event,
+        json data = json::object()) {
+    if (!trace || !trace->emit) {
+        return;
+    }
+    if (!data.is_object()) {
+        data = json::object();
+    }
+    if (!trace->request_id.empty() && !data.contains("request_id")) {
+        data["request_id"] = trace->request_id;
+    }
+    if (!trace->mode_label.empty() && !data.contains("mode_label")) {
+        data["mode_label"] = trace->mode_label;
+    }
+    trace->emit(event, std::move(data));
+}
+
 static bool deepseek_prepare_shared_client_locked(
         deepseek_shared_client_state & state,
         const deepseek_runtime_config & config,
         std::string * out_url,
-        server_http_url * out_parts) {
+        server_http_url * out_parts,
+        bool * out_reused = nullptr) {
     const std::string url = deepseek_chat_completions_url(config);
     const bool reuse_existing = state.client && state.url == url;
     if (!reuse_existing) {
@@ -226,6 +246,9 @@ static bool deepseek_prepare_shared_client_locked(
     }
     if (out_parts) {
         *out_parts = state.parts;
+    }
+    if (out_reused) {
+        *out_reused = reuse_existing;
     }
     return true;
 }
@@ -610,7 +633,8 @@ bool deepseek_complete_chat(
         const json & body,
         deepseek_chat_result * out_result,
         const deepseek_stream_observer * observer,
-        json * out_error) {
+        json * out_error,
+        const deepseek_request_trace * trace) {
     if (!out_result) {
         if (out_error) {
             *out_error = format_error_response("DeepSeek result output must not be null.", ERROR_TYPE_SERVER);
@@ -638,11 +662,27 @@ bool deepseek_complete_chat(
         return false;
     }
 
+    const auto request_started_at = std::chrono::steady_clock::now();
+    deepseek_emit_trace_event(trace, "provider_request_started", {
+        {"provider", "deepseek"},
+        {"model", json_value(provider_body, "model", config.model)},
+        {"message_count", provider_body.contains("messages") && provider_body.at("messages").is_array() ?
+                static_cast<int64_t>(provider_body.at("messages").size()) : 0},
+        {"tool_count", provider_body.contains("tools") && provider_body.at("tools").is_array() ?
+                static_cast<int64_t>(provider_body.at("tools").size()) : 0},
+        {"max_tokens", json_value(provider_body, "max_tokens", int64_t(0))},
+        {"temperature", json_value(provider_body, "temperature", 0.0)},
+        {"thinking", provider_body.contains("thinking") ? provider_body.at("thinking") : json(nullptr)},
+        {"response_format", provider_body.contains("response_format") ? provider_body.at("response_format") : json(nullptr)},
+        {"endpoint", server_http_show_masked_url(server_http_parse_url(deepseek_chat_completions_url(config)))},
+    });
+
     try {
         auto & shared_client_state = deepseek_shared_client_state_instance();
         std::unique_lock<std::mutex> client_lock(shared_client_state.mutex);
         server_http_url parts;
-        deepseek_prepare_shared_client_locked(shared_client_state, config, nullptr, &parts);
+        bool reused_client = false;
+        deepseek_prepare_shared_client_locked(shared_client_state, config, nullptr, &parts, &reused_client);
         ++shared_client_state.request_count;
 
         httplib::Headers headers = {
@@ -706,6 +746,13 @@ bool deepseek_complete_chat(
                     return true;
                 });
         if (!response) {
+            deepseek_emit_trace_event(trace, "provider_request_error", {
+                {"provider", "deepseek"},
+                {"elapsed_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - request_started_at).count()},
+                {"reused_client", reused_client},
+                {"message", "DeepSeek provider request failed before a response was received."},
+            });
             if (out_error) {
                 *out_error = format_error_response(
                         "DeepSeek provider request failed before a response was received.",
@@ -728,12 +775,28 @@ bool deepseek_complete_chat(
             }
         }
         if (!event_data.empty() && !flush_event()) {
+            deepseek_emit_trace_event(trace, "provider_request_error", {
+                {"provider", "deepseek"},
+                {"status", response->status},
+                {"elapsed_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - request_started_at).count()},
+                {"reused_client", reused_client},
+                {"message", json_value(stream_error, "message", std::string("provider stream error"))},
+            });
             if (out_error) {
                 *out_error = stream_error;
             }
             return false;
         }
         if (!stream_error.is_null()) {
+            deepseek_emit_trace_event(trace, "provider_request_error", {
+                {"provider", "deepseek"},
+                {"status", response->status},
+                {"elapsed_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - request_started_at).count()},
+                {"reused_client", reused_client},
+                {"message", json_value(stream_error, "message", std::string("provider stream error"))},
+            });
             if (out_error) {
                 *out_error = stream_error;
             }
@@ -741,6 +804,14 @@ bool deepseek_complete_chat(
         }
 
         if (response->status == 401 || response->status == 403) {
+            deepseek_emit_trace_event(trace, "provider_request_error", {
+                {"provider", "deepseek"},
+                {"status", response->status},
+                {"elapsed_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - request_started_at).count()},
+                {"reused_client", reused_client},
+                {"message", "DeepSeek authentication failed. Check VICUNA_DEEPSEEK_API_KEY."},
+            });
             if (out_error) {
                 *out_error = format_error_response(
                         "DeepSeek authentication failed. Check VICUNA_DEEPSEEK_API_KEY.",
@@ -767,6 +838,14 @@ bool deepseek_complete_chat(
             if (out_error) {
                 *out_error = format_error_response("DeepSeek provider error: " + message, type);
             }
+            deepseek_emit_trace_event(trace, "provider_request_error", {
+                {"provider", "deepseek"},
+                {"status", response->status},
+                {"elapsed_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - request_started_at).count()},
+                {"reused_client", reused_client},
+                {"message", message},
+            });
             return false;
         }
 
@@ -774,9 +853,25 @@ bool deepseek_complete_chat(
             try {
                 const json response_body = json::parse(raw_body);
                 if (!deepseek_parse_response_json(response_body, out_result, observer, out_error)) {
+                    deepseek_emit_trace_event(trace, "provider_request_error", {
+                        {"provider", "deepseek"},
+                        {"status", response->status},
+                        {"elapsed_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - request_started_at).count()},
+                        {"reused_client", reused_client},
+                        {"message", out_error ? json_value(*out_error, "message", std::string("provider response parse failed")) : std::string("provider response parse failed")},
+                    });
                     return false;
                 }
             } catch (const std::exception & e) {
+                deepseek_emit_trace_event(trace, "provider_request_error", {
+                    {"provider", "deepseek"},
+                    {"status", response->status},
+                    {"elapsed_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - request_started_at).count()},
+                    {"reused_client", reused_client},
+                    {"message", std::string("DeepSeek provider response parse failed: ") + e.what()},
+                });
                 if (out_error) {
                     *out_error = format_error_response(
                             std::string("DeepSeek provider response parse failed: ") + e.what(),
@@ -786,11 +881,39 @@ bool deepseek_complete_chat(
             }
         }
         if (!deepseek_finalize_tool_calls(out_result, out_error)) {
+            deepseek_emit_trace_event(trace, "provider_request_error", {
+                {"provider", "deepseek"},
+                {"status", response->status},
+                {"elapsed_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - request_started_at).count()},
+                {"reused_client", reused_client},
+                {"message", out_error ? json_value(*out_error, "message", std::string("provider tool finalization failed")) : std::string("provider tool finalization failed")},
+            });
             return false;
         }
 
+        deepseek_emit_trace_event(trace, "provider_request_finished", {
+            {"provider", "deepseek"},
+            {"status", response->status},
+            {"elapsed_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - request_started_at).count()},
+            {"reused_client", reused_client},
+            {"finish_reason", out_result->finish_reason},
+            {"prompt_tokens", out_result->prompt_tokens},
+            {"completion_tokens", out_result->completion_tokens},
+            {"tool_call_count", static_cast<int64_t>(out_result->tool_calls.size())},
+            {"reasoning_chars", static_cast<int64_t>(out_result->reasoning_content.size())},
+            {"content_chars", static_cast<int64_t>(out_result->content.size())},
+            {"saw_stream_event", saw_stream_event},
+        });
         return true;
     } catch (const std::exception & e) {
+        deepseek_emit_trace_event(trace, "provider_request_error", {
+            {"provider", "deepseek"},
+            {"elapsed_ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - request_started_at).count()},
+            {"message", std::string("DeepSeek provider request failed: ") + e.what()},
+        });
         if (out_error) {
             *out_error = format_error_response(
                     std::string("DeepSeek provider request failed: ") + e.what(),

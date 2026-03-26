@@ -21,6 +21,12 @@ struct deepseek_stream_observer {
     std::function<void(const std::string &)> on_runtime_event;
 };
 
+struct deepseek_request_trace {
+    std::string request_id;
+    std::string mode_label;
+    std::function<void(const std::string &, const json &)> emit;
+};
+
 struct deepseek_tool_call {
     std::string id;
     std::string name;
@@ -44,7 +50,8 @@ bool deepseek_complete_chat(
         const json & body,
         deepseek_chat_result * out_result,
         const deepseek_stream_observer * observer = nullptr,
-        json * out_error = nullptr);
+        json * out_error = nullptr,
+        const deepseek_request_trace * trace = nullptr);
 
 json deepseek_build_health_json(const deepseek_runtime_config & config);
 json deepseek_build_models_json(const deepseek_runtime_config & config);

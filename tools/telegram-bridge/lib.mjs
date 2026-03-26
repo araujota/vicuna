@@ -21,6 +21,7 @@ export const DEFAULT_MAX_DOCUMENT_CHARS = 12000;
 export const DEFAULT_MAX_DOCUMENT_CHUNKS = 128;
 export const DEFAULT_MAX_PENDING_OPTION_PROMPTS = 32;
 export const DEFAULT_MAX_CONVERSATION_MESSAGE_LINKS = 64;
+export const DEFAULT_PROVIDER_MAX_TOKENS = 256;
 export const TELEGRAM_BRIDGE_STATE_SCHEMA_VERSION = 2;
 export const TELEGRAM_BRIDGE_ASK_OUTBOX_POLL_IDLE_MS = 200;
 export const TELEGRAM_BRIDGE_SELF_EMIT_ACTIVE_DELAY_MS = 250;
@@ -43,16 +44,19 @@ export const TELEGRAM_RELAY_ALLOWED_METHODS = [
   'sendDice',
 ];
 
-export function buildTelegramChatCompletionRequest({ model, transcript, maxTokens = -1, temperature = 0.2 }) {
+export function buildTelegramChatCompletionRequest({
+  model,
+  transcript,
+  maxTokens = DEFAULT_PROVIDER_MAX_TOKENS,
+  temperature = 0.2,
+}) {
   const messages = Array.isArray(transcript) ? structuredClone(transcript) : [];
   const payload = {
     model: String(model ?? '').trim(),
     temperature,
     messages,
   };
-  if (maxTokens >= 0) {
-    payload.max_tokens = Math.max(32, Number(maxTokens) || 32);
-  }
+  payload.max_tokens = DEFAULT_PROVIDER_MAX_TOKENS;
   return payload;
 }
 

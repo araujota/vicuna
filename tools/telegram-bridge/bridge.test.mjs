@@ -197,14 +197,14 @@ test('buildTelegramChatCompletionRequest forwards only the carried transcript an
   const payload = buildTelegramChatCompletionRequest({
     model: 'deepseek-reasoner',
     transcript,
-    maxTokens: 1024,
+    maxTokens: 4096,
   });
 
   assert.deepEqual(payload, {
     model: 'deepseek-reasoner',
     temperature: 0.2,
     messages: transcript,
-    max_tokens: 1024,
+    max_tokens: 256,
   });
   assert.equal('tools' in payload, false);
 });

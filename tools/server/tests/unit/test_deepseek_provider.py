@@ -239,6 +239,13 @@ def test_provider_mode_health_and_models_exclude_local_runtime_surfaces():
             assert health.body["proactive_mailbox"]["live_stream_connected"] is False
             assert health.body["bridge_runtime"]["telegram_runtime_tool_cache"]["cached"] is False
             assert health.body["bridge_runtime"]["staged_prompt_cache"]["cached"] is False
+            assert health.body["request_traces"] == {
+                "stored_events": 0,
+                "max_events": 512,
+                "total_events": 0,
+                "latest_request_id": None,
+                "latest_event": None,
+            }
             assert health.body["emotive_runtime"]["enabled"] is True
             assert health.body["emotive_runtime"]["embedding_backend"]["mode"] == "lexical_only"
             assert health.body["emotive_runtime"]["cognitive_replay"]["enabled"] is True
@@ -340,7 +347,7 @@ def test_provider_mode_responses_route_emits_reasoning_item():
             assert response.body["output"][1]["content"][0]["text"] == "Hello from DeepSeek."
             assert response.body["vicuna_emotive_trace"]["blocks"][0]["source"]["kind"] == "user_message"
             assert response.body["vicuna_emotive_trace"]["final_vad"]["style_guide"]["tone_label"]
-            assert state["requests"][0]["body"]["max_tokens"] == 1024
+            assert state["requests"][0]["body"]["max_tokens"] == 256
             assert state["requests"][0]["body"]["temperature"] == 0.2
         finally:
             server.stop()
@@ -377,6 +384,53 @@ def test_provider_mode_reuses_shared_deepseek_http_client():
             assert {request["client"]["port"] for request in provider_requests} == {
                 provider_requests[0]["client"]["port"],
             }
+        finally:
+            server.stop()
+
+
+def test_provider_mode_request_trace_endpoint_returns_correlated_foreground_events():
+    global server
+    with run_mock_deepseek() as (base_url, _):
+        server = make_provider_server(base_url)
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Trace this request."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "trace_fg_1",
+            })
+            assert response.status_code == 200
+            assert response.headers["x-client-request-id"] == "trace_fg_1"
+            assert response.headers["x-request-id"]
+
+            traces = server.make_request("GET", "/v1/debug/request-traces?request_id=trace_fg_1&limit=20")
+            assert traces.status_code == 200
+            assert traces.body["object"] == "vicuna.request_traces"
+            assert traces.body["request_id"] == "trace_fg_1"
+            events = [item["event"] for item in traces.body["items"]]
+            assert events == [
+                "request_received",
+                "provider_request_started",
+                "provider_request_finished",
+                "request_completed",
+            ]
+            assert all(item["request_id"] == "trace_fg_1" for item in traces.body["items"])
+            assert traces.body["items"][0]["component"] == "runtime"
+            assert traces.body["items"][1]["component"] == "provider"
+            assert traces.body["items"][1]["data"]["max_tokens"] == 256
+            assert traces.body["items"][1]["data"]["temperature"] == 0.2
+            assert traces.body["items"][2]["data"]["finish_reason"] == "stop"
+
+            health = server.make_request("GET", "/health")
+            assert health.body["request_traces"]["stored_events"] >= 4
+            assert health.body["request_traces"]["latest_request_id"] == "trace_fg_1"
+            assert health.body["request_traces"]["latest_event"] == "request_completed"
         finally:
             server.stop()
 
@@ -546,7 +600,7 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
             payload_request = state["requests"][2]["body"]
 
             assert "tools" not in family_request
-            assert family_request["max_tokens"] == 1024
+            assert family_request["max_tokens"] == 256
             assert family_request["thinking"] == {"type": "enabled"}
             assert family_request["response_format"] == {"type": "json_object"}
             assert family_request["messages"][2]["reasoning_content"] == request["messages"][1]["reasoning_content"]
@@ -559,13 +613,13 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
             assert family_request["messages"][-1]["role"] == "system"
             assert "choosing one tool family" in family_request["messages"][-1]["content"].lower()
 
-            assert method_request["max_tokens"] == 1024
+            assert method_request["max_tokens"] == 256
             assert method_request["thinking"] == {"type": "enabled"}
             assert method_request["response_format"] == {"type": "json_object"}
             assert method_request["messages"][-1]["role"] == "system"
             assert "choosing a method of the ongoing tasks" in method_request["messages"][-1]["content"].lower()
 
-            assert payload_request["max_tokens"] == 1024
+            assert payload_request["max_tokens"] == 256
             assert payload_request["thinking"] == {"type": "enabled"}
             assert payload_request["response_format"] == {"type": "json_object"}
             assert payload_request["messages"][-1]["role"] == "system"
@@ -679,8 +733,8 @@ def test_provider_mode_interleaved_guidance_is_request_scoped_and_forwards_think
 
             first_outbound = state["requests"][0]["body"]
             second_outbound = state["requests"][1]["body"]
-            assert first_outbound["max_tokens"] == 1024
-            assert second_outbound["max_tokens"] == 1024
+            assert first_outbound["max_tokens"] == 256
+            assert second_outbound["max_tokens"] == 256
             assert first_outbound["thinking"] == {"type": "enabled"}
             assert second_outbound["thinking"] == {"type": "enabled"}
             assert first_outbound["messages"][3]["role"] == "system"
@@ -947,7 +1001,7 @@ def test_provider_mode_staged_tool_loop_supports_back_navigation_and_completion(
             assert response.body["choices"][0]["finish_reason"] == "stop"
             assert response.body["choices"][0]["message"]["content"] == "All set."
             assert len(state["requests"]) == 5
-            assert all(request["body"]["max_tokens"] == 1024 for request in state["requests"])
+            assert all(request["body"]["max_tokens"] == 256 for request in state["requests"])
             assert "choosing one tool family" in state["requests"][0]["body"]["messages"][-1]["content"].lower()
             assert "choosing a method of the ongoing tasks" in state["requests"][1]["body"]["messages"][-1]["content"].lower()
             assert "choosing one tool family" in state["requests"][2]["body"]["messages"][-1]["content"].lower()
@@ -1420,6 +1474,103 @@ def test_provider_mode_normalizes_plain_text_bridge_completion_into_telegram_out
                 "reply_to_message_id": 77,
                 "dedupe_key": "bridge:tc1:77:sendMessage",
             }]
+        finally:
+            server.stop()
+
+
+def test_provider_mode_request_trace_endpoint_records_bridge_events():
+    global server
+
+    def staged_complete_response(payload):
+        stage_prompt = payload["messages"][-1]["content"].lower()
+        if "choosing one tool family" in stage_prompt:
+            return {
+                "id": "bridge-trace-family",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"family": "Telegram"}),
+                        "reasoning_content": "Reply on Telegram.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "choosing a method of the telegram" in stage_prompt:
+            return {
+                "id": "bridge-trace-method",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"method": "complete"}),
+                        "reasoning_content": "I can answer directly.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        return {
+            "id": "bridge-trace-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello from DeepSeek.",
+                    "reasoning_content": "I should greet the user and keep the reply brief.",
+                },
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 11,
+                "total_tokens": 16,
+            },
+        }
+
+    with run_mock_deepseek(staged_complete_response) as (base_url, _):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": "[]",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Reply on Telegram."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "trace_bridge_1",
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "77",
+                "X-Vicuna-Telegram-Deferred-Delivery": "1",
+                "X-Vicuna-Telegram-Conversation-Id": "tc-trace",
+            })
+
+            assert response.status_code == 200
+            traces = server.make_request("GET", "/v1/debug/request-traces?request_id=trace_bridge_1&limit=50")
+            assert traces.status_code == 200
+            events = [item["event"] for item in traces.body["items"]]
+            assert "request_received" in events
+            assert "telegram_runtime_tools_loaded" in events
+            assert "bridge_round_started" in events
+            assert "family_selection_attempt_started" in events
+            assert "family_selection_attempt_succeeded" in events
+            assert "method_selection_attempt_started" in events
+            assert "method_selection_attempt_succeeded" in events
+            assert "bridge_round_completed_without_tool_call" in events
+            assert "telegram_outbox_enqueued" in events
+            assert events[-1] == "request_completed"
+            assert all(item["request_id"] == "trace_bridge_1" for item in traces.body["items"])
+            assert all(item["bridge_scoped"] is True for item in traces.body["items"])
+            assert any(item["component"] == "telegram_delivery" for item in traces.body["items"])
         finally:
             server.stop()
 

@@ -41,6 +41,7 @@ import {
   TELEGRAM_BRIDGE_SELF_EMIT_ACTIVE_DELAY_MS,
   TELEGRAM_BRIDGE_SELF_EMIT_ERROR_DELAY_MS,
   TELEGRAM_BRIDGE_WATCHDOG_DELAY_MS,
+  DEFAULT_PROVIDER_MAX_TOKENS,
   updateTelegramOffset,
 } from './lib.mjs';
 
@@ -55,8 +56,8 @@ const env = {
   pollTimeoutSeconds: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS, 30)),
   maxHistoryMessages: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES, 12)),
   maxTokens: (() => {
-    const configured = parseInteger(process.env.TELEGRAM_BRIDGE_MAX_TOKENS, -1);
-    return configured < 0 ? -1 : Math.max(32, configured);
+    const configured = parseInteger(process.env.TELEGRAM_BRIDGE_MAX_TOKENS, DEFAULT_PROVIDER_MAX_TOKENS);
+    return Math.max(32, Math.min(DEFAULT_PROVIDER_MAX_TOKENS, configured));
   })(),
   maxDocumentChars: Math.max(256, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_DOCUMENT_CHARS, 12000)),
   selfEmitAfter: Math.max(0, parseInteger(process.env.TELEGRAM_BRIDGE_SELF_EMIT_AFTER, 0)),
@@ -98,6 +99,18 @@ function log(message, extra = undefined) {
   console.log(`${prefix} ${message}`, extra);
 }
 
+function createBridgeRequestId(prefix = 'tg') {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function logEvent(event, fields = {}) {
+  console.log('[telegram-bridge]', JSON.stringify({
+    timestamp_ms: Date.now(),
+    event,
+    ...fields,
+  }));
+}
+
 function transcriptSummary(chatId, conversationId = '') {
   const transcript = getChatTranscript(state, chatId, conversationId ? { conversationId } : {});
   return {
@@ -119,10 +132,13 @@ function vicunaHeaders() {
   return headers;
 }
 
-async function postVicunaJson(pathname, payload) {
+async function postVicunaJson(pathname, payload, options = {}) {
   const response = await fetch(`${env.vicunaBaseUrl}${pathname}`, {
     method: 'POST',
-    headers: vicunaHeaders(),
+    headers: {
+      ...vicunaHeaders(),
+      ...(options.headers ?? {}),
+    },
     body: JSON.stringify(payload ?? {}),
   });
   const body = await response.json();
@@ -463,11 +479,24 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, options = {})
   const historyTurns = Math.max(1, Math.ceil(transcript.length / 2));
   const deferredDelivery = options?.deferredDelivery === true;
   const messages = transcript.length > 0 ? transcript : [];
+  const requestId = typeof options?.requestId === 'string' && options.requestId.trim()
+    ? options.requestId.trim()
+    : createBridgeRequestId('vicuna');
 
   if (messages.length === 0) {
     throw new Error('Telegram turn forwarding requires a non-empty transcript');
   }
 
+  const requestStartedAt = Date.now();
+  logEvent('vicuna_request_started', {
+    requestId,
+    chatId: String(chatId),
+    conversationId,
+    messageId,
+    deferredDelivery,
+    carriedTranscriptMessageCount: transcript.length,
+    maxTokens: env.maxTokens,
+  });
   log('forwarding Telegram transcript to Vicuna', {
     chatId: String(chatId),
     conversationId,
@@ -481,6 +510,7 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, options = {})
     method: 'POST',
     headers: {
       ...vicunaHeaders(),
+      'X-Client-Request-Id': requestId,
       'X-Vicuna-Telegram-Chat-Id': String(chatId),
       ...(deferredDelivery ? { 'X-Vicuna-Telegram-Deferred-Delivery': '1' } : {}),
       'X-Vicuna-Telegram-Message-Id': String(messageId || 0),
@@ -492,11 +522,37 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, options = {})
       transcript: messages,
       maxTokens: env.maxTokens,
     })),
+    signal: AbortSignal.timeout(300000),
   });
   const body = await response.json();
+  const runtimeRequestId = response.headers.get('x-client-request-id')
+    || response.headers.get('x-request-id')
+    || requestId;
   if (!response.ok) {
+    logEvent('vicuna_request_failed', {
+      requestId: runtimeRequestId,
+      chatId: String(chatId),
+      conversationId,
+      messageId,
+      elapsedMs: Date.now() - requestStartedAt,
+      status: response.status,
+      deferredDelivery,
+      error: `vicuna chat failed: ${response.status} ${JSON.stringify(body)}`,
+    });
     throw new Error(`vicuna chat failed: ${response.status} ${JSON.stringify(body)}`);
   }
+  logEvent('vicuna_request_finished', {
+    requestId: runtimeRequestId,
+    chatId: String(chatId),
+    conversationId,
+    messageId,
+    elapsedMs: Date.now() - requestStartedAt,
+    status: response.status,
+    deferredDelivery,
+    finishReason: body?.choices?.[0]?.finish_reason ?? '',
+    toolCallCount: Array.isArray(body?.choices?.[0]?.message?.tool_calls) ? body.choices[0].message.tool_calls.length : 0,
+    queuedTelegramDelivery: body?.vicuna_telegram_delivery?.queued === true,
+  });
   if (body?.vicuna_telegram_delivery?.handled === true) {
     return '';
   }
@@ -513,10 +569,12 @@ async function callVicunaForTelegramMessage(chatId, messageId = 0, options = {})
 }
 
 async function runDeferredTelegramTurn({ chatId, messageId = 0, conversationId = '' }) {
+  const requestId = createBridgeRequestId('deferred');
   try {
     const reply = await callVicunaForTelegramMessage(chatId, messageId, {
       deferredDelivery: true,
       conversationId,
+      requestId,
     });
     if (reply) {
       const resolved = resolveTelegramConversationForOutbound(state, chatId, {
@@ -548,8 +606,26 @@ async function runDeferredTelegramTurn({ chatId, messageId = 0, conversationId =
         messageId,
         conversationId,
       });
+      logEvent('deferred_turn_bridge_fallback_delivery', {
+        requestId,
+        chatId: String(chatId),
+        messageId,
+        conversationId,
+      });
     }
   } catch (error) {
+    const classification = error?.name === 'TimeoutError'
+      ? 'timeout'
+      : (String(error?.message ?? '').includes('fetch failed') ? 'transport' : 'runtime');
+    logEvent('deferred_turn_failed', {
+      requestId,
+      chatId: String(chatId),
+      messageId,
+      conversationId,
+      classification,
+      errorName: String(error?.name ?? ''),
+      error: error.message,
+    });
     log('deferred Telegram turn failed', {
       chatId: String(chatId),
       messageId,
