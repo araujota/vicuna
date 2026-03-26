@@ -97,21 +97,44 @@ static json deepseek_normalize_outbound_tool_calls(const json & tool_calls) {
     return normalized;
 }
 
-static std::string deepseek_chat_completions_url(const deepseek_runtime_config & config) {
+static std::string deepseek_chat_completions_url(const deepseek_runtime_config & config, bool use_beta = false) {
     std::string url = trim_ascii_copy_local(config.base_url);
     if (url.empty()) {
         url = "https://api.deepseek.com";
     }
-    if (url.size() >= std::string("/chat/completions").size() &&
-            url.compare(url.size() - std::string("/chat/completions").size(),
-                        std::string("/chat/completions").size(),
-                        "/chat/completions") == 0) {
+    const std::string suffix = use_beta ? "/beta/chat/completions" : "/chat/completions";
+    const std::string alternate_suffix = use_beta ? "/chat/completions" : "/beta/chat/completions";
+    if (url.size() >= suffix.size() &&
+            url.compare(url.size() - suffix.size(), suffix.size(), suffix) == 0) {
         return url;
+    }
+    if (url.size() >= alternate_suffix.size() &&
+            url.compare(url.size() - alternate_suffix.size(), alternate_suffix.size(), alternate_suffix) == 0) {
+        url.erase(url.size() - alternate_suffix.size());
     }
     if (!url.empty() && url.back() == '/') {
         url.pop_back();
     }
-    return url + "/chat/completions";
+    return url + suffix;
+}
+
+static bool deepseek_request_uses_strict_tools(const json & provider_body) {
+    if (!provider_body.contains("tools") || !provider_body.at("tools").is_array()) {
+        return false;
+    }
+    for (const auto & item : provider_body.at("tools")) {
+        if (!item.is_object() || json_value(item, "type", std::string()) != "function") {
+            continue;
+        }
+        const json function = item.value("function", json::object());
+        if (!function.is_object()) {
+            continue;
+        }
+        if (function.contains("strict") && function.at("strict").is_boolean() && function.at("strict").get<bool>()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static json deepseek_build_provider_messages(const json & body) {
@@ -218,10 +241,11 @@ static void deepseek_emit_trace_event(
 static bool deepseek_prepare_shared_client_locked(
         deepseek_shared_client_state & state,
         const deepseek_runtime_config & config,
+        const std::string & request_url,
         std::string * out_url,
         server_http_url * out_parts,
         bool * out_reused = nullptr) {
-    const std::string url = deepseek_chat_completions_url(config);
+    const std::string url = request_url.empty() ? deepseek_chat_completions_url(config) : request_url;
     const bool reuse_existing = state.client && state.url == url;
     if (!reuse_existing) {
         auto [client, parts] = server_http_client(url);
@@ -677,6 +701,8 @@ bool deepseek_complete_chat(
         }
         return false;
     }
+    const bool use_beta_endpoint = deepseek_request_uses_strict_tools(provider_body);
+    const std::string request_url = deepseek_chat_completions_url(config, use_beta_endpoint);
 
     const auto request_started_at = std::chrono::steady_clock::now();
     deepseek_emit_trace_event(trace, "provider_request_started", {
@@ -690,8 +716,9 @@ bool deepseek_complete_chat(
         {"temperature", json_value(provider_body, "temperature", 0.0)},
         {"thinking", provider_body.contains("thinking") ? provider_body.at("thinking") : json(nullptr)},
         {"response_format", provider_body.contains("response_format") ? provider_body.at("response_format") : json(nullptr)},
+        {"strict_tools", use_beta_endpoint},
         {"system_messages", deepseek_collect_system_messages(provider_body)},
-        {"endpoint", server_http_show_masked_url(server_http_parse_url(deepseek_chat_completions_url(config)))},
+        {"endpoint", server_http_show_masked_url(server_http_parse_url(request_url))},
     });
 
     try {
@@ -699,7 +726,7 @@ bool deepseek_complete_chat(
         std::unique_lock<std::mutex> client_lock(shared_client_state.mutex);
         server_http_url parts;
         bool reused_client = false;
-        deepseek_prepare_shared_client_locked(shared_client_state, config, nullptr, &parts, &reused_client);
+        deepseek_prepare_shared_client_locked(shared_client_state, config, request_url, nullptr, &parts, &reused_client);
         ++shared_client_state.request_count;
 
         httplib::Headers headers = {

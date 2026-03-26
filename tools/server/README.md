@@ -50,18 +50,21 @@ selection, the server no longer exposes the flat tool list directly to the
 provider. Instead it runs an explicit staged loop:
 
 - family selection: the provider sees only high-level tool families and must
-  return `{"family":"..."}` in JSON
+  call one strict selector tool with `family: enum[...]`
 - method selection: the provider sees only methods for the chosen family and
-  must return `{"method":"..."}`, `{"method":"back"}`, or
-  `{"method":"complete"}`
+  must call one strict selector tool with `method: enum[...]`, including
+  `back` and `complete`
 - payload construction: the provider sees the chosen method's typed contract
-  and must return `{"action":"submit","payload":{...}}` or
-  `{"action":"back"}`
+  and must call either a strict `submit_payload` tool whose arguments mirror
+  the contract schema or a strict `go_back` tool
 
-Each staged selector prompt now explicitly says to respond promptly with
-exactly one non-empty JSON object and nothing else, and the runtime collapses
-the staged core prompt plus stage-specific instructions into one system
-message to reduce selector overhead.
+Staged selector turns run through DeepSeek beta strict-tool mode instead of
+`response_format={"type":"json_object"}`. The runtime now splits selector
+assembly into a stable instruction prefix plus a dynamic family/method/contract
+context so repeated staged turns keep a prefix-stable prompt shape. Optional
+payload fields are strictified with `anyOf` wrappers and may use the sentinel
+`__VICUNA_OMIT__`, which the server strips before validating against the
+original tool contract.
 
 After a valid payload is produced, the server emits one normal OpenAI tool call
 back to the caller. After the caller returns a real tool result on the next
@@ -91,6 +94,8 @@ The staged prompts are additive and keep:
 - replayed assistant `reasoning_content` unchanged
 - request-scoped VAD guidance unchanged
 - heuristic guidance unchanged
+- staged follow-up turns receive renewed additive VAD guidance even without a
+  classic assistant/tool continuation span
 
 Tool metadata policy:
 

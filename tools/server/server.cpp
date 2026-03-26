@@ -1069,11 +1069,19 @@ struct staged_tool_catalog {
     std::vector<staged_tool_family> families;
 };
 
+struct staged_tool_prompt_spec {
+    std::string stable_prefix;
+    std::string dynamic_suffix;
+};
+
 struct staged_tool_prompt_bundle {
     staged_tool_catalog catalog;
-    std::string family_selection_prompt;
-    std::map<std::string, std::string> method_selection_prompts;
-    std::map<std::string, std::map<std::string, std::string>> payload_prompts;
+    staged_tool_prompt_spec family_selection_prompt;
+    json family_selection_tools = json::array();
+    std::map<std::string, staged_tool_prompt_spec> method_selection_prompts;
+    std::map<std::string, json> method_selection_tools;
+    std::map<std::string, std::map<std::string, staged_tool_prompt_spec>> payload_prompts;
+    std::map<std::string, std::map<std::string, json>> payload_tools;
 };
 
 struct staged_tool_prompt_cache_state {
@@ -1098,6 +1106,12 @@ struct staged_tool_payload_choice {
     staged_tool_payload_choice_kind kind = STAGED_TOOL_PAYLOAD_SUBMIT;
     json payload = json::object();
 };
+
+static constexpr const char * STAGED_SELECTOR_OPTIONAL_OMIT = "__VICUNA_OMIT__";
+static constexpr const char * STAGED_SELECTOR_TOOL_FAMILY = "select_family";
+static constexpr const char * STAGED_SELECTOR_TOOL_METHOD = "select_method";
+static constexpr const char * STAGED_SELECTOR_TOOL_SUBMIT_PAYLOAD = "submit_payload";
+static constexpr const char * STAGED_SELECTOR_TOOL_GO_BACK = "go_back";
 
 static std::string staged_tool_titleize(const std::string & raw) {
     std::ostringstream out;
@@ -1324,38 +1338,276 @@ static const staged_tool_method * staged_tool_find_method(
 
 static std::string build_staged_tool_core_system_prompt() {
     return
-            "You are Vicuña, a helpful personal concierge. Choose the next tool step that best helps the user.";
+            "You are Vicuña, a helpful personal concierge. Select the next tool step that best helps the user. "
+            "When a selector tool is available, call exactly one selector tool immediately and do not answer in plain text.";
 }
 
-static std::string build_staged_family_selection_prompt(const staged_tool_catalog & catalog) {
+static json build_staged_selector_tool(
+        const std::string & name,
+        const std::string & description,
+        const json & parameters) {
+    return {
+        {"type", "function"},
+        {"function", {
+            {"name", name},
+            {"description", description},
+            {"strict", true},
+            {"parameters", parameters},
+        }},
+    };
+}
+
+static json build_staged_selector_enum_tool(
+        const std::string & name,
+        const std::string & description,
+        const std::string & field_name,
+        const std::string & field_description,
+        const std::vector<std::string> & values) {
+    json enum_values = json::array();
+    for (const auto & value : values) {
+        enum_values.push_back(value);
+    }
+    return build_staged_selector_tool(name, description, {
+        {"type", "object"},
+        {"description", description},
+        {"properties", {
+            {field_name, {
+                {"type", "string"},
+                {"description", field_description},
+                {"enum", enum_values},
+            }},
+        }},
+        {"required", json::array({field_name})},
+        {"additionalProperties", false},
+    });
+}
+
+static json build_staged_back_selector_tool() {
+    return build_staged_selector_tool(
+            STAGED_SELECTOR_TOOL_GO_BACK,
+            "Go back to the previous stage in the staged tool-selection loop.",
+            {
+                {"type", "object"},
+                {"description", "No arguments. Call this tool to return to the previous stage."},
+                {"properties", json::object()},
+                {"required", json::array()},
+                {"additionalProperties", false},
+            });
+}
+
+static bool staged_schema_property_is_required(const json & schema, const std::string & key) {
+    if (!schema.is_object() || !schema.contains("required") || !schema.at("required").is_array()) {
+        return false;
+    }
+    for (const auto & item : schema.at("required")) {
+        if (item.is_string() && item.get<std::string>() == key) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static json strictify_staged_selector_schema(const json & schema);
+
+static json staged_optional_wrapper_schema(const json & schema) {
+    json wrapped = {
+        {"anyOf", json::array({
+            strictify_staged_selector_schema(schema),
+            {
+                {"type", "string"},
+                {"description", "Use this sentinel string when leaving an optional field unused."},
+                {"enum", json::array({STAGED_SELECTOR_OPTIONAL_OMIT})},
+            },
+        })},
+    };
+    const std::string description = trim_copy(json_value(schema, "description", std::string()));
+    if (!description.empty()) {
+        wrapped["description"] = description + " Use " + STAGED_SELECTOR_OPTIONAL_OMIT + " when this optional field is not needed.";
+    }
+    return wrapped;
+}
+
+static json strictify_staged_selector_schema(const json & schema) {
+    if (!schema.is_object()) {
+        return json::object();
+    }
+
+    if (schema.contains("anyOf") && schema.at("anyOf").is_array()) {
+        json strict_any_of = json::array();
+        for (const auto & item : schema.at("anyOf")) {
+            strict_any_of.push_back(strictify_staged_selector_schema(item));
+        }
+        json result = {
+            {"anyOf", std::move(strict_any_of)},
+        };
+        const std::string description = trim_copy(json_value(schema, "description", std::string()));
+        if (!description.empty()) {
+            result["description"] = description;
+        }
+        return result;
+    }
+
+    const std::string type = trim_copy(json_value(schema, "type", std::string()));
+    if (type == "object" || schema.contains("properties")) {
+        json properties = json::object();
+        json required = json::array();
+        if (schema.contains("properties") && schema.at("properties").is_object()) {
+            for (const auto & item : schema.at("properties").items()) {
+                const bool is_required = staged_schema_property_is_required(schema, item.key());
+                properties[item.key()] = is_required ?
+                        strictify_staged_selector_schema(item.value()) :
+                        staged_optional_wrapper_schema(item.value());
+                required.push_back(item.key());
+            }
+        }
+        json result = {
+            {"type", "object"},
+            {"properties", std::move(properties)},
+            {"required", std::move(required)},
+            {"additionalProperties", false},
+        };
+        const std::string description = trim_copy(json_value(schema, "description", std::string()));
+        if (!description.empty()) {
+            result["description"] = description;
+        }
+        return result;
+    }
+
+    if (type == "array") {
+        json result = {
+            {"type", "array"},
+            {"items", strictify_staged_selector_schema(schema.value("items", json::object()))},
+        };
+        if (schema.contains("minItems")) {
+            result["minItems"] = schema.at("minItems");
+        }
+        if (schema.contains("maxItems")) {
+            result["maxItems"] = schema.at("maxItems");
+        }
+        const std::string description = trim_copy(json_value(schema, "description", std::string()));
+        if (!description.empty()) {
+            result["description"] = description;
+        }
+        return result;
+    }
+
+    json result = json::object();
+    for (const char * key : {"type", "description", "enum", "minimum", "maximum", "minLength", "maxLength", "pattern"}) {
+        if (schema.contains(key)) {
+            result[key] = schema.at(key);
+        }
+    }
+    return result;
+}
+
+static void strip_staged_optional_omit_sentinels(
+        json * value,
+        const json & schema) {
+    if (!value) {
+        return;
+    }
+    if (!schema.is_object()) {
+        return;
+    }
+    const std::string type = trim_copy(json_value(schema, "type", std::string()));
+    if ((type == "object" || schema.contains("properties")) && value->is_object() &&
+            schema.contains("properties") && schema.at("properties").is_object()) {
+        std::vector<std::string> keys_to_erase;
+        for (const auto & item : schema.at("properties").items()) {
+            if (!value->contains(item.key())) {
+                continue;
+            }
+            json & child = (*value)[item.key()];
+            if (!staged_schema_property_is_required(schema, item.key()) &&
+                    child.is_string() && child.get<std::string>() == STAGED_SELECTOR_OPTIONAL_OMIT) {
+                keys_to_erase.push_back(item.key());
+                continue;
+            }
+            strip_staged_optional_omit_sentinels(&child, item.value());
+        }
+        for (const auto & key : keys_to_erase) {
+            value->erase(key);
+        }
+        return;
+    }
+    if (type == "array" && value->is_array() && schema.contains("items")) {
+        for (auto & item : *value) {
+            strip_staged_optional_omit_sentinels(&item, schema.at("items"));
+        }
+    }
+}
+
+static staged_tool_prompt_spec build_staged_family_selection_prompt(const staged_tool_catalog & catalog) {
+    staged_tool_prompt_spec prompt = {};
+    prompt.stable_prefix =
+            "Stage: select a tool family.\n"
+            "Call the selector tool immediately.\n"
+            "Choose the family whose brief description best matches the next step.";
     std::ostringstream out;
-    out << "You are choosing one tool family.\n";
-    out << "Respond promptly with exactly one non-empty JSON object and nothing else.\n";
-    out << "Use this shape: {\"family\":\"<exact family name>\"}.\n";
-    out << "Families:\n";
+    out << "Available families:\n";
     for (const auto & family : catalog.families) {
         out << "- " << family.family_name << ": " << family.family_description << "\n";
     }
-    return out.str();
+    prompt.dynamic_suffix = out.str();
+    return prompt;
 }
 
-static std::string build_staged_method_selection_prompt(
+static json build_staged_family_selection_tools(const staged_tool_catalog & catalog) {
+    std::vector<std::string> family_names;
+    family_names.reserve(catalog.families.size());
+    for (const auto & family : catalog.families) {
+        family_names.push_back(family.family_name);
+    }
+    return json::array({
+        build_staged_selector_enum_tool(
+                STAGED_SELECTOR_TOOL_FAMILY,
+                "Select the next tool family to use.",
+                "family",
+                "The exact family name to use for the next staged step.",
+                family_names),
+    });
+}
+
+static staged_tool_prompt_spec build_staged_method_selection_prompt(
         const staged_tool_family & family,
         bool allow_completion) {
+    staged_tool_prompt_spec prompt = {};
+    prompt.stable_prefix =
+            "Stage: select a method within the chosen family.\n"
+            "Call the selector tool immediately.\n"
+            "Choose back to return to family selection.";
     std::ostringstream out;
-    out << "You are choosing a method of the " << family.family_name << " tool family.\n";
-    out << "Respond promptly with exactly one non-empty JSON object and nothing else.\n";
-    out << "Use {\"method\":\"<exact method name>\"}.\n";
-    out << "Sentinels:\n";
-    out << "- {\"method\":\"back\"} to go back to tool-family selection.\n";
+    out << "Chosen family: " << family.family_name << "\n";
+    out << "Available methods:\n";
     if (allow_completion) {
-        out << "- {\"method\":\"complete\"} if the active tool loop is finished.\n";
+        out << "- complete: Finish the active staged loop without selecting another method.\n";
     }
-    out << "Methods:\n";
+    out << "- back: Return to family selection.\n";
     for (const auto & method : family.methods) {
         out << "- " << method.method_name << ": " << method.method_description << "\n";
     }
-    return out.str();
+    prompt.dynamic_suffix = out.str();
+    return prompt;
+}
+
+static json build_staged_method_selection_tools(
+        const staged_tool_family & family,
+        bool allow_completion) {
+    std::vector<std::string> method_names = {"back"};
+    if (allow_completion) {
+        method_names.push_back("complete");
+    }
+    for (const auto & method : family.methods) {
+        method_names.push_back(method.method_name);
+    }
+    return json::array({
+        build_staged_selector_enum_tool(
+                STAGED_SELECTOR_TOOL_METHOD,
+                "Select the next method within the chosen tool family.",
+                "method",
+                "The exact method name to use next. Choose back to return or complete when the staged loop is done.",
+                method_names),
+    });
 }
 
 static void append_staged_contract_lines(
@@ -1403,23 +1655,39 @@ static void append_staged_contract_lines(
     }
 }
 
-static std::string build_staged_payload_prompt(
+static staged_tool_prompt_spec build_staged_payload_prompt(
         const staged_tool_family & family,
         const staged_tool_method & method,
         const std::string & validation_error = std::string()) {
+    staged_tool_prompt_spec prompt = {};
+    prompt.stable_prefix =
+            "Stage: construct a payload for the selected method.\n"
+            "Call exactly one payload tool immediately.\n"
+            "Call go_back to return to method selection.\n"
+            "Every payload field is required by the strict schema. When an optional field is not needed, set it to "
+            + std::string(STAGED_SELECTOR_OPTIONAL_OMIT) + ".";
     std::ostringstream out;
-    out << "You are constructing a payload for the " << method.method_name
-        << " method of the " << family.family_name << " tool family.\n";
-    out << "Respond promptly with exactly one non-empty JSON object and nothing else.\n";
-    out << "Use {\"action\":\"back\"} to go back to method selection.\n";
-    out << "Otherwise use {\"action\":\"submit\",\"payload\":{...}}.\n";
+    out << "Chosen family: " << family.family_name << "\n";
+    out << "Chosen method: " << method.method_name << "\n";
+    out << "Method summary: " << method.method_description << "\n";
     if (!validation_error.empty()) {
         out << "Previous payload error: " << validation_error << "\n";
     }
-    out << "Method: " << method.method_description << "\n";
     out << "Contract:\n";
     append_staged_contract_lines(out, "payload", method.parameters);
-    return out.str();
+    prompt.dynamic_suffix = out.str();
+    return prompt;
+}
+
+static json build_staged_payload_tools(
+        const staged_tool_method & method) {
+    return json::array({
+        build_staged_selector_tool(
+                STAGED_SELECTOR_TOOL_SUBMIT_PAYLOAD,
+                "Submit the payload for the selected method.",
+                strictify_staged_selector_schema(method.parameters)),
+        build_staged_back_selector_tool(),
+    });
 }
 
 static staged_tool_prompt_bundle build_staged_tool_prompt_bundle(const json & tools) {
@@ -1430,12 +1698,17 @@ static staged_tool_prompt_bundle build_staged_tool_prompt_bundle(const json & to
     }
 
     bundle.family_selection_prompt = build_staged_family_selection_prompt(bundle.catalog);
+    bundle.family_selection_tools = build_staged_family_selection_tools(bundle.catalog);
     for (const auto & family : bundle.catalog.families) {
         bundle.method_selection_prompts[family.family_name] =
                 build_staged_method_selection_prompt(family, true);
+        bundle.method_selection_tools[family.family_name] =
+                build_staged_method_selection_tools(family, true);
         auto & payload_by_method = bundle.payload_prompts[family.family_name];
+        auto & payload_tools_by_method = bundle.payload_tools[family.family_name];
         for (const auto & method : family.methods) {
             payload_by_method[method.method_name] = build_staged_payload_prompt(family, method);
+            payload_tools_by_method[method.method_name] = build_staged_payload_tools(method);
         }
     }
     return bundle;
@@ -1475,12 +1748,33 @@ static json staged_tool_prompt_cache_health_json() {
 
 static json build_staged_messages(
         const json & original_messages,
-        const std::string & stage_prompt) {
+        const staged_tool_prompt_spec & stage_prompt,
+        const std::string & validation_error = std::string()) {
     json messages = json::array();
     messages.push_back({
         {"role", "system"},
-        {"content", build_staged_tool_core_system_prompt() + "\n" + stage_prompt},
+        {"content", build_staged_tool_core_system_prompt()},
     });
+    if (!stage_prompt.stable_prefix.empty()) {
+        messages.push_back({
+            {"role", "system"},
+            {"content", stage_prompt.stable_prefix},
+        });
+    }
+    if (!stage_prompt.dynamic_suffix.empty()) {
+        messages.push_back({
+            {"role", "system"},
+            {"content", stage_prompt.dynamic_suffix},
+        });
+    }
+    if (!validation_error.empty()) {
+        messages.push_back({
+            {"role", "system"},
+            {"content",
+                    "Previous response error: " + validation_error + "\n"
+                    "Call exactly one selector tool immediately and do not answer in plain text."},
+        });
+    }
     if (original_messages.is_array()) {
         for (const auto & item : original_messages) {
             messages.push_back(item);
@@ -1489,41 +1783,74 @@ static json build_staged_messages(
     return messages;
 }
 
-static json build_staged_provider_body(const json & base_body, const json & messages) {
+static json build_staged_provider_body(
+        const json & base_body,
+        const json & messages,
+        const json & tools,
+        bool stage_followup_guidance) {
     static constexpr int64_t staged_max_tokens = 768;
     json staged = base_body;
-    staged.erase("tools");
-    staged.erase("tool_choice");
-    staged.erase("parallel_tool_calls");
+    staged["parallel_tool_calls"] = false;
+    staged["tools"] = tools;
+    if (tools.is_array() && tools.size() == 1 && tools.at(0).is_object() && tools.at(0).contains("function")) {
+        staged["tool_choice"] = {
+            {"type", "function"},
+            {"function", {
+                {"name", json_value(tools.at(0).at("function"), "name", std::string())},
+            }},
+        };
+    } else {
+        staged["tool_choice"] = "required";
+    }
     staged["messages"] = messages;
     staged["stream"] = false;
     staged["max_tokens"] = staged_max_tokens;
-    staged["response_format"] = {
-        {"type", "json_object"},
-    };
+    staged.erase("response_format");
+    staged["x-vicuna-stage-followup-guidance"] = stage_followup_guidance;
     return staged;
 }
 
-static std::string build_staged_retry_prompt(
-        const std::string & stage_prompt,
-        const std::string & validation_error) {
-    if (validation_error.empty()) {
-        return stage_prompt;
-    }
-    std::ostringstream out;
-    out << stage_prompt;
-    out << "Previous response error: " << validation_error << "\n";
-    out << "Respond promptly with exactly one non-empty JSON object and nothing else.\n";
-    return out.str();
-}
-
 static bool parse_staged_family_selection_response(
-        const std::string & text,
+        const deepseek_chat_result & result,
         const staged_tool_catalog & catalog,
         std::string * out_family_name,
         std::string * out_error) {
+    if (!result.tool_calls.empty()) {
+        const deepseek_tool_call & tool_call = result.tool_calls.front();
+        if (tool_call.name != STAGED_SELECTOR_TOOL_FAMILY) {
+            if (out_error) {
+                *out_error = "staged family selection returned an unexpected tool call";
+            }
+            return false;
+        }
+        try {
+            const json payload = json::parse(tool_call.arguments_json);
+            const std::string family_name = trim_copy(json_value(payload, "family", std::string()));
+            if (family_name.empty()) {
+                if (out_error) {
+                    *out_error = "staged family selection did not include family";
+                }
+                return false;
+            }
+            if (!staged_tool_find_family(catalog, family_name)) {
+                if (out_error) {
+                    *out_error = "staged family selection chose an unknown family";
+                }
+                return false;
+            }
+            if (out_family_name) {
+                *out_family_name = family_name;
+            }
+            return true;
+        } catch (const std::exception & e) {
+            if (out_error) {
+                *out_error = server_string_format("staged family selection tool arguments were not valid JSON: %s", e.what());
+            }
+            return false;
+        }
+    }
     try {
-        const json payload = json::parse(extract_json_object_payload(text));
+        const json payload = json::parse(extract_json_object_payload(result.content));
         const std::string family_name = trim_copy(json_value(payload, "family", std::string()));
         if (family_name.empty()) {
             if (out_error) {
@@ -1550,7 +1877,7 @@ static bool parse_staged_family_selection_response(
 }
 
 static bool parse_staged_method_selection_response(
-        const std::string & text,
+        const deepseek_chat_result & result,
         const staged_tool_family & family,
         bool allow_completion,
         staged_tool_method_choice * out_choice,
@@ -1562,7 +1889,19 @@ static bool parse_staged_method_selection_response(
         return false;
     }
     try {
-        const json payload = json::parse(extract_json_object_payload(text));
+        json payload;
+        if (!result.tool_calls.empty()) {
+            const deepseek_tool_call & tool_call = result.tool_calls.front();
+            if (tool_call.name != STAGED_SELECTOR_TOOL_METHOD) {
+                if (out_error) {
+                    *out_error = "staged method selection returned an unexpected tool call";
+                }
+                return false;
+            }
+            payload = json::parse(tool_call.arguments_json);
+        } else {
+            payload = json::parse(extract_json_object_payload(result.content));
+        }
         const std::string method_name = trim_copy(json_value(payload, "method", std::string()));
         if (method_name == "back") {
             out_choice->kind = STAGED_TOOL_METHOD_GO_BACK;
@@ -1699,7 +2038,7 @@ static bool validate_payload_against_schema(
 }
 
 static bool parse_staged_payload_response(
-        const std::string & text,
+        const deepseek_chat_result & result,
         const staged_tool_method & method,
         staged_tool_payload_choice * out_choice,
         std::string * out_error) {
@@ -1710,7 +2049,33 @@ static bool parse_staged_payload_response(
         return false;
     }
     try {
-        const json payload = json::parse(extract_json_object_payload(text));
+        if (!result.tool_calls.empty()) {
+            const deepseek_tool_call & tool_call = result.tool_calls.front();
+            if (tool_call.name == STAGED_SELECTOR_TOOL_GO_BACK) {
+                out_choice->kind = STAGED_TOOL_PAYLOAD_GO_BACK;
+                out_choice->payload = json::object();
+                return true;
+            }
+            if (tool_call.name != STAGED_SELECTOR_TOOL_SUBMIT_PAYLOAD) {
+                if (out_error) {
+                    *out_error = "staged payload selection returned an unexpected tool call";
+                }
+                return false;
+            }
+            json payload = json::parse(tool_call.arguments_json);
+            strip_staged_optional_omit_sentinels(&payload, method.parameters);
+            std::string validation_error;
+            if (!validate_payload_against_schema(payload, method.parameters, &validation_error)) {
+                if (out_error) {
+                    *out_error = validation_error;
+                }
+                return false;
+            }
+            out_choice->kind = STAGED_TOOL_PAYLOAD_SUBMIT;
+            out_choice->payload = std::move(payload);
+            return true;
+        }
+        const json payload = json::parse(extract_json_object_payload(result.content));
         const std::string action = trim_copy(json_value(payload, "action", std::string()));
         if (action == "back") {
             out_choice->kind = STAGED_TOOL_PAYLOAD_GO_BACK;
@@ -1745,14 +2110,17 @@ static bool execute_staged_selection_turn(
         const deepseek_runtime_config & config,
         server_emotive_runtime & emotive_runtime,
         const json & base_body,
-        const std::string & stage_prompt,
+        const staged_tool_prompt_spec & stage_prompt,
+        const json & stage_tools,
+        const std::string & validation_error,
+        bool stage_followup_guidance,
         deepseek_chat_result * out_result,
         json * out_error,
         bool suppress_replay_admission = false,
         const std::string & mode_label = std::string(),
         const runtime_request_trace_context * trace_context = nullptr) {
-    const json messages = build_staged_messages(base_body.at("messages"), stage_prompt);
-    const json staged_body = build_staged_provider_body(base_body, messages);
+    const json messages = build_staged_messages(base_body.at("messages"), stage_prompt, validation_error);
+    const json staged_body = build_staged_provider_body(base_body, messages, stage_tools, stage_followup_guidance);
     return execute_deepseek_chat_with_emotive(
             config,
             emotive_runtime,
@@ -1781,9 +2149,22 @@ static bool execute_final_completion_after_staged_loop(
     completion_body.erase("tools");
     completion_body.erase("tool_choice");
     completion_body.erase("parallel_tool_calls");
-    completion_body["messages"] = build_staged_messages(
-            body.at("messages"),
-            "The staged tool loop is complete. Reply directly to the user or conclude the task without JSON.");
+    completion_body["x-vicuna-stage-followup-guidance"] = true;
+    completion_body["messages"] = json::array({
+        {
+            {"role", "system"},
+            {"content", build_staged_tool_core_system_prompt()},
+        },
+        {
+            {"role", "system"},
+            {"content", "The staged tool loop is complete. Reply directly to the user or conclude the task without JSON."},
+        },
+    });
+    if (body.at("messages").is_array()) {
+        for (const auto & item : body.at("messages")) {
+            completion_body["messages"].push_back(item);
+        }
+    }
     return execute_deepseek_chat_with_emotive(
             config,
             emotive_runtime,
@@ -1849,13 +2230,13 @@ static bool execute_deepseek_chat_with_staged_tools(
     const staged_tool_catalog & catalog = prompt_bundle->catalog;
 
     const int max_stage_turns = 24;
-    const int max_stage_json_attempts = 2;
+    const int max_stage_selector_attempts = 2;
     int stage_turn = 0;
     std::string selected_family_name;
     while (stage_turn < max_stage_turns) {
         bool family_valid = false;
         std::string family_validation_error;
-        for (int family_attempt = 0; family_attempt < max_stage_json_attempts && stage_turn < max_stage_turns; ++family_attempt) {
+        for (int family_attempt = 0; family_attempt < max_stage_selector_attempts && stage_turn < max_stage_turns; ++family_attempt) {
             ++stage_turn;
             if (trace_context) {
                 runtime_request_trace_log(*trace_context, "staged_tool_loop", "family_selection_attempt_started", {
@@ -1866,13 +2247,14 @@ static bool execute_deepseek_chat_with_staged_tools(
                 });
             }
             deepseek_chat_result family_result;
-            if (!execute_staged_selection_turn(
+                if (!execute_staged_selection_turn(
                         config,
                         emotive_runtime,
                         body,
-                        build_staged_retry_prompt(
-                                prompt_bundle->family_selection_prompt,
-                                family_validation_error),
+                        prompt_bundle->family_selection_prompt,
+                        prompt_bundle->family_selection_tools,
+                        family_validation_error,
+                        stage_turn > 1 || family_attempt > 0,
                         &family_result,
                         out_error,
                         suppress_replay_admission,
@@ -1882,7 +2264,7 @@ static bool execute_deepseek_chat_with_staged_tools(
             }
 
             std::string parse_error;
-            if (parse_staged_family_selection_response(family_result.content, catalog, &selected_family_name, &parse_error)) {
+            if (parse_staged_family_selection_response(family_result, catalog, &selected_family_name, &parse_error)) {
                 if (trace_context) {
                     runtime_request_trace_log(*trace_context, "staged_tool_loop", "family_selection_attempt_succeeded", {
                         {"stage_turn", stage_turn},
@@ -1920,7 +2302,7 @@ static bool execute_deepseek_chat_with_staged_tools(
             staged_tool_method_choice method_choice = {};
             bool method_valid = false;
             std::string method_validation_error;
-            for (int method_attempt = 0; method_attempt < max_stage_json_attempts && stage_turn < max_stage_turns; ++method_attempt) {
+            for (int method_attempt = 0; method_attempt < max_stage_selector_attempts && stage_turn < max_stage_turns; ++method_attempt) {
                 ++stage_turn;
                 if (trace_context) {
                     runtime_request_trace_log(*trace_context, "staged_tool_loop", "method_selection_attempt_started", {
@@ -1935,9 +2317,10 @@ static bool execute_deepseek_chat_with_staged_tools(
                             config,
                             emotive_runtime,
                             body,
-                            build_staged_retry_prompt(
-                                    prompt_bundle->method_selection_prompts.at(family->family_name),
-                                    method_validation_error),
+                            prompt_bundle->method_selection_prompts.at(family->family_name),
+                            prompt_bundle->method_selection_tools.at(family->family_name),
+                            method_validation_error,
+                            true,
                             &method_result,
                             out_error,
                             suppress_replay_admission,
@@ -1947,7 +2330,7 @@ static bool execute_deepseek_chat_with_staged_tools(
                 }
 
                 std::string method_error;
-                if (parse_staged_method_selection_response(method_result.content, *family, true, &method_choice, &method_error)) {
+                if (parse_staged_method_selection_response(method_result, *family, true, &method_choice, &method_error)) {
                     if (trace_context) {
                         runtime_request_trace_log(*trace_context, "staged_tool_loop", "method_selection_attempt_succeeded", {
                             {"stage_turn", stage_turn},
@@ -2031,6 +2414,9 @@ static bool execute_deepseek_chat_with_staged_tools(
                             payload_validation_error.empty() ?
                                     prompt_bundle->payload_prompts.at(family->family_name).at(method->method_name) :
                                     build_staged_payload_prompt(*family, *method, payload_validation_error),
+                            prompt_bundle->payload_tools.at(family->family_name).at(method->method_name),
+                            payload_validation_error,
+                            true,
                             &payload_result,
                             out_error,
                             suppress_replay_admission,
@@ -2041,7 +2427,7 @@ static bool execute_deepseek_chat_with_staged_tools(
 
                 staged_tool_payload_choice payload_choice = {};
                 std::string payload_error;
-                if (!parse_staged_payload_response(payload_result.content, *method, &payload_choice, &payload_error)) {
+                if (!parse_staged_payload_response(payload_result, *method, &payload_choice, &payload_error)) {
                     if (trace_context) {
                         runtime_request_trace_log(*trace_context, "staged_tool_loop", "payload_attempt_failed", {
                             {"stage_turn", stage_turn},
@@ -3562,6 +3948,21 @@ struct active_tool_continuation_span {
     size_t last_tool_index = 0;
 };
 
+static size_t find_leading_system_message_boundary(const json & messages) {
+    if (!messages.is_array()) {
+        return 0;
+    }
+    size_t index = 0;
+    while (index < messages.size()) {
+        const auto & item = messages.at(index);
+        if (!item.is_object() || json_value(item, "role", std::string()) != "system") {
+            break;
+        }
+        ++index;
+    }
+    return index;
+}
+
 static active_tool_continuation_span find_active_tool_continuation_span(const json & messages) {
     active_tool_continuation_span span;
     if (!messages.is_array() || messages.empty()) {
@@ -3791,21 +4192,33 @@ static json inject_additive_runtime_guidance(
     }
 
     json messages = body.at("messages");
+    const bool stage_followup_guidance =
+            body.contains("x-vicuna-stage-followup-guidance") &&
+            body.at("x-vicuna-stage-followup-guidance").is_boolean() &&
+            body.at("x-vicuna-stage-followup-guidance").get<bool>();
     const active_tool_continuation_span span = find_active_tool_continuation_span(messages);
-    const size_t insertion_index = span.valid ? span.last_tool_index + 1 : messages.size();
+    const size_t insertion_index = span.valid ?
+            span.last_tool_index + 1 :
+            (stage_followup_guidance ? find_leading_system_message_boundary(messages) : messages.size());
 
     std::string vad_guidance;
     std::string vad_skip_reason;
-    if (builder && builder->has_current_state() && span.valid) {
-        const auto & assistant = messages.at(span.assistant_index);
-        const std::string reasoning = json_value(assistant, "reasoning_content", std::string());
-        if (!reasoning.empty()) {
-            vad_guidance = format_interleaved_vad_guidance(builder->current_vad());
+    if (builder && builder->has_current_state() && (span.valid || stage_followup_guidance)) {
+        if (span.valid) {
+            const auto & assistant = messages.at(span.assistant_index);
+            const std::string reasoning = json_value(assistant, "reasoning_content", std::string());
+            if (!reasoning.empty()) {
+                vad_guidance = format_interleaved_vad_guidance(builder->current_vad());
+            } else {
+                vad_skip_reason = "assistant_reasoning_missing";
+            }
         } else {
-            vad_skip_reason = "assistant_reasoning_missing";
+            vad_guidance = format_interleaved_vad_guidance(builder->current_vad());
         }
     } else if (!builder || !builder->has_current_state()) {
         vad_skip_reason = "builder_state_missing";
+    } else if (stage_followup_guidance) {
+        vad_skip_reason = "stage_followup_disabled_by_builder";
     } else if (!span.valid) {
         vad_skip_reason = "no_active_tool_continuation_span";
     }
@@ -3843,6 +4256,7 @@ static json inject_additive_runtime_guidance(
         json data = {
             {"insertion_index", static_cast<int64_t>(insertion_index)},
             {"span_valid", span.valid},
+            {"stage_followup_guidance", stage_followup_guidance},
             {"builder_has_state", builder && builder->has_current_state()},
             {"heuristic_search_launched", launched_heuristic_search},
             {"vad_guidance", vad_guidance.empty() ? json(nullptr) : json(vad_guidance)},

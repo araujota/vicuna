@@ -85,13 +85,14 @@ Staged tool-loop policy:
 
 - intercept OpenAI-compatible requests that include `tools` and auto tool choice
 - normalize those flat tools into family, method, and typed-contract layers
-- ask the provider for one JSON family choice, then one JSON method choice, then one JSON payload
-- keep selector prompts minimal and require: "Respond promptly with exactly one non-empty JSON object and nothing else."
-- collapse the staged core prompt and stage-specific instructions into one system message
+- ask the provider for one strict selector tool call for family, then one for method, then one strict payload submission or `go_back` tool call
+- route staged selector turns through DeepSeek beta strict-tool mode instead of `response_format=json_object`
+- keep selector prompts minimal, prefix-stable, and explicit about calling exactly one selector tool immediately
+- split selector assembly into a stable instruction prefix plus dynamic catalog/contract context so repeated staged turns reuse a common prompt prefix
 - allow `back` from method and payload stages and `complete` from method selection
 - after payload validation, emit one normal OpenAI tool call back to the caller
 - when `complete` is chosen, run one final direct-response turn without tools
-- if DeepSeek JSON mode returns empty or malformed family/method output, retry that staged selector once with the validation error injected back into the prompt
+- if a staged selector returns malformed tool arguments or falls back to empty/malformed content, retry that staged selector once with the validation error injected back into the prompt
 - prefer explicit request-tool metadata:
   - `x-vicuna-family-id`
   - `x-vicuna-family-name`
@@ -99,6 +100,7 @@ Staged tool-loop policy:
   - `x-vicuna-method-name`
   - `x-vicuna-method-description`
 - require typed field descriptions throughout the method contract so payload prompts stay inspectable
+- strict payload selector schemas require every field at the API layer; optional contract fields are wrapped with `anyOf` and may use `__VICUNA_OMIT__`, which the server strips before validating against the original contract
 - expect live callers to inject the authoritative direct tool definitions for
   that turn unless the request is the retained bridge-scoped Telegram surface
 - do not reintroduce bridge-owned prompt construction, live-tool catalogs, or
@@ -108,6 +110,7 @@ Staged tool-loop policy:
 - cache the retained bridge-scoped Telegram runtime tool catalog and the
   derived staged prompt bundle in memory; inspect both counters at
   `/health -> bridge_runtime`
+- treat staged selector turns after the first family attempt as VAD-eligible follow-up turns even when there is no classic assistant/tool continuation span
 - source one durable host env file from `VICUNA_SYSTEM_ENV_FILE` or
   `/etc/vicuna/vicuna.env` before startup
 - rehydrate stable OpenClaw secrets and runtime-catalog files outside the

@@ -59,7 +59,7 @@ def run_mock_deepseek(response_factory=None, route_factory=None):
                 },
             })
 
-            if self.path != "/chat/completions":
+            if self.path not in ("/chat/completions", "/beta/chat/completions"):
                 if not route_factory:
                     self.send_response(404)
                     self.end_headers()
@@ -200,6 +200,46 @@ def run_mock_deepseek(response_factory=None, route_factory=None):
 
 def requests_for_path(state, path: str):
     return [request for request in state["requests"] if request["path"] == path]
+
+
+def selector_tool_name(payload):
+    tools = payload.get("tools", [])
+    if not tools:
+        return ""
+    return tools[0]["function"]["name"]
+
+
+def selector_tool_names(payload):
+    return [tool["function"]["name"] for tool in payload.get("tools", [])]
+
+
+def selector_choice_response(response_id: str, reasoning: str, tool_name: str, arguments: dict):
+    return {
+        "id": response_id,
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": f"{response_id}_call",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(arguments),
+                    },
+                }],
+                "reasoning_content": reasoning,
+            },
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 6,
+            "total_tokens": 16,
+        },
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -445,8 +485,9 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
     global server
 
     def tool_response(payload):
-        stage_prompt = payload["messages"][0]["content"]
-        if "choosing one tool family" in stage_prompt.lower():
+        selector_tools = payload.get("tools", [])
+        selector_name = selector_tools[0]["function"]["name"] if selector_tools else ""
+        if selector_name == "select_family":
             return {
                 "id": "chatcmpl-stage-family",
                 "object": "chat.completion",
@@ -455,9 +496,17 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
                     "finish_reason": "stop",
                     "message": {
                         "role": "assistant",
-                        "content": json.dumps({
-                            "family": "Ongoing Tasks",
-                        }),
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call_select_family",
+                            "type": "function",
+                            "function": {
+                                "name": "select_family",
+                                "arguments": json.dumps({
+                                    "family": "Ongoing Tasks",
+                                }),
+                            },
+                        }],
                         "reasoning_content": "The ongoing task family is the right place to inspect what is due.",
                     },
                 }],
@@ -467,7 +516,7 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
                     "total_tokens": 26,
                 },
             }
-        if "choosing a method of the ongoing tasks" in stage_prompt.lower():
+        if selector_name == "select_method":
             return {
                 "id": "chatcmpl-stage-method",
                 "object": "chat.completion",
@@ -476,9 +525,17 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
                     "finish_reason": "stop",
                     "message": {
                         "role": "assistant",
-                        "content": json.dumps({
-                            "method": "get_due",
-                        }),
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call_select_method",
+                            "type": "function",
+                            "function": {
+                                "name": "select_method",
+                                "arguments": json.dumps({
+                                    "method": "get_due",
+                                }),
+                            },
+                        }],
                         "reasoning_content": "The due-task getter will fetch the exact recurring task state I need.",
                     },
                 }],
@@ -488,7 +545,7 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
                     "total_tokens": 26,
                 },
             }
-        if "constructing a payload for the get_due" in stage_prompt.lower():
+        if any(tool["function"]["name"] == "submit_payload" for tool in selector_tools):
             return {
                 "id": "chatcmpl-stage-payload",
                 "object": "chat.completion",
@@ -497,12 +554,17 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
                     "finish_reason": "stop",
                     "message": {
                         "role": "assistant",
-                        "content": json.dumps({
-                            "action": "submit",
-                            "payload": {
-                                "task_id": "task_123",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "call_submit_payload",
+                            "type": "function",
+                            "function": {
+                                "name": "submit_payload",
+                                "arguments": json.dumps({
+                                    "task_id": "task_123",
+                                }),
                             },
-                        }),
+                        }],
                         "reasoning_content": "Constrain the due-task lookup to the one task that matters.",
                     },
                 }],
@@ -600,22 +662,32 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
                 },
             }]
 
-            assert len(state["requests"]) == 3
-            family_request = state["requests"][0]["body"]
-            method_request = state["requests"][1]["body"]
-            payload_request = state["requests"][2]["body"]
+            provider_requests = [request for request in state["requests"] if request["path"] == "/beta/chat/completions"]
+            assert len(provider_requests) == 3
+            family_request = provider_requests[0]["body"]
+            method_request = provider_requests[1]["body"]
+            payload_request = provider_requests[2]["body"]
 
-            assert "tools" not in family_request
+            assert family_request["tools"][0]["function"]["name"] == "select_family"
+            assert family_request["tool_choice"]["function"]["name"] == "select_family"
             assert family_request["max_tokens"] == 768
             assert family_request["thinking"] == {"type": "enabled"}
-            assert family_request["response_format"] == {"type": "json_object"}
-            assert family_request["messages"][2]["reasoning_content"] == request["messages"][1]["reasoning_content"]
-            assert family_request["messages"][2]["tool_calls"] == request["messages"][1]["tool_calls"]
-            assert family_request["messages"][3]["tool_call_id"] == "call_due_1"
-            assert family_request["messages"][3]["content"] == "{\"tasks\":[]}"
+            assert "response_format" not in family_request
+            assert any(
+                message.get("reasoning_content") == request["messages"][1]["reasoning_content"]
+                for message in family_request["messages"]
+            )
+            assert any(
+                message.get("tool_calls") == request["messages"][1]["tool_calls"]
+                for message in family_request["messages"]
+            )
+            assert any(
+                message.get("tool_call_id") == "call_due_1" and message.get("content") == "{\"tasks\":[]}"
+                for message in family_request["messages"]
+            )
             assert family_request["messages"][0]["role"] == "system"
-            assert "choosing one tool family" in family_request["messages"][0]["content"].lower()
-            assert "respond promptly with exactly one non-empty json object and nothing else" in family_request["messages"][0]["content"].lower()
+            assert "call exactly one selector tool immediately" in family_request["messages"][0]["content"].lower()
+            assert "stage: select a tool family" in family_request["messages"][1]["content"].lower()
             assert any(
                 message["role"] == "system" and message["content"].startswith("Current emotive guidance: valence=")
                 for message in family_request["messages"]
@@ -623,17 +695,25 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
 
             assert method_request["max_tokens"] == 768
             assert method_request["thinking"] == {"type": "enabled"}
-            assert method_request["response_format"] == {"type": "json_object"}
+            assert "response_format" not in method_request
+            assert method_request["tools"][0]["function"]["name"] == "select_method"
             assert method_request["messages"][0]["role"] == "system"
-            assert "choosing a method of the ongoing tasks" in method_request["messages"][0]["content"].lower()
-            assert "respond promptly with exactly one non-empty json object and nothing else" in method_request["messages"][0]["content"].lower()
+            assert "stage: select a method within the chosen family" in method_request["messages"][1]["content"].lower()
+            assert any(
+                message["role"] == "system" and message["content"].startswith("Current emotive guidance: valence=")
+                for message in method_request["messages"]
+            )
 
             assert payload_request["max_tokens"] == 768
             assert payload_request["thinking"] == {"type": "enabled"}
-            assert payload_request["response_format"] == {"type": "json_object"}
+            assert "response_format" not in payload_request
+            assert payload_request["tool_choice"] == "required"
             assert payload_request["messages"][0]["role"] == "system"
-            assert "constructing a payload for the get_due" in payload_request["messages"][0]["content"].lower()
-            assert "respond promptly with exactly one non-empty json object and nothing else" in payload_request["messages"][0]["content"].lower()
+            assert "stage: construct a payload for the selected method" in payload_request["messages"][1]["content"].lower()
+            assert any(
+                message["role"] == "system" and message["content"].startswith("Current emotive guidance: valence=")
+                for message in payload_request["messages"]
+            )
 
             traced = server.make_request("GET", "/v1/debug/request-traces?limit=100")
             assert traced.status_code == 200
@@ -780,67 +860,27 @@ def test_provider_mode_responses_route_emits_function_call_items():
     global server
 
     def tool_response(payload):
-        stage_prompt = payload["messages"][0]["content"]
-        if "choosing one tool family" in stage_prompt.lower():
-            return {
-                "id": "resp-stage-family",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"family": "Ongoing Tasks"}),
-                        "reasoning_content": "Recurring-task inspection belongs to the ongoing task family.",
-                    },
-                }],
-                "usage": {
-                    "prompt_tokens": 8,
-                    "completion_tokens": 4,
-                    "total_tokens": 12,
-                },
-            }
-        if "choosing a method of the ongoing tasks" in stage_prompt.lower():
-            return {
-                "id": "resp-stage-method",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"method": "get_due"}),
-                        "reasoning_content": "The due-task method is the right recurring-task operation.",
-                    },
-                }],
-                "usage": {
-                    "prompt_tokens": 8,
-                    "completion_tokens": 4,
-                    "total_tokens": 12,
-                },
-            }
-        if "constructing a payload for the get_due" in stage_prompt.lower():
-            return {
-                "id": "resp-stage-payload",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({
-                            "action": "submit",
-                            "payload": {},
-                        }),
-                        "reasoning_content": "No arguments are required for the due-task lookup.",
-                    },
-                }],
-                "usage": {
-                    "prompt_tokens": 8,
-                    "completion_tokens": 4,
-                    "total_tokens": 12,
-                },
-            }
+        if selector_tool_name(payload) == "select_family":
+            return selector_choice_response(
+                "resp-stage-family",
+                "Recurring-task inspection belongs to the ongoing task family.",
+                "select_family",
+                {"family": "Ongoing Tasks"},
+            )
+        if selector_tool_name(payload) == "select_method":
+            return selector_choice_response(
+                "resp-stage-method",
+                "The due-task method is the right recurring-task operation.",
+                "select_method",
+                {"method": "get_due"},
+            )
+        if "submit_payload" in selector_tool_names(payload):
+            return selector_choice_response(
+                "resp-stage-payload",
+                "No arguments are required for the due-task lookup.",
+                "submit_payload",
+                {},
+            )
         return {
             "id": "resp-mock-tools-unexpected",
             "object": "chat.completion",
@@ -900,55 +940,38 @@ def test_provider_mode_staged_tool_loop_supports_back_navigation_and_completion(
     stage_counter = {"family": 0}
 
     def staged_response(payload):
-        stage_prompt = payload["messages"][0]["content"]
-        if "choosing one tool family" in stage_prompt.lower():
+        if selector_tool_name(payload) == "select_family":
             stage_counter["family"] += 1
             family = "Ongoing Tasks" if stage_counter["family"] == 1 else "Telegram"
-            return {
-                "id": f"stage-family-{stage_counter['family']}",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"family": family}),
-                        "reasoning_content": f"Choose the {family.lower()} family first.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "choosing a method of the ongoing tasks" in stage_prompt.lower():
-            return {
-                "id": "stage-method-back",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"method": "back"}),
-                        "reasoning_content": "Back out and pick a better family.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "choosing a method of the telegram" in stage_prompt.lower():
-            return {
-                "id": "stage-method-complete",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"method": "complete"}),
-                        "reasoning_content": "The tool loop is complete.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "tool loop is complete" in stage_prompt.lower():
+            return selector_choice_response(
+                f"stage-family-{stage_counter['family']}",
+                f"Choose the {family.lower()} family first.",
+                "select_family",
+                {"family": family},
+            )
+        if selector_tool_name(payload) == "select_method":
+            stage_details = "\n".join(
+                message["content"] for message in payload["messages"]
+                if message.get("role") == "system"
+            ).lower()
+            if "chosen family: ongoing tasks" in stage_details:
+                return selector_choice_response(
+                    "stage-method-back",
+                    "Back out and pick a better family.",
+                    "select_method",
+                    {"method": "back"},
+                )
+            if "chosen family: telegram" in stage_details:
+                return selector_choice_response(
+                    "stage-method-complete",
+                    "The tool loop is complete.",
+                    "select_method",
+                    {"method": "complete"},
+                )
+        if any(
+            message.get("role") == "system" and "tool loop is complete" in message.get("content", "").lower()
+            for message in payload["messages"]
+        ):
             return {
                 "id": "stage-final-response",
                 "object": "chat.completion",
@@ -1034,11 +1057,15 @@ def test_provider_mode_staged_tool_loop_supports_back_navigation_and_completion(
             assert response.body["choices"][0]["message"]["content"] == "All set."
             assert len(state["requests"]) == 5
             assert all(request["body"]["max_tokens"] == 768 for request in state["requests"])
-            assert "choosing one tool family" in state["requests"][0]["body"]["messages"][0]["content"].lower()
-            assert "choosing a method of the ongoing tasks" in state["requests"][1]["body"]["messages"][0]["content"].lower()
-            assert "choosing one tool family" in state["requests"][2]["body"]["messages"][0]["content"].lower()
-            assert "choosing a method of the telegram" in state["requests"][3]["body"]["messages"][0]["content"].lower()
-            assert "tool loop is complete" in state["requests"][4]["body"]["messages"][0]["content"].lower()
+            assert state["requests"][0]["body"]["tools"][0]["function"]["name"] == "select_family"
+            assert state["requests"][1]["body"]["tools"][0]["function"]["name"] == "select_method"
+            assert state["requests"][2]["body"]["tools"][0]["function"]["name"] == "select_family"
+            assert state["requests"][3]["body"]["tools"][0]["function"]["name"] == "select_method"
+            assert any(
+                "tool loop is complete" in message.get("content", "").lower()
+                for message in state["requests"][4]["body"]["messages"]
+                if message.get("role") == "system"
+            )
         finally:
             server.stop()
 
@@ -1048,54 +1075,43 @@ def test_provider_mode_retries_invalid_staged_family_selection_once():
     family_attempts = {"count": 0}
 
     def staged_response(payload):
-        stage_prompt = payload["messages"][0]["content"]
-        if "choosing one tool family" in stage_prompt.lower():
+        if selector_tool_name(payload) == "select_family":
             family_attempts["count"] += 1
-            content = "" if family_attempts["count"] == 1 else json.dumps({"family": "Ongoing Tasks"})
-            return {
-                "id": f"retry-family-{family_attempts['count']}",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": content,
-                        "reasoning_content": "Pick the ongoing task family once the JSON is valid.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "choosing a method of the ongoing tasks" in stage_prompt.lower():
-            return {
-                "id": "retry-family-method",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"method": "get_due"}),
-                        "reasoning_content": "Use the due-task getter.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "constructing a payload for the get_due" in stage_prompt.lower():
-            return {
-                "id": "retry-family-payload",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"action": "submit", "payload": {}}),
-                        "reasoning_content": "No payload fields are required.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
+            if family_attempts["count"] == 1:
+                return {
+                    "id": "retry-family-1",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": "Pick the ongoing task family once the JSON is valid.",
+                        },
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+                }
+            return selector_choice_response(
+                "retry-family-2",
+                "Pick the ongoing task family once the JSON is valid.",
+                "select_family",
+                {"family": "Ongoing Tasks"},
+            )
+        if selector_tool_name(payload) == "select_method":
+            return selector_choice_response(
+                "retry-family-method",
+                "Use the due-task getter.",
+                "select_method",
+                {"method": "get_due"},
+            )
+        if "submit_payload" in selector_tool_names(payload):
+            return selector_choice_response(
+                "retry-family-payload",
+                "No payload fields are required.",
+                "submit_payload",
+                {},
+            )
         return {
             "id": "retry-family-unexpected",
             "object": "chat.completion",
@@ -1142,9 +1158,21 @@ def test_provider_mode_retries_invalid_staged_family_selection_once():
             assert response.body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "ongoing_tasks_get_due"
             assert response.body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] == "{}"
             assert len(state["requests"]) == 4
-            assert "Previous response error:" not in state["requests"][0]["body"]["messages"][0]["content"]
-            assert "Previous response error:" in state["requests"][1]["body"]["messages"][0]["content"]
-            assert "non-empty JSON object" in state["requests"][1]["body"]["messages"][0]["content"]
+            assert not any(
+                "Previous response error:" in message.get("content", "")
+                for message in state["requests"][0]["body"]["messages"]
+                if message.get("role") == "system"
+            )
+            assert any(
+                "Previous response error:" in message.get("content", "")
+                for message in state["requests"][1]["body"]["messages"]
+                if message.get("role") == "system"
+            )
+            assert any(
+                "Call exactly one selector tool immediately" in message.get("content", "")
+                for message in state["requests"][1]["body"]["messages"]
+                if message.get("role") == "system"
+            )
         finally:
             server.stop()
 
@@ -1154,54 +1182,43 @@ def test_provider_mode_retries_invalid_staged_method_selection_once():
     method_attempts = {"count": 0}
 
     def staged_response(payload):
-        stage_prompt = payload["messages"][0]["content"]
-        if "choosing one tool family" in stage_prompt.lower():
-            return {
-                "id": "retry-method-family",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"family": "Ongoing Tasks"}),
-                        "reasoning_content": "Choose the ongoing tasks family.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "choosing a method of the ongoing tasks" in stage_prompt.lower():
+        if selector_tool_name(payload) == "select_family":
+            return selector_choice_response(
+                "retry-method-family",
+                "Choose the ongoing tasks family.",
+                "select_family",
+                {"family": "Ongoing Tasks"},
+            )
+        if selector_tool_name(payload) == "select_method":
             method_attempts["count"] += 1
-            content = "" if method_attempts["count"] == 1 else json.dumps({"method": "get_due"})
-            return {
-                "id": f"retry-method-{method_attempts['count']}",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": content,
-                        "reasoning_content": "Pick the due-task getter once the JSON is valid.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "constructing a payload for the get_due" in stage_prompt.lower():
-            return {
-                "id": "retry-method-payload",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"action": "submit", "payload": {}}),
-                        "reasoning_content": "No payload fields are required.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
+            if method_attempts["count"] == 1:
+                return {
+                    "id": "retry-method-1",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": "Pick the due-task getter once the JSON is valid.",
+                        },
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+                }
+            return selector_choice_response(
+                "retry-method-2",
+                "Pick the due-task getter once the JSON is valid.",
+                "select_method",
+                {"method": "get_due"},
+            )
+        if "submit_payload" in selector_tool_names(payload):
+            return selector_choice_response(
+                "retry-method-payload",
+                "No payload fields are required.",
+                "submit_payload",
+                {},
+            )
         return {
             "id": "retry-method-unexpected",
             "object": "chat.completion",
@@ -1248,9 +1265,21 @@ def test_provider_mode_retries_invalid_staged_method_selection_once():
             assert response.body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "ongoing_tasks_get_due"
             assert response.body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] == "{}"
             assert len(state["requests"]) == 4
-            assert "Previous response error:" not in state["requests"][1]["body"]["messages"][0]["content"]
-            assert "Previous response error:" in state["requests"][2]["body"]["messages"][0]["content"]
-            assert "non-empty JSON object" in state["requests"][2]["body"]["messages"][0]["content"]
+            assert not any(
+                "Previous response error:" in message.get("content", "")
+                for message in state["requests"][1]["body"]["messages"]
+                if message.get("role") == "system"
+            )
+            assert any(
+                "Previous response error:" in message.get("content", "")
+                for message in state["requests"][2]["body"]["messages"]
+                if message.get("role") == "system"
+            )
+            assert any(
+                "Call exactly one selector tool immediately" in message.get("content", "")
+                for message in state["requests"][2]["body"]["messages"]
+                if message.get("role") == "system"
+            )
         finally:
             server.stop()
 
@@ -1407,37 +1436,20 @@ def test_provider_mode_normalizes_plain_text_bridge_completion_into_telegram_out
     global server
 
     def staged_complete_response(payload):
-        stage_prompt = payload["messages"][0]["content"].lower()
-        if "choosing one tool family" in stage_prompt:
-            return {
-                "id": "bridge-family-telegram",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"family": "Telegram"}),
-                        "reasoning_content": "Reply on Telegram.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "choosing a method of the telegram" in stage_prompt:
-            return {
-                "id": "bridge-method-complete",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"method": "complete"}),
-                        "reasoning_content": "I can answer directly.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
+        if selector_tool_name(payload) == "select_family":
+            return selector_choice_response(
+                "bridge-family-telegram",
+                "Reply on Telegram.",
+                "select_family",
+                {"family": "Telegram"},
+            )
+        if selector_tool_name(payload) == "select_method":
+            return selector_choice_response(
+                "bridge-method-complete",
+                "I can answer directly.",
+                "select_method",
+                {"method": "complete"},
+            )
         return {
             "id": "bridge-final-answer",
             "object": "chat.completion",
@@ -1514,37 +1526,20 @@ def test_provider_mode_request_trace_endpoint_records_bridge_events():
     global server
 
     def staged_complete_response(payload):
-        stage_prompt = payload["messages"][0]["content"].lower()
-        if "choosing one tool family" in stage_prompt:
-            return {
-                "id": "bridge-trace-family",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"family": "Telegram"}),
-                        "reasoning_content": "Reply on Telegram.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "choosing a method of the telegram" in stage_prompt:
-            return {
-                "id": "bridge-trace-method",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"method": "complete"}),
-                        "reasoning_content": "I can answer directly.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
+        if selector_tool_name(payload) == "select_family":
+            return selector_choice_response(
+                "bridge-trace-family",
+                "Reply on Telegram.",
+                "select_family",
+                {"family": "Telegram"},
+            )
+        if selector_tool_name(payload) == "select_method":
+            return selector_choice_response(
+                "bridge-trace-method",
+                "I can answer directly.",
+                "select_method",
+                {"method": "complete"},
+            )
         return {
             "id": "bridge-trace-final",
             "object": "chat.completion",
@@ -1629,112 +1624,68 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
     }]
 
     def staged_telegram_response(payload):
-        stage_prompt = payload["messages"][0]["content"].lower()
         saw_runtime_observation = any(
             message.get("role") == "tool" and "downloaded_movie_count" in str(message.get("content", ""))
             for message in payload["messages"]
         )
-        if "choosing one tool family" in stage_prompt:
+        if selector_tool_name(payload) == "select_family":
             if saw_runtime_observation:
-                return {
-                    "id": "stage-family-telegram",
-                    "object": "chat.completion",
-                    "choices": [{
-                        "index": 0,
-                        "finish_reason": "stop",
-                        "message": {
-                            "role": "assistant",
-                            "content": json.dumps({"family": "Telegram"}),
-                            "reasoning_content": "Now that I have the Radarr result, I should reply on Telegram.",
-                        },
-                    }],
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-                }
-            return {
-                "id": "stage-family-radarr",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"family": "Radarr"}),
-                        "reasoning_content": "Inspect Radarr first.",
+                return selector_choice_response(
+                    "stage-family-telegram",
+                    "Now that I have the Radarr result, I should reply on Telegram.",
+                    "select_family",
+                    {"family": "Telegram"},
+                )
+            return selector_choice_response(
+                "stage-family-radarr",
+                "Inspect Radarr first.",
+                "select_family",
+                {"family": "Radarr"},
+            )
+        if selector_tool_name(payload) == "select_method":
+            stage_details = "\n".join(
+                message["content"] for message in payload["messages"]
+                if message.get("role") == "system"
+            ).lower()
+            if "chosen family: radarr" in stage_details:
+                return selector_choice_response(
+                    "stage-method-radarr",
+                    "List the downloaded movies.",
+                    "select_method",
+                    {"method": "list_downloaded_movies"},
+                )
+            if "chosen family: telegram" in stage_details:
+                return selector_choice_response(
+                    "stage-method-telegram",
+                    "Send a formatted Telegram message.",
+                    "select_method",
+                    {"method": "send_formatted_text"},
+                )
+        if "submit_payload" in selector_tool_names(payload):
+            stage_details = "\n".join(
+                message["content"] for message in payload["messages"]
+                if message.get("role") == "system"
+            ).lower()
+            if "chosen method: list_downloaded_movies" in stage_details:
+                return selector_choice_response(
+                    "stage-payload-radarr",
+                    "Submit the empty Radarr payload.",
+                    "submit_payload",
+                    {},
+                )
+            if "chosen method: send_formatted_text" in stage_details:
+                return selector_choice_response(
+                    "stage-payload-telegram",
+                    "Queue a structured Telegram reply.",
+                    "submit_payload",
+                    {
+                        "chat_scope": "12345",
+                        "reply_to_message_id": 88,
+                        "text": "<b>Ready</b>",
+                        "parse_mode": "HTML",
+                        "reply_markup": "__VICUNA_OMIT__",
                     },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "choosing a method of the radarr" in stage_prompt:
-            return {
-                "id": "stage-method-radarr",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"method": "list_downloaded_movies"}),
-                        "reasoning_content": "List the downloaded movies.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "constructing a payload for the list_downloaded_movies method of the radarr tool family" in stage_prompt:
-            return {
-                "id": "stage-payload-radarr",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({
-                            "action": "submit",
-                            "payload": {},
-                        }),
-                        "reasoning_content": "Submit the empty Radarr payload.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "choosing a method of the telegram" in stage_prompt:
-            return {
-                "id": "stage-method-telegram",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"method": "send_formatted_text"}),
-                        "reasoning_content": "Send a formatted Telegram message.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "constructing a payload for the send_formatted_text method of the telegram tool family" in stage_prompt:
-            return {
-                "id": "stage-payload-telegram",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({
-                            "action": "submit",
-                            "payload": {
-                                "text": "<b>Ready</b>",
-                                "parse_mode": "HTML",
-                                "chat_scope": "12345",
-                                "reply_to_message_id": 88,
-                            },
-                        }),
-                        "reasoning_content": "Queue a structured Telegram reply.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
+                )
         raise AssertionError(f"unexpected staged prompt: {payload['messages'][-1]['content']}")
 
     with run_mock_deepseek(staged_telegram_response) as (base_url, state):
@@ -1785,13 +1736,16 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
             telegram_method_request = state["requests"][4]["body"]
             assert all(request["body"]["temperature"] == 0.2 for request in state["requests"])
             assert first_request["messages"][0]["role"] == "system"
-            assert first_request["messages"][1]["role"] == "user"
+            assert first_request["messages"][1]["role"] == "system"
             assert "You are Vicuña, a helpful personal concierge." in first_request["messages"][0]["content"]
-            assert "Respond promptly with exactly one non-empty JSON object and nothing else." in first_request["messages"][0]["content"]
-            assert "Families:" in first_request["messages"][0]["content"]
-            assert "Radarr: Inspect and manage the Radarr movie library on the media server." in first_request["messages"][0]["content"]
-            assert "Telegram: Send direct user-facing follow-up messages through the Telegram bridge outbox." in first_request["messages"][0]["content"]
-            assert "Respond promptly with exactly one non-empty JSON object and nothing else." in first_request["messages"][0]["content"]
+            first_system_text = "\n".join(
+                message["content"] for message in first_request["messages"]
+                if message.get("role") == "system"
+            )
+            assert "call exactly one selector tool immediately" in first_system_text.lower()
+            assert "available families:" in first_system_text.lower()
+            assert "Radarr: Inspect and manage the Radarr movie library on the media server." in first_system_text
+            assert "Telegram: Send direct user-facing follow-up messages through the Telegram bridge outbox." in first_system_text
             assert any(
                 message.get("role") == "assistant" and
                 message.get("tool_calls") and
@@ -1802,10 +1756,14 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
                 message.get("role") == "tool" and "downloaded_movie_count" in str(message.get("content", ""))
                 for message in follow_up_family_request["messages"]
             )
-            assert "send_formatted_text" in telegram_method_request["messages"][0]["content"]
-            assert "send_plain_text" in telegram_method_request["messages"][0]["content"]
-            assert "send_photo" in telegram_method_request["messages"][0]["content"]
-            assert "relay" not in telegram_method_request["messages"][0]["content"]
+            telegram_system_text = "\n".join(
+                message["content"] for message in telegram_method_request["messages"]
+                if message.get("role") == "system"
+            )
+            assert "send_formatted_text" in telegram_system_text
+            assert "send_plain_text" in telegram_system_text
+            assert "send_photo" in telegram_system_text
+            assert "relay" not in telegram_system_text
 
             outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
             assert outbox.status_code == 200
@@ -1830,37 +1788,20 @@ def test_provider_mode_bridge_request_reuses_runtime_tool_and_staged_prompt_cach
     global server
 
     def staged_response(payload):
-        stage_prompt = payload["messages"][0]["content"].lower()
-        if "choosing one tool family" in stage_prompt:
-            return {
-                "id": "cache-family",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"family": "Telegram"}),
-                        "reasoning_content": "Telegram is the only family I need.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "choosing a method of the telegram" in stage_prompt:
-            return {
-                "id": "cache-method",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"method": "complete"}),
-                        "reasoning_content": "A direct answer is enough.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
+        if selector_tool_name(payload) == "select_family":
+            return selector_choice_response(
+                "cache-family",
+                "Telegram is the only family I need.",
+                "select_family",
+                {"family": "Telegram"},
+            )
+        if selector_tool_name(payload) == "select_method":
+            return selector_choice_response(
+                "cache-method",
+                "A direct answer is enough.",
+                "select_method",
+                {"method": "complete"},
+            )
         return {
             "id": "cache-final",
             "object": "chat.completion",
@@ -1952,39 +1893,28 @@ def test_provider_mode_retries_invalid_bridge_scoped_family_selection_once():
     family_attempts = {"count": 0}
 
     def staged_response(payload):
-        stage_prompt = payload["messages"][0]["content"]
-        if "choosing one tool family" in stage_prompt.lower():
+        if selector_tool_name(payload) == "select_family":
             family_attempts["count"] += 1
-            content = "{}" if family_attempts["count"] == 1 else json.dumps({"family": "Telegram"})
-            return {
-                "id": f"bridge-retry-family-{family_attempts['count']}",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": content,
-                        "reasoning_content": "Choose Telegram once the family JSON is valid.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
-        if "choosing a method of the telegram" in stage_prompt.lower():
-            return {
-                "id": "bridge-retry-method",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({"method": "complete"}),
-                        "reasoning_content": "Answer directly now.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
-            }
+            if family_attempts["count"] == 1:
+                return selector_choice_response(
+                    "bridge-retry-family-1",
+                    "Choose Telegram once the family JSON is valid.",
+                    "select_family",
+                    {},
+                )
+            return selector_choice_response(
+                "bridge-retry-family-2",
+                "Choose Telegram once the family JSON is valid.",
+                "select_family",
+                {"family": "Telegram"},
+            )
+        if selector_tool_name(payload) == "select_method":
+            return selector_choice_response(
+                "bridge-retry-method",
+                "Answer directly now.",
+                "select_method",
+                {"method": "complete"},
+            )
         return {
             "id": "bridge-retry-final",
             "object": "chat.completion",
@@ -2023,9 +1953,16 @@ def test_provider_mode_retries_invalid_bridge_scoped_family_selection_once():
             assert response.status_code == 200
             assert response.body["vicuna_telegram_delivery"]["source"] == "compat_plain_text"
             assert len(state["requests"]) == 4
-            assert "Previous response error:" not in state["requests"][0]["body"]["messages"][0]["content"]
-            assert "Previous response error:" in state["requests"][1]["body"]["messages"][0]["content"]
-            assert "did not include family" in state["requests"][1]["body"]["messages"][0]["content"]
+            assert not any(
+                "Previous response error:" in message.get("content", "")
+                for message in state["requests"][0]["body"]["messages"]
+                if message.get("role") == "system"
+            )
+            assert any(
+                "Previous response error:" in message.get("content", "") and "did not include family" in message.get("content", "")
+                for message in state["requests"][1]["body"]["messages"]
+                if message.get("role") == "system"
+            )
         finally:
             server.stop()
 
