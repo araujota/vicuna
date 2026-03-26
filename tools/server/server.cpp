@@ -331,87 +331,210 @@ static telegram_bridge_request_context parse_telegram_bridge_request_context(con
     return context;
 }
 
-static std::string build_telegram_bridge_system_prompt(const telegram_bridge_request_context & context) {
-    std::ostringstream out;
-    out << "You are Vicuña, a helpful personal concierge replying to a Telegram user through the retained transport bridge. "
-        << "Maintain continuity from the carried Telegram transcript and the current user turn. "
-        << "Use the live runtime tools made available on this turn instead of claiming you lack access to external systems. "
-        << "If earlier dialogue said a live system was unavailable, treat that as stale and use the tool that is available now. "
-        << "Deliver user-visible Telegram replies through telegram_relay instead of plain assistant text. "
-        << "For simple responses, call telegram_relay with text. "
-        << "For richer Telegram-native output, send request={method,payload}, prefer sendMessage plus parse_mode and reply_markup for most rich text/button replies, "
-        << "and prefer parse_mode over raw Telegram entity offsets unless you intentionally provide valid UTF-16-based entities.";
-    if (context.reply_to_message_id > 0) {
-        out << " Reply to the current user turn by default using Telegram message id "
-            << context.reply_to_message_id << " unless a different reply target is clearly required.";
-    }
-    return out.str();
+static json build_telegram_bridge_common_properties() {
+    return json{
+        {"chat_scope", {
+            {"type", "string"},
+            {"description", "Optional Telegram chat scope override. Leave unset on bridge-scoped turns to reply into the current chat."},
+        }},
+        {"reply_to_message_id", {
+            {"type", "integer"},
+            {"minimum", 1},
+            {"description", "Optional Telegram message id to use as the reply anchor. Leave unset to default to the current user turn on bridge-scoped requests."},
+        }},
+        {"intent", {
+            {"type", "string"},
+            {"description", "Optional intent label that classifies the follow-up, such as question or conclusion."},
+        }},
+        {"dedupe_key", {
+            {"type", "string"},
+            {"description", "Optional dedupe key used to suppress duplicate queued follow-ups for the same chat."},
+        }},
+        {"urgency", {
+            {"type", "number"},
+            {"minimum", 0},
+            {"description", "Optional normalized urgency score for the queued follow-up."},
+        }},
+    };
 }
 
-static json build_telegram_bridge_relay_tool() {
+static json build_telegram_bridge_tool(
+        const std::string & tool_name,
+        const std::string & method_name,
+        const std::string & method_description,
+        json parameters) {
     return json{
         {"type", "function"},
         {"function", {
-            {"name", "telegram_relay"},
-            {"description", "Queue one Telegram follow-up message through the provider-only bridge outbox."},
-            {"parameters", {
-                {"type", "object"},
-                {"description", "The Telegram relay payload. Use text for simple replies or request={method,payload} for structured Telegram-native output."},
-                {"anyOf", json::array({
-                    json{{"required", json::array({"text"})}},
-                    json{{"required", json::array({"request"})}},
-                })},
-                {"properties", {
-                    {"text", {
-                        {"type", "string"},
-                        {"description", "Optional simple plain-text Telegram reply."},
-                    }},
-                    {"request", {
-                        {"type", "object"},
-                        {"description", "Optional structured Telegram Bot API send request. Allowed methods: sendMessage, sendPhoto, sendDocument, sendAudio, sendVoice, sendVideo, sendAnimation, sendSticker, sendMediaGroup, sendLocation, sendVenue, sendContact, sendPoll, or sendDice. Do not include chat_id; the relay fills routing."},
-                        {"required", json::array({"method", "payload"})},
-                        {"properties", {
-                            {"method", {
-                                {"type", "string"},
-                                {"description", "Allowed outbound Telegram method, such as sendMessage, sendPhoto, sendDocument, sendAudio, sendVoice, sendVideo, sendAnimation, sendSticker, sendMediaGroup, sendLocation, sendVenue, sendContact, sendPoll, or sendDice."},
-                            }},
-                            {"payload", {
-                                {"type", "object"},
-                                {"description", "Telegram Bot API payload for the selected method. Prefer sendMessage plus parse_mode, link_preview_options, and reply_markup for most rich text and button replies."},
-                            }},
-                        }},
-                    }},
-                    {"chat_scope", {
-                        {"type", "string"},
-                        {"description", "The Telegram chat scope to route the follow-up into. Leave this unset on bridge-scoped turns unless overriding the default route is necessary."},
-                    }},
-                    {"reply_to_message_id", {
-                        {"type", "integer"},
-                        {"minimum", 1},
-                        {"description", "Optional Telegram message id to use as the reply anchor."},
-                    }},
-                    {"intent", {
-                        {"type", "string"},
-                        {"description", "Optional intent label that classifies the follow-up, such as question or conclusion."},
-                    }},
-                    {"dedupe_key", {
-                        {"type", "string"},
-                        {"description", "Optional dedupe key used to suppress duplicate queued follow-ups for the same chat."},
-                    }},
-                    {"urgency", {
-                        {"type", "number"},
-                        {"minimum", 0},
-                        {"description", "Optional normalized urgency score for the queued follow-up."},
-                    }},
-                }},
-            }},
+            {"name", tool_name},
+            {"description", method_description},
+            {"parameters", std::move(parameters)},
             {"x-vicuna-family-id", "telegram"},
             {"x-vicuna-family-name", "Telegram"},
             {"x-vicuna-family-description", "Send direct user-facing follow-up messages through the Telegram bridge outbox."},
-            {"x-vicuna-method-name", "relay"},
-            {"x-vicuna-method-description", "Queue one Telegram follow-up message as plain text or a structured Bot API send request."},
+            {"x-vicuna-method-name", method_name},
+            {"x-vicuna-method-description", method_description},
         }},
     };
+}
+
+static json build_telegram_bridge_tools() {
+    const json common = build_telegram_bridge_common_properties();
+
+    json tools = json::array();
+
+    json plain_props = common;
+    plain_props["text"] = {
+        {"type", "string"},
+        {"description", "Plain Telegram text to send to the user."},
+    };
+    tools.push_back(build_telegram_bridge_tool(
+            "telegram_send_plain_text",
+            "send_plain_text",
+            "Send a simple plain-text Telegram reply.",
+            {
+                {"type", "object"},
+                {"description", "Payload for a simple Telegram plain-text reply."},
+                {"required", json::array({"text"})},
+                {"properties", std::move(plain_props)},
+            }));
+
+    json rich_props = common;
+    rich_props["text"] = {
+        {"type", "string"},
+        {"description", "Telegram message text with formatting markup."},
+    };
+    rich_props["parse_mode"] = {
+        {"type", "string"},
+        {"enum", json::array({"HTML", "MarkdownV2"})},
+        {"description", "Formatting mode for the message text."},
+    };
+    rich_props["disable_web_page_preview"] = {
+        {"type", "boolean"},
+        {"description", "Set true to disable link previews for the message."},
+    };
+    rich_props["reply_markup"] = {
+        {"type", "object"},
+        {"description", "Optional Telegram reply markup, such as an inline keyboard."},
+    };
+    tools.push_back(build_telegram_bridge_tool(
+            "telegram_send_formatted_text",
+            "send_formatted_text",
+            "Send a formatted Telegram text reply with parse_mode and optional reply markup.",
+            {
+                {"type", "object"},
+                {"description", "Payload for a formatted Telegram text reply."},
+                {"required", json::array({"text"})},
+                {"properties", std::move(rich_props)},
+            }));
+
+    json photo_props = common;
+    photo_props["photo"] = {
+        {"type", "string"},
+        {"description", "Telegram file_id, URL, or attachable reference for the photo."},
+    };
+    photo_props["caption"] = {
+        {"type", "string"},
+        {"description", "Optional caption for the photo."},
+    };
+    photo_props["parse_mode"] = {
+        {"type", "string"},
+        {"enum", json::array({"HTML", "MarkdownV2"})},
+        {"description", "Formatting mode for the photo caption."},
+    };
+    photo_props["reply_markup"] = {
+        {"type", "object"},
+        {"description", "Optional Telegram reply markup, such as an inline keyboard."},
+    };
+    tools.push_back(build_telegram_bridge_tool(
+            "telegram_send_photo",
+            "send_photo",
+            "Send a Telegram photo with an optional formatted caption.",
+            {
+                {"type", "object"},
+                {"description", "Payload for a Telegram photo reply."},
+                {"required", json::array({"photo"})},
+                {"properties", std::move(photo_props)},
+            }));
+
+    json document_props = common;
+    document_props["document"] = {
+        {"type", "string"},
+        {"description", "Telegram file_id, URL, or attachable reference for the document."},
+    };
+    document_props["caption"] = {
+        {"type", "string"},
+        {"description", "Optional caption for the document."},
+    };
+    document_props["parse_mode"] = {
+        {"type", "string"},
+        {"enum", json::array({"HTML", "MarkdownV2"})},
+        {"description", "Formatting mode for the document caption."},
+    };
+    document_props["reply_markup"] = {
+        {"type", "object"},
+        {"description", "Optional Telegram reply markup, such as an inline keyboard."},
+    };
+    tools.push_back(build_telegram_bridge_tool(
+            "telegram_send_document",
+            "send_document",
+            "Send a Telegram document with an optional formatted caption.",
+            {
+                {"type", "object"},
+                {"description", "Payload for a Telegram document reply."},
+                {"required", json::array({"document"})},
+                {"properties", std::move(document_props)},
+            }));
+
+    json poll_props = common;
+    poll_props["question"] = {
+        {"type", "string"},
+        {"description", "Poll question to show to the user."},
+    };
+    poll_props["options"] = {
+        {"type", "array"},
+        {"minItems", 2},
+        {"items", {
+            {"type", "string"},
+        }},
+        {"description", "Poll answer options. Provide at least two."},
+    };
+    poll_props["is_anonymous"] = {
+        {"type", "boolean"},
+        {"description", "Whether the poll is anonymous."},
+    };
+    poll_props["allows_multiple_answers"] = {
+        {"type", "boolean"},
+        {"description", "Whether the poll allows multiple answers."},
+    };
+    tools.push_back(build_telegram_bridge_tool(
+            "telegram_send_poll",
+            "send_poll",
+            "Send a Telegram poll.",
+            {
+                {"type", "object"},
+                {"description", "Payload for a Telegram poll reply."},
+                {"required", json::array({"question", "options"})},
+                {"properties", std::move(poll_props)},
+            }));
+
+    json dice_props = common;
+    dice_props["emoji"] = {
+        {"type", "string"},
+        {"enum", json::array({"🎲", "🎯", "🏀", "⚽", "🎳", "🎰"})},
+        {"description", "Optional dice emoji variant to send."},
+    };
+    tools.push_back(build_telegram_bridge_tool(
+            "telegram_send_dice",
+            "send_dice",
+            "Send a Telegram dice-style emoji roll.",
+            {
+                {"type", "object"},
+                {"description", "Payload for a Telegram dice reply."},
+                {"properties", std::move(dice_props)},
+            }));
+
+    return tools;
 }
 
 static telegram_runtime_tool_adapter_config telegram_runtime_tool_adapter_config_from_env() {
@@ -631,7 +754,7 @@ static bool load_server_owned_telegram_runtime_tools(
     if (!used_override) {
         const std::string command_line =
                 shell_escape_single_quoted(config.node_bin) + " " +
-                shell_escape_single_quoted(config.entry_path) + " runtime-tools --exclude-tool-name=telegram_relay 2>&1";
+                shell_escape_single_quoted(config.entry_path) + " runtime-tools 2>&1";
         if (!run_shell_json_command(command_line, &payload, &command_error)) {
             if (out_error) {
                 *out_error = "unable to load Telegram runtime tool catalog: " + command_error;
@@ -652,7 +775,9 @@ static bool load_server_owned_telegram_runtime_tools(
     }
 
     json final_tools = tools;
-    final_tools.push_back(build_telegram_bridge_relay_tool());
+    for (const auto & telegram_tool : build_telegram_bridge_tools()) {
+        final_tools.push_back(telegram_tool);
+    }
 
     {
         std::lock_guard<std::mutex> lock(cache_state.mutex);
@@ -794,14 +919,10 @@ static json build_bridge_tool_result_message(const deepseek_tool_call & tool_cal
 
 static json build_server_owned_bridge_request_body(
         const json & body,
-        const telegram_bridge_request_context & context,
+        const telegram_bridge_request_context & /*context*/,
         const json & runtime_tools) {
     json augmented = body;
     json messages = json::array();
-    messages.push_back({
-        {"role", "system"},
-        {"content", build_telegram_bridge_system_prompt(context)},
-    });
     for (const auto & item : body.at("messages")) {
         messages.push_back(item);
     }
@@ -2925,14 +3046,23 @@ static telegram_outbox_item telegram_outbox_item_from_json(const json & body) {
     return request;
 }
 
-static bool parse_telegram_relay_tool_call(
+static bool is_server_owned_telegram_delivery_tool_name(const std::string & tool_name) {
+    return tool_name == "telegram_send_plain_text" ||
+            tool_name == "telegram_send_formatted_text" ||
+            tool_name == "telegram_send_photo" ||
+            tool_name == "telegram_send_document" ||
+            tool_name == "telegram_send_poll" ||
+            tool_name == "telegram_send_dice";
+}
+
+static bool parse_server_owned_telegram_delivery_tool_call(
         const deepseek_tool_call & tool_call,
         const telegram_bridge_request_context & context,
         telegram_outbox_item * out_item,
         std::string * out_error) {
     if (!out_item) {
         if (out_error) {
-            *out_error = "telegram relay parsing requires an output item";
+            *out_error = "telegram delivery parsing requires an output item";
         }
         return false;
     }
@@ -2942,22 +3072,13 @@ static bool parse_telegram_relay_tool_call(
         arguments = json::parse(tool_call.arguments_json.empty() ? std::string("{}") : tool_call.arguments_json);
     } catch (const std::exception & e) {
         if (out_error) {
-            *out_error = server_string_format("telegram_relay arguments were not valid JSON: %s", e.what());
+            *out_error = server_string_format("%s arguments were not valid JSON: %s", tool_call.name.c_str(), e.what());
         }
         return false;
     }
     if (!arguments.is_object()) {
         if (out_error) {
-            *out_error = "telegram_relay arguments must be a JSON object";
-        }
-        return false;
-    }
-
-    const bool has_text = !trim_copy(json_value(arguments, "text", std::string())).empty();
-    const bool has_request = arguments.contains("request") && arguments.at("request").is_object();
-    if (has_text == has_request) {
-        if (out_error) {
-            *out_error = "telegram_relay requires exactly one of text or request";
+            *out_error = "Telegram delivery arguments must be a JSON object";
         }
         return false;
     }
@@ -2973,28 +3094,82 @@ static bool parse_telegram_relay_tool_call(
 
     if (item.chat_scope.empty()) {
         if (out_error) {
-            *out_error = "telegram_relay requires chat_scope when no bridge-scoped default is available";
+            *out_error = "Telegram delivery requires chat_scope when no bridge-scoped default is available";
         }
         return false;
     }
 
-    if (has_text) {
+    if (tool_call.name == "telegram_send_plain_text") {
         item.text = trim_copy(json_value(arguments, "text", std::string()));
         item.telegram_method = "sendMessage";
         item.telegram_payload = json{
             {"text", item.text},
         };
+    } else if (tool_call.name == "telegram_send_formatted_text") {
+        item.telegram_method = "sendMessage";
+        item.telegram_payload = json{
+            {"text", trim_copy(json_value(arguments, "text", std::string()))},
+        };
+        if (arguments.contains("parse_mode")) {
+            item.telegram_payload["parse_mode"] = arguments.at("parse_mode");
+        }
+        if (arguments.contains("disable_web_page_preview")) {
+            item.telegram_payload["disable_web_page_preview"] = arguments.at("disable_web_page_preview");
+        }
+        if (arguments.contains("reply_markup")) {
+            item.telegram_payload["reply_markup"] = arguments.at("reply_markup");
+        }
+    } else if (tool_call.name == "telegram_send_photo") {
+        item.telegram_method = "sendPhoto";
+        item.telegram_payload = json{
+            {"photo", trim_copy(json_value(arguments, "photo", std::string()))},
+        };
+        if (arguments.contains("caption")) {
+            item.telegram_payload["caption"] = arguments.at("caption");
+        }
+        if (arguments.contains("parse_mode")) {
+            item.telegram_payload["parse_mode"] = arguments.at("parse_mode");
+        }
+        if (arguments.contains("reply_markup")) {
+            item.telegram_payload["reply_markup"] = arguments.at("reply_markup");
+        }
+    } else if (tool_call.name == "telegram_send_document") {
+        item.telegram_method = "sendDocument";
+        item.telegram_payload = json{
+            {"document", trim_copy(json_value(arguments, "document", std::string()))},
+        };
+        if (arguments.contains("caption")) {
+            item.telegram_payload["caption"] = arguments.at("caption");
+        }
+        if (arguments.contains("parse_mode")) {
+            item.telegram_payload["parse_mode"] = arguments.at("parse_mode");
+        }
+        if (arguments.contains("reply_markup")) {
+            item.telegram_payload["reply_markup"] = arguments.at("reply_markup");
+        }
+    } else if (tool_call.name == "telegram_send_poll") {
+        item.telegram_method = "sendPoll";
+        item.telegram_payload = json{
+            {"question", trim_copy(json_value(arguments, "question", std::string()))},
+            {"options", arguments.contains("options") ? arguments.at("options") : json::array()},
+        };
+        if (arguments.contains("is_anonymous")) {
+            item.telegram_payload["is_anonymous"] = arguments.at("is_anonymous");
+        }
+        if (arguments.contains("allows_multiple_answers")) {
+            item.telegram_payload["allows_multiple_answers"] = arguments.at("allows_multiple_answers");
+        }
+    } else if (tool_call.name == "telegram_send_dice") {
+        item.telegram_method = "sendDice";
+        item.telegram_payload = json::object();
+        if (arguments.contains("emoji")) {
+            item.telegram_payload["emoji"] = arguments.at("emoji");
+        }
     } else {
-        const json & request = arguments.at("request");
-        item.telegram_method = trim_copy(json_value(request, "method", std::string()));
-        if (request.contains("payload")) {
-            item.telegram_payload = request.at("payload");
-        } else {
-            item.telegram_payload = json::object();
+        if (out_error) {
+            *out_error = "unknown Telegram delivery tool name";
         }
-        if (item.telegram_payload.is_object()) {
-            item.telegram_payload.erase("chat_id");
-        }
+        return false;
     }
 
     try {
@@ -3011,7 +3186,7 @@ static bool parse_telegram_relay_tool_call(
 
     if (item.text.empty()) {
         if (out_error) {
-            *out_error = "telegram_relay did not produce relayable summary text";
+            *out_error = "Telegram delivery did not produce relayable summary text";
         }
         return false;
     }
@@ -3143,12 +3318,13 @@ static bool execute_telegram_delivery_for_bridge_request(
 
     telegram_outbox_item item = {};
     std::string delivery_source;
-    if (result->tool_calls.size() == 1 && result->tool_calls.front().name == "telegram_relay") {
+    if (result->tool_calls.size() == 1 && is_server_owned_telegram_delivery_tool_name(result->tool_calls.front().name)) {
         std::string parse_error;
-        if (!parse_telegram_relay_tool_call(result->tool_calls.front(), context, &item, &parse_error)) {
+        if (!parse_server_owned_telegram_delivery_tool_call(result->tool_calls.front(), context, &item, &parse_error)) {
             if (trace_context) {
-                runtime_request_trace_log(*trace_context, "telegram_delivery", "telegram_relay_parse_failed", {
+                runtime_request_trace_log(*trace_context, "telegram_delivery", "telegram_delivery_parse_failed", {
                     {"message", parse_error},
+                    {"tool_name", result->tool_calls.front().name},
                 });
             }
             if (out_error) {
@@ -3160,8 +3336,8 @@ static bool execute_telegram_delivery_for_bridge_request(
     } else {
         if (!result->tool_calls.empty()) {
             // Bridge-scoped requests may now continue through direct runtime tool calls.
-            // Only intercept the bridge-local telegram_relay tool here; leave other tool calls
-            // intact so the bridge can execute them and continue the loop client-side.
+            // Only intercept the server-owned Telegram delivery tools here; leave other tool
+            // calls intact so the bridge can execute them and continue the loop client-side.
             return true;
         }
         const std::string text = trim_copy(result->content);
@@ -4051,24 +4227,24 @@ static bool execute_bridge_scoped_telegram_request(
             return true;
         }
 
-        bool contains_telegram_relay = false;
+        bool contains_telegram_delivery = false;
         bool contains_runtime_tool = false;
         for (const auto & tool_call : round_result.tool_calls) {
-            if (tool_call.name == "telegram_relay") {
-                contains_telegram_relay = true;
+            if (is_server_owned_telegram_delivery_tool_name(tool_call.name)) {
+                contains_telegram_delivery = true;
             } else {
                 contains_runtime_tool = true;
             }
         }
-        if (contains_telegram_relay && contains_runtime_tool) {
+        if (contains_telegram_delivery && contains_runtime_tool) {
             if (out_error) {
-                *out_error = format_error_response("bridge-scoped Telegram request returned mixed telegram_relay and runtime tool calls", ERROR_TYPE_SERVER);
+                *out_error = format_error_response("bridge-scoped Telegram request returned mixed Telegram delivery and runtime tool calls", ERROR_TYPE_SERVER);
             }
             return false;
         }
-        if (contains_telegram_relay) {
+        if (contains_telegram_delivery) {
             if (trace_context) {
-                runtime_request_trace_log(*trace_context, "runtime", "bridge_round_selected_telegram_relay", {
+                runtime_request_trace_log(*trace_context, "runtime", "bridge_round_selected_telegram_delivery", {
                     {"round", round + 1},
                     {"tool_call_count", static_cast<int64_t>(round_result.tool_calls.size())},
                 });

@@ -46,15 +46,16 @@ Telegram outbox policy:
   queueing a message item
 - queued items keep a normalized summary `text` field for bridge transcript and
   delivery logging purposes
-- bridge-scoped Telegram requests may now resolve `telegram_relay` internally:
-  the server queues the outbox item itself, returns `vicuna_telegram_delivery`,
-  and suppresses outward tool calls so the bridge only delivers from outbox
+- bridge-scoped Telegram requests may now resolve explicit Telegram delivery
+  methods internally, such as `send_plain_text` or `send_formatted_text`: the
+  server queues the outbox item itself, returns `vicuna_telegram_delivery`, and
+  suppresses outward tool calls so the bridge only delivers from outbox
 - bridge-scoped plain assistant text is normalized into a `sendMessage` outbox
   item as a compatibility backstop instead of being allowed to drop
 - bridge-scoped Telegram requests also own their runtime context inside the
-  server: the server injects Telegram guidance, loads the runtime tool catalog,
-  appends `telegram_relay`, executes selected runtime tools, and continues the
-  staged loop itself until final delivery or a direct final answer
+  server: the server loads the runtime tool catalog, appends explicit Telegram
+  delivery methods, executes selected runtime tools, and continues the staged
+  loop itself until final delivery or a direct final answer
 
 Interleaved-thinking policy:
 

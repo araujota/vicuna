@@ -1674,13 +1674,13 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
                     "finish_reason": "stop",
                     "message": {
                         "role": "assistant",
-                        "content": json.dumps({"method": "relay"}),
-                        "reasoning_content": "Relay the answer.",
+                        "content": json.dumps({"method": "send_formatted_text"}),
+                        "reasoning_content": "Send a formatted Telegram message.",
                     },
                 }],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
             }
-        if "constructing a payload for the relay method of the telegram tool family" in stage_prompt:
+        if "constructing a payload for the send_formatted_text method of the telegram tool family" in stage_prompt:
             return {
                 "id": "stage-payload-telegram",
                 "object": "chat.completion",
@@ -1692,13 +1692,8 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
                         "content": json.dumps({
                             "action": "submit",
                             "payload": {
-                                "request": {
-                                    "method": "sendMessage",
-                                    "payload": {
-                                        "text": "<b>Ready</b>",
-                                        "parse_mode": "HTML",
-                                    },
-                                },
+                                "text": "<b>Ready</b>",
+                                "parse_mode": "HTML",
                                 "chat_scope": "12345",
                                 "reply_to_message_id": 88,
                             },
@@ -1755,15 +1750,28 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
             assert len(state["requests"]) == 6
             first_request = state["requests"][0]["body"]
             follow_up_family_request = state["requests"][3]["body"]
+            telegram_method_request = state["requests"][4]["body"]
             assert all(request["body"]["temperature"] == 0.2 for request in state["requests"])
             assert first_request["messages"][0]["role"] == "system"
+            assert first_request["messages"][1]["role"] == "user"
             assert "helpful personal concierge with access to tool families" in first_request["messages"][0]["content"]
-            assert "replying to a Telegram user through the retained transport bridge" in first_request["messages"][1]["content"]
             assert "Available families:" in first_request["messages"][-1]["content"]
             assert "Radarr: Inspect and manage the Radarr movie library on the media server." in first_request["messages"][-1]["content"]
             assert "Telegram: Send direct user-facing follow-up messages through the Telegram bridge outbox." in first_request["messages"][-1]["content"]
-            assert follow_up_family_request["messages"][3]["tool_calls"][0]["function"]["name"] == "radarr_list_downloaded_movies"
-            assert "downloaded_movie_count" in follow_up_family_request["messages"][4]["content"]
+            assert any(
+                message.get("role") == "assistant" and
+                message.get("tool_calls") and
+                message["tool_calls"][0]["function"]["name"] == "radarr_list_downloaded_movies"
+                for message in follow_up_family_request["messages"]
+            )
+            assert any(
+                message.get("role") == "tool" and "downloaded_movie_count" in str(message.get("content", ""))
+                for message in follow_up_family_request["messages"]
+            )
+            assert "send_formatted_text" in telegram_method_request["messages"][-1]["content"]
+            assert "send_plain_text" in telegram_method_request["messages"][-1]["content"]
+            assert "send_photo" in telegram_method_request["messages"][-1]["content"]
+            assert "relay" not in telegram_method_request["messages"][-1]["content"]
 
             outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
             assert outbox.status_code == 200
@@ -1862,7 +1870,7 @@ def test_provider_mode_bridge_request_reuses_runtime_tool_and_staged_prompt_cach
                 "hits": 1,
                 "misses": 1,
                 "loaded_from_override": True,
-                "tool_count": 1,
+                "tool_count": 6,
             }
             assert health.body["bridge_runtime"]["staged_prompt_cache"] == {
                 "cached": True,

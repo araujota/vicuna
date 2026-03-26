@@ -62,9 +62,9 @@ request, the staged loop begins again from family selection.
 The server now assumes callers inject the real direct tool definitions they
 want exposed for that turn, with one explicit exception: bridge-scoped
 Telegram requests. For those requests the server loads the installed runtime
-tool catalog itself, prepends Telegram-specific system guidance, injects
-`telegram_relay`, executes any selected runtime tools internally, and
-continues the staged loop until it can queue final Telegram delivery.
+tool catalog itself, appends explicit Telegram delivery methods, executes any
+selected runtime tools internally, and continues the staged loop until it can
+queue final Telegram delivery.
 
 For retained bridge-scoped Telegram turns, the server also caches the loaded
 runtime tool catalog plus the derived staged family/method/payload prompt
@@ -72,10 +72,11 @@ bundle in memory. Inspect those bounded cache counters at
 `/health -> bridge_runtime`.
 
 Bridge-scoped Telegram turns are the one built-in exception: when a request
-arrives with Telegram bridge headers and resolves to `telegram_relay`, the
-server enqueues the Telegram outbox item itself, clears the outward tool call,
-and returns additive `vicuna_telegram_delivery` metadata so the bridge can wait
-for outbox delivery instead of trying to relay assistant text directly.
+arrives with Telegram bridge headers and resolves to an explicit Telegram
+delivery method, the server enqueues the Telegram outbox item itself, clears
+the outward tool call, and returns additive `vicuna_telegram_delivery` metadata
+so the bridge can wait for outbox delivery instead of trying to relay
+assistant text directly.
 
 The staged prompts are additive and keep:
 

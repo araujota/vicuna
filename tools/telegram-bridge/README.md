@@ -124,23 +124,23 @@ The key runtime variables are:
   turn finishes
 - every forwarded Telegram turn now sends only the bounded transcript plus
   Telegram routing headers
-- the server owns Telegram prompt construction, runtime tool catalog loading,
-  staged family -> method -> payload orchestration, runtime tool execution, and
-  the final `telegram_relay` delivery decision
+- the server owns runtime tool catalog loading, staged family -> method ->
+  payload orchestration, runtime tool execution, and the final explicit
+  Telegram delivery decision
 - the bridge now tracks a per-chat Telegram conversation anchor so replies to
   runtime-authored assistant messages, plus plain next messages when one latest
   active conversation is clear, stay attached to the same bounded continuity
   transcript instead of starting an unrelated follow-up thread
-- runtime-owned follow-up messages delivered through the provider-only
-  `telegram_relay` tool now arrive through the dedicated Telegram outbox
+- runtime-owned follow-up messages delivered through server-owned explicit
+  Telegram delivery methods now arrive through the dedicated Telegram outbox
   surface, not through fallback assistant text
 - if a bridge-scoped Telegram turn still comes back as plain assistant text, the
   runtime now normalizes that into a `sendMessage` outbox item and returns
   `vicuna_telegram_delivery` metadata so the bridge does not drop or duplicate
   the reply while waiting for outbox delivery
-- those runtime-owned follow-up messages may now be either simple plain text or
-  structured Telegram Bot API send requests with explicit method/payload
-  envelopes, so formatting, media sends, and reply markup survive the bridge
+- those runtime-owned follow-up messages may now be simple plain text, rich
+  formatted text, photos, documents, polls, or dice sends with typed method
+  contracts, so formatting, media sends, and reply markup survive the bridge
 - runtime-owned mutation approvals are delivered through the same outbox as
   `approval_request` items; the bridge submits inline-button decisions back to
   `/v1/telegram/approval` as structured approval events instead of rewriting
@@ -208,8 +208,8 @@ The key runtime variables are:
   new `appended Telegram user turn` entries appear, the defect is in transcript
   shaping rather than Telegram update replay
 - intentionally empty completion text is now allowed on Telegram turns because
-  the user-visible payload may already have been delivered by a tool such as
-  `telegram_relay`
+  the user-visible payload may already have been delivered by an explicit
+  Telegram delivery method
 - the bridge should remain transport/state middleware only; future work should
   not reintroduce bridge-owned prompt construction, live-tool injection, or a
   second tool-continuation loop

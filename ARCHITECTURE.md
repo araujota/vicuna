@@ -105,8 +105,8 @@ The staged controller keeps tool policy explicit in CPU-side code:
 - final tool execution remains a normal tool call or runtime action after
   server-side validation
 - bridge-scoped Telegram turns are a built-in server-owned variant: the server
-  loads the installed runtime catalog, injects Telegram guidance plus
-  `telegram_relay`, and continues runtime tool execution internally until final
+  loads the installed runtime catalog, appends explicit Telegram delivery
+  methods, and continues runtime tool execution internally until final
   Telegram delivery or a direct final answer
 
 ## VAD Projection
