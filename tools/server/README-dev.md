@@ -63,9 +63,13 @@ Interleaved-thinking policy:
 - derive the continuation VAD from that request-scoped replay state
 - inject the VAD sentence as a separate `system` message so tool payloads stay unchanged
 - preserve `reasoning_content` exactly while adding any VAD or heuristic guidance messages
-- pass through DeepSeek's top-level `thinking` field when callers provide it
+- default DeepSeek provider requests to `deepseek-chat` with `thinking={"type":"enabled"}`
+- pass through DeepSeek's top-level `thinking` field unchanged when callers provide it
 - force every outbound DeepSeek request, including staged and background turns, to use `max_tokens: 1024`
+- force every outbound DeepSeek request, including staged and background turns, to use `temperature: 0.2`
 - ignore caller-supplied `max_tokens`, `max_completion_tokens`, and `max_output_tokens` values that differ from the fixed runtime cap
+- reuse one configured `cpp-httplib` client per DeepSeek authority and expose
+  its build/reuse counters at `/health -> provider -> transport`
 
 Staged tool-loop policy:
 
@@ -89,6 +93,9 @@ Staged tool-loop policy:
   second-pass tool continuation loops
 - the retained Telegram bridge should forward transcript plus routing headers
   only; the server is the sole owner of Telegram prompt and tool policy
+- cache the retained bridge-scoped Telegram runtime tool catalog and the
+  derived staged prompt bundle in memory; inspect both counters at
+  `/health -> bridge_runtime`
 
 Cognitive replay policy:
 

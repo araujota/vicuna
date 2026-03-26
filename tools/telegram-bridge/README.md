@@ -10,6 +10,8 @@ It does two jobs in one process:
   registered Telegram chat
 - polls `/v1/telegram/outbox` for runtime-owned follow-up messages and other
   retained compatibility items
+- keeps those retained outbox/self-emit polling loops intentionally tight so a
+  completed server turn is surfaced with less trailing delay
 
 ## Environment
 
@@ -33,7 +35,7 @@ Required variables:
 Optional variables:
 
 - `TELEGRAM_BRIDGE_VICUNA_BASE_URL` default: `http://127.0.0.1:8080`
-- `TELEGRAM_BRIDGE_MODEL` default: `vicuna-runtime`
+- `TELEGRAM_BRIDGE_MODEL` default: `deepseek-chat`
 - `TELEGRAM_BRIDGE_STATE_PATH` default: `/tmp/vicuna-telegram-bridge-state.json`
 - `TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS` default: `30`
 - `TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES` default: `12`
@@ -181,6 +183,8 @@ The key runtime variables are:
   closes an idle stream; it always reconnects with `after=0` and deduplicates
   by retained `response_id`, so retained self-emits are replay-safe across
   reconnects
+- retained outbox polling and self-emit reconnect delays are intentionally
+  shorter now; the Telegram Bot API `getUpdates` long-poll timeout is unchanged
 - repeated Telegram `409 Conflict: terminated by other getUpdates request`
   errors mean another bot poller is still running with the same token, either
   on this host or somewhere else; clear the extra poller before expecting

@@ -16,12 +16,12 @@ def make_provider_server(base_url: str, extra_env: Optional[Dict[str, str]] = No
     server = ServerProcess()
     server.model_hf_repo = None
     server.model_hf_file = None
-    server.model_alias = "deepseek-reasoner"
+    server.model_alias = "deepseek-chat"
     server.no_webui = True
     server.extra_env = {
         "VICUNA_DEEPSEEK_API_KEY": "test-key",
         "VICUNA_DEEPSEEK_BASE_URL": base_url,
-        "VICUNA_DEEPSEEK_MODEL": "deepseek-reasoner",
+        "VICUNA_DEEPSEEK_MODEL": "deepseek-chat",
         "VICUNA_DEEPSEEK_TIMEOUT_MS": "5000",
     }
     if extra_env:
@@ -43,6 +43,8 @@ def run_mock_deepseek(response_factory=None, route_factory=None):
     state = {"requests": []}
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length).decode("utf-8")
@@ -51,6 +53,10 @@ def run_mock_deepseek(response_factory=None, route_factory=None):
                 "path": self.path,
                 "headers": dict(self.headers),
                 "body": payload,
+                "client": {
+                    "host": self.client_address[0],
+                    "port": self.client_address[1],
+                },
             })
 
             if self.path != "/chat/completions":
@@ -221,16 +227,25 @@ def test_provider_mode_health_and_models_exclude_local_runtime_surfaces():
             assert health.body["status"] == "ok"
             assert health.body["state"] == "ready"
             assert health.body["provider"]["name"] == "deepseek"
-            assert health.body["provider"]["model"] == "deepseek-reasoner"
+            assert health.body["provider"]["model"] == "deepseek-chat"
+            assert health.body["provider"]["transport"] == {
+                "shared_client_cached": False,
+                "client_builds": 0,
+                "request_count": 0,
+                "reused_request_count": 0,
+                "base_url": None,
+            }
             assert "runtime_persistence" not in health.body
             assert health.body["proactive_mailbox"]["live_stream_connected"] is False
+            assert health.body["bridge_runtime"]["telegram_runtime_tool_cache"]["cached"] is False
+            assert health.body["bridge_runtime"]["staged_prompt_cache"]["cached"] is False
             assert health.body["emotive_runtime"]["enabled"] is True
             assert health.body["emotive_runtime"]["embedding_backend"]["mode"] == "lexical_only"
             assert health.body["emotive_runtime"]["cognitive_replay"]["enabled"] is True
 
             models = server.make_request("GET", "/v1/models")
             assert models.status_code == 200
-            assert models.body["data"][0]["id"] == "deepseek-reasoner"
+            assert models.body["data"][0]["id"] == "deepseek-chat"
             assert models.body["data"][0]["owned_by"] == "deepseek"
 
             lora = server.make_request("GET", "/lora-adapters")
@@ -249,6 +264,7 @@ def test_provider_mode_chat_completion_exposes_reasoning_trace():
 
             response = server.make_request("POST", "/v1/chat/completions", data={
                 "model": "deepseek-reasoner",
+                "temperature": 0.9,
                 "messages": [
                     {"role": "user", "content": "Hello"},
                 ],
@@ -259,7 +275,7 @@ def test_provider_mode_chat_completion_exposes_reasoning_trace():
             assert choice["message"]["content"] == "Hello from DeepSeek."
             assert choice["message"]["reasoning_content"] == "I should greet the user and keep the reply brief."
             assert choice["finish_reason"] == "stop"
-            assert response.body["model"] == "deepseek-reasoner"
+            assert response.body["model"] == "deepseek-chat"
             trace = response.body["vicuna_emotive_trace"]
             assert trace["embedding_mode"] == "lexical_only"
             assert [block["source"]["kind"] for block in trace["blocks"]] == [
@@ -285,7 +301,9 @@ def test_provider_mode_chat_completion_exposes_reasoning_trace():
             assert state["requests"]
             outbound = state["requests"][0]
             assert outbound["path"] == "/chat/completions"
-            assert outbound["body"]["model"] == "deepseek-reasoner"
+            assert outbound["body"]["model"] == "deepseek-chat"
+            assert outbound["body"]["thinking"] == {"type": "enabled"}
+            assert outbound["body"]["temperature"] == 0.2
             assert outbound["body"]["stream"] is True
             assert outbound["body"]["messages"] == [
                 {"role": "user", "content": "Hello"},
@@ -323,6 +341,42 @@ def test_provider_mode_responses_route_emits_reasoning_item():
             assert response.body["vicuna_emotive_trace"]["blocks"][0]["source"]["kind"] == "user_message"
             assert response.body["vicuna_emotive_trace"]["final_vad"]["style_guide"]["tone_label"]
             assert state["requests"][0]["body"]["max_tokens"] == 1024
+            assert state["requests"][0]["body"]["temperature"] == 0.2
+        finally:
+            server.stop()
+
+
+def test_provider_mode_reuses_shared_deepseek_http_client():
+    global server
+    with run_mock_deepseek() as (base_url, state):
+        server = make_provider_server(base_url)
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            for prompt in ("First", "Second"):
+                response = server.make_request("POST", "/v1/chat/completions", data={
+                    "model": "deepseek-chat",
+                    "messages": [
+                        {"role": "user", "content": prompt},
+                    ],
+                    "stream": False,
+                })
+                assert response.status_code == 200
+
+            health = server.make_request("GET", "/health")
+            transport = health.body["provider"]["transport"]
+            assert transport["shared_client_cached"] is True
+            assert transport["client_builds"] == 1
+            assert transport["request_count"] == 2
+            assert transport["reused_request_count"] >= 1
+
+            provider_requests = requests_for_path(state, "/chat/completions")
+            assert len(provider_requests) == 2
+            assert all(request["body"]["temperature"] == 0.2 for request in provider_requests)
+            assert {request["client"]["port"] for request in provider_requests} == {
+                provider_requests[0]["client"]["port"],
+            }
         finally:
             server.stop()
 
@@ -493,6 +547,7 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
 
             assert "tools" not in family_request
             assert family_request["max_tokens"] == 1024
+            assert family_request["thinking"] == {"type": "enabled"}
             assert family_request["response_format"] == {"type": "json_object"}
             assert family_request["messages"][2]["reasoning_content"] == request["messages"][1]["reasoning_content"]
             assert family_request["messages"][2]["tool_calls"] == request["messages"][1]["tool_calls"]
@@ -505,11 +560,13 @@ def test_provider_mode_chat_completion_round_trips_tools_and_tool_history():
             assert "choosing one tool family" in family_request["messages"][-1]["content"].lower()
 
             assert method_request["max_tokens"] == 1024
+            assert method_request["thinking"] == {"type": "enabled"}
             assert method_request["response_format"] == {"type": "json_object"}
             assert method_request["messages"][-1]["role"] == "system"
             assert "choosing a method of the ongoing tasks" in method_request["messages"][-1]["content"].lower()
 
             assert payload_request["max_tokens"] == 1024
+            assert payload_request["thinking"] == {"type": "enabled"}
             assert payload_request["response_format"] == {"type": "json_object"}
             assert payload_request["messages"][-1]["role"] == "system"
             assert "constructing a payload for the get_due" in payload_request["messages"][-1]["content"].lower()
@@ -1547,6 +1604,7 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
             assert len(state["requests"]) == 6
             first_request = state["requests"][0]["body"]
             follow_up_family_request = state["requests"][3]["body"]
+            assert all(request["body"]["temperature"] == 0.2 for request in state["requests"])
             assert first_request["messages"][0]["role"] == "system"
             assert "helpful personal concierge with access to tool families" in first_request["messages"][0]["content"]
             assert "replying to a Telegram user through the retained transport bridge" in first_request["messages"][1]["content"]
@@ -1571,6 +1629,97 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
                 "reply_to_message_id": 88,
                 "dedupe_key": "bridge:tc2:88:sendMessage",
             }]
+        finally:
+            server.stop()
+
+
+def test_provider_mode_bridge_request_reuses_runtime_tool_and_staged_prompt_caches():
+    global server
+
+    def staged_response(payload):
+        stage_prompt = payload["messages"][-1]["content"].lower()
+        if "choosing one tool family" in stage_prompt:
+            return {
+                "id": "cache-family",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"family": "Telegram"}),
+                        "reasoning_content": "Telegram is the only family I need.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        if "choosing a method of the telegram" in stage_prompt:
+            return {
+                "id": "cache-method",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps({"method": "complete"}),
+                        "reasoning_content": "A direct answer is enough.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+            }
+        return {
+            "id": "cache-final",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Done.",
+                    "reasoning_content": "Reply directly now.",
+                },
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16},
+        }
+
+    with run_mock_deepseek(staged_response) as (base_url, state):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": "[]",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            for message_id in ("201", "202"):
+                response = server.make_request("POST", "/v1/chat/completions", data={
+                    "model": "deepseek-chat",
+                    "messages": [
+                        {"role": "user", "content": "Reply on Telegram."},
+                    ],
+                    "stream": False,
+                }, headers={
+                    "X-Vicuna-Telegram-Chat-Id": "12345",
+                    "X-Vicuna-Telegram-Message-Id": message_id,
+                    "X-Vicuna-Telegram-Conversation-Id": "tc-cache",
+                })
+                assert response.status_code == 200
+
+            health = server.make_request("GET", "/health")
+            assert health.body["bridge_runtime"]["telegram_runtime_tool_cache"] == {
+                "cached": True,
+                "hits": 1,
+                "misses": 1,
+                "loaded_from_override": True,
+                "tool_count": 1,
+            }
+            assert health.body["bridge_runtime"]["staged_prompt_cache"] == {
+                "cached": True,
+                "hits": 1,
+                "misses": 1,
+                "family_count": 1,
+            }
+            assert all(request["body"]["temperature"] == 0.2 for request in state["requests"])
         finally:
             server.stop()
 

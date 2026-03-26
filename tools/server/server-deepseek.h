@@ -10,7 +10,8 @@ struct deepseek_runtime_config {
     bool enabled = false;
     std::string api_key;
     std::string base_url = "https://api.deepseek.com";
-    std::string model = "deepseek-reasoner";
+    std::string model = "deepseek-chat";
+    bool default_thinking_enabled = true;
     int32_t timeout_ms = 60000;
 };
 

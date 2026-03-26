@@ -37,6 +37,10 @@ import {
   setPendingOptionPrompt,
   shouldBootstrapTelegramOutboxOffset,
   splitSseBuffer,
+  TELEGRAM_BRIDGE_ASK_OUTBOX_POLL_IDLE_MS,
+  TELEGRAM_BRIDGE_SELF_EMIT_ACTIVE_DELAY_MS,
+  TELEGRAM_BRIDGE_SELF_EMIT_ERROR_DELAY_MS,
+  TELEGRAM_BRIDGE_WATCHDOG_DELAY_MS,
   updateTelegramOffset,
 } from './lib.mjs';
 
@@ -46,7 +50,7 @@ const bridgeDir = path.dirname(fileURLToPath(import.meta.url));
 const env = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
   vicunaBaseUrl: (process.env.TELEGRAM_BRIDGE_VICUNA_BASE_URL ?? 'http://127.0.0.1:8080').replace(/\/+$/, ''),
-  model: process.env.TELEGRAM_BRIDGE_MODEL ?? process.env.VICUNA_DEEPSEEK_MODEL ?? 'deepseek-reasoner',
+  model: process.env.TELEGRAM_BRIDGE_MODEL ?? process.env.VICUNA_DEEPSEEK_MODEL ?? 'deepseek-chat',
   statePath: process.env.TELEGRAM_BRIDGE_STATE_PATH ?? '/tmp/vicuna-telegram-bridge-state.json',
   pollTimeoutSeconds: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS, 30)),
   maxHistoryMessages: Math.max(1, parseInteger(process.env.TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES, 12)),
@@ -834,7 +838,7 @@ async function pollTelegramAskOutboxLoop() {
           oldestSequence: Number(body?.oldest_sequence ?? 0) || 0,
           newestSequence: Number(body?.newest_sequence ?? 0) || 0,
         });
-        await delay(1000);
+        await delay(TELEGRAM_BRIDGE_ASK_OUTBOX_POLL_IDLE_MS);
         continue;
       }
       if (env.replayRetainedOutbox && !state.telegramOutboxCheckpointInitialized) {
@@ -1017,7 +1021,7 @@ async function pollTelegramAskOutboxLoop() {
     } catch (error) {
       log(`Telegram ask-with-options outbox polling error: ${error.message}`);
     }
-    await delay(1000);
+    await delay(TELEGRAM_BRIDGE_ASK_OUTBOX_POLL_IDLE_MS);
   }
 }
 
@@ -1180,7 +1184,7 @@ function openSelfEmitStream(streamGeneration) {
 async function runSelfEmitStreamLoop() {
   for (;;) {
     if (selfEmitStreamActive) {
-      await delay(1000);
+      await delay(TELEGRAM_BRIDGE_SELF_EMIT_ACTIVE_DELAY_MS);
       continue;
     }
     selfEmitStreamActive = true;
@@ -1192,7 +1196,7 @@ async function runSelfEmitStreamLoop() {
       await delay(250);
     } catch (error) {
       log(`self-emit stream error generation=${streamGeneration}: ${error.message}`);
-      await delay(1000);
+      await delay(TELEGRAM_BRIDGE_SELF_EMIT_ERROR_DELAY_MS);
     } finally {
       selfEmitStreamActive = false;
     }
@@ -1216,7 +1220,7 @@ async function watchdogLoop() {
     } catch (error) {
       log(`watchdog health check failed: ${error.message}`);
     }
-    await delay(5000);
+    await delay(TELEGRAM_BRIDGE_WATCHDOG_DELAY_MS);
   }
 }
 

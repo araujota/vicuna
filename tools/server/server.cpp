@@ -173,27 +173,24 @@ static telegram_bridge_request_context parse_telegram_bridge_request_context(con
     return context;
 }
 
-static std::string build_telegram_bridge_system_prompt() {
-    return "You are Vicuña, a helpful personal concierge replying to a Telegram user through the retained transport bridge. "
-           "Maintain continuity from the carried Telegram transcript and the current user turn. "
-           "Use the live runtime tools made available on this turn instead of claiming you lack access to external systems. "
-           "If earlier dialogue said a live system was unavailable, treat that as stale and use the tool that is available now. "
-           "Deliver user-visible Telegram replies through telegram_relay instead of plain assistant text. "
-           "For simple responses, call telegram_relay with text. "
-           "For richer Telegram-native output, send request={method,payload}, prefer sendMessage plus parse_mode and reply_markup for most rich text/button replies, "
-           "and prefer parse_mode over raw Telegram entity offsets unless you intentionally provide valid UTF-16-based entities.";
+static std::string build_telegram_bridge_system_prompt(const telegram_bridge_request_context & context) {
+    std::ostringstream out;
+    out << "You are Vicuña, a helpful personal concierge replying to a Telegram user through the retained transport bridge. "
+        << "Maintain continuity from the carried Telegram transcript and the current user turn. "
+        << "Use the live runtime tools made available on this turn instead of claiming you lack access to external systems. "
+        << "If earlier dialogue said a live system was unavailable, treat that as stale and use the tool that is available now. "
+        << "Deliver user-visible Telegram replies through telegram_relay instead of plain assistant text. "
+        << "For simple responses, call telegram_relay with text. "
+        << "For richer Telegram-native output, send request={method,payload}, prefer sendMessage plus parse_mode and reply_markup for most rich text/button replies, "
+        << "and prefer parse_mode over raw Telegram entity offsets unless you intentionally provide valid UTF-16-based entities.";
+    if (context.reply_to_message_id > 0) {
+        out << " Reply to the current user turn by default using Telegram message id "
+            << context.reply_to_message_id << " unless a different reply target is clearly required.";
+    }
+    return out.str();
 }
 
-static json build_telegram_bridge_relay_tool(const telegram_bridge_request_context & context) {
-    std::ostringstream reply_id_description;
-    if (context.reply_to_message_id > 0) {
-        reply_id_description << "Optional Telegram message id to use as the reply anchor. Use "
-                             << context.reply_to_message_id
-                             << " to reply to the current user turn.";
-    } else {
-        reply_id_description << "Optional Telegram message id to use as the reply anchor.";
-    }
-
+static json build_telegram_bridge_relay_tool() {
     return json{
         {"type", "function"},
         {"function", {
@@ -228,12 +225,12 @@ static json build_telegram_bridge_relay_tool(const telegram_bridge_request_conte
                     }},
                     {"chat_scope", {
                         {"type", "string"},
-                        {"description", "The Telegram chat scope to route the follow-up into. Use " + json(context.chat_scope).dump() + " for this turn."},
+                        {"description", "The Telegram chat scope to route the follow-up into. Leave this unset on bridge-scoped turns unless overriding the default route is necessary."},
                     }},
                     {"reply_to_message_id", {
                         {"type", "integer"},
                         {"minimum", 1},
-                        {"description", reply_id_description.str()},
+                        {"description", "Optional Telegram message id to use as the reply anchor."},
                     }},
                     {"intent", {
                         {"type", "string"},
@@ -406,9 +403,43 @@ static bool parse_runtime_tools_override(json * out_payload, std::string * out_e
     }
 }
 
+struct telegram_runtime_tool_cache_state {
+    mutable std::mutex mutex;
+    std::string cache_key;
+    json tools = json::array();
+    bool loaded_from_override = false;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+};
+
+struct staged_tool_prompt_cache_state;
+
+static telegram_runtime_tool_cache_state & telegram_runtime_tool_cache_state_instance() {
+    static telegram_runtime_tool_cache_state state;
+    return state;
+}
+
+static staged_tool_prompt_cache_state & staged_tool_prompt_cache_state_instance();
+
+static std::string build_telegram_runtime_tool_cache_key(
+        const telegram_runtime_tool_adapter_config & config,
+        bool used_override,
+        const json & payload) {
+    if (used_override) {
+        return "override:" + safe_json_to_str(payload);
+    }
+
+    std::string mtime_token = "missing";
+    try {
+        const auto mtime = std::filesystem::last_write_time(config.entry_path).time_since_epoch().count();
+        mtime_token = std::to_string(static_cast<long long>(mtime));
+    } catch (...) {
+    }
+    return "entry:" + config.node_bin + "|" + config.entry_path + "|" + mtime_token;
+}
+
 static bool load_server_owned_telegram_runtime_tools(
         const telegram_runtime_tool_adapter_config & config,
-        const telegram_bridge_request_context & context,
         json * out_tools,
         std::string * out_error) {
     if (!out_tools) {
@@ -426,6 +457,17 @@ static bool load_server_owned_telegram_runtime_tools(
             *out_error = command_error;
         }
         return false;
+    }
+
+    const std::string cache_key = build_telegram_runtime_tool_cache_key(config, used_override, payload);
+    auto & cache_state = telegram_runtime_tool_cache_state_instance();
+    {
+        std::lock_guard<std::mutex> lock(cache_state.mutex);
+        if (!cache_state.cache_key.empty() && cache_state.cache_key == cache_key) {
+            ++cache_state.hits;
+            *out_tools = cache_state.tools;
+            return true;
+        }
     }
 
     if (!used_override) {
@@ -452,9 +494,30 @@ static bool load_server_owned_telegram_runtime_tools(
     }
 
     json final_tools = tools;
-    final_tools.push_back(build_telegram_bridge_relay_tool(context));
+    final_tools.push_back(build_telegram_bridge_relay_tool());
+
+    {
+        std::lock_guard<std::mutex> lock(cache_state.mutex);
+        cache_state.cache_key = cache_key;
+        cache_state.tools = final_tools;
+        cache_state.loaded_from_override = used_override;
+        ++cache_state.misses;
+    }
+
     *out_tools = std::move(final_tools);
     return true;
+}
+
+static json telegram_runtime_tool_cache_health_json() {
+    const auto & cache_state = telegram_runtime_tool_cache_state_instance();
+    std::lock_guard<std::mutex> lock(cache_state.mutex);
+    return {
+        {"cached", !cache_state.cache_key.empty()},
+        {"hits", cache_state.hits},
+        {"misses", cache_state.misses},
+        {"loaded_from_override", cache_state.loaded_from_override},
+        {"tool_count", cache_state.tools.is_array() ? static_cast<int64_t>(cache_state.tools.size()) : 0},
+    };
 }
 
 static bool lookup_runtime_tool_observation_override(
@@ -579,7 +642,7 @@ static json build_server_owned_bridge_request_body(
     json messages = json::array();
     messages.push_back({
         {"role", "system"},
-        {"content", build_telegram_bridge_system_prompt()},
+        {"content", build_telegram_bridge_system_prompt(context)},
     });
     for (const auto & item : body.at("messages")) {
         messages.push_back(item);
@@ -588,7 +651,6 @@ static json build_server_owned_bridge_request_body(
     augmented["tools"] = runtime_tools;
     augmented["tool_choice"] = "auto";
     augmented["parallel_tool_calls"] = false;
-    (void) context;
     return augmented;
 }
 
@@ -727,6 +789,26 @@ struct staged_tool_family {
 struct staged_tool_catalog {
     std::vector<staged_tool_family> families;
 };
+
+struct staged_tool_prompt_bundle {
+    staged_tool_catalog catalog;
+    std::string family_selection_prompt;
+    std::map<std::string, std::string> method_selection_prompts;
+    std::map<std::string, std::map<std::string, std::string>> payload_prompts;
+};
+
+struct staged_tool_prompt_cache_state {
+    mutable std::mutex mutex;
+    std::string cache_key;
+    std::shared_ptr<const staged_tool_prompt_bundle> bundle;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+};
+
+static staged_tool_prompt_cache_state & staged_tool_prompt_cache_state_instance() {
+    static staged_tool_prompt_cache_state state;
+    return state;
+}
 
 struct staged_tool_method_choice {
     staged_tool_method_choice_kind kind = STAGED_TOOL_METHOD_CHOOSE_METHOD;
@@ -1061,6 +1143,57 @@ static std::string build_staged_payload_prompt(
     append_staged_contract_lines(out, "payload", method.parameters);
     out << "Return JSON only.\n";
     return out.str();
+}
+
+static staged_tool_prompt_bundle build_staged_tool_prompt_bundle(const json & tools) {
+    staged_tool_prompt_bundle bundle = {};
+    bundle.catalog = build_staged_tool_catalog_from_request(tools);
+    if (bundle.catalog.families.empty()) {
+        return bundle;
+    }
+
+    bundle.family_selection_prompt = build_staged_family_selection_prompt(bundle.catalog);
+    for (const auto & family : bundle.catalog.families) {
+        bundle.method_selection_prompts[family.family_name] =
+                build_staged_method_selection_prompt(family, true);
+        auto & payload_by_method = bundle.payload_prompts[family.family_name];
+        for (const auto & method : family.methods) {
+            payload_by_method[method.method_name] = build_staged_payload_prompt(family, method);
+        }
+    }
+    return bundle;
+}
+
+static std::shared_ptr<const staged_tool_prompt_bundle> get_cached_staged_tool_prompt_bundle(const json & tools) {
+    auto & cache_state = staged_tool_prompt_cache_state_instance();
+    const std::string cache_key = safe_json_to_str(tools);
+    {
+        std::lock_guard<std::mutex> lock(cache_state.mutex);
+        if (cache_state.bundle && cache_state.cache_key == cache_key) {
+            ++cache_state.hits;
+            return cache_state.bundle;
+        }
+    }
+
+    auto bundle = std::make_shared<staged_tool_prompt_bundle>(build_staged_tool_prompt_bundle(tools));
+    {
+        std::lock_guard<std::mutex> lock(cache_state.mutex);
+        cache_state.cache_key = cache_key;
+        cache_state.bundle = bundle;
+        ++cache_state.misses;
+    }
+    return bundle;
+}
+
+static json staged_tool_prompt_cache_health_json() {
+    const auto & cache_state = staged_tool_prompt_cache_state_instance();
+    std::lock_guard<std::mutex> lock(cache_state.mutex);
+    return {
+        {"cached", cache_state.bundle != nullptr},
+        {"hits", cache_state.hits},
+        {"misses", cache_state.misses},
+        {"family_count", cache_state.bundle ? static_cast<int64_t>(cache_state.bundle->catalog.families.size()) : 0},
+    };
 }
 
 static json build_staged_messages(
@@ -1419,8 +1552,8 @@ static bool execute_deepseek_chat_with_staged_tools(
     }
     *out_result = deepseek_chat_result();
 
-    const staged_tool_catalog catalog = build_staged_tool_catalog_from_request(body.at("tools"));
-    if (catalog.families.empty()) {
+    const auto prompt_bundle = get_cached_staged_tool_prompt_bundle(body.at("tools"));
+    if (!prompt_bundle || prompt_bundle->catalog.families.empty()) {
         return execute_deepseek_chat_with_emotive(
                 config,
                 emotive_runtime,
@@ -1434,6 +1567,7 @@ static bool execute_deepseek_chat_with_staged_tools(
                 suppress_replay_admission,
                 mode_label);
     }
+    const staged_tool_catalog & catalog = prompt_bundle->catalog;
 
     const int max_stage_turns = 24;
     const int max_stage_json_attempts = 2;
@@ -1450,7 +1584,7 @@ static bool execute_deepseek_chat_with_staged_tools(
                         emotive_runtime,
                         body,
                         build_staged_retry_prompt(
-                                build_staged_family_selection_prompt(catalog),
+                                prompt_bundle->family_selection_prompt,
                                 family_validation_error),
                         &family_result,
                         out_error,
@@ -1492,7 +1626,7 @@ static bool execute_deepseek_chat_with_staged_tools(
                             emotive_runtime,
                             body,
                             build_staged_retry_prompt(
-                                    build_staged_method_selection_prompt(*family, true),
+                                    prompt_bundle->method_selection_prompts.at(family->family_name),
                                     method_validation_error),
                             &method_result,
                             out_error,
@@ -1545,7 +1679,9 @@ static bool execute_deepseek_chat_with_staged_tools(
                             config,
                             emotive_runtime,
                             body,
-                            build_staged_payload_prompt(*family, *method, payload_validation_error),
+                            payload_validation_error.empty() ?
+                                    prompt_bundle->payload_prompts.at(family->family_name).at(method->method_name) :
+                                    build_staged_payload_prompt(*family, *method, payload_validation_error),
                             &payload_result,
                             out_error,
                             suppress_replay_admission,
@@ -3554,7 +3690,7 @@ static bool execute_bridge_scoped_telegram_request(
     const telegram_runtime_tool_adapter_config adapter_config = telegram_runtime_tool_adapter_config_from_env();
     json runtime_tools;
     std::string tool_error;
-    if (!load_server_owned_telegram_runtime_tools(adapter_config, context, &runtime_tools, &tool_error)) {
+    if (!load_server_owned_telegram_runtime_tools(adapter_config, &runtime_tools, &tool_error)) {
         if (out_error) {
             *out_error = format_error_response(tool_error, ERROR_TYPE_SERVER);
         }
@@ -4358,6 +4494,10 @@ int main(int argc, char ** argv) {
             {"live_stream_connected", bridge_state.live_stream_connected.load()},
         };
         payload["telegram_outbox"] = telegram_outbox_health_json(telegram_outbox);
+        payload["bridge_runtime"] = {
+            {"telegram_runtime_tool_cache", telegram_runtime_tool_cache_health_json()},
+            {"staged_prompt_cache", staged_tool_prompt_cache_health_json()},
+        };
         payload["emotive_runtime"] = emotive_runtime.health_json();
         payload["emotive_runtime"]["cognitive_replay"]["worker"] =
                 cognitive_replay_worker_json(replay_worker_state, request_activity);

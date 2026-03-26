@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <ctime>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 
 static std::string trim_ascii_copy_local(const std::string & value) {
@@ -177,6 +179,68 @@ static json deepseek_build_provider_messages(const json & body) {
 }
 
 static constexpr int64_t VICUNA_OUTBOUND_MAX_TOKENS = 1024;
+static constexpr double VICUNA_OUTBOUND_TEMPERATURE = 0.2;
+
+struct deepseek_shared_client_state {
+    std::mutex mutex;
+    std::string url;
+    server_http_url parts;
+    std::unique_ptr<httplib::Client> client;
+    int64_t client_builds = 0;
+    int64_t request_count = 0;
+    int64_t reused_request_count = 0;
+};
+
+static deepseek_shared_client_state & deepseek_shared_client_state_instance() {
+    static deepseek_shared_client_state state;
+    return state;
+}
+
+static bool deepseek_prepare_shared_client_locked(
+        deepseek_shared_client_state & state,
+        const deepseek_runtime_config & config,
+        std::string * out_url,
+        server_http_url * out_parts) {
+    const std::string url = deepseek_chat_completions_url(config);
+    const bool reuse_existing = state.client && state.url == url;
+    if (!reuse_existing) {
+        auto [client, parts] = server_http_client(url);
+        auto shared_client = std::make_unique<httplib::Client>(std::move(client));
+        shared_client->set_keep_alive(true);
+        state.client = std::move(shared_client);
+        state.parts = std::move(parts);
+        state.url = url;
+        ++state.client_builds;
+    } else {
+        ++state.reused_request_count;
+    }
+
+    if (state.client) {
+        state.client->set_connection_timeout(std::chrono::milliseconds(config.timeout_ms));
+        state.client->set_read_timeout(std::chrono::milliseconds(config.timeout_ms));
+        state.client->set_write_timeout(std::chrono::milliseconds(config.timeout_ms));
+    }
+
+    if (out_url) {
+        *out_url = state.url;
+    }
+    if (out_parts) {
+        *out_parts = state.parts;
+    }
+    return true;
+}
+
+static json deepseek_transport_health_json() {
+    auto & state = deepseek_shared_client_state_instance();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return {
+        {"shared_client_cached", state.client != nullptr},
+        {"client_builds", state.client_builds},
+        {"request_count", state.request_count},
+        {"reused_request_count", state.reused_request_count},
+        {"base_url", state.url.empty() ? json(nullptr) : json(server_http_show_masked_url(state.parts))},
+    };
+}
 
 static json deepseek_build_provider_body(const deepseek_runtime_config & config, const json & body) {
     json provider_body = {
@@ -184,11 +248,8 @@ static json deepseek_build_provider_body(const deepseek_runtime_config & config,
         {"messages", deepseek_build_provider_messages(body)},
         {"stream", true},
         {"max_tokens", VICUNA_OUTBOUND_MAX_TOKENS},
+        {"temperature", VICUNA_OUTBOUND_TEMPERATURE},
     };
-
-    if (body.contains("temperature")) {
-        provider_body["temperature"] = body.at("temperature");
-    }
     if (body.contains("top_p")) {
         provider_body["top_p"] = body.at("top_p");
     }
@@ -215,6 +276,10 @@ static json deepseek_build_provider_body(const deepseek_runtime_config & config,
     }
     if (body.contains("thinking")) {
         provider_body["thinking"] = body.at("thinking");
+    } else if (config.default_thinking_enabled) {
+        provider_body["thinking"] = {
+            {"type", "enabled"},
+        };
     }
 
     return provider_body;
@@ -574,11 +639,11 @@ bool deepseek_complete_chat(
     }
 
     try {
-        const std::string url = deepseek_chat_completions_url(config);
-        auto [client, parts] = server_http_client(url);
-        client.set_connection_timeout(std::chrono::milliseconds(config.timeout_ms));
-        client.set_read_timeout(std::chrono::milliseconds(config.timeout_ms));
-        client.set_write_timeout(std::chrono::milliseconds(config.timeout_ms));
+        auto & shared_client_state = deepseek_shared_client_state_instance();
+        std::unique_lock<std::mutex> client_lock(shared_client_state.mutex);
+        server_http_url parts;
+        deepseek_prepare_shared_client_locked(shared_client_state, config, nullptr, &parts);
+        ++shared_client_state.request_count;
 
         httplib::Headers headers = {
             {"Authorization", "Bearer " + config.api_key},
@@ -601,7 +666,7 @@ bool deepseek_complete_chat(
             return ok;
         };
 
-        auto response = client.Post(
+        auto response = shared_client_state.client->Post(
                 parts.path.c_str(),
                 headers,
                 provider_body.dump(),
@@ -743,6 +808,7 @@ json deepseek_build_health_json(const deepseek_runtime_config & config) {
             {"name", "deepseek"},
             {"model", config.model},
             {"base_url", server_http_show_masked_url(server_http_parse_url(deepseek_chat_completions_url(config)))},
+            {"transport", deepseek_transport_health_json()},
         }},
     };
 }

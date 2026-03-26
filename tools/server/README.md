@@ -16,13 +16,22 @@ When a request resumes an active DeepSeek tool loop, the server now:
 - injects at most one brief critical-guidance heuristic when the current trace matches a stored bad path
 - keeps the original tool payload unchanged
 
-If you send a provider-native `thinking` object, the server forwards it
-unchanged to DeepSeek.
+By default the server targets `deepseek-chat` and injects
+`thinking: {"type":"enabled"}` on outbound DeepSeek requests. If you send a
+provider-native `thinking` object, the server forwards it unchanged instead of
+rewriting it.
 
 All outbound DeepSeek turns, including staged family/method/payload turns and
 background/internal provider passes, are capped at `max_tokens: 1024`. The
 server enforces that ceiling even if the caller supplies a different output
 token field, and it does so without disabling reasoning traces.
+Every outbound DeepSeek turn also uses `temperature: 0.2`. The runtime stamps
+that value onto direct, staged, bridge-scoped, and background turns instead of
+leaving temperature implicit or caller-controlled.
+
+The DeepSeek adapter reuses one persistent configured HTTP client per provider
+authority instead of rebuilding transport state on every turn. Inspect the
+live transport counters at `/health -> provider -> transport`.
 
 ## Staged tool loop
 
@@ -49,6 +58,11 @@ Telegram requests. For those requests the server loads the installed runtime
 tool catalog itself, prepends Telegram-specific system guidance, injects
 `telegram_relay`, executes any selected runtime tools internally, and
 continues the staged loop until it can queue final Telegram delivery.
+
+For retained bridge-scoped Telegram turns, the server also caches the loaded
+runtime tool catalog plus the derived staged family/method/payload prompt
+bundle in memory. Inspect those bounded cache counters at
+`/health -> bridge_runtime`.
 
 Bridge-scoped Telegram turns are the one built-in exception: when a request
 arrives with Telegram bridge headers and resolves to `telegram_relay`, the
@@ -181,7 +195,7 @@ cmake --build build --target llama-server -j8
 
 ```bash
 export VICUNA_DEEPSEEK_API_KEY="your-key"
-export VICUNA_DEEPSEEK_MODEL="deepseek-reasoner"
+export VICUNA_DEEPSEEK_MODEL="deepseek-chat"
 export VICUNA_DEEPSEEK_BASE_URL="https://api.deepseek.com"
 export VICUNA_EMOTIVE_EMBED_MODEL="/absolute/path/to/Qwen3-Embedding-0.6B-Q8_0.gguf"
 export VICUNA_EMOTIVE_EMBED_POOLING="last"

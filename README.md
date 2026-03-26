@@ -26,7 +26,7 @@ cmake --build build --target llama-server -j8
 
 ```bash
 export VICUNA_DEEPSEEK_API_KEY="your-key"
-export VICUNA_DEEPSEEK_MODEL="deepseek-reasoner"
+export VICUNA_DEEPSEEK_MODEL="deepseek-chat"
 export VICUNA_DEEPSEEK_BASE_URL="https://api.deepseek.com"
 
 ./build/bin/llama-server --host 127.0.0.1 --port 8080 --api-surface openai --no-webui

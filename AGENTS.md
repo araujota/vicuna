@@ -49,6 +49,10 @@ Work should remove or avoid reintroducing:
 - hard-memory-backed ongoing-task registry read over HTTP plus existing in-memory worker state and emotive trace history (118-idle-ongoing-tasks)
 - C++17 native server/runtime code plus Python provider integration tests + existing `nlohmann::json`, current provider request assembly, current emotive runtime, existing tool catalog metadata in `tools/openclaw-harness` (119-staged-tool-loop)
 - existing in-memory request/controller state plus existing hard-memory/replay persistence (119-staged-tool-loop)
+- C++17 and Python 3 + `tools/server/server.cpp`, `tools/server/server-deepseek.cpp`, provider test harness in `tools/server/tests/unit/test_deepseek_provider.py` (121-reasoning-token-cap)
+- C++17, JavaScript ESM on Node 20+, and TypeScript for OpenClaw harness utilities + `tools/telegram-bridge/index.mjs`, `tools/telegram-bridge/lib.mjs`, `tools/openclaw-harness/src/*.ts`, `tools/server/server.cpp`, Node child-process execution, existing OpenClaw wrapper binaries under `tools/openclaw-harness/bin/` (122-tool-catalog-execution)
+- file-backed OpenClaw secrets/runtime catalog under `.cache/vicuna`, bridge state JSON under `/var/lib/vicuna`, and existing hard-memory-backed wrapper backends (122-tool-catalog-execution)
+- C++17 for runtime code, Python 3 for unit tests, shell for ops scripts + `httplib`, `nlohmann::json`, pytest provider harness (124-deepseek-v32-thinking)
 
 ## Recent Changes
 - 114-tool-vad-interleaving: Added C++17 native server/runtime code plus existing Python provider integration tests + existing `cpp-httplib` client/server stack, `nlohmann::json`, existing server-local emotive runtime and VAD projector

@@ -46,6 +46,10 @@ import {
   shouldBootstrapTelegramOutboxOffset,
   splitSseBuffer,
   summarizeChatCompletion,
+  TELEGRAM_BRIDGE_ASK_OUTBOX_POLL_IDLE_MS,
+  TELEGRAM_BRIDGE_SELF_EMIT_ACTIVE_DELAY_MS,
+  TELEGRAM_BRIDGE_SELF_EMIT_ERROR_DELAY_MS,
+  TELEGRAM_BRIDGE_WATCHDOG_DELAY_MS,
   updateTelegramOffset,
 } from './lib.mjs';
 
@@ -203,6 +207,13 @@ test('buildTelegramChatCompletionRequest forwards only the carried transcript an
     max_tokens: 1024,
   });
   assert.equal('tools' in payload, false);
+});
+
+test('bridge polling constants are tightened for lower tail latency', () => {
+  assert.equal(TELEGRAM_BRIDGE_ASK_OUTBOX_POLL_IDLE_MS, 200);
+  assert.equal(TELEGRAM_BRIDGE_SELF_EMIT_ACTIVE_DELAY_MS, 250);
+  assert.equal(TELEGRAM_BRIDGE_SELF_EMIT_ERROR_DELAY_MS, 250);
+  assert.equal(TELEGRAM_BRIDGE_WATCHDOG_DELAY_MS, 1000);
 });
 
 test('summarizeChatCompletion reports non-text completion shape', () => {
