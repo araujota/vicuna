@@ -581,5 +581,5 @@ export async function runHardMemoryCli(argv: string[]): Promise<void> {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  void runHardMemoryCli(process.argv.slice(2));
+  await runHardMemoryCli(process.argv.slice(2));
 }

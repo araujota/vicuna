@@ -233,5 +233,5 @@ export async function runSkillsCli(argv: string[]): Promise<void> {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  void runSkillsCli(process.argv.slice(2));
+  await runSkillsCli(process.argv.slice(2));
 }

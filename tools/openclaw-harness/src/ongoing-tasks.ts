@@ -847,5 +847,5 @@ export async function runOngoingTasksCli(argv: string[], clock: Clock = () => ne
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  void runOngoingTasksCli(process.argv.slice(2));
+  await runOngoingTasksCli(process.argv.slice(2));
 }
