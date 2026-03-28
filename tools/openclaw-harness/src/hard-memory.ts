@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 
 import { defaultPaths, loadToolSecrets } from "./config.js";
+import { isCliEntrypoint } from "./cli-entrypoint.js";
 
 export type HardMemoryInvocation = {
   query?: unknown;
@@ -580,6 +581,6 @@ export async function runHardMemoryCli(argv: string[]): Promise<void> {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isCliEntrypoint(import.meta.url, process.argv[1])) {
   await runHardMemoryCli(process.argv.slice(2));
 }

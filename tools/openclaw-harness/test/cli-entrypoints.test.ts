@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
 
+import { isCliEntrypoint } from "../src/cli-entrypoint.js";
+
 function packageRoot(): string {
   return path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 }
@@ -104,6 +106,22 @@ test("CLI entrypoints write stdout when executed as standalone scripts", () => {
     const ongoingResponse = JSON.parse(ongoingStdout);
     assert.equal(ongoingResponse.ok, true);
     assert.equal(ongoingResponse.installed, true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CLI entrypoint detection accepts symlinked invocation paths", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vicuna-cli-symlink-"));
+  const realDir = path.join(tempDir, "real");
+  const realScript = path.join(realDir, "hard-memory.ts");
+  const symlinkDir = path.join(tempDir, "symlinked");
+  const symlinkScript = path.join(symlinkDir, "hard-memory.ts");
+  fs.mkdirSync(realDir, { recursive: true });
+  fs.writeFileSync(realScript, "// test fixture\n", "utf8");
+  fs.symlinkSync(realDir, symlinkDir, "dir");
+  try {
+    assert.equal(isCliEntrypoint(new URL(`file://${realScript}`).href, symlinkScript), true);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

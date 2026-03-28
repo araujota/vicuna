@@ -6,6 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { defaultOngoingTasksDir, defaultRepoRoot, loadToolSecrets } from "./config.js";
+import { isCliEntrypoint } from "./cli-entrypoint.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -846,6 +847,6 @@ export async function runOngoingTasksCli(argv: string[], clock: Clock = () => ne
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isCliEntrypoint(import.meta.url, process.argv[1])) {
   await runOngoingTasksCli(process.argv.slice(2));
 }

@@ -3,6 +3,7 @@ import path from "node:path";
 import { Buffer } from "node:buffer";
 
 import { defaultPaths, loadToolSecrets } from "./config.js";
+import { isCliEntrypoint } from "./cli-entrypoint.js";
 
 export type SkillsInvocation = {
   action?: unknown;
@@ -232,6 +233,6 @@ export async function runSkillsCli(argv: string[]): Promise<void> {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isCliEntrypoint(import.meta.url, process.argv[1])) {
   await runSkillsCli(process.argv.slice(2));
 }
