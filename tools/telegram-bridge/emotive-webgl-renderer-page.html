@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Vicuña Emotive WebGL Renderer</title>
+    <style>
+      html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #000;
+      }
+
+      body {
+        font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      }
+
+      #capture-root {
+        position: relative;
+        width: 720px;
+        height: 720px;
+        background: #000;
+        overflow: hidden;
+      }
+
+      #scene {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+
+      #labels {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+      }
+
+      .label {
+        position: absolute;
+        color: rgba(255, 255, 255, 0.98);
+        background: rgba(0, 0, 0, 0.84);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 6px;
+        padding: 4px 8px;
+        font-size: 14px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+        line-height: 1.1;
+        white-space: nowrap;
+        transform: translate(-50%, -50%);
+      }
+
+      .label-line {
+        position: absolute;
+        height: 1px;
+        background: rgba(255, 255, 255, 0.46);
+        transform-origin: 0 50%;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "__THREE_MODULE_URL__",
+          "three/addons/": "__THREE_ADDONS_BASE_URL__"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="capture-root">
+      <canvas id="scene"></canvas>
+      <div id="labels"></div>
+    </div>
+    <script type="module">
+      import * as THREE from 'three';
+      import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+      import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+      import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+      import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+      import {
+        ANCHOR_BASE_RADIUS,
+        ANCHOR_MIN_RADIUS,
+        ANCHOR_MAX_RADIUS,
+        BACKGROUND_COLOR,
+        buildFrameGeometry,
+        buildOuterHullTopology,
+        clamp01,
+        computeBundleRadiusNormalizationRange,
+        coerceNormalizedBundle,
+        projectPoint,
+        supportedAnchorRadiusForMagnitude,
+      } from '__SCENE_MODULE_URL__';
+
+      const captureRoot = document.getElementById('capture-root');
+      const canvas = document.getElementById('scene');
+      const labelsRoot = document.getElementById('labels');
+
+      const renderer = new THREE.WebGLRenderer({
+        canvas,
+        antialias: true,
+        alpha: false,
+        preserveDrawingBuffer: true,
+        powerPreference: 'high-performance',
+      });
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 0.70;
+      renderer.setPixelRatio(1);
+      renderer.setClearColor(new THREE.Color(BACKGROUND_COLOR), 1);
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(BACKGROUND_COLOR);
+
+      const camera = new THREE.PerspectiveCamera(32, 1, 0.1, 100);
+      camera.position.set(0, 0, 6.1);
+      camera.lookAt(0, 0, 0);
+      const composer = new EffectComposer(renderer);
+      const renderPass = new RenderPass(scene, camera);
+      const bloomPass = new UnrealBloomPass(new THREE.Vector2(720, 720), 0.08, 0.48, 0.52);
+      const outputPass = new OutputPass();
+      composer.addPass(renderPass);
+      composer.addPass(bloomPass);
+      composer.addPass(outputPass);
+
+      let mesh = null;
+      let topology = null;
+      let bundle = null;
+      let bundleRadiusRange = { minRadius: ANCHOR_MIN_RADIUS, maxRadius: ANCHOR_MAX_RADIUS };
+      let labelNodes = [];
+
+      const membraneMaterial = new THREE.ShaderMaterial({
+        side: THREE.FrontSide,
+        transparent: false,
+        uniforms: {
+          uRadiusRange: { value: new THREE.Vector2(0.72, 1.53) },
+          uBandDensity: { value: 4.2 },
+          uBandStrength: { value: 0.09 },
+          uRimStrength: { value: 0.12 },
+          uSaturationBoost: { value: 2.3 },
+        },
+        vertexShader: `
+          varying vec3 vWorldPosition;
+          varying vec3 vWorldNormal;
+          varying float vRadius;
+
+          void main() {
+            vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+            vWorldPosition = worldPosition.xyz;
+            vWorldNormal = normalize(mat3(modelMatrix) * normal);
+            vRadius = length(position);
+            gl_Position = projectionMatrix * viewMatrix * worldPosition;
+          }
+        `,
+        fragmentShader: `
+          uniform vec2 uRadiusRange;
+          uniform float uBandDensity;
+          uniform float uBandStrength;
+          uniform float uRimStrength;
+          uniform float uSaturationBoost;
+
+          varying vec3 vWorldPosition;
+          varying vec3 vWorldNormal;
+          varying float vRadius;
+
+          float saturate(float value) {
+            return clamp(value, 0.0, 1.0);
+          }
+
+          vec3 heatColor(float alpha) {
+            vec3 c0 = vec3(0.82, 0.00, 1.00);
+            vec3 c1 = vec3(0.00, 0.12, 1.00);
+            vec3 c2 = vec3(0.00, 1.00, 0.38);
+            vec3 c3 = vec3(1.00, 0.98, 0.00);
+            vec3 c4 = vec3(1.00, 0.34, 0.00);
+            vec3 c5 = vec3(1.00, 0.00, 0.00);
+            float t = saturate(alpha);
+            if (t < 0.20) return mix(c0, c1, t / 0.20);
+            if (t < 0.40) return mix(c1, c2, (t - 0.20) / 0.20);
+            if (t < 0.60) return mix(c2, c3, (t - 0.40) / 0.20);
+            if (t < 0.80) return mix(c3, c4, (t - 0.60) / 0.20);
+            return mix(c4, c5, (t - 0.80) / 0.20);
+          }
+
+          vec3 applySaturation(vec3 color, float amount) {
+            float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+            return clamp(mix(vec3(luma), color, amount), 0.0, 1.0);
+          }
+
+          void main() {
+            float radiusSpan = max(0.0001, uRadiusRange.y - uRadiusRange.x);
+            float radiusAlpha = saturate((vRadius - uRadiusRange.x) / radiusSpan);
+            vec3 baseColor = applySaturation(heatColor(radiusAlpha), uSaturationBoost);
+
+            float contourPhase = fract(radiusAlpha * uBandDensity);
+            float contour = smoothstep(0.80, 1.0, abs(contourPhase - 0.5) * 2.0);
+            vec3 contourColor = clamp(baseColor * (1.0 + contour * uBandStrength), 0.0, 1.0);
+
+            vec3 viewDir = normalize(cameraPosition - vWorldPosition);
+            float fresnel = pow(1.0 - saturate(dot(normalize(vWorldNormal), viewDir)), 2.5);
+            vec3 rimColor = mix(vec3(0.90, 0.24, 1.0), vec3(1.0, 0.88, 0.06), radiusAlpha);
+
+            vec3 color = (contourColor * 0.94) + (rimColor * fresnel * uRimStrength);
+            gl_FragColor = vec4(color, 1.0);
+          }
+        `,
+      });
+
+      function setViewport(width, height) {
+        captureRoot.style.width = `${width}px`;
+        captureRoot.style.height = `${height}px`;
+        canvas.width = width;
+        canvas.height = height;
+        renderer.setSize(width, height, false);
+        composer.setSize(width, height);
+        bloomPass.setSize(width, height);
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
+      }
+
+      function clearLabels() {
+        labelNodes.forEach((node) => {
+          node.label.remove();
+          node.line.remove();
+        });
+        labelNodes = [];
+      }
+
+      function createLabels(nextBundle) {
+        clearLabels();
+        labelNodes = nextBundle.dimensions.map((dimension, anchorIndex) => {
+          const label = document.createElement('div');
+          label.className = 'label';
+          label.textContent = dimension.label;
+          const line = document.createElement('div');
+          line.className = 'label-line';
+          labelsRoot.append(label, line);
+          return { dimension, anchorIndex, label, line };
+        });
+      }
+
+      function ensureMesh(nextBundle) {
+        if (mesh) {
+          scene.remove(mesh);
+          mesh.geometry.dispose();
+        }
+        topology = buildOuterHullTopology(nextBundle);
+        mesh = new THREE.Mesh(topology.geometry, membraneMaterial);
+        mesh.frustumCulled = false;
+        scene.add(mesh);
+      }
+
+      function readGpuInfoFromContext(gl) {
+        if (!gl) {
+          return null;
+        }
+        const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+        const vendor = debugInfo
+          ? gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL)
+          : gl.getParameter(gl.VENDOR);
+        const rendererName = debugInfo
+          ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)
+          : gl.getParameter(gl.RENDERER);
+        const version = gl.getParameter(gl.VERSION);
+        return {
+          vendor: String(vendor ?? '').trim(),
+          renderer: String(rendererName ?? '').trim(),
+          version: String(version ?? '').trim(),
+        };
+      }
+
+      function isUsableGpuInfo(info) {
+        if (!info) {
+          return false;
+        }
+        return info.vendor.length > 0 || info.renderer.length > 0;
+      }
+
+      function getGpuInfo() {
+        let info = readGpuInfoFromContext(renderer.getContext());
+        if (!isUsableGpuInfo(info)) {
+          const probeCanvas = document.createElement('canvas');
+          const probeContext =
+            probeCanvas.getContext('webgl2', {
+              antialias: false,
+              alpha: false,
+              powerPreference: 'high-performance',
+            }) ||
+            probeCanvas.getContext('webgl', {
+              antialias: false,
+              alpha: false,
+              powerPreference: 'high-performance',
+            });
+          info = readGpuInfoFromContext(probeContext) ?? info;
+          const loseContext = probeContext?.getExtension?.('WEBGL_lose_context');
+          loseContext?.loseContext?.();
+        }
+        const vendor = info?.vendor ?? '';
+        const rendererName = info?.renderer ?? '';
+        const software = /swiftshader|llvmpipe|software|mesa offscreen/i.test(`${vendor} ${rendererName}`);
+        return {
+          vendor,
+          renderer: rendererName,
+          version: info?.version ?? '',
+          software,
+        };
+      }
+
+      function findPeakPointForAnchor(worldVertices, nextTopology, anchorIndex) {
+        const startIndex = nextTopology.anchorVertexIndices.get(anchorIndex);
+        if (startIndex === undefined) {
+          return null;
+        }
+
+        let bestIndex = startIndex;
+        let bestRadius = worldVertices[startIndex]?.length() ?? 0;
+        const visited = new Set([startIndex]);
+        let frontier = [startIndex];
+
+        for (let depth = 0; depth < 3; depth += 1) {
+          const nextFrontier = [];
+          for (const vertexIndex of frontier) {
+            const neighbors = nextTopology.adjacency[vertexIndex] ?? [];
+            for (const neighborIndex of neighbors) {
+              if (visited.has(neighborIndex)) {
+                continue;
+              }
+              visited.add(neighborIndex);
+              nextFrontier.push(neighborIndex);
+              const radius = worldVertices[neighborIndex]?.length() ?? 0;
+              if (radius > bestRadius) {
+                bestRadius = radius;
+                bestIndex = neighborIndex;
+              }
+            }
+          }
+          frontier = nextFrontier;
+          if (frontier.length === 0) {
+            break;
+          }
+        }
+
+        return worldVertices[bestIndex]?.clone() ?? null;
+      }
+
+      function prepare(rawBundle) {
+        const nextBundle = coerceNormalizedBundle(rawBundle);
+        if (!nextBundle) {
+          throw new Error('emotive animation bundle was invalid');
+        }
+        bundle = nextBundle;
+        setViewport(bundle.viewportWidth, bundle.viewportHeight);
+        ensureMesh(bundle);
+        bundleRadiusRange = computeBundleRadiusNormalizationRange(bundle, topology) ?? bundleRadiusRange;
+        membraneMaterial.uniforms.uRadiusRange.value.set(bundleRadiusRange.minRadius, bundleRadiusRange.maxRadius);
+        createLabels(bundle);
+        return {
+          traceId: bundle.traceId,
+          keyframeCount: bundle.distinctKeyframeCount,
+          rawKeyframeCount: bundle.rawKeyframeCount,
+          totalFrames: bundle.totalFrames,
+          durationSeconds: bundle.durationSeconds,
+          fps: bundle.fps,
+        };
+      }
+
+      function renderFrame(frameIndex) {
+        if (!bundle || !topology || !mesh) {
+          throw new Error('renderer is not prepared');
+        }
+
+        const { frameState, rotation, worldVertices } = buildFrameGeometry(bundle, topology, frameIndex);
+        membraneMaterial.uniforms.uRadiusRange.value.set(bundleRadiusRange.minRadius, bundleRadiusRange.maxRadius);
+
+        composer.render();
+
+        for (const node of labelNodes) {
+          const magnitude = frameState.magnitudes[node.dimension.id] ?? 0;
+          const peakPoint = findPeakPointForAnchor(worldVertices, topology, node.anchorIndex);
+          const point = peakPoint
+            ? peakPoint
+            : node.dimension.direction
+              .clone()
+              .multiplyScalar(supportedAnchorRadiusForMagnitude(magnitude))
+              .applyMatrix4(rotation);
+          if (point.lengthSq() > 1e-9) {
+            point.add(point.clone().normalize().multiplyScalar(0.08));
+          }
+          const viewPoint = point.clone().applyMatrix4(camera.matrixWorldInverse);
+          const projected = projectPoint(point, camera, bundle.viewportWidth, bundle.viewportHeight);
+          const side = projected.x >= bundle.viewportWidth / 2 ? 1 : -1;
+          const labelOffset = 16;
+          const labelPaddingX = 84;
+          const labelPaddingY = 30;
+          const textX = clamp01((projected.x + (side * labelOffset)) / bundle.viewportWidth) * bundle.viewportWidth;
+          const textY = clamp01((projected.y - 12) / bundle.viewportHeight) * bundle.viewportHeight;
+          const clampedTextX = Math.max(labelPaddingX, Math.min(bundle.viewportWidth - labelPaddingX, textX));
+          const clampedTextY = Math.max(labelPaddingY, Math.min(bundle.viewportHeight - labelPaddingY, textY));
+          const alpha = Math.max(0.28, Math.min(1, 1.18 - Math.max(0, viewPoint.z + 1.8) * 0.18));
+          const lineLength = Math.max(6, Math.abs(clampedTextX - projected.x) - 4);
+          const angle = Math.atan2(clampedTextY - projected.y, clampedTextX - projected.x);
+
+          node.label.style.left = `${clampedTextX}px`;
+          node.label.style.top = `${clampedTextY}px`;
+          node.label.style.textAlign = side > 0 ? 'left' : 'right';
+          node.label.style.opacity = `${alpha}`;
+
+          node.line.style.left = `${projected.x}px`;
+          node.line.style.top = `${projected.y}px`;
+          node.line.style.width = `${lineLength}px`;
+          node.line.style.opacity = `${alpha}`;
+          node.line.style.transform = `rotate(${angle}rad)`;
+        }
+
+        return {
+          t: frameState.t,
+          scene: {
+            background: BACKGROUND_COLOR,
+            anchorCount: topology.anchorCount,
+            vertexCount: topology.vertexCount,
+            triangleCount: topology.triangleCount,
+          },
+          gpu: getGpuInfo(),
+        };
+      }
+
+      window.vicunaWebglRenderer = {
+        ping() {
+          return {
+            ready: true,
+            gpu: getGpuInfo(),
+          };
+        },
+        prepare,
+        renderFrame,
+      };
+    </script>
+  </body>
+</html>

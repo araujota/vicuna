@@ -80,9 +80,25 @@ surfaces always carry `temperature: 0.2`
 
 - [x] T012 [US4] Make the DeepSeek adapter emit `temperature: 0.2` on every outbound provider request in [/Users/tyleraraujo/vicuna/tools/server/server-deepseek.cpp](/Users/tyleraraujo/vicuna/tools/server/server-deepseek.cpp)
 
-## Phase 7: Polish & Cross-Cutting Concerns
+## Phase 7: User Story 5 - Every Provider Turn Uses One Explicit Max Token Cap (Priority: P1)
 
-- [x] T013 [P] Update runtime and bridge docs in [/Users/tyleraraujo/vicuna/tools/server/README.md](/Users/tyleraraujo/vicuna/tools/server/README.md), [/Users/tyleraraujo/vicuna/tools/server/README-dev.md](/Users/tyleraraujo/vicuna/tools/server/README-dev.md), and [/Users/tyleraraujo/vicuna/tools/telegram-bridge/README.md](/Users/tyleraraujo/vicuna/tools/telegram-bridge/README.md)
-- [x] T014 Run `DEVELOPER_DIR=/Library/Developer/CommandLineTools cmake --build /Users/tyleraraujo/vicuna/build-codex-emotive --target llama-server -j8`
-- [x] T015 Run `LLAMA_SERVER_BIN_PATH=/Users/tyleraraujo/vicuna/build-codex-emotive/bin/llama-server /opt/homebrew/bin/pytest /Users/tyleraraujo/vicuna/tools/server/tests/unit/test_deepseek_provider.py -q`
-- [x] T016 Run `node --test /Users/tyleraraujo/vicuna/tools/telegram-bridge/bridge.test.mjs`
+**Goal**: keep direct, staged, bridge-scoped, and background DeepSeek turns on
+one explicit `max_tokens: 256` policy
+
+**Independent Test**: provider tests and bridge request-shape tests assert that
+outbound request paths carry `256` instead of the previous `1024` cap
+
+### Tests for User Story 5
+
+- [x] T013 [P] [US5] Update provider and bridge assertions to require `max_tokens: 256` in [/Users/tyleraraujo/vicuna/tools/server/tests/unit/test_deepseek_provider.py](/Users/tyleraraujo/vicuna/tools/server/tests/unit/test_deepseek_provider.py) and [/Users/tyleraraujo/vicuna/tools/telegram-bridge/bridge.test.mjs](/Users/tyleraraujo/vicuna/tools/telegram-bridge/bridge.test.mjs)
+
+### Implementation for User Story 5
+
+- [x] T014 [US5] Reduce the fixed outbound and staged token caps to `256` in [/Users/tyleraraujo/vicuna/tools/server/server-deepseek.cpp](/Users/tyleraraujo/vicuna/tools/server/server-deepseek.cpp), [/Users/tyleraraujo/vicuna/tools/server/server.cpp](/Users/tyleraraujo/vicuna/tools/server/server.cpp), and [/Users/tyleraraujo/vicuna/tools/telegram-bridge/lib.mjs](/Users/tyleraraujo/vicuna/tools/telegram-bridge/lib.mjs)
+
+## Phase 8: Polish & Cross-Cutting Concerns
+
+- [x] T015 [P] Update runtime and bridge docs in [/Users/tyleraraujo/vicuna/tools/server/README.md](/Users/tyleraraujo/vicuna/tools/server/README.md), [/Users/tyleraraujo/vicuna/tools/server/README-dev.md](/Users/tyleraraujo/vicuna/tools/server/README-dev.md), and [/Users/tyleraraujo/vicuna/tools/telegram-bridge/README.md](/Users/tyleraraujo/vicuna/tools/telegram-bridge/README.md)
+- [ ] T016 Run `DEVELOPER_DIR=/Library/Developer/CommandLineTools cmake --build /Users/tyleraraujo/vicuna/build-codex-emotive --target llama-server -j8`
+- [ ] T017 Run `LLAMA_SERVER_BIN_PATH=/Users/tyleraraujo/vicuna/build-codex-emotive/bin/llama-server /opt/homebrew/bin/pytest /Users/tyleraraujo/vicuna/tools/server/tests/unit/test_deepseek_provider.py -q`
+- [ ] T018 Run `node --test /Users/tyleraraujo/vicuna/tools/telegram-bridge/bridge.test.mjs`

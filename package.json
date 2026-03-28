@@ -9,6 +9,7 @@
   "dependencies": {
     "@napi-rs/canvas": "^0.1.80",
     "pdf-parse": "^2.4.5",
+    "puppeteer-core": "^24.8.0",
     "supermemory": "^4.17.0",
     "three": "^0.181.1"
   }

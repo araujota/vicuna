@@ -5,18 +5,33 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   buildEmotiveAnimationRenderPlan,
+  extractEmotiveAnimationTerminalMoment,
   normalizeEmotiveAnimationBundle,
+  prependEmotiveAnimationStartMoment,
   renderEmotiveAnimationFrames,
 } from './emotive-animation-render.mjs';
+import {
+  ANCHOR_MAX_RADIUS,
+  ANCHOR_MIN_RADIUS,
+  buildFrameGeometry,
+  buildOuterHullTopology,
+  computeBundleRadiusNormalizationRange,
+} from './emotive-animation-scene.mjs';
+import {
+  getWebglRendererHealth,
+  renderEmotiveAnimationViaWebglService,
+} from './emotive-webgl-renderer-client.mjs';
 
 import {
   appendProactiveId,
   appendChatTranscriptMessage,
+  buildTelegramAnimationDeliveryPlan,
   buildTelegramChatCompletionRequest,
   bootstrapTelegramOutboxOffset,
   buildTelegramDocumentDescriptor,
   buildTelegramDocumentLinkage,
   buildTelegramParsedChunkMemories,
+  buildTelegramSpoilerVideoPayload,
   buildChatCompletionToolResultMessage,
   buildTelegramFileUrl,
   createTelegramConversation,
@@ -26,6 +41,7 @@ import {
   extractChatCompletionToolCalls,
   extractResponseText,
   getConversationForTelegramMessage,
+  getTelegramEmotiveAnimationState,
   getChatTranscript,
   getLatestConversationId,
   getTelegramRequestDeltaMessages,
@@ -37,6 +53,7 @@ import {
   loadState,
   normalizeDoclingParsedDocument,
   normalizeDocumentPlainText,
+  normalizeTelegramRichTextPayload,
   normalizeTelegramOutboxItem,
   normalizeState,
   parseSseChunk,
@@ -46,6 +63,7 @@ import {
   resolveTelegramConversationForMessage,
   resolveTelegramConversationForOutbound,
   saveState,
+  setTelegramEmotiveAnimationState,
   sanitizeAssistantRelayText,
   setTelegramOutboxCheckpoint,
   shouldBootstrapTelegramOutboxOffset,
@@ -54,40 +72,84 @@ import {
   TELEGRAM_BRIDGE_ASK_OUTBOX_POLL_IDLE_MS,
   TELEGRAM_BRIDGE_SELF_EMIT_ACTIVE_DELAY_MS,
   TELEGRAM_BRIDGE_SELF_EMIT_ERROR_DELAY_MS,
+  TELEGRAM_VIDEO_CAPTION_LIMIT,
   TELEGRAM_BRIDGE_WATCHDOG_DELAY_MS,
   updateTelegramOffset,
 } from './lib.mjs';
 
 function sampleEmotiveAnimationBundle() {
   return {
-    bundle_version: 1,
+    bundle_version: 2,
     trace_id: 'emo_test',
     generation_start_block_index: 3,
+    raw_keyframe_count: 4,
+    distinct_keyframe_count: 2,
     seconds_per_keyframe: 0.5,
-    fps: 24,
+    fps: 30,
     viewport_width: 720,
     viewport_height: 720,
     rotation_period_seconds: 12,
     dimensions: [
-      { id: 'confidence', label: 'Confidence', direction_index: 0, direction_xyz: [1, 0, 0] },
-      { id: 'caution', label: 'Caution', direction_index: 1, direction_xyz: [0, 1, 0] },
+      { id: 'confidence', label: 'Confidence', direction_index: 0, direction_xyz: [0.577, 0.577, 0.577] },
+      { id: 'caution', label: 'Caution', direction_index: 1, direction_xyz: [-0.577, -0.577, 0.577] },
+      { id: 'curiosity', label: 'Curiosity', direction_index: 2, direction_xyz: [-0.577, 0.577, -0.577] },
+      { id: 'satisfaction', label: 'Satisfaction', direction_index: 3, direction_xyz: [0.577, -0.577, -0.577] },
     ],
     keyframes: [
       {
         ordinal: 0,
         trace_block_index: 3,
         source_kind: 'assistant_reasoning',
-        moment: { confidence: 0.2, caution: 0.7 },
+        hold_keyframe_count: 2,
+        trace_block_span: [3, 4],
+        moment: { confidence: 0.2, caution: 0.7, curiosity: 0.35, satisfaction: 0.4 },
         dominant_dimensions: ['caution'],
       },
       {
         ordinal: 1,
-        trace_block_index: 4,
+        trace_block_index: 5,
         source_kind: 'assistant_content',
-        moment: { confidence: 0.85, caution: 0.25 },
+        hold_keyframe_count: 2,
+        trace_block_span: [5, 6],
+        moment: { confidence: 0.85, caution: 0.25, curiosity: 0.65, satisfaction: 0.75 },
         dominant_dimensions: ['confidence'],
       },
     ],
+  };
+}
+
+function lowSignalEmotiveAnimationBundle() {
+  return {
+    bundle_version: 2,
+    trace_id: 'emo_low_signal',
+    seconds_per_keyframe: 0.5,
+    fps: 30,
+    viewport_width: 720,
+    viewport_height: 720,
+    dimensions: sampleEmotiveAnimationBundle().dimensions,
+    keyframes: [{
+      ordinal: 0,
+      trace_block_index: 0,
+      source_kind: 'assistant_content',
+      hold_keyframe_count: 1,
+      moment: {
+        confidence: 0.8,
+        caution: 0,
+        curiosity: 0,
+        satisfaction: 0.12,
+      },
+    }, {
+      ordinal: 1,
+      trace_block_index: 1,
+      source_kind: 'runtime_event',
+      hold_keyframe_count: 1,
+      moment: {
+        confidence: 0.7,
+        caution: 0,
+        curiosity: 0,
+        satisfaction: 0.105,
+      },
+    }],
   };
 }
 
@@ -133,6 +195,20 @@ test('extractChatCompletionText strips vicuna tool-call xml', () => {
   });
 
   assert.equal(text, 'I should search.');
+});
+
+test('extractChatCompletionText strips DSML tool-call markup', () => {
+  const text = extractChatCompletionText({
+    choices: [
+      {
+        message: {
+          content: "Checking.\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"web_search\">\n<｜DSML｜parameter name=\"query\" string=\"true\">Penelope's Vegan Taqueria Logan Square</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+        },
+      },
+    ],
+  });
+
+  assert.equal(text, 'Checking.');
 });
 
 test('extractChatCompletionText returns empty string for tool-call-only completion', () => {
@@ -294,6 +370,14 @@ test('sanitizeAssistantRelayText strips known tool-call xml blocks', () => {
   assert.equal(text, 'prefix\n\nsuffix');
 });
 
+test('sanitizeAssistantRelayText strips DSML blocks even when they run to end-of-string', () => {
+  const text = sanitizeAssistantRelayText(
+    'prefix\n<｜DSML｜function_calls>\n<｜DSML｜invoke name="web_search">\n<｜DSML｜parameter name="query" string="true">vegan restaurants</｜DSML｜parameter>\n</｜DSML｜invoke>',
+  );
+
+  assert.equal(text, 'prefix');
+});
+
 test('detectTelegramDocumentLogicalType supports Docling-backed formats and rejects legacy doc', () => {
   assert.equal(detectTelegramDocumentLogicalType({
     mime_type: 'application/pdf',
@@ -426,7 +510,7 @@ test('normalizeDoclingParsedDocument keeps parsed markdown and contextualized ch
   assert.equal(parsed.chunks[1].contextualText, 'Heading\nAlpha');
 });
 
-test('buildTelegramParsedChunkMemories creates searchable metadata for each stored chunk', () => {
+test('buildTelegramParsedChunkMemories preserves searchable parsed chunk metadata', () => {
   const linkage = buildTelegramDocumentLinkage({
     chatId: '42',
     messageId: '9',
@@ -444,9 +528,6 @@ test('buildTelegramParsedChunkMemories creates searchable metadata for each stor
       logicalType: 'docx',
     },
     linkage,
-    runtimeIdentity: 'vicuna',
-    rawDocumentId: 'raw_doc_1',
-    parsedDocumentId: 'parsed_doc_1',
     parsedDocument: {
       title: 'memo.docx',
       doclingVersion: '2.0.0',
@@ -460,34 +541,11 @@ test('buildTelegramParsedChunkMemories creates searchable metadata for each stor
   assert.equal(memories[0].content, 'Intro chunk');
   assert.equal(memories[0].metadata.contentKind, 'parsed_chunk');
   assert.equal(memories[0].metadata.documentTitle, 'memo.docx');
-  assert.equal(memories[0].metadata.rawDocumentId, 'raw_doc_1');
-  assert.equal(memories[0].metadata.parsedDocumentId, 'parsed_doc_1');
+  assert.equal(memories[0].metadata.linkKey, linkage.linkKey);
 });
 
-test('ingestTelegramDocumentMessage persists raw and extracted documents with shared linkage', async () => {
-  const calls = {
-    upload: [],
-    update: [],
-    add: [],
-    writeMemories: [],
-  };
-  const supermemoryClient = {
-    documents: {
-      async uploadFile(payload) {
-        calls.upload.push(payload);
-        return { id: 'raw_doc_1' };
-      },
-      async update(id, payload) {
-        calls.update.push({ id, payload });
-        return { id, status: 'done' };
-      },
-      async add(payload) {
-        calls.add.push(payload);
-        return { id: 'text_doc_1' };
-      },
-    },
-  };
-
+test('ingestTelegramDocumentMessage persists local source and parsed bundles with shared linkage', async () => {
+  const docsRoot = await mkdtemp(path.join(os.tmpdir(), 'vicuna-doc-bundle-'));
   const result = await ingestTelegramDocumentMessage({
     message: {
       chat: { id: 77 },
@@ -526,34 +584,22 @@ test('ingestTelegramDocumentMessage persists raw and extracted documents with sh
         },
       ],
     }),
-    writeChunkMemories: async (payload) => {
-      calls.writeMemories.push(payload);
-    },
-    supermemoryClient,
-    toFileFactory: async (buffer, fileName) => ({ buffer: Buffer.from(buffer), fileName }),
-    runtimeIdentity: 'vicuna',
+    docsRoot,
     documentContainerTag: 'shared-documents',
   });
 
   assert.equal(result.ok, true);
-  assert.equal(result.rawDocumentId, 'raw_doc_1');
-  assert.equal(result.parsedDocumentId, 'text_doc_1');
+  assert.match(result.bundleId, /^telegram-doc-/);
   assert.equal(result.storedChunkCount, 2);
   assert.match(result.transcriptText, /Parsed contents of report\.pdf/);
   assert.match(result.transcriptText, /Alpha\n\nBeta/);
-  assert.equal(calls.upload.length, 1);
-  assert.equal(calls.update.length, 1);
-  assert.equal(calls.add.length, 1);
-  assert.equal(calls.writeMemories.length, 1);
-
-  const rawMetadata = JSON.parse(calls.upload[0].metadata);
-  assert.equal(rawMetadata.contentKind, 'source_file');
-  assert.equal(calls.update[0].payload.metadata.linkKey, rawMetadata.linkKey);
-  assert.equal(calls.add[0].metadata.linkKey, rawMetadata.linkKey);
-  assert.equal(calls.add[0].metadata.contentKind, 'parsed_output');
-  assert.equal(calls.add[0].containerTag, calls.update[0].payload.containerTag);
-  assert.equal(calls.writeMemories[0].containerTag, 'shared-documents');
-  assert.equal(calls.writeMemories[0].memories[0].metadata.contentKind, 'parsed_chunk');
+  const metadata = JSON.parse(await readFile(path.join(docsRoot, result.bundleId, 'metadata.json'), 'utf8'));
+  const chunks = JSON.parse(await readFile(path.join(docsRoot, result.bundleId, 'chunks.json'), 'utf8'));
+  assert.equal(metadata.parse_status, 'parsed');
+  assert.equal(metadata.source_path, result.sourcePath);
+  assert.equal(chunks[0].document_title, 'report.pdf');
+  assert.equal(chunks[0].link_key, result.bundleId);
+  await rm(docsRoot, { recursive: true, force: true });
 });
 
 test('ingestTelegramDocumentMessage rejects unsupported documents cleanly', async () => {
@@ -567,46 +613,39 @@ test('ingestTelegramDocumentMessage rejects unsupported documents cleanly', asyn
         mime_type: 'application/zip',
       },
     },
-    supermemoryClient: {},
   });
 
   assert.equal(result.ok, false);
   assert.equal(result.userError, 'Only Docling-supported document uploads such as PDF and DOCX are supported right now.');
 });
 
-test('ingestTelegramDocumentMessage requires supermemory for document processing', async () => {
-  const result = await ingestTelegramDocumentMessage({
-    message: {
-      chat: { id: 77 },
-      message_id: 10,
-      document: {
-        file_id: 'file_1',
-        file_name: 'report.pdf',
-        mime_type: 'application/pdf',
+test('ingestTelegramDocumentMessage requires a local docs root for document processing', async () => {
+  await assert.rejects(
+    ingestTelegramDocumentMessage({
+      message: {
+        chat: { id: 77 },
+        message_id: 10,
+        document: {
+          file_id: 'file_1',
+          file_name: 'report.pdf',
+          mime_type: 'application/pdf',
+        },
       },
-    },
-    supermemoryClient: null,
-  });
-
-  assert.equal(result.ok, false);
-  assert.equal(result.userError, 'SUPERMEMORY_API_KEY is required for Telegram document ingestion.');
+      resolveTelegramFile: async () => ({ file_path: 'docs/report.pdf' }),
+      downloadTelegramFile: async () => Buffer.from('pdf bytes'),
+      parseDocument: async () => ({
+        title: 'report.pdf',
+        parsed_markdown: '# Report\n\nAlpha',
+        plain_text: 'Alpha',
+        chunks: [{ chunk_index: 0, source_text: 'Alpha', contextual_text: 'Report\nAlpha' }],
+      }),
+    }),
+    /local docs root/,
+  );
 });
 
-test('ingestTelegramDocumentMessage surfaces partial failure after raw upload', async () => {
-  const supermemoryClient = {
-    documents: {
-      async uploadFile() {
-        return { id: 'raw_doc_1' };
-      },
-      async update() {
-        return { id: 'raw_doc_1', status: 'done' };
-      },
-      async add() {
-        throw new Error('text add failed');
-      },
-    },
-  };
-
+test('ingestTelegramDocumentMessage preserves the source file when Docling parsing fails', async () => {
+  const docsRoot = await mkdtemp(path.join(os.tmpdir(), 'vicuna-doc-fail-'));
   const result = await ingestTelegramDocumentMessage({
     message: {
       chat: { id: 77 },
@@ -620,48 +659,24 @@ test('ingestTelegramDocumentMessage surfaces partial failure after raw upload', 
     },
     resolveTelegramFile: async () => ({ file_path: 'docs/report.pdf' }),
     downloadTelegramFile: async () => Buffer.from('pdf bytes'),
-    parseDocument: async () => ({
-      title: 'report.pdf',
-      parsed_markdown: '# Report\n\nAlpha',
-      plain_text: 'Alpha',
-      chunks: [{ chunk_index: 0, source_text: 'Alpha', contextual_text: 'Report\nAlpha' }],
-    }),
-    supermemoryClient,
-    writeChunkMemories: async () => undefined,
-    toFileFactory: async () => ({ name: 'report.pdf' }),
-  });
-
-  assert.equal(result.ok, false);
-  assert.equal(result.partialFailure, true);
-  assert.match(result.userError, /partially failed after raw file storage/);
-});
-
-test('ingestTelegramDocumentMessage surfaces Docling parsing failures directly', async () => {
-  const result = await ingestTelegramDocumentMessage({
-    message: {
-      chat: { id: 77 },
-      message_id: 10,
-      document: {
-        file_id: 'file_1',
-        file_name: 'report.docx',
-        mime_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      },
-    },
-    resolveTelegramFile: async () => ({ file_path: 'docs/report.doc' }),
-    downloadTelegramFile: async () => Buffer.from('doc bytes'),
     parseDocument: async () => {
       throw new Error('Docling is not available in the configured Python environment.');
     },
-    supermemoryClient: { documents: {} },
-    writeChunkMemories: async () => undefined,
-    toFileFactory: async () => ({ name: 'report.doc' }),
+    docsRoot,
   });
 
   assert.equal(result.ok, false);
+  assert.equal(result.partialFailure, true);
+  assert.match(result.userError, /local source storage/);
   assert.match(result.userError, /Docling/);
+  const metadata = JSON.parse(await readFile(path.join(docsRoot, result.bundleId, 'metadata.json'), 'utf8'));
+  assert.equal(metadata.parse_status, 'parse_failed');
+  assert.equal(typeof result.sourcePath, 'string');
+  await rm(docsRoot, { recursive: true, force: true });
 });
 
-test('ingestTelegramDocumentMessage surfaces partial failure after parsed output storage when chunks cannot be written', async () => {
+test('ingestTelegramDocumentMessage rejects parsed outputs with no searchable chunks', async () => {
+  const docsRoot = await mkdtemp(path.join(os.tmpdir(), 'vicuna-doc-empty-'));
   const result = await ingestTelegramDocumentMessage({
     message: {
       chat: { id: 77 },
@@ -679,31 +694,15 @@ test('ingestTelegramDocumentMessage surfaces partial failure after parsed output
       title: 'report.pdf',
       parsed_markdown: '# Report\n\nAlpha',
       plain_text: 'Alpha',
-      chunks: [{ chunk_index: 0, source_text: 'Alpha', contextual_text: 'Report\nAlpha' }],
+      chunks: [],
     }),
-    supermemoryClient: {
-      documents: {
-        async uploadFile() {
-          return { id: 'raw_doc_1' };
-        },
-        async update() {
-          return { id: 'raw_doc_1', status: 'done' };
-        },
-        async add() {
-          return { id: 'parsed_doc_1' };
-        },
-      },
-    },
-    writeChunkMemories: async () => {
-      throw new Error('chunk write failed');
-    },
-    toFileFactory: async () => ({ name: 'report.pdf' }),
+    docsRoot,
   });
 
   assert.equal(result.ok, false);
   assert.equal(result.partialFailure, true);
-  assert.equal(result.parsedDocumentId, 'parsed_doc_1');
-  assert.match(result.userError, /parsed output storage/);
+  assert.match(result.userError, /no searchable chunks/);
+  await rm(docsRoot, { recursive: true, force: true });
 });
 
 test('parseSseChunk parses response events', () => {
@@ -1206,17 +1205,370 @@ test('normalizeTelegramOutboxItem preserves emotive animation bundles for messag
   assert.equal(item.emotiveAnimation.keyframes.length, 2);
 });
 
+test('buildTelegramSpoilerVideoPayload derives a spoilered sendVideo caption payload', () => {
+  assert.deepEqual(buildTelegramSpoilerVideoPayload({
+    telegramMethod: 'sendMessage',
+    text: '<b>Hello!</b>',
+    telegramPayload: {
+      text: '<b>Hello!</b>',
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [[{ text: 'Open', url: 'https://example.com' }]],
+      },
+      disable_notification: true,
+      disable_web_page_preview: true,
+    },
+  }), {
+    ok: true,
+    method: 'sendVideo',
+    captionLength: 6,
+    payload: {
+      caption: '<b>Hello!</b>',
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [[{ text: 'Open', url: 'https://example.com' }]],
+      },
+      disable_notification: true,
+      show_caption_above_media: true,
+      has_spoiler: true,
+      supports_streaming: true,
+    },
+  });
+});
+
+test('normalizeTelegramRichTextPayload converts markdownish sendMessage text into Telegram HTML', () => {
+  const normalized = normalizeTelegramRichTextPayload({
+    telegramMethod: 'sendMessage',
+    telegramPayload: {
+      text: '### Status\n\n**Ready**\n\n---\n\n> steady\n\n`code`',
+    },
+  });
+
+  assert.equal(normalized.normalized, true);
+  assert.equal(normalized.payload.parse_mode, 'HTML');
+  assert.equal(
+    normalized.payload.text,
+    '<b>Status</b>\n\n<b>Ready</b>\n\n━━━━━━━━━━━━\n\n<blockquote>steady</blockquote>\n\n<code>code</code>',
+  );
+});
+
+test('normalizeTelegramRichTextPayload promotes provider-authored Telegram HTML to parse_mode HTML', () => {
+  const normalized = normalizeTelegramRichTextPayload({
+    telegramMethod: 'sendMessage',
+    telegramPayload: {
+      text: '✅ <b>Added</b> <i>successfully</i>',
+    },
+  });
+
+  assert.equal(normalized.normalized, true);
+  assert.equal(normalized.payload.parse_mode, 'HTML');
+  assert.equal(normalized.payload.text, '✅ <b>Added</b> <i>successfully</i>');
+  assert.equal(normalized.textLength, '✅ Added successfully'.length);
+});
+
+test('normalizeTelegramRichTextPayload canonicalizes htmlish paragraphs and headings into Telegram HTML', () => {
+  const normalized = normalizeTelegramRichTextPayload({
+    telegramMethod: 'sendMessage',
+    telegramPayload: {
+      text: '<h3>Status</h3><p><strong>Ready</strong></p><p>Next<br>Step</p>',
+    },
+  });
+
+  assert.equal(normalized.payload.parse_mode, 'HTML');
+  assert.equal(
+    normalized.payload.text,
+    '<b>Status</b>\n\n<b>Ready</b>\n\nNext\nStep',
+  );
+  assert.equal(normalized.textLength, 'Status\n\nReady\n\nNext\nStep'.length);
+});
+
+test('normalizeTelegramRichTextPayload canonicalizes markdown parse_mode into HTML', () => {
+  const normalized = normalizeTelegramRichTextPayload({
+    telegramMethod: 'sendMessage',
+    telegramPayload: {
+      parse_mode: 'MarkdownV2',
+      text: '### Status\n\n**Ready**',
+    },
+  });
+
+  assert.equal(normalized.payload.parse_mode, 'HTML');
+  assert.equal(normalized.payload.text, '<b>Status</b>\n\n<b>Ready</b>');
+  assert.equal(normalized.textLength, 'Status\n\nReady'.length);
+});
+
+test('normalizeTelegramRichTextPayload canonicalizes captions for media methods', () => {
+  const normalized = normalizeTelegramRichTextPayload({
+    telegramMethod: 'sendPhoto',
+    telegramPayload: {
+      caption: '<p><b>Ready</b> &amp; steady</p>',
+    },
+  });
+
+  assert.equal(normalized.payload.parse_mode, 'HTML');
+  assert.equal(normalized.payload.caption, '<b>Ready</b> &amp; steady');
+  assert.equal(normalized.textLength, 'Ready & steady'.length);
+});
+
+test('normalizeTelegramRichTextPayload converts markdown pipe tables into preformatted grids', () => {
+  const normalized = normalizeTelegramRichTextPayload({
+    telegramMethod: 'sendMessage',
+    telegramPayload: {
+      text: '| Name | Score |\n| --- | --- |\n| Calm | 0.42 |\n| Trust | 0.80 |',
+    },
+  });
+
+  assert.equal(normalized.payload.parse_mode, 'HTML');
+  assert.equal(
+    normalized.payload.text,
+    '<pre>+-------+-------+\n| Name  | Score |\n+-------+-------+\n| Calm  | 0.42  |\n| Trust | 0.80  |\n+-------+-------+</pre>',
+  );
+});
+
+test('normalizeTelegramRichTextPayload strips DSML markup before canonicalizing HTML', () => {
+  const normalized = normalizeTelegramRichTextPayload({
+    telegramMethod: 'sendMessage',
+    telegramPayload: {
+      text: '### Status\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name="web_search">\n<｜DSML｜parameter name="query" string="true">vegan</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>\n\n**Ready**',
+    },
+  });
+
+  assert.equal(normalized.payload.parse_mode, 'HTML');
+  assert.equal(normalized.payload.text, '<b>Status</b>\n\n<b>Ready</b>');
+});
+
+test('buildTelegramSpoilerVideoPayload maps entities and rejects captions over Telegram limits', () => {
+  const withEntities = buildTelegramSpoilerVideoPayload({
+    telegramMethod: 'sendMessage',
+    text: 'Hello',
+    telegramPayload: {
+      text: 'Hello',
+      entities: [{ type: 'bold', offset: 0, length: 5 }],
+    },
+  });
+  assert.equal(withEntities.ok, true);
+  assert.deepEqual(withEntities.payload.caption_entities, [{ type: 'bold', offset: 0, length: 5 }]);
+  assert.equal(Object.prototype.hasOwnProperty.call(withEntities.payload, 'parse_mode'), false);
+
+  assert.deepEqual(buildTelegramSpoilerVideoPayload({
+    telegramMethod: 'sendMessage',
+    text: 'x'.repeat(TELEGRAM_VIDEO_CAPTION_LIMIT + 1),
+    telegramPayload: {
+      text: 'x'.repeat(TELEGRAM_VIDEO_CAPTION_LIMIT + 1),
+    },
+  }), {
+    ok: false,
+    reason: 'caption_too_long',
+    method: 'sendMessage',
+    captionLength: TELEGRAM_VIDEO_CAPTION_LIMIT + 1,
+    captionLimit: TELEGRAM_VIDEO_CAPTION_LIMIT,
+  });
+});
+
+test('buildTelegramSpoilerVideoPayload counts visible text length after markdown normalization', () => {
+  const payload = buildTelegramSpoilerVideoPayload({
+    telegramMethod: 'sendMessage',
+    text: '**Bold**',
+    telegramPayload: {
+      text: '**Bold**',
+    },
+  });
+
+  assert.equal(payload.ok, true);
+  assert.equal(payload.captionLength, 4);
+  assert.equal(payload.payload.caption, '<b>Bold</b>');
+  assert.equal(payload.payload.parse_mode, 'HTML');
+});
+
+test('buildTelegramSpoilerVideoPayload preserves provider-authored HTML captions', () => {
+  const payload = buildTelegramSpoilerVideoPayload({
+    telegramMethod: 'sendMessage',
+    text: '✅ <b>Added</b> <i>successfully</i>',
+    telegramPayload: {
+      text: '✅ <b>Added</b> <i>successfully</i>',
+    },
+  });
+
+  assert.equal(payload.ok, true);
+  assert.equal(payload.captionLength, '✅ Added successfully'.length);
+  assert.equal(payload.payload.caption, '✅ <b>Added</b> <i>successfully</i>');
+  assert.equal(payload.payload.parse_mode, 'HTML');
+});
+
+test('buildTelegramAnimationDeliveryPlan switches to split text and video when caption is too long', () => {
+  const sourceText = `### Status\n\n${'x'.repeat(TELEGRAM_VIDEO_CAPTION_LIMIT + 5)}`;
+  const plan = buildTelegramAnimationDeliveryPlan({
+    telegramMethod: 'sendMessage',
+    text: sourceText,
+    telegramPayload: {
+      text: sourceText,
+      disable_notification: true,
+      reply_markup: {
+        inline_keyboard: [[{ text: 'Open', url: 'https://example.com' }]],
+      },
+    },
+  });
+
+  assert.equal(plan.ok, true);
+  assert.equal(plan.strategy, 'split_text_and_video');
+  assert.equal(plan.messagePayload.parse_mode, 'HTML');
+  assert.equal(plan.messagePayload.disable_notification, true);
+  assert.deepEqual(plan.messagePayload.reply_markup, {
+    inline_keyboard: [[{ text: 'Open', url: 'https://example.com' }]],
+  });
+  assert.deepEqual(plan.videoPayload, {
+    has_spoiler: true,
+    supports_streaming: true,
+    disable_notification: true,
+  });
+  assert.equal(plan.captionLength, TELEGRAM_VIDEO_CAPTION_LIMIT + 5 + 'Status'.length + 2);
+  assert.equal(plan.captionLimit, TELEGRAM_VIDEO_CAPTION_LIMIT);
+});
+
+test('webgl renderer page keeps the saturated heatmap shader controls', async () => {
+  const page = await readFile(
+    new URL('./emotive-webgl-renderer-page.html', import.meta.url),
+    'utf8',
+  );
+
+  assert.match(page, /uSaturationBoost:\s*\{\s*value:\s*2\.3\s*\}/);
+  assert.match(page, /vec3 c0 = vec3\(0\.82,\s*0\.00,\s*1\.00\)/);
+  assert.match(page, /vec3 c5 = vec3\(1\.00,\s*0\.00,\s*0\.00\)/);
+  assert.match(page, /renderer\.toneMappingExposure = 0\.70/);
+});
+
 test('normalizeEmotiveAnimationBundle and render plan keep timing explicit', () => {
   const bundle = normalizeEmotiveAnimationBundle(sampleEmotiveAnimationBundle());
   const plan = buildEmotiveAnimationRenderPlan(sampleEmotiveAnimationBundle());
 
   assert.equal(bundle.traceId, 'emo_test');
-  assert.equal(bundle.dimensions.length, 2);
+  assert.equal(bundle.dimensions.length, 4);
   assert.equal(bundle.keyframes.length, 2);
-  assert.equal(bundle.durationSeconds, 1);
+  assert.equal(bundle.keyframes[0].holdKeyframeCount, 2);
+  assert.equal(bundle.rawKeyframeCount, 4);
+  assert.equal(bundle.distinctKeyframeCount, 2);
+  assert.equal(bundle.durationSeconds, 2);
+  assert.equal(bundle.timelineSlots.length, 4);
   assert.equal(plan.keyframeCount, 2);
-  assert.equal(plan.totalFrames, 24);
-  assert.equal(plan.durationSeconds, 1);
+  assert.equal(plan.rawKeyframeCount, 4);
+  assert.equal(plan.totalFrames, 60);
+  assert.equal(plan.durationSeconds, 2);
+});
+
+test('computeBundleRadiusNormalizationRange anchors the heatmap to the explicit support range', () => {
+  const range = computeBundleRadiusNormalizationRange(sampleEmotiveAnimationBundle());
+
+  assert.equal(range.minRadius, ANCHOR_MIN_RADIUS);
+  assert.equal(range.maxRadius, ANCHOR_MAX_RADIUS);
+  assert.equal(range.maxMomentValue, 0.85);
+});
+
+test('outer hull shoulder moat profile remains broad across the solved topology', () => {
+  const bundle = normalizeEmotiveAnimationBundle(sampleEmotiveAnimationBundle());
+  const topology = buildOuterHullTopology(bundle);
+
+  for (let anchorIndex = 0; anchorIndex < bundle.dimensions.length; anchorIndex += 1) {
+    const shoulderCoverage = topology.vertexBindings.filter(
+      (binding) => binding.shoulderProfile[anchorIndex] > 0.1,
+    ).length;
+    const moatCoverage = topology.vertexBindings.filter(
+      (binding) => binding.shoulderRingProfile[anchorIndex] > 0.1,
+    ).length;
+    const moatMin = Math.min(...topology.vertexBindings.map(
+      (binding) => binding.shoulderRingProfile[anchorIndex],
+    ));
+
+    assert.ok(shoulderCoverage > 0);
+    assert.ok(moatCoverage / shoulderCoverage > 0.9);
+    assert.ok(moatMin > 0.05);
+  }
+});
+
+test('low-signal bundles still solve to a visible membrane above the minimum hull radius', () => {
+  const bundle = normalizeEmotiveAnimationBundle(lowSignalEmotiveAnimationBundle());
+  const topology = buildOuterHullTopology(bundle);
+  const { worldVertices } = buildFrameGeometry(bundle, topology, 0);
+  const radii = worldVertices.map((vertex) => vertex.length());
+
+  assert.ok(Math.min(...radii) >= ANCHOR_MIN_RADIUS);
+  assert.ok(Math.max(...radii) > 1.05);
+  assert.ok(Math.max(...radii) - Math.min(...radii) > 0.35);
+});
+
+test('strong register values stay materially expressed in the solved membrane and disturb the full topology', () => {
+  const bundle = normalizeEmotiveAnimationBundle(sampleEmotiveAnimationBundle());
+  const topology = buildOuterHullTopology(bundle);
+  const neverAboveFloor = new Array(topology.vertexCount).fill(true);
+  let globalMax = -Infinity;
+
+  for (let frameIndex = 0; frameIndex < bundle.totalFrames; frameIndex += 1) {
+    const { worldVertices } = buildFrameGeometry(bundle, topology, frameIndex);
+    for (let vertexIndex = 0; vertexIndex < worldVertices.length; vertexIndex += 1) {
+      const radius = worldVertices[vertexIndex].length();
+      globalMax = Math.max(globalMax, radius);
+      if (radius > (ANCHOR_MIN_RADIUS + 0.01)) {
+        neverAboveFloor[vertexIndex] = false;
+      }
+    }
+  }
+
+  assert.ok(globalMax > 1.12);
+  assert.ok(neverAboveFloor.filter(Boolean).length <= 4);
+});
+
+test('prependEmotiveAnimationStartMoment seeds the next clip from the prior terminal pose', () => {
+  const priorMoment = {
+    confidence: 0.91,
+    caution: 0.12,
+    curiosity: 0.66,
+    satisfaction: 0.73,
+  };
+  const bundle = prependEmotiveAnimationStartMoment(sampleEmotiveAnimationBundle(), priorMoment);
+
+  assert.equal(bundle.keyframes.length, 3);
+  assert.equal(bundle.rawKeyframeCount, 5);
+  assert.equal(bundle.keyframes[0].sourceKind, 'prior_delivery_terminal');
+  assert.equal(bundle.keyframes[0].holdKeyframeCount, 1);
+  assert.deepEqual(bundle.keyframes[0].moment, priorMoment);
+  assert.equal(bundle.durationSeconds, 2.5);
+  assert.equal(bundle.totalFrames, 75);
+  assert.equal(bundle.timelineSlots.length, 5);
+  assert.equal(bundle.keyframes[1].ordinal, 1);
+});
+
+test('telegram emotive animation state persists the last delivered terminal moment per conversation', () => {
+  let state = setTelegramEmotiveAnimationState({}, 'chat-1', {
+    lastMoment: {
+      confidence: 0.4,
+      caution: 0.8,
+    },
+    lastRenderedAtMs: 1234,
+  }, {
+    conversationId: 'tc1',
+  });
+
+  assert.deepEqual(getTelegramEmotiveAnimationState(state, 'chat-1', { conversationId: 'tc1' }), {
+    chatId: 'chat-1',
+    conversationId: 'tc1',
+    lastMoment: {
+      confidence: 0.4,
+      caution: 0.8,
+    },
+    lastRenderedAtMs: 1234,
+  });
+
+  state = setTelegramEmotiveAnimationState(state, 'chat-1', null, {
+    conversationId: 'tc1',
+  });
+  assert.equal(getTelegramEmotiveAnimationState(state, 'chat-1', { conversationId: 'tc1' }), null);
+});
+
+test('extractEmotiveAnimationTerminalMoment returns the final normalized keyframe moment', () => {
+  assert.deepEqual(extractEmotiveAnimationTerminalMoment(sampleEmotiveAnimationBundle()), {
+    confidence: 0.85,
+    caution: 0.25,
+    curiosity: 0.65,
+    satisfaction: 0.75,
+  });
 });
 
 test('renderEmotiveAnimationFrames writes one PNG per planned frame', async () => {
@@ -1225,10 +1577,14 @@ test('renderEmotiveAnimationFrames writes one PNG per planned frame', async () =
     const result = await renderEmotiveAnimationFrames(sampleEmotiveAnimationBundle(), dir);
     const files = await readdir(dir);
 
-    assert.equal(result.totalFrames, 24);
-    assert.equal(files.length, 24);
+    assert.equal(result.totalFrames, 60);
+    assert.equal(files.length, 60);
     assert.equal(files[0], 'frame-0000.png');
-    assert.equal(files.at(-1), 'frame-0023.png');
+    assert.equal(files.at(-1), 'frame-0059.png');
+    assert.equal(result.topology.anchorCount, 4);
+    assert.ok(result.topology.vertexCount > 700);
+    assert.ok(result.topology.triangleCount > 1500);
+    assert.equal(result.scene.background, '#000000');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -1322,4 +1678,64 @@ test('normalizeState preserves approval prompt metadata and drops malformed appr
       createdAtMs: 10,
     },
   });
+});
+
+test('renderEmotiveAnimationViaWebglService posts a render job and returns the service payload', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (url, init) => {
+      assert.equal(String(url), 'http://127.0.0.1:8091/render');
+      assert.equal(init?.method, 'POST');
+      const parsed = JSON.parse(String(init?.body));
+      assert.equal(parsed.outputPath, '/tmp/out.mp4');
+      assert.equal(parsed.bundle.bundle_version, 2);
+      return {
+        ok: true,
+        async json() {
+          return {
+            outputPath: '/tmp/out.mp4',
+            backend: 'chromium_webgl',
+            keyframeCount: 2,
+          };
+        },
+      };
+    };
+
+    const result = await renderEmotiveAnimationViaWebglService(sampleEmotiveAnimationBundle(), {
+      serviceUrl: 'http://127.0.0.1:8091',
+      outputPath: '/tmp/out.mp4',
+    });
+    assert.equal(result.outputPath, '/tmp/out.mp4');
+    assert.equal(result.backend, 'chromium_webgl');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('getWebglRendererHealth reads the local service health payload', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (url) => {
+      assert.equal(String(url), 'http://127.0.0.1:8091/health');
+      return {
+        ok: true,
+        async json() {
+          return {
+            status: 'ok',
+            backend: 'chromium_webgl',
+            gpu: {
+              renderer: 'NVIDIA RTX',
+              software: false,
+            },
+          };
+        },
+      };
+    };
+
+    const health = await getWebglRendererHealth('http://127.0.0.1:8091');
+    assert.equal(health.status, 'ok');
+    assert.equal(health.gpu.renderer, 'NVIDIA RTX');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

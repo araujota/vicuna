@@ -1,220 +1,122 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  errorEnvelope,
   handleOngoingTasks,
   type OngoingTasksConfig,
-  type OngoingTasksInvocation,
 } from "../src/ongoing-tasks.js";
 
-type MockHardMemoryState = {
-  registryText?: string;
-  writeBodies: unknown[];
-};
-
-async function readJson(req: IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  const body = Buffer.concat(chunks).toString("utf8");
-  return body ? JSON.parse(body) : {};
-}
-
-function writeJson(res: ServerResponse, statusCode: number, payload: unknown): void {
-  const encoded = Buffer.from(JSON.stringify(payload), "utf8");
-  res.statusCode = statusCode;
-  res.setHeader("content-type", "application/json");
-  res.setHeader("content-length", String(encoded.length));
-  res.end(encoded);
-}
-
-async function startMockHardMemory(state: MockHardMemoryState): Promise<{ baseUrl: string; close: () => Promise<void> }> {
-  const server = createServer(async (req, res) => {
-    const body = await readJson(req);
-    if (req.method === "POST" && req.url === "/v4/profile") {
-      const searchResults = state.registryText
-        ? {
-            results: [{
-              id: "memory-registry-1",
-              title: "Ongoing task registry",
-              memory: state.registryText,
-              metadata: {
-                key: "ongoing-tasks-registry",
-                title: "Ongoing task registry",
-              },
-            }],
-          }
-        : { results: [] };
-      writeJson(res, 200, { searchResults });
-      return;
-    }
-
-    if (req.method === "POST" && req.url === "/v4/memories") {
-      state.writeBodies.push(body);
-      const payload = body as {
-        memories?: Array<{ content?: string }>;
-      };
-      state.registryText = payload.memories?.[0]?.content;
-      writeJson(res, 200, { ok: true });
-      return;
-    }
-
-    writeJson(res, 404, { error: "not found" });
-  });
-
-  await new Promise<void>((resolve) => {
-    server.listen(0, "127.0.0.1", () => resolve());
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("expected TCP server address");
-  }
-
+function createConfig(tempDir: string): OngoingTasksConfig {
   return {
-    baseUrl: `http://127.0.0.1:${address.port}`,
-    close: async () => {
-      await new Promise<void>((resolve, reject) => {
-        server.close((error) => (error ? reject(error) : resolve()));
-      });
-    },
+    tasksDir: path.join(tempDir, "ongoing-tasks"),
+    runnerScript: "/tmp/run-ongoing-task-cron.sh",
+    crontabBin: "/usr/bin/crontab",
+    flockBin: "/usr/bin/flock",
+    tempDir: path.join(tempDir, "ongoing-tasks", "tmp"),
+    runtimeUrl: "http://127.0.0.1:8080/v1/chat/completions",
+    runtimeModel: "deepseek-chat",
+    hostUser: "vicuna",
+    managedCrontabPath: path.join(tempDir, "vicuna.crontab"),
   };
 }
 
-function config(baseUrl: string): OngoingTasksConfig {
-  return {
-    baseUrl,
-    authToken: "test-token",
-    containerTag: "vicuna",
-    runtimeIdentity: "vicuna",
-    registryKey: "ongoing-tasks-registry",
-    registryTitle: "Ongoing task registry",
-    queryThreshold: 0,
-  };
-}
-
-function fixedClock(iso: string): () => Date {
-  return () => new Date(iso);
-}
-
-test("ongoing-task registry supports create, due polling, complete, edit, and delete with compact summaries", async () => {
-  const state: MockHardMemoryState = { writeBodies: [] };
-  const mock = await startMockHardMemory(state);
+test("ongoing task create and delete manage one Vicuña-owned crontab block", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vicuna-ongoing-"));
+  const config = createConfig(tempDir);
   try {
-    const taskConfig = config(mock.baseUrl);
-    const create = await handleOngoingTasks(
-      {
-        action: "create",
-        task_text:
-          "Every few days, analyze the movies we have saved in Radarr and recommend one I might like.",
-        interval: 3,
-        unit: "days",
-      },
-      taskConfig,
-      fixedClock("2026-03-25T12:00:00.000Z")
-    );
+    const created = await handleOngoingTasks({
+      action: "create",
+      task_text: "Every week, summarize the local Radarr backlog.",
+      interval: 1,
+      unit: "weeks",
+    }, config);
 
-    assert.equal(create.ok, true);
-    assert.equal(create.family, "ongoing_tasks");
-    assert.ok(create.task);
-    assert.equal(create.task.task_text.includes("Radarr"), true);
-    assert.equal(create.task.frequency.interval, 3);
-    assert.equal(create.task.frequency.unit, "days");
-    assert.equal(create.task.due_now, true);
-    assert.equal(create.task.next_due_at, "2026-03-25T12:00:00.000Z");
-    assert.equal("base_url" in create, false);
-    assert.equal("request" in create, false);
+    assert.equal(created.ok, true);
+    assert.equal(created.task?.schedule_expression, "0 0 * * 0");
 
-    const taskId = create.task.task_id;
-    const due = await handleOngoingTasks(
-      { action: "get", due_only: true },
-      taskConfig,
-      fixedClock("2026-03-25T12:30:00.000Z")
-    );
-    assert.equal(due.ok, true);
-    assert.equal(due.due_only, true);
-    assert.equal(due.count, 1);
-    assert.equal(due.tasks?.[0]?.task_id, taskId);
+    const crontabText = fs.readFileSync(config.managedCrontabPath!, "utf8");
+    assert.match(crontabText, /VICUNA MANAGED TASK/);
+    assert.match(crontabText, /run-ongoing-task-cron\.sh/);
+    assert.match(crontabText, /--task-id/);
 
-    const complete = await handleOngoingTasks(
-      { action: "complete", task_id: taskId, completed_at: "2026-03-25T13:00:00.000Z" },
-      taskConfig,
-      fixedClock("2026-03-25T13:00:00.000Z")
-    );
-    assert.equal(complete.ok, true);
-    assert.ok(complete.task);
-    assert.equal(complete.task.last_done_at, "2026-03-25T13:00:00.000Z");
-    assert.equal(complete.task.next_due_at, "2026-03-28T13:00:00.000Z");
-    assert.equal(complete.task.due_now, false);
+    const deleted = await handleOngoingTasks({
+      action: "delete",
+      task_id: created.task?.task_id,
+    }, config);
 
-    const notYetDue = await handleOngoingTasks(
-      { action: "get", due_only: true },
-      taskConfig,
-      fixedClock("2026-03-26T13:00:00.000Z")
-    );
-    assert.equal(notYetDue.ok, true);
-    assert.equal(notYetDue.count, 0);
-
-    const edited = await handleOngoingTasks(
-      { action: "edit", task_id: taskId, interval: 1, unit: "days" },
-      taskConfig,
-      fixedClock("2026-03-27T13:05:00.000Z")
-    );
-    assert.equal(edited.ok, true);
-    assert.ok(edited.task);
-    assert.equal(edited.task.frequency.interval, 1);
-    assert.equal(edited.task.frequency.unit, "days");
-    assert.equal(edited.task.due_now, true);
-    assert.equal(edited.task.next_due_at, "2026-03-26T13:00:00.000Z");
-
-    const deleted = await handleOngoingTasks(
-      { action: "delete", task_id: taskId },
-      taskConfig,
-      fixedClock("2026-03-27T13:10:00.000Z")
-    );
     assert.equal(deleted.ok, true);
-    assert.equal(deleted.deleted_task_id, taskId);
-    assert.equal(deleted.remaining_count, 0);
-
-    const remaining = await handleOngoingTasks(
-      { action: "get" },
-      taskConfig,
-      fixedClock("2026-03-27T13:15:00.000Z")
-    );
-    assert.equal(remaining.ok, true);
-    assert.equal(remaining.count, 0);
-    assert.equal(state.writeBodies.length >= 4, true);
+    const prunedCrontab = fs.readFileSync(config.managedCrontabPath!, "utf8");
+    assert.doesNotMatch(prunedCrontab, /VICUNA MANAGED TASK/);
   } finally {
-    await mock.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
 
-test("ongoing-task registry surfaces typed invalid-registry errors without leaking raw storage payloads", async () => {
-  const state: MockHardMemoryState = {
-    registryText: "{not valid json",
-    writeBodies: [],
-  };
-  const mock = await startMockHardMemory(state);
+test("scheduled execute sends the stored recurring prompt as a system message and updates completion time", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vicuna-ongoing-exec-"));
+  const config = createConfig(tempDir);
+  let clockMs = Date.parse("2026-03-27T12:00:00Z");
+  const clock = () => new Date(clockMs);
+  const fetchCalls: unknown[] = [];
   try {
-    await assert.rejects(
-      () => handleOngoingTasks({ action: "get" } satisfies OngoingTasksInvocation, config(mock.baseUrl)),
-      /stored ongoing-task registry was not valid JSON/
-    );
+    const created = await handleOngoingTasks({
+      action: "create",
+      task_text: "Review the local docs directory and report the most recent uploads.",
+      interval: 1,
+      unit: "minutes",
+    }, config, clock);
 
-    try {
-      await handleOngoingTasks({ action: "get" }, config(mock.baseUrl));
-      assert.fail("expected invalid registry to throw");
-    } catch (error) {
-      const envelope = errorEnvelope("get", error);
-      assert.equal(envelope.ok, false);
-      assert.equal(envelope.error?.kind, "invalid_registry");
-      assert.equal(envelope.error?.message.includes("valid JSON"), true);
-      assert.equal("tasks" in envelope, false);
-      assert.equal("deleted_task_id" in envelope, false);
-    }
+    clockMs += 61_000;
+    const executed = await handleOngoingTasks({
+      action: "execute",
+      task_id: created.task?.task_id,
+    }, config, clock, undefined, async (url, init) => {
+      fetchCalls.push({ url, init });
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    assert.equal(executed.ok, true);
+    assert.equal(fetchCalls.length, 1);
+    const request = fetchCalls[0] as { url: string; init?: RequestInit };
+    assert.equal(request.url, "http://127.0.0.1:8080/v1/chat/completions");
+    const body = JSON.parse(String(request.init?.body));
+    assert.equal(body.messages[0].role, "system");
+    assert.equal(body.messages[0].content, "Review the local docs directory and report the most recent uploads.");
+    assert.equal(executed.task?.last_done_at, "2026-03-27T12:01:01.000Z");
   } finally {
-    await mock.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("scheduled execute skips fetch when the recurring task is not due yet", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vicuna-ongoing-skip-"));
+  const config = createConfig(tempDir);
+  try {
+    const created = await handleOngoingTasks({
+      action: "create",
+      task_text: "Check for new bridge errors.",
+      interval: 1,
+      unit: "hours",
+    }, config, () => new Date("2026-03-27T12:00:00Z"));
+
+    let called = false;
+    const executed = await handleOngoingTasks({
+      action: "execute",
+      task_id: created.task?.task_id,
+    }, config, () => new Date("2026-03-27T12:30:00Z"), undefined, async () => {
+      called = true;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+
+    assert.equal(executed.ok, true);
+    assert.equal(called, false);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });

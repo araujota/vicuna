@@ -18,11 +18,14 @@
 #include <deque>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <iomanip>
 #include <memory>
 #include <set>
 #include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <sstream>
 #include <signal.h>
 #include <thread>
@@ -49,6 +52,26 @@ static bool execute_deepseek_chat_with_emotive(
         float ongoing_task_due = 0.0f,
         const std::string & mode_label = std::string(),
         const runtime_request_trace_context * trace_context = nullptr);
+static int32_t env_to_int_local(const char * name, int32_t default_value);
+static float env_to_float_local(const char * name, float default_value);
+static std::string iso_from_epoch_ms(int64_t epoch_ms);
+
+struct runtime_session_memory_candidate {
+    std::string title;
+    std::string key;
+    std::string kind;
+    std::string domain;
+    std::vector<std::string> tags;
+    std::string content;
+    float importance = 0.7f;
+    float confidence = 0.9f;
+};
+
+struct runtime_session_memory_capture_decision {
+    bool write = false;
+    std::string reason;
+    std::vector<runtime_session_memory_candidate> memories;
+};
 
 static std::string trim_copy(std::string value) {
     const auto is_not_space = [](unsigned char ch) {
@@ -120,6 +143,37 @@ static json build_telegram_emotive_moment_json(const json & raw_moment) {
     return moment;
 }
 
+static bool telegram_emotive_moments_equal(const json & lhs, const json & rhs) {
+    return lhs.is_object() && rhs.is_object() && lhs == rhs;
+}
+
+static void append_unique_string_values(json & target, const json & values) {
+    if (!target.is_array()) {
+        target = json::array();
+    }
+
+    std::set<std::string> seen;
+    for (const auto & value : target) {
+        const std::string text = trim_copy(value.is_string() ? value.get<std::string>() : std::string());
+        if (!text.empty()) {
+            seen.insert(text);
+        }
+    }
+
+    if (!values.is_array()) {
+        return;
+    }
+
+    for (const auto & value : values) {
+        const std::string text = trim_copy(value.is_string() ? value.get<std::string>() : std::string());
+        if (text.empty() || seen.count(text) > 0) {
+            continue;
+        }
+        target.push_back(text);
+        seen.insert(text);
+    }
+}
+
 static json build_telegram_emotive_animation_bundle(const json & trace) {
     if (!trace.is_object()) {
         return nullptr;
@@ -146,6 +200,7 @@ static json build_telegram_emotive_animation_bundle(const json & trace) {
     }
 
     json keyframes = json::array();
+    int32_t raw_keyframe_count = 0;
     for (int32_t block_index = live_start; block_index < total_blocks; ++block_index) {
         const json & block = blocks.at(static_cast<size_t>(block_index));
         if (!block.is_object()) {
@@ -157,12 +212,36 @@ static json build_telegram_emotive_animation_bundle(const json & trace) {
             continue;
         }
 
+        const int32_t source_block_index = json_value(block, "block_index", block_index);
+        const json dominant_dimensions = block.value("vad", json::object()).value("dominant_dimensions", json::array());
+        raw_keyframe_count += 1;
+
+        if (!keyframes.empty() &&
+                telegram_emotive_moments_equal(keyframes.back().value("moment", json::object()), moment)) {
+            json & previous = keyframes.back();
+            previous["hold_keyframe_count"] = json_value(previous, "hold_keyframe_count", int32_t(1)) + 1;
+            if (!previous.contains("trace_block_span") ||
+                    !previous["trace_block_span"].is_array() ||
+                    previous["trace_block_span"].size() != 2) {
+                previous["trace_block_span"] = json::array({
+                    json_value(previous, "trace_block_index", source_block_index),
+                    source_block_index,
+                });
+            } else {
+                previous["trace_block_span"][1] = source_block_index;
+            }
+            append_unique_string_values(previous["dominant_dimensions"], dominant_dimensions);
+            continue;
+        }
+
         keyframes.push_back({
             {"ordinal", static_cast<int32_t>(keyframes.size())},
-            {"trace_block_index", json_value(block, "block_index", block_index)},
+            {"trace_block_index", source_block_index},
             {"source_kind", json_value(block.value("source", json::object()), "kind", std::string("runtime_event"))},
+            {"hold_keyframe_count", 1},
+            {"trace_block_span", json::array({source_block_index, source_block_index})},
             {"moment", moment},
-            {"dominant_dimensions", block.value("vad", json::object()).value("dominant_dimensions", json::array())},
+            {"dominant_dimensions", dominant_dimensions},
         });
     }
 
@@ -172,15 +251,17 @@ static json build_telegram_emotive_animation_bundle(const json & trace) {
 
     const double seconds_per_keyframe = 0.5;
     return {
-        {"bundle_version", 1},
+        {"bundle_version", 2},
         {"trace_id", json_value(trace, "trace_id", std::string())},
         {"generation_start_block_index", live_start},
+        {"raw_keyframe_count", raw_keyframe_count},
+        {"distinct_keyframe_count", static_cast<int32_t>(keyframes.size())},
         {"seconds_per_keyframe", seconds_per_keyframe},
-        {"fps", 24},
+        {"fps", 30},
         {"viewport_width", 720},
         {"viewport_height", 720},
         {"rotation_period_seconds", 12.0},
-        {"duration_seconds", seconds_per_keyframe * static_cast<double>(keyframes.size())},
+        {"duration_seconds", seconds_per_keyframe * static_cast<double>(raw_keyframe_count)},
         {"dimensions", std::move(dimensions)},
         {"keyframes", std::move(keyframes)},
     };
@@ -347,6 +428,1425 @@ static json runtime_request_trace_health_json() {
         {"total_events", static_cast<int64_t>(state.total_events)},
         {"latest_request_id", state.events.empty() ? json(nullptr) : json(json_value(state.events.back(), "request_id", std::string()))},
         {"latest_event", state.events.empty() ? json(nullptr) : json(json_value(state.events.back(), "event", std::string()))},
+    };
+}
+
+struct server_policy_runtime_config {
+    bool enabled = false;
+    std::string mode = "disabled";
+    int32_t max_transitions = 256;
+    std::string candidate_url;
+    std::string reward_config_path;
+    std::string config_error;
+    int32_t timeout_ms = 500;
+    float live_confidence_threshold = 0.70f;
+    std::vector<int32_t> canary_steps = {10, 50, 100};
+    int32_t min_requests_per_step = 10;
+    float rollback_max_candidate_failure_rate = 0.30f;
+    float rollback_max_invalid_action_rate = 0.20f;
+    float rollback_max_fallback_rate = 0.40f;
+    server_policy_reward_model reward_model;
+};
+
+struct server_policy_rollout_window {
+    uint64_t sampled_request_count = 0;
+    uint64_t candidate_execution_count = 0;
+    uint64_t fallback_count = 0;
+    uint64_t low_confidence_count = 0;
+    uint64_t candidate_failure_count = 0;
+    uint64_t invalid_action_count = 0;
+};
+
+struct server_policy_runtime_state {
+    mutable std::mutex mutex;
+    std::deque<server_policy_transition> transitions;
+    size_t max_transitions = 256;
+    uint64_t total_transitions = 0;
+    uint64_t shadow_request_count = 0;
+    uint64_t shadow_disagreement_count = 0;
+    uint64_t candidate_failure_count = 0;
+    uint64_t safety_guard_hit_count = 0;
+    uint64_t sampled_request_count = 0;
+    uint64_t live_candidate_execution_count = 0;
+    uint64_t live_fallback_count = 0;
+    uint64_t low_confidence_count = 0;
+    uint64_t invalid_action_count = 0;
+    uint64_t rollback_count = 0;
+    int32_t current_rollout_step_index = 0;
+    bool rollout_rolled_back = false;
+    bool rollout_completed = false;
+    std::string behavior_policy_version = "control_surface_v2";
+    std::string candidate_policy_version;
+    std::string candidate_policy_alias;
+    std::string last_candidate_error;
+    std::string last_rollback_reason;
+    server_policy_rollout_window current_window;
+};
+
+static server_policy_runtime_config & policy_runtime_config_instance() {
+    static server_policy_runtime_config config;
+    return config;
+}
+
+static server_policy_runtime_state & policy_runtime_state_instance() {
+    static server_policy_runtime_state state;
+    return state;
+}
+
+static std::string generate_policy_decision_id() {
+    static std::atomic<uint64_t> counter = 0;
+    return "policy_dec_" + std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+}
+
+static std::string generate_policy_transition_id() {
+    static std::atomic<uint64_t> counter = 0;
+    return "policy_tr_" + std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+}
+
+static std::vector<int32_t> parse_policy_canary_steps(const char * raw_value) {
+    std::vector<int32_t> steps;
+    if (!raw_value) {
+        return steps;
+    }
+
+    std::stringstream ss(raw_value);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        const std::string trimmed = trim_copy(token);
+        if (trimmed.empty()) {
+            continue;
+        }
+        const int parsed = std::atoi(trimmed.c_str());
+        if (parsed > 0 && parsed <= 100) {
+            steps.push_back(parsed);
+        }
+    }
+    std::sort(steps.begin(), steps.end());
+    steps.erase(std::unique(steps.begin(), steps.end()), steps.end());
+    return steps;
+}
+
+static std::string normalize_policy_runtime_mode(const std::string & raw_mode) {
+    if (raw_mode == "capture" || raw_mode == "shadow" || raw_mode == "native_only" ||
+            raw_mode == "eval_only" || raw_mode == "canary_live") {
+        return raw_mode;
+    }
+    return "disabled";
+}
+
+static bool policy_runtime_requests_candidate(const std::string & mode) {
+    return mode == "shadow" || mode == "eval_only" || mode == "canary_live";
+}
+
+static bool policy_runtime_is_canary_live(const std::string & mode) {
+    return mode == "canary_live";
+}
+
+static int32_t policy_runtime_current_canary_share_percent_locked(
+        const server_policy_runtime_config & config,
+        const server_policy_runtime_state & state) {
+    if (config.canary_steps.empty()) {
+        return 0;
+    }
+    const int32_t bounded_index = std::max<int32_t>(
+            0,
+            std::min<int32_t>(state.current_rollout_step_index, static_cast<int32_t>(config.canary_steps.size()) - 1));
+    return config.canary_steps.at(static_cast<size_t>(bounded_index));
+}
+
+static std::string policy_runtime_rollout_state_label_locked(
+        const server_policy_runtime_config & config,
+        const server_policy_runtime_state & state) {
+    if (!config.enabled) {
+        return "disabled";
+    }
+    if (state.rollout_rolled_back) {
+        return "rolled_back";
+    }
+    if (config.mode == "shadow" || config.mode == "eval_only") {
+        return "analysis_only";
+    }
+    if (config.mode == "canary_live") {
+        return state.rollout_completed ? "completed" : "canary_active";
+    }
+    if (config.mode == "capture") {
+        return "capture_only";
+    }
+    return "native_only";
+}
+
+static float policy_rate(uint64_t numerator, uint64_t denominator) {
+    if (denominator == 0) {
+        return 0.0f;
+    }
+    return static_cast<float>(numerator) / static_cast<float>(denominator);
+}
+
+struct policy_reward_moment_axis_spec {
+    const char * name;
+    float server_emotive_vector::* value;
+};
+
+struct policy_reward_vad_axis_spec {
+    const char * name;
+    float server_policy_vad_axes::* policy_value;
+    float server_emotive_vad::* observation_value;
+    bool signed_domain = false;
+};
+
+static const std::array<policy_reward_moment_axis_spec, 14> k_policy_reward_moment_axes = {{
+    {"epistemic_pressure", &server_emotive_vector::epistemic_pressure},
+    {"confidence", &server_emotive_vector::confidence},
+    {"contradiction_pressure", &server_emotive_vector::contradiction_pressure},
+    {"planning_clarity", &server_emotive_vector::planning_clarity},
+    {"curiosity", &server_emotive_vector::curiosity},
+    {"caution", &server_emotive_vector::caution},
+    {"frustration", &server_emotive_vector::frustration},
+    {"satisfaction", &server_emotive_vector::satisfaction},
+    {"momentum", &server_emotive_vector::momentum},
+    {"stall", &server_emotive_vector::stall},
+    {"semantic_novelty", &server_emotive_vector::semantic_novelty},
+    {"user_alignment", &server_emotive_vector::user_alignment},
+    {"runtime_trust", &server_emotive_vector::runtime_trust},
+    {"runtime_failure_pressure", &server_emotive_vector::runtime_failure_pressure},
+}};
+
+static const std::array<policy_reward_vad_axis_spec, 3> k_policy_reward_vad_axes = {{
+    {"valence", &server_policy_vad_axes::valence, &server_emotive_vad::valence, true},
+    {"arousal", &server_policy_vad_axes::arousal, &server_emotive_vad::arousal, false},
+    {"dominance", &server_policy_vad_axes::dominance, &server_emotive_vad::dominance, true},
+}};
+
+static float clamp_unit_interval(float value) {
+    return std::min(1.0f, std::max(0.0f, value));
+}
+
+static float clamp_signed_interval(float value) {
+    return std::min(1.0f, std::max(-1.0f, value));
+}
+
+static server_policy_reward_model default_policy_reward_model() {
+    server_policy_reward_model model = {};
+    model.model_version = "desired_state_reward_v1";
+    model.target_moment = {
+        0.20f,
+        0.82f,
+        0.08f,
+        0.84f,
+        0.48f,
+        0.42f,
+        0.08f,
+        0.78f,
+        0.62f,
+        0.06f,
+        0.38f,
+        0.88f,
+        0.78f,
+        0.05f,
+    };
+    model.target_vad = {0.65f, 0.22f, 0.72f};
+    model.moment_weights = {
+        0.85f,
+        1.25f,
+        1.20f,
+        1.30f,
+        0.65f,
+        0.75f,
+        1.20f,
+        1.00f,
+        0.80f,
+        1.40f,
+        0.55f,
+        1.40f,
+        1.10f,
+        1.35f,
+    };
+    model.vad_weights = {0.80f, 0.50f, 0.80f};
+    model.progress_weight = 0.65f;
+    model.terminal_closeness_weight = 0.35f;
+    model.shaping_gamma = 1.0f;
+    model.completion_stop_reward = 0.20f;
+    model.completion_non_stop_reward = 0.05f;
+    model.latency_cost_cap = 0.25f;
+    model.latency_ms_scale = 4000.0f;
+    model.token_cost_cap = 0.25f;
+    model.token_scale = 4096.0f;
+    model.tool_success_bonus = 0.05f;
+    model.candidate_failure_penalty = 0.05f;
+    return model;
+}
+
+static std::optional<float> json_number_if_present(const json & object, const char * key) {
+    if (!object.is_object() || !object.contains(key) || object.at(key).is_null()) {
+        return std::nullopt;
+    }
+    const json & value = object.at(key);
+    if (!value.is_number()) {
+        throw std::runtime_error(std::string("expected numeric field: ") + key);
+    }
+    return value.get<float>();
+}
+
+static void apply_reward_model_override(server_policy_reward_model & model, const json & payload) {
+    if (!payload.is_object()) {
+        throw std::runtime_error("reward config override must be a JSON object");
+    }
+
+    if (payload.contains("schema_version")) {
+        if (!payload.at("schema_version").is_string()) {
+            throw std::runtime_error("reward config schema_version must be a string");
+        }
+        model.schema_version = payload.at("schema_version").get<std::string>();
+    }
+    if (payload.contains("model_version")) {
+        if (!payload.at("model_version").is_string()) {
+            throw std::runtime_error("reward config model_version must be a string");
+        }
+        model.model_version = payload.at("model_version").get<std::string>();
+    }
+
+    if (payload.contains("target_moment")) {
+        const json & object = payload.at("target_moment");
+        if (!object.is_object()) {
+            throw std::runtime_error("target_moment must be a JSON object");
+        }
+        for (const auto & axis : k_policy_reward_moment_axes) {
+            if (const auto value = json_number_if_present(object, axis.name)) {
+                model.target_moment.*(axis.value) = *value;
+            }
+        }
+    }
+    if (payload.contains("moment_weights")) {
+        const json & object = payload.at("moment_weights");
+        if (!object.is_object()) {
+            throw std::runtime_error("moment_weights must be a JSON object");
+        }
+        for (const auto & axis : k_policy_reward_moment_axes) {
+            if (const auto value = json_number_if_present(object, axis.name)) {
+                model.moment_weights.*(axis.value) = *value;
+            }
+        }
+    }
+    if (payload.contains("target_vad")) {
+        const json & object = payload.at("target_vad");
+        if (!object.is_object()) {
+            throw std::runtime_error("target_vad must be a JSON object");
+        }
+        for (const auto & axis : k_policy_reward_vad_axes) {
+            if (const auto value = json_number_if_present(object, axis.name)) {
+                model.target_vad.*(axis.policy_value) = *value;
+            }
+        }
+    }
+    if (payload.contains("vad_weights")) {
+        const json & object = payload.at("vad_weights");
+        if (!object.is_object()) {
+            throw std::runtime_error("vad_weights must be a JSON object");
+        }
+        for (const auto & axis : k_policy_reward_vad_axes) {
+            if (const auto value = json_number_if_present(object, axis.name)) {
+                model.vad_weights.*(axis.policy_value) = *value;
+            }
+        }
+    }
+
+    const struct {
+        const char * name;
+        float server_policy_reward_model::* member;
+    } scalar_fields[] = {
+        {"progress_weight", &server_policy_reward_model::progress_weight},
+        {"terminal_closeness_weight", &server_policy_reward_model::terminal_closeness_weight},
+        {"shaping_gamma", &server_policy_reward_model::shaping_gamma},
+        {"completion_stop_reward", &server_policy_reward_model::completion_stop_reward},
+        {"completion_non_stop_reward", &server_policy_reward_model::completion_non_stop_reward},
+        {"latency_cost_cap", &server_policy_reward_model::latency_cost_cap},
+        {"latency_ms_scale", &server_policy_reward_model::latency_ms_scale},
+        {"token_cost_cap", &server_policy_reward_model::token_cost_cap},
+        {"token_scale", &server_policy_reward_model::token_scale},
+        {"tool_success_bonus", &server_policy_reward_model::tool_success_bonus},
+        {"candidate_failure_penalty", &server_policy_reward_model::candidate_failure_penalty},
+    };
+    for (const auto & field : scalar_fields) {
+        if (const auto value = json_number_if_present(payload, field.name)) {
+            model.*(field.member) = *value;
+        }
+    }
+}
+
+static bool validate_reward_model(const server_policy_reward_model & model, std::string * out_error) {
+    auto fail = [out_error](const std::string & message) {
+        if (out_error) {
+            *out_error = message;
+        }
+        return false;
+    };
+
+    if (trim_copy(model.schema_version).empty()) {
+        return fail("reward model schema_version must be non-empty");
+    }
+    if (trim_copy(model.model_version).empty()) {
+        return fail("reward model model_version must be non-empty");
+    }
+    for (const auto & axis : k_policy_reward_moment_axes) {
+        const float target = model.target_moment.*(axis.value);
+        const float weight = model.moment_weights.*(axis.value);
+        if (target < 0.0f || target > 1.0f) {
+            return fail(std::string("target_moment.") + axis.name + " must be within [0, 1]");
+        }
+        if (weight <= 0.0f) {
+            return fail(std::string("moment_weights.") + axis.name + " must be > 0");
+        }
+    }
+    for (const auto & axis : k_policy_reward_vad_axes) {
+        const float target = model.target_vad.*(axis.policy_value);
+        const float weight = model.vad_weights.*(axis.policy_value);
+        if (axis.signed_domain) {
+            if (target < -1.0f || target > 1.0f) {
+                return fail(std::string("target_vad.") + axis.name + " must be within [-1, 1]");
+            }
+        } else if (target < 0.0f || target > 1.0f) {
+            return fail(std::string("target_vad.") + axis.name + " must be within [0, 1]");
+        }
+        if (weight <= 0.0f) {
+            return fail(std::string("vad_weights.") + axis.name + " must be > 0");
+        }
+    }
+    if (model.progress_weight <= 0.0f) {
+        return fail("progress_weight must be > 0");
+    }
+    if (model.terminal_closeness_weight <= 0.0f) {
+        return fail("terminal_closeness_weight must be > 0");
+    }
+    if (model.shaping_gamma <= 0.0f || model.shaping_gamma > 1.0f) {
+        return fail("shaping_gamma must be within (0, 1]");
+    }
+    if (model.latency_cost_cap <= 0.0f || model.latency_ms_scale <= 0.0f) {
+        return fail("latency_cost_cap and latency_ms_scale must be > 0");
+    }
+    if (model.token_cost_cap <= 0.0f || model.token_scale <= 0.0f) {
+        return fail("token_cost_cap and token_scale must be > 0");
+    }
+    if (model.candidate_failure_penalty < 0.0f) {
+        return fail("candidate_failure_penalty must be >= 0");
+    }
+    if (model.tool_success_bonus < 0.0f) {
+        return fail("tool_success_bonus must be >= 0");
+    }
+    return true;
+}
+
+static float compute_desired_state_score(
+        const server_policy_reward_model & model,
+        const server_emotive_vector & moment,
+        const server_emotive_vad & vad) {
+    float weighted_distance = 0.0f;
+    float total_weight = 0.0f;
+    for (const auto & axis : k_policy_reward_moment_axes) {
+        const float weight = model.moment_weights.*(axis.value);
+        weighted_distance += weight * std::fabs(moment.*(axis.value) - model.target_moment.*(axis.value));
+        total_weight += weight;
+    }
+    for (const auto & axis : k_policy_reward_vad_axes) {
+        const float weight = model.vad_weights.*(axis.policy_value);
+        const float current = vad.*(axis.observation_value);
+        const float target = model.target_vad.*(axis.policy_value);
+        const float normalizer = axis.signed_domain ? 2.0f : 1.0f;
+        weighted_distance += weight * (std::fabs(current - target) / normalizer);
+        total_weight += weight;
+    }
+    if (total_weight <= 0.0f) {
+        return 0.0f;
+    }
+    return clamp_unit_interval(1.0f - (weighted_distance / total_weight));
+}
+
+static server_policy_reward_breakdown compute_policy_reward_breakdown(
+        const server_policy_reward_model & model,
+        const server_policy_observation & before,
+        const server_policy_observation & after,
+        const deepseek_chat_result & result,
+        int64_t latency_ms,
+        bool candidate_policy_failure) {
+    server_policy_reward_breakdown breakdown = {};
+    breakdown.model_version = model.model_version;
+    breakdown.before_score = compute_desired_state_score(model, before.moment, before.vad);
+    breakdown.after_score = compute_desired_state_score(model, after.moment, after.vad);
+    breakdown.progress_reward =
+            model.progress_weight * ((model.shaping_gamma * breakdown.after_score) - breakdown.before_score);
+    breakdown.terminal_closeness_reward =
+            model.terminal_closeness_weight * ((2.0f * breakdown.after_score) - 1.0f);
+    breakdown.completion_quality_reward =
+            (result.finish_reason == "stop") ? model.completion_stop_reward : model.completion_non_stop_reward;
+    breakdown.latency_cost = -std::min(
+            model.latency_cost_cap,
+            static_cast<float>(latency_ms) / std::max(1.0f, model.latency_ms_scale));
+    breakdown.token_cost = -std::min(
+            model.token_cost_cap,
+            static_cast<float>(result.prompt_tokens + result.completion_tokens) / std::max(1.0f, model.token_scale));
+    breakdown.tool_success_reward = result.tool_calls.empty() ? 0.0f : model.tool_success_bonus;
+    breakdown.candidate_failure_penalty = candidate_policy_failure ? -model.candidate_failure_penalty : 0.0f;
+    breakdown.total =
+            breakdown.progress_reward +
+            breakdown.terminal_closeness_reward +
+            breakdown.completion_quality_reward +
+            breakdown.latency_cost +
+            breakdown.token_cost +
+            breakdown.tool_success_reward +
+            breakdown.candidate_failure_penalty;
+    return breakdown;
+}
+
+static server_policy_runtime_config server_policy_runtime_config_from_env() {
+    server_policy_runtime_config config;
+    config.reward_model = default_policy_reward_model();
+    const std::string mode = normalize_policy_runtime_mode(
+            to_lower_copy(trim_copy(std::getenv("VICUNA_POLICY_MODE") ? std::getenv("VICUNA_POLICY_MODE") : "")));
+    if (mode != "disabled") {
+        config.mode = mode;
+        config.enabled = true;
+    }
+    config.max_transitions = env_to_int_local("VICUNA_POLICY_MAX_TRANSITIONS", config.max_transitions);
+    config.timeout_ms = env_to_int_local("VICUNA_POLICY_TIMEOUT_MS", config.timeout_ms);
+    config.live_confidence_threshold = std::min(
+            1.0f,
+            std::max(0.0f, env_to_float_local(
+                    "VICUNA_POLICY_LIVE_CONFIDENCE_THRESHOLD",
+                    config.live_confidence_threshold)));
+    config.min_requests_per_step = env_to_int_local(
+            "VICUNA_POLICY_CANARY_MIN_REQUESTS_PER_STEP",
+            config.min_requests_per_step);
+    config.rollback_max_candidate_failure_rate = std::min(
+            1.0f,
+            std::max(0.0f, env_to_float_local(
+                    "VICUNA_POLICY_ROLLBACK_MAX_CANDIDATE_FAILURE_RATE",
+                    config.rollback_max_candidate_failure_rate)));
+    config.rollback_max_invalid_action_rate = std::min(
+            1.0f,
+            std::max(0.0f, env_to_float_local(
+                    "VICUNA_POLICY_ROLLBACK_MAX_INVALID_ACTION_RATE",
+                    config.rollback_max_invalid_action_rate)));
+    config.rollback_max_fallback_rate = std::min(
+            1.0f,
+            std::max(0.0f, env_to_float_local(
+                    "VICUNA_POLICY_ROLLBACK_MAX_FALLBACK_RATE",
+                    config.rollback_max_fallback_rate)));
+    if (const char * value = std::getenv("VICUNA_POLICY_CANDIDATE_URL")) {
+        config.candidate_url = trim_copy(value);
+    }
+    if (const char * value = std::getenv("VICUNA_POLICY_CANARY_STEPS")) {
+        const std::vector<int32_t> parsed_steps = parse_policy_canary_steps(value);
+        if (!parsed_steps.empty()) {
+            config.canary_steps = parsed_steps;
+        }
+    }
+    if (const char * value = std::getenv("VICUNA_POLICY_REWARD_CONFIG_PATH")) {
+        config.reward_config_path = trim_copy(value);
+    }
+    if (!config.reward_config_path.empty()) {
+        try {
+            std::ifstream input(config.reward_config_path);
+            if (!input) {
+                throw std::runtime_error("unable to open reward config path");
+            }
+            const json payload = json::parse(input);
+            apply_reward_model_override(config.reward_model, payload);
+        } catch (const std::exception & exc) {
+            config.config_error = std::string("invalid reward config: ") + exc.what();
+            return config;
+        }
+    }
+    std::string reward_error;
+    if (!validate_reward_model(config.reward_model, &reward_error)) {
+        config.config_error = reward_error;
+    }
+    return config;
+}
+
+static void configure_policy_runtime(const server_policy_runtime_config & config) {
+    policy_runtime_config_instance() = config;
+    auto & state = policy_runtime_state_instance();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.max_transitions = static_cast<size_t>(std::max<int32_t>(1, config.max_transitions));
+    while (state.transitions.size() > state.max_transitions) {
+        state.transitions.pop_front();
+    }
+    state.current_rollout_step_index = 0;
+    state.rollout_rolled_back = false;
+    state.rollout_completed = false;
+    state.last_rollback_reason.clear();
+    state.current_window = server_policy_rollout_window();
+}
+
+static std::vector<std::string> default_allowed_modes() {
+    return {"direct", "reflective", "tool_light", "tool_heavy", "background_defer"};
+}
+
+static std::vector<std::string> default_allowed_reasoning_depths() {
+    return {"none", "short", "medium", "deep"};
+}
+
+static std::vector<std::string> default_allowed_thinking_modes() {
+    return {"enabled", "disabled"};
+}
+
+static std::vector<std::string> default_allowed_prefix_profiles() {
+    return {"none", "bounded_answer", "replan_outline", "json_object_open"};
+}
+
+static std::vector<std::string> default_allowed_stop_profiles() {
+    return {"none", "concise_answer", "markdown_code_fence"};
+}
+
+static std::vector<std::string> default_allowed_sampling_profiles() {
+    return {"provider_default", "deterministic", "balanced", "creative"};
+}
+
+static std::vector<std::string> default_allowed_repetition_profiles() {
+    return {"none", "anti_stall_soft", "anti_stall_hard", "novelty_soft"};
+}
+
+static std::vector<std::string> default_allowed_tool_choice_profiles() {
+    return {"caller_default", "none", "auto", "required"};
+}
+
+static bool vector_contains_value(const std::vector<std::string> & values, const std::string & value) {
+    return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+static int64_t policy_token_budget_bucket_for_depth(const std::string & reasoning_depth) {
+    if (reasoning_depth == "none") {
+        return 256;
+    }
+    if (reasoning_depth == "short") {
+        return 512;
+    }
+    if (reasoning_depth == "medium") {
+        return 1024;
+    }
+    return 2048;
+}
+
+static server_policy_action build_policy_action_from_native(
+        const server_metacognitive_policy_decision & policy_decision) {
+    server_policy_action action = {};
+    action.policy_version = policy_decision.policy_version;
+    action.selected_mode = policy_decision.selected_mode;
+    action.reasoning_depth = policy_decision.reasoning_depth;
+    action.token_budget_bucket = policy_token_budget_bucket_for_depth(policy_decision.reasoning_depth);
+    action.tool_parallelism_cap = policy_decision.tool_parallelism_cap;
+    action.interrupt_allowed = policy_decision.interrupt_allowed;
+    action.replan_required = policy_decision.replan_required;
+    action.early_stop_ok = policy_decision.early_stop_ok;
+    action.force_synthesis = policy_decision.force_synthesis;
+    action.thinking_mode = policy_decision.thinking_mode;
+    action.prefix_profile = policy_decision.prefix_profile;
+    action.stop_profile = policy_decision.stop_profile;
+    action.sampling_profile = policy_decision.sampling_profile;
+    action.repetition_profile = policy_decision.repetition_profile;
+    action.tool_choice_profile = policy_decision.tool_choice_profile;
+    action.proposal_source = "native";
+    return action;
+}
+
+static server_metacognitive_policy_decision apply_policy_action_to_decision(
+        const server_metacognitive_policy_decision & base_decision,
+        const server_policy_action & action) {
+    server_metacognitive_policy_decision decision = base_decision;
+    decision.policy_version = action.policy_version;
+    decision.selected_mode = action.selected_mode;
+    decision.reasoning_depth = action.reasoning_depth;
+    decision.tool_parallelism_cap = action.tool_parallelism_cap;
+    decision.interrupt_allowed = action.interrupt_allowed;
+    decision.replan_required = action.replan_required;
+    decision.early_stop_ok = action.early_stop_ok;
+    decision.force_synthesis = action.force_synthesis;
+    decision.thinking_mode = action.thinking_mode;
+    decision.prefix_profile = action.prefix_profile;
+    decision.stop_profile = action.stop_profile;
+    decision.sampling_profile = action.sampling_profile;
+    decision.repetition_profile = action.repetition_profile;
+    decision.tool_choice_profile = action.tool_choice_profile;
+    return decision;
+}
+
+static server_policy_action_mask default_policy_action_mask() {
+    server_policy_action_mask mask = {};
+    mask.allowed_modes = default_allowed_modes();
+    mask.allowed_reasoning_depths = default_allowed_reasoning_depths();
+    mask.allowed_thinking_modes = default_allowed_thinking_modes();
+    mask.allowed_prefix_profiles = default_allowed_prefix_profiles();
+    mask.allowed_stop_profiles = default_allowed_stop_profiles();
+    mask.allowed_sampling_profiles = default_allowed_sampling_profiles();
+    mask.allowed_repetition_profiles = default_allowed_repetition_profiles();
+    mask.allowed_tool_choice_profiles = default_allowed_tool_choice_profiles();
+    mask.max_tool_parallelism_cap = 2;
+    return mask;
+}
+
+static int32_t request_tool_count(const json & body) {
+    if (!body.contains("tools") || !body.at("tools").is_array()) {
+        return 0;
+    }
+    return static_cast<int32_t>(body.at("tools").size());
+}
+
+static bool body_requests_json_object(const json & body) {
+    if (!body.contains("response_format") || !body.at("response_format").is_object()) {
+        return false;
+    }
+    return json_value(body.at("response_format"), "type", std::string()) == "json_object";
+}
+
+static bool body_has_named_tool_choice(const json & body) {
+    if (!body.contains("tool_choice") || !body.at("tool_choice").is_object()) {
+        return false;
+    }
+    const json & tool_choice = body.at("tool_choice");
+    const json function = tool_choice.value("function", json::object());
+    return function.is_object() && !json_value(function, "name", std::string()).empty();
+}
+
+static void append_string_once(std::vector<std::string> * values, const std::string & value) {
+    if (!values || value.empty()) {
+        return;
+    }
+    if (std::find(values->begin(), values->end(), value) == values->end()) {
+        values->push_back(value);
+    }
+}
+
+static std::string prefix_text_for_profile(const std::string & prefix_profile) {
+    if (prefix_profile == "bounded_answer") {
+        return "Best bounded answer:\n";
+    }
+    if (prefix_profile == "replan_outline") {
+        return "Revised plan:\n1. ";
+    }
+    if (prefix_profile == "json_object_open") {
+        return "{";
+    }
+    return std::string();
+}
+
+static std::vector<std::string> stop_sequences_for_profile(const std::string & stop_profile) {
+    if (stop_profile == "concise_answer") {
+        return {"\n\n"};
+    }
+    if (stop_profile == "markdown_code_fence") {
+        return {"```"};
+    }
+    return {};
+}
+
+static json apply_policy_provider_controls(
+        const json & body,
+        const server_policy_action & action,
+        server_policy_applied_provider_controls * out_controls) {
+    json shaped = body;
+    server_policy_applied_provider_controls controls = {};
+    controls.thinking_enabled = action.thinking_mode != "disabled";
+    controls.prefix_profile = action.prefix_profile;
+    controls.stop_profile = action.stop_profile;
+    controls.sampling_profile = action.sampling_profile;
+    controls.repetition_profile = action.repetition_profile;
+    controls.tool_choice_profile = action.tool_choice_profile;
+    controls.field_sources["thinking"] = "policy";
+    shaped["thinking"] = {{"type", controls.thinking_enabled ? "enabled" : "disabled"}};
+
+    const bool json_object_requested = body_requests_json_object(shaped);
+    const bool named_tool_choice_locked = body_has_named_tool_choice(shaped);
+    const bool tools_available = request_tool_count(shaped) > 0;
+
+    if (controls.thinking_enabled) {
+        if (action.sampling_profile != "provider_default") {
+            append_string_once(&controls.suppressed_fields, "sampling_profile");
+        }
+        if (action.repetition_profile != "none") {
+            append_string_once(&controls.suppressed_fields, "repetition_profile");
+        }
+        for (const char * key : {"temperature", "top_p", "frequency_penalty", "presence_penalty", "logprobs", "top_logprobs"}) {
+            if (shaped.contains(key)) {
+                shaped.erase(key);
+                controls.suppressed_fields.push_back(key);
+            }
+        }
+    } else {
+        if (action.sampling_profile == "deterministic") {
+            shaped["temperature"] = 0.0;
+            shaped.erase("top_p");
+            controls.temperature_present = true;
+            controls.temperature = 0.0;
+            controls.field_sources["temperature"] = "policy_profile";
+        } else if (action.sampling_profile == "balanced") {
+            shaped["temperature"] = 0.2;
+            shaped.erase("top_p");
+            controls.temperature_present = true;
+            controls.temperature = 0.2;
+            controls.field_sources["temperature"] = "policy_profile";
+        } else if (action.sampling_profile == "creative") {
+            shaped.erase("temperature");
+            shaped["top_p"] = 0.95;
+            controls.top_p_present = true;
+            controls.top_p = 0.95;
+            controls.field_sources["top_p"] = "policy_profile";
+        } else {
+            if (shaped.contains("temperature") && shaped.at("temperature").is_number()) {
+                controls.temperature_present = true;
+                controls.temperature = shaped.at("temperature").get<double>();
+                controls.field_sources["temperature"] = "caller";
+            } else if (shaped.contains("top_p") && shaped.at("top_p").is_number()) {
+                controls.top_p_present = true;
+                controls.top_p = shaped.at("top_p").get<double>();
+                controls.field_sources["top_p"] = "caller";
+            } else {
+                controls.defaulted_fields.push_back("sampling_profile");
+            }
+        }
+
+        if (action.repetition_profile == "anti_stall_soft") {
+            shaped["frequency_penalty"] = 0.4;
+            shaped["presence_penalty"] = 0.1;
+            controls.frequency_penalty_present = true;
+            controls.frequency_penalty = 0.4;
+            controls.presence_penalty_present = true;
+            controls.presence_penalty = 0.1;
+            controls.field_sources["frequency_penalty"] = "policy_profile";
+            controls.field_sources["presence_penalty"] = "policy_profile";
+        } else if (action.repetition_profile == "anti_stall_hard") {
+            shaped["frequency_penalty"] = 0.8;
+            shaped["presence_penalty"] = 0.2;
+            controls.frequency_penalty_present = true;
+            controls.frequency_penalty = 0.8;
+            controls.presence_penalty_present = true;
+            controls.presence_penalty = 0.2;
+            controls.field_sources["frequency_penalty"] = "policy_profile";
+            controls.field_sources["presence_penalty"] = "policy_profile";
+        } else if (action.repetition_profile == "novelty_soft") {
+            shaped["frequency_penalty"] = 0.0;
+            shaped["presence_penalty"] = 0.4;
+            controls.frequency_penalty_present = true;
+            controls.frequency_penalty = 0.0;
+            controls.presence_penalty_present = true;
+            controls.presence_penalty = 0.4;
+            controls.field_sources["frequency_penalty"] = "policy_profile";
+            controls.field_sources["presence_penalty"] = "policy_profile";
+        } else {
+            if (shaped.contains("frequency_penalty")) {
+                shaped.erase("frequency_penalty");
+                controls.suppressed_fields.push_back("frequency_penalty");
+            }
+            if (shaped.contains("presence_penalty")) {
+                shaped.erase("presence_penalty");
+                controls.suppressed_fields.push_back("presence_penalty");
+            }
+        }
+    }
+
+    if (!tools_available) {
+        append_string_once(&controls.suppressed_fields, "tool_choice_profile");
+    } else if (named_tool_choice_locked) {
+        append_string_once(&controls.suppressed_fields, "tool_choice_profile");
+    } else if (action.tool_choice_profile != "caller_default") {
+        shaped["tool_choice"] = action.tool_choice_profile;
+        controls.tool_choice = action.tool_choice_profile;
+        controls.field_sources["tool_choice"] = "policy_profile";
+    } else if (shaped.contains("tool_choice")) {
+        if (shaped.at("tool_choice").is_string()) {
+            controls.tool_choice = shaped.at("tool_choice").get<std::string>();
+        }
+        controls.field_sources["tool_choice"] = "caller";
+    }
+
+    bool prefix_allowed = !controls.thinking_enabled;
+    if (action.prefix_profile == "json_object_open" && !json_object_requested) {
+        prefix_allowed = false;
+        append_string_once(&controls.suppressed_fields, "prefix_profile");
+    }
+    if ((action.prefix_profile == "bounded_answer" || action.prefix_profile == "replan_outline") && json_object_requested) {
+        prefix_allowed = false;
+        append_string_once(&controls.suppressed_fields, "prefix_profile");
+    }
+    if (tools_available && action.prefix_profile != "none") {
+        prefix_allowed = false;
+        append_string_once(&controls.suppressed_fields, "prefix_profile");
+    }
+    if (controls.thinking_enabled && action.prefix_profile != "none") {
+        append_string_once(&controls.suppressed_fields, "prefix_profile");
+    }
+
+    if (action.prefix_profile != "none" && prefix_allowed &&
+            shaped.contains("messages") && shaped.at("messages").is_array()) {
+        const std::string prefix_text = prefix_text_for_profile(action.prefix_profile);
+        if (!prefix_text.empty()) {
+            shaped["messages"].push_back({
+                {"role", "assistant"},
+                {"content", prefix_text},
+                {"prefix", true},
+            });
+            controls.prefix_used = true;
+            controls.field_sources["prefix"] = "policy_profile";
+            controls.beta_routing_reason = "prefix_completion";
+        }
+    }
+
+    const bool stop_suppressed_by_prefix_state =
+            action.stop_profile != "none" && action.prefix_profile != "none" && !controls.prefix_used;
+    if (stop_suppressed_by_prefix_state) {
+        append_string_once(&controls.suppressed_fields, "stop_profile");
+        if (shaped.contains("stop")) {
+            shaped.erase("stop");
+            append_string_once(&controls.suppressed_fields, "stop");
+        }
+    } else if (action.stop_profile == "none") {
+        if (shaped.contains("stop")) {
+            shaped.erase("stop");
+            controls.suppressed_fields.push_back("stop");
+        }
+    } else {
+        std::vector<std::string> stop_sequences = stop_sequences_for_profile(action.stop_profile);
+        const bool stop_allowed = !(json_object_requested && action.stop_profile == "concise_answer");
+        if (!stop_allowed) {
+            append_string_once(&controls.suppressed_fields, "stop_profile");
+        } else if (!stop_sequences.empty()) {
+            shaped["stop"] = stop_sequences;
+            controls.stop_sequences = std::move(stop_sequences);
+            controls.field_sources["stop"] = "policy_profile";
+        }
+    }
+
+    if (out_controls) {
+        *out_controls = std::move(controls);
+    }
+    return shaped;
+}
+
+static server_policy_observation build_policy_observation(
+        const std::string & request_id,
+        const std::string & decision_id,
+        const std::string & trace_id,
+        const std::string & mode_label,
+        const server_metacognitive_control_state & control_state,
+        const server_heuristic_retrieval_decision & heuristic_decision,
+        const json & body) {
+    server_policy_observation observation = {};
+    observation.request_id = request_id;
+    observation.trace_id = trace_id;
+    observation.decision_id = decision_id;
+    observation.mode_label = mode_label;
+    observation.bridge_scoped = control_state.bridge_scoped;
+    observation.cognitive_replay = control_state.cognitive_replay;
+    observation.ongoing_task_due = control_state.ongoing_task_due;
+    observation.moment = control_state.moment;
+    observation.vad = control_state.vad;
+    observation.heuristic_matched = heuristic_decision.matched;
+    observation.heuristic_id = heuristic_decision.heuristic_id;
+    observation.available_tool_count = request_tool_count(body);
+    observation.parallel_tool_calls_requested = json_value(body, "parallel_tool_calls", false);
+    if (body.contains("messages") && body.at("messages").is_array()) {
+        observation.input_message_count = static_cast<int32_t>(body.at("messages").size());
+    }
+    return observation;
+}
+
+static bool parse_candidate_policy_action(
+        const json & payload,
+        server_policy_action * out_action,
+        std::string * out_policy_version,
+        std::string * out_policy_alias,
+        bool * out_confidence_present,
+        float * out_confidence,
+        std::string * out_error) {
+    if (!out_action) {
+        if (out_error) {
+            *out_error = "candidate action output must not be null";
+        }
+        return false;
+    }
+    if (!payload.is_object() || !payload.contains("action") || !payload.at("action").is_object()) {
+        if (out_error) {
+            *out_error = "candidate policy response missing action object";
+        }
+        return false;
+    }
+
+    const json & action_json = payload.at("action");
+    server_policy_action action = {};
+    action.policy_version = json_value(payload, "policy_version", std::string("shadow_candidate_v1"));
+    action.selected_mode = json_value(action_json, "selected_mode", std::string());
+    action.reasoning_depth = json_value(action_json, "reasoning_depth", std::string());
+    if (action_json.contains("token_budget_bucket")) {
+        if (action_json.at("token_budget_bucket").is_number_integer()) {
+            action.token_budget_bucket = action_json.at("token_budget_bucket").get<int64_t>();
+        } else if (action_json.at("token_budget_bucket").is_string()) {
+            action.token_budget_bucket = std::strtoll(
+                    action_json.at("token_budget_bucket").get_ref<const std::string &>().c_str(),
+                    nullptr,
+                    10);
+        }
+    }
+    action.tool_parallelism_cap = json_value(action_json, "tool_parallelism_cap", int32_t(0));
+    action.interrupt_allowed = json_value(action_json, "interrupt_allowed", false);
+    action.replan_required = json_value(action_json, "replan_required", false);
+    action.early_stop_ok = json_value(action_json, "early_stop_ok", false);
+    action.force_synthesis = json_value(action_json, "force_synthesis", false);
+    action.thinking_mode = json_value(
+            action_json,
+            "thinking_mode",
+            action.reasoning_depth == "none" ? std::string("disabled") : std::string("enabled"));
+    action.prefix_profile = json_value(action_json, "prefix_profile", std::string("none"));
+    action.stop_profile = json_value(action_json, "stop_profile", std::string("none"));
+    action.sampling_profile = json_value(action_json, "sampling_profile", std::string("provider_default"));
+    action.repetition_profile = json_value(action_json, "repetition_profile", std::string("none"));
+    action.tool_choice_profile = json_value(action_json, "tool_choice_profile", std::string("caller_default"));
+    action.proposal_source = "candidate";
+
+    if (action.selected_mode.empty() || action.reasoning_depth.empty() || action.token_budget_bucket <= 0) {
+        if (out_error) {
+            *out_error = "candidate policy response missing required bounded action fields";
+        }
+        return false;
+    }
+
+    *out_action = std::move(action);
+    if (out_policy_version) {
+        *out_policy_version = out_action->policy_version;
+    }
+    if (out_policy_alias) {
+        *out_policy_alias = json_value(payload, "policy_alias", std::string());
+    }
+    if (out_confidence_present) {
+        *out_confidence_present = false;
+    }
+    if (out_confidence) {
+        *out_confidence = 0.0f;
+    }
+    if (payload.contains("confidence")) {
+        const json & confidence_json = payload.at("confidence");
+        float parsed_confidence = 0.0f;
+        bool parsed_present = false;
+        if (confidence_json.is_number()) {
+            parsed_confidence = confidence_json.get<float>();
+            parsed_present = true;
+        } else if (confidence_json.is_object() && confidence_json.contains("overall") &&
+                confidence_json.at("overall").is_number()) {
+            parsed_confidence = confidence_json.at("overall").get<float>();
+            parsed_present = true;
+        }
+        if (parsed_present) {
+            parsed_confidence = std::min(1.0f, std::max(0.0f, parsed_confidence));
+            if (out_confidence_present) {
+                *out_confidence_present = true;
+            }
+            if (out_confidence) {
+                *out_confidence = parsed_confidence;
+            }
+        }
+    }
+    return true;
+}
+
+static server_policy_safety_guard_result shield_candidate_policy_action(
+        const server_policy_action_mask & mask,
+        const server_policy_action & native_action,
+        const server_policy_action & candidate_action,
+        server_policy_action * out_shielded_action) {
+    server_policy_safety_guard_result result = {};
+    result.candidate_present = true;
+    result.allowed = true;
+
+    server_policy_action shielded = candidate_action;
+    if (!vector_contains_value(mask.allowed_modes, shielded.selected_mode)) {
+        shielded.selected_mode = native_action.selected_mode;
+        result.blocked_fields.push_back("selected_mode");
+        result.allowed = false;
+    }
+    if (!vector_contains_value(mask.allowed_reasoning_depths, shielded.reasoning_depth)) {
+        shielded.reasoning_depth = native_action.reasoning_depth;
+        result.blocked_fields.push_back("reasoning_depth");
+        result.allowed = false;
+    }
+    if (!vector_contains_value(mask.allowed_thinking_modes, shielded.thinking_mode)) {
+        shielded.thinking_mode = native_action.thinking_mode;
+        result.blocked_fields.push_back("thinking_mode");
+        result.allowed = false;
+    }
+    if (!vector_contains_value(mask.allowed_prefix_profiles, shielded.prefix_profile)) {
+        shielded.prefix_profile = native_action.prefix_profile;
+        result.blocked_fields.push_back("prefix_profile");
+        result.allowed = false;
+    }
+    if (!vector_contains_value(mask.allowed_stop_profiles, shielded.stop_profile)) {
+        shielded.stop_profile = native_action.stop_profile;
+        result.blocked_fields.push_back("stop_profile");
+        result.allowed = false;
+    }
+    if (!vector_contains_value(mask.allowed_sampling_profiles, shielded.sampling_profile)) {
+        shielded.sampling_profile = native_action.sampling_profile;
+        result.blocked_fields.push_back("sampling_profile");
+        result.allowed = false;
+    }
+    if (!vector_contains_value(mask.allowed_repetition_profiles, shielded.repetition_profile)) {
+        shielded.repetition_profile = native_action.repetition_profile;
+        result.blocked_fields.push_back("repetition_profile");
+        result.allowed = false;
+    }
+    if (!vector_contains_value(mask.allowed_tool_choice_profiles, shielded.tool_choice_profile)) {
+        shielded.tool_choice_profile = native_action.tool_choice_profile;
+        result.blocked_fields.push_back("tool_choice_profile");
+        result.allowed = false;
+    }
+    if (shielded.tool_parallelism_cap < 0) {
+        shielded.tool_parallelism_cap = 0;
+        result.clipped_fields.push_back("tool_parallelism_cap");
+        result.allowed = false;
+    }
+    if (shielded.tool_parallelism_cap > mask.max_tool_parallelism_cap) {
+        shielded.tool_parallelism_cap = mask.max_tool_parallelism_cap;
+        result.clipped_fields.push_back("tool_parallelism_cap");
+        result.allowed = false;
+    }
+    if (!mask.allow_interrupt && shielded.interrupt_allowed) {
+        shielded.interrupt_allowed = native_action.interrupt_allowed;
+        result.blocked_fields.push_back("interrupt_allowed");
+        result.allowed = false;
+    }
+    if (!mask.allow_replan && shielded.replan_required) {
+        shielded.replan_required = native_action.replan_required;
+        result.blocked_fields.push_back("replan_required");
+        result.allowed = false;
+    }
+    if (!mask.allow_early_stop && shielded.early_stop_ok) {
+        shielded.early_stop_ok = native_action.early_stop_ok;
+        result.blocked_fields.push_back("early_stop_ok");
+        result.allowed = false;
+    }
+    if (!mask.allow_force_synthesis && shielded.force_synthesis) {
+        shielded.force_synthesis = native_action.force_synthesis;
+        result.blocked_fields.push_back("force_synthesis");
+        result.allowed = false;
+    }
+
+    result.fallback_to_native = !result.allowed;
+    result.reason = result.allowed ?
+            "candidate proposal remained inside bounded runtime limits" :
+            "candidate proposal required native bounds enforcement";
+    if (out_shielded_action) {
+        *out_shielded_action = std::move(shielded);
+    }
+    return result;
+}
+
+static bool policy_actions_differ(
+        const server_policy_action & lhs,
+        const server_policy_action & rhs) {
+    return lhs.selected_mode != rhs.selected_mode ||
+            lhs.reasoning_depth != rhs.reasoning_depth ||
+            lhs.token_budget_bucket != rhs.token_budget_bucket ||
+            lhs.tool_parallelism_cap != rhs.tool_parallelism_cap ||
+            lhs.interrupt_allowed != rhs.interrupt_allowed ||
+            lhs.replan_required != rhs.replan_required ||
+            lhs.early_stop_ok != rhs.early_stop_ok ||
+            lhs.force_synthesis != rhs.force_synthesis ||
+            lhs.thinking_mode != rhs.thinking_mode ||
+            lhs.prefix_profile != rhs.prefix_profile ||
+            lhs.stop_profile != rhs.stop_profile ||
+            lhs.sampling_profile != rhs.sampling_profile ||
+            lhs.repetition_profile != rhs.repetition_profile ||
+            lhs.tool_choice_profile != rhs.tool_choice_profile;
+}
+
+struct server_policy_rollout_decision {
+    std::string rollout_mode = "disabled";
+    bool rollout_sampled = false;
+    bool execute_candidate_live = false;
+    bool candidate_confidence_present = false;
+    float candidate_confidence = 0.0f;
+    bool candidate_confidence_passed = false;
+    std::string reason = "native_only";
+    int32_t canary_share_percent = 0;
+    int32_t rollout_step_index = 0;
+};
+
+static bool should_sample_canary_request(const std::string & request_id, int32_t canary_share_percent) {
+    if (canary_share_percent <= 0) {
+        return false;
+    }
+    if (canary_share_percent >= 100) {
+        return true;
+    }
+    const uint64_t bucket = std::hash<std::string>{}(request_id) % 10000ULL;
+    return bucket < static_cast<uint64_t>(canary_share_percent) * 100ULL;
+}
+
+static server_policy_rollout_decision decide_policy_rollout_action(
+        const server_policy_runtime_config & config,
+        const server_policy_runtime_state & state,
+        const std::string & request_id,
+        bool have_candidate_policy_action,
+        bool candidate_policy_failure,
+        bool candidate_confidence_present,
+        float candidate_confidence,
+        const server_policy_safety_guard_result & safety_guard) {
+    server_policy_rollout_decision decision = {};
+    decision.rollout_mode = config.mode;
+    decision.rollout_step_index = state.current_rollout_step_index;
+    decision.candidate_confidence_present = candidate_confidence_present;
+    decision.candidate_confidence = candidate_confidence;
+    decision.candidate_confidence_passed = !candidate_confidence_present ||
+            candidate_confidence >= config.live_confidence_threshold;
+
+    if (config.mode == "shadow") {
+        decision.reason = "shadow_compare_only";
+        return decision;
+    }
+    if (config.mode == "eval_only") {
+        decision.reason = "eval_only";
+        return decision;
+    }
+    if (config.mode == "capture" || config.mode == "native_only") {
+        decision.reason = "native_only";
+        return decision;
+    }
+    if (!policy_runtime_is_canary_live(config.mode)) {
+        decision.reason = "disabled";
+        return decision;
+    }
+
+    decision.canary_share_percent = policy_runtime_current_canary_share_percent_locked(config, state);
+    if (state.rollout_rolled_back) {
+        decision.reason = "rollback_active";
+        return decision;
+    }
+
+    decision.rollout_sampled = should_sample_canary_request(request_id, decision.canary_share_percent);
+    if (!decision.rollout_sampled) {
+        decision.reason = "outside_canary_sample";
+        return decision;
+    }
+    if (candidate_policy_failure) {
+        decision.reason = "candidate_failure";
+        return decision;
+    }
+    if (!have_candidate_policy_action) {
+        decision.reason = "candidate_missing";
+        return decision;
+    }
+    if (!decision.candidate_confidence_passed) {
+        decision.reason = "low_confidence";
+        return decision;
+    }
+    if (!safety_guard.allowed) {
+        decision.reason = "safety_guard_override";
+        return decision;
+    }
+
+    decision.execute_candidate_live = true;
+    decision.reason = "candidate_live";
+    return decision;
+}
+
+static void policy_runtime_update_rollout_after_request_locked(
+        server_policy_runtime_state & state,
+        const server_policy_runtime_config & config,
+        const server_policy_rollout_decision & decision,
+        bool candidate_policy_failure,
+        const server_policy_safety_guard_result & safety_guard) {
+    if (!policy_runtime_is_canary_live(config.mode) || state.rollout_rolled_back) {
+        return;
+    }
+    if (!decision.rollout_sampled) {
+        return;
+    }
+
+    ++state.sampled_request_count;
+    ++state.current_window.sampled_request_count;
+    if (decision.execute_candidate_live) {
+        ++state.live_candidate_execution_count;
+        ++state.current_window.candidate_execution_count;
+    } else {
+        ++state.live_fallback_count;
+        ++state.current_window.fallback_count;
+    }
+    if (candidate_policy_failure) {
+        ++state.current_window.candidate_failure_count;
+    }
+    if (decision.reason == "low_confidence") {
+        ++state.low_confidence_count;
+        ++state.current_window.low_confidence_count;
+    }
+    if (safety_guard.candidate_present &&
+            (!safety_guard.blocked_fields.empty() || !safety_guard.clipped_fields.empty())) {
+        ++state.invalid_action_count;
+        ++state.current_window.invalid_action_count;
+    }
+
+    if (state.current_window.sampled_request_count < static_cast<uint64_t>(config.min_requests_per_step)) {
+        return;
+    }
+
+    const float candidate_failure_rate = policy_rate(
+            state.current_window.candidate_failure_count,
+            state.current_window.sampled_request_count);
+    const float invalid_action_rate = policy_rate(
+            state.current_window.invalid_action_count,
+            state.current_window.sampled_request_count);
+    const float fallback_rate = policy_rate(
+            state.current_window.fallback_count,
+            state.current_window.sampled_request_count);
+
+    if (candidate_failure_rate > config.rollback_max_candidate_failure_rate) {
+        state.rollout_rolled_back = true;
+        ++state.rollback_count;
+        state.last_rollback_reason = "candidate_failure_rate_exceeded";
+        return;
+    }
+    if (invalid_action_rate > config.rollback_max_invalid_action_rate) {
+        state.rollout_rolled_back = true;
+        ++state.rollback_count;
+        state.last_rollback_reason = "invalid_action_rate_exceeded";
+        return;
+    }
+    if (fallback_rate > config.rollback_max_fallback_rate) {
+        state.rollout_rolled_back = true;
+        ++state.rollback_count;
+        state.last_rollback_reason = "fallback_rate_exceeded";
+        return;
+    }
+
+    if (state.current_rollout_step_index + 1 < static_cast<int32_t>(config.canary_steps.size())) {
+        ++state.current_rollout_step_index;
+        state.current_window = server_policy_rollout_window();
+        return;
+    }
+    state.rollout_completed = true;
+}
+
+static void policy_runtime_record_transition(const server_policy_transition & transition) {
+    auto & state = policy_runtime_state_instance();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.transitions.push_back(transition);
+    ++state.total_transitions;
+    while (state.transitions.size() > state.max_transitions) {
+        state.transitions.pop_front();
+    }
+}
+
+static json policy_runtime_status_json() {
+    const auto & config = policy_runtime_config_instance();
+    auto & state = policy_runtime_state_instance();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    const int32_t current_canary_share = policy_runtime_current_canary_share_percent_locked(config, state);
+    return {
+        {"object", "vicuna.policy.status"},
+        {"enabled", config.enabled},
+        {"mode", config.mode},
+        {"rollout_mode", config.mode},
+        {"rollout_state", policy_runtime_rollout_state_label_locked(config, state)},
+        {"behavior_policy_version", state.behavior_policy_version},
+        {"candidate_policy_version", state.candidate_policy_version.empty() ? json(nullptr) : json(state.candidate_policy_version)},
+        {"candidate_policy_alias", state.candidate_policy_alias.empty() ? json(nullptr) : json(state.candidate_policy_alias)},
+        {"stored_transitions", static_cast<int64_t>(state.transitions.size())},
+        {"max_transitions", static_cast<int64_t>(state.max_transitions)},
+        {"total_transitions", static_cast<int64_t>(state.total_transitions)},
+        {"shadow_request_count", static_cast<int64_t>(state.shadow_request_count)},
+        {"shadow_disagreement_count", static_cast<int64_t>(state.shadow_disagreement_count)},
+        {"candidate_failure_count", static_cast<int64_t>(state.candidate_failure_count)},
+        {"safety_guard_hit_count", static_cast<int64_t>(state.safety_guard_hit_count)},
+        {"sampled_request_count", static_cast<int64_t>(state.sampled_request_count)},
+        {"live_candidate_execution_count", static_cast<int64_t>(state.live_candidate_execution_count)},
+        {"live_fallback_count", static_cast<int64_t>(state.live_fallback_count)},
+        {"low_confidence_count", static_cast<int64_t>(state.low_confidence_count)},
+        {"invalid_action_count", static_cast<int64_t>(state.invalid_action_count)},
+        {"rollback_count", static_cast<int64_t>(state.rollback_count)},
+        {"last_rollback_reason", state.last_rollback_reason.empty() ? json(nullptr) : json(state.last_rollback_reason)},
+        {"current_rollout_step_index", state.current_rollout_step_index},
+        {"canary_steps", config.canary_steps},
+        {"current_canary_share_percent", current_canary_share},
+        {"confidence_threshold", config.live_confidence_threshold},
+        {"min_requests_per_step", config.min_requests_per_step},
+        {"reward_model", server_policy_reward_model_to_json(config.reward_model)},
+        {"current_window", {
+            {"sampled_request_count", static_cast<int64_t>(state.current_window.sampled_request_count)},
+            {"candidate_execution_count", static_cast<int64_t>(state.current_window.candidate_execution_count)},
+            {"fallback_count", static_cast<int64_t>(state.current_window.fallback_count)},
+            {"low_confidence_count", static_cast<int64_t>(state.current_window.low_confidence_count)},
+            {"candidate_failure_count", static_cast<int64_t>(state.current_window.candidate_failure_count)},
+            {"invalid_action_count", static_cast<int64_t>(state.current_window.invalid_action_count)},
+            {"candidate_failure_rate", policy_rate(state.current_window.candidate_failure_count, state.current_window.sampled_request_count)},
+            {"invalid_action_rate", policy_rate(state.current_window.invalid_action_count, state.current_window.sampled_request_count)},
+            {"fallback_rate", policy_rate(state.current_window.fallback_count, state.current_window.sampled_request_count)},
+        }},
+        {"latest_transition_id", state.transitions.empty() ? json(nullptr) : json(state.transitions.back().transition_id)},
+        {"latest_applied_provider_controls", state.transitions.empty() ?
+                json(nullptr) :
+                server_policy_applied_provider_controls_to_json(state.transitions.back().applied_provider_controls)},
+        {"last_candidate_error", state.last_candidate_error.empty() ? json(nullptr) : json(state.last_candidate_error)},
+        {"candidate_url", config.candidate_url.empty() ? json(nullptr) : json(config.candidate_url)},
+        {"reward_config_path", config.reward_config_path.empty() ? json(nullptr) : json(config.reward_config_path)},
+    };
+}
+
+static json policy_runtime_health_json() {
+    const auto & config = policy_runtime_config_instance();
+    auto & state = policy_runtime_state_instance();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    const int32_t current_canary_share = policy_runtime_current_canary_share_percent_locked(config, state);
+    return {
+        {"enabled", config.enabled},
+        {"mode", config.mode},
+        {"rollout_mode", config.mode},
+        {"rollout_state", policy_runtime_rollout_state_label_locked(config, state)},
+        {"stored_transitions", static_cast<int64_t>(state.transitions.size())},
+        {"max_transitions", static_cast<int64_t>(state.max_transitions)},
+        {"total_transitions", static_cast<int64_t>(state.total_transitions)},
+        {"shadow_request_count", static_cast<int64_t>(state.shadow_request_count)},
+        {"shadow_disagreement_count", static_cast<int64_t>(state.shadow_disagreement_count)},
+        {"candidate_failure_count", static_cast<int64_t>(state.candidate_failure_count)},
+        {"safety_guard_hit_count", static_cast<int64_t>(state.safety_guard_hit_count)},
+        {"candidate_policy_version", state.candidate_policy_version.empty() ? json(nullptr) : json(state.candidate_policy_version)},
+        {"candidate_policy_alias", state.candidate_policy_alias.empty() ? json(nullptr) : json(state.candidate_policy_alias)},
+        {"sampled_request_count", static_cast<int64_t>(state.sampled_request_count)},
+        {"live_candidate_execution_count", static_cast<int64_t>(state.live_candidate_execution_count)},
+        {"live_fallback_count", static_cast<int64_t>(state.live_fallback_count)},
+        {"low_confidence_count", static_cast<int64_t>(state.low_confidence_count)},
+        {"invalid_action_count", static_cast<int64_t>(state.invalid_action_count)},
+        {"rollback_count", static_cast<int64_t>(state.rollback_count)},
+        {"last_rollback_reason", state.last_rollback_reason.empty() ? json(nullptr) : json(state.last_rollback_reason)},
+        {"current_rollout_step_index", state.current_rollout_step_index},
+        {"current_canary_share_percent", current_canary_share},
+        {"reward_model", server_policy_reward_model_to_json(config.reward_model)},
+        {"latest_applied_provider_controls", state.transitions.empty() ?
+                json(nullptr) :
+                server_policy_applied_provider_controls_to_json(state.transitions.back().applied_provider_controls)},
+    };
+}
+
+static json policy_runtime_transitions_json(const server_http_req & req) {
+    const std::string request_id = trim_copy(req.get_param("request_id", ""));
+    const int64_t limit = std::max<int64_t>(1, std::min<int64_t>(
+            512,
+            std::strtoll(req.get_param("limit", "100").c_str(), nullptr, 10)));
+
+    auto & state = policy_runtime_state_instance();
+    json items = json::array();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    for (auto it = state.transitions.rbegin(); it != state.transitions.rend(); ++it) {
+        if (!request_id.empty() && it->request_id != request_id) {
+            continue;
+        }
+        items.push_back(server_policy_transition_to_json(*it));
+        if ((int64_t) items.size() >= limit) {
+            break;
+        }
+    }
+    std::reverse(items.begin(), items.end());
+    return {
+        {"object", "vicuna.policy.transitions"},
+        {"request_id", request_id.empty() ? json(nullptr) : json(request_id)},
+        {"count", static_cast<int64_t>(items.size())},
+        {"stored_transitions", static_cast<int64_t>(state.transitions.size())},
+        {"max_transitions", static_cast<int64_t>(state.max_transitions)},
+        {"items", std::move(items)},
     };
 }
 
@@ -527,7 +2027,7 @@ static json build_telegram_bridge_tools() {
     tools.push_back(build_telegram_bridge_tool(
             "telegram_send_plain_text",
             "send_plain_text",
-            "Send a simple plain-text Telegram reply. Do not include Markdown or HTML formatting markers.",
+            "Send a simple Telegram reply with no intended rich formatting. If you need formatting, prefer the formatted HTML tool instead of Markdown.",
             {
                 {"type", "object"},
                 {"description", "Payload for a simple Telegram plain-text reply."},
@@ -1070,7 +2570,10 @@ static json build_server_owned_bridge_request_body(
                 "Bridge-scoped delivery contract: when you are ready to respond to the user, do not call a Telegram tool. "
                 "Return normal assistant content instead. You may optionally start with YAML front matter delimited by --- lines. "
                 "Supported fields are format (plain_text|markdown|html), title, disable_web_page_preview, delivery_hint (reply|replace_prompt|silent), "
-                "and reply_markup. After the closing --- line, include the user-facing rich text body."},
+                "and reply_markup. HTML is the canonical Telegram rich-text format for user-facing delivery. Prefer format: html whenever you intend any formatting. "
+                "Markdown front matter and markdown-like decorators are accepted for compatibility and will be normalized into Telegram-supported HTML. "
+                "For tabular or chart-like output, prefer HTML or a preformatted grid; do not rely on raw markdown pipe tables. "
+                "After the closing --- line, include the user-facing rich text body."},
     });
     for (const auto & item : body.at("messages")) {
         messages.push_back(item);
@@ -2841,15 +4344,11 @@ static float env_to_float_local(const char * name, float default_value) {
 
 static server_ongoing_task_config server_ongoing_task_config_from_env() {
     server_ongoing_task_config config;
-    config.enabled = env_to_bool_local("VICUNA_ONGOING_TASKS_ENABLED", false);
+    config.enabled = false;
     if (const char * value = std::getenv("VICUNA_ONGOING_TASKS_BASE_URL")) {
-        config.base_url = trim_copy(value);
-    } else if (const char * value = std::getenv("SUPERMEMORY_BASE_URL")) {
         config.base_url = trim_copy(value);
     }
     if (const char * value = std::getenv("VICUNA_ONGOING_TASKS_AUTH_TOKEN")) {
-        config.auth_token = trim_copy(value);
-    } else if (const char * value = std::getenv("SUPERMEMORY_API_KEY")) {
         config.auth_token = trim_copy(value);
     }
     if (const char * value = std::getenv("VICUNA_ONGOING_TASKS_CONTAINER_TAG")) {
@@ -3996,7 +5495,7 @@ static json telegram_delivery_result_to_json(const telegram_delivery_result & de
 
 struct server_rich_plan_response {
     bool valid = false;
-    std::string format = "markdown";
+    std::string format = "plain_text";
     std::string title;
     std::string body;
     bool disable_web_page_preview = false;
@@ -4076,6 +5575,395 @@ static json parse_rich_plan_reply_markup_block(const std::vector<std::string> & 
         return nullptr;
     }
     return json{{"inline_keyboard", rows}};
+}
+
+static std::string telegram_html_escape(const std::string & value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (const char ch : value) {
+        switch (ch) {
+            case '&': escaped += "&amp;"; break;
+            case '<': escaped += "&lt;"; break;
+            case '>': escaped += "&gt;"; break;
+            default: escaped.push_back(ch); break;
+        }
+    }
+    return escaped;
+}
+
+static std::string sanitize_telegram_code_language(const std::string & value) {
+    std::string sanitized;
+    sanitized.reserve(value.size());
+    for (const unsigned char ch : value) {
+        if (std::isalnum(ch) || ch == '_' || ch == '-') {
+            sanitized.push_back(static_cast<char>(ch));
+        }
+    }
+    return sanitized;
+}
+
+static bool is_markdown_divider_line(const std::string & value) {
+    const std::string trimmed = trim_copy(value);
+    if (trimmed.size() < 3) {
+        return false;
+    }
+    const char marker = trimmed.front();
+    if (marker != '-' && marker != '*' && marker != '_') {
+        return false;
+    }
+    return std::all_of(trimmed.begin(), trimmed.end(), [marker](char ch) {
+        return ch == marker;
+    });
+}
+
+static std::string convert_markdown_inline_to_telegram_html(const std::string & text) {
+    std::string html;
+    for (size_t index = 0; index < text.size();) {
+        if (text.compare(index, 3, "***") == 0) {
+            const size_t closing = text.find("***", index + 3);
+            if (closing != std::string::npos && closing > index + 3) {
+                html += "<b><i>" + convert_markdown_inline_to_telegram_html(text.substr(index + 3, closing - index - 3)) + "</i></b>";
+                index = closing + 3;
+                continue;
+            }
+        }
+        if (text.compare(index, 2, "**") == 0) {
+            const size_t closing = text.find("**", index + 2);
+            if (closing != std::string::npos && closing > index + 2) {
+                html += "<b>" + convert_markdown_inline_to_telegram_html(text.substr(index + 2, closing - index - 2)) + "</b>";
+                index = closing + 2;
+                continue;
+            }
+        }
+        if (text.compare(index, 2, "__") == 0) {
+            const size_t closing = text.find("__", index + 2);
+            if (closing != std::string::npos && closing > index + 2) {
+                html += "<u>" + convert_markdown_inline_to_telegram_html(text.substr(index + 2, closing - index - 2)) + "</u>";
+                index = closing + 2;
+                continue;
+            }
+        }
+        if (text.compare(index, 2, "~~") == 0) {
+            const size_t closing = text.find("~~", index + 2);
+            if (closing != std::string::npos && closing > index + 2) {
+                html += "<s>" + convert_markdown_inline_to_telegram_html(text.substr(index + 2, closing - index - 2)) + "</s>";
+                index = closing + 2;
+                continue;
+            }
+        }
+        if (text[index] == '*') {
+            const size_t closing = text.find('*', index + 1);
+            if (closing != std::string::npos && closing > index + 1) {
+                html += "<i>" + convert_markdown_inline_to_telegram_html(text.substr(index + 1, closing - index - 1)) + "</i>";
+                index = closing + 1;
+                continue;
+            }
+        }
+        if (text[index] == '`') {
+            const size_t closing = text.find('`', index + 1);
+            if (closing != std::string::npos && closing > index + 1) {
+                html += "<code>" + telegram_html_escape(text.substr(index + 1, closing - index - 1)) + "</code>";
+                index = closing + 1;
+                continue;
+            }
+        }
+        html += telegram_html_escape(std::string(1, text[index]));
+        index += 1;
+    }
+    return html;
+}
+
+static std::string render_markdown_paragraph_line_to_telegram_html(const std::string & line) {
+    const std::string trimmed = trim_copy(line);
+    if (trimmed.rfind("- ", 0) == 0 || trimmed.rfind("* ", 0) == 0) {
+        return "\xE2\x80\xA2 " + convert_markdown_inline_to_telegram_html(trimmed.substr(2));
+    }
+    return convert_markdown_inline_to_telegram_html(trimmed);
+}
+
+static std::string strip_telegram_html_tags(const std::string & value) {
+    std::string stripped;
+    stripped.reserve(value.size());
+    bool in_tag = false;
+    for (const char ch : value) {
+        if (ch == '<') {
+            in_tag = true;
+            continue;
+        }
+        if (ch == '>') {
+            in_tag = false;
+            continue;
+        }
+        if (!in_tag) {
+            stripped.push_back(ch);
+        }
+    }
+    return stripped;
+}
+
+static std::vector<std::string> parse_markdown_table_cells(const std::string & line) {
+    std::string trimmed = trim_copy(line);
+    if (trimmed.find('|') == std::string::npos) {
+        return {};
+    }
+    if (!trimmed.empty() && trimmed.front() == '|') {
+        trimmed.erase(trimmed.begin());
+    }
+    if (!trimmed.empty() && trimmed.back() == '|') {
+        trimmed.pop_back();
+    }
+
+    std::vector<std::string> cells;
+    size_t begin = 0;
+    while (begin <= trimmed.size()) {
+        const size_t separator = trimmed.find('|', begin);
+        const std::string cell = separator == std::string::npos
+                ? trimmed.substr(begin)
+                : trimmed.substr(begin, separator - begin);
+        cells.push_back(trim_copy(cell));
+        if (separator == std::string::npos) {
+            break;
+        }
+        begin = separator + 1;
+    }
+    if (cells.size() < 2) {
+        return {};
+    }
+    return cells;
+}
+
+static bool is_markdown_table_separator_row(const std::string & line) {
+    const std::vector<std::string> cells = parse_markdown_table_cells(line);
+    if (cells.size() < 2) {
+        return false;
+    }
+    return std::all_of(cells.begin(), cells.end(), [](const std::string & cell) {
+        if (cell.size() < 3) {
+            return false;
+        }
+        size_t begin = 0;
+        size_t end = cell.size();
+        if (cell.front() == ':') {
+            begin += 1;
+        }
+        if (end > begin && cell.back() == ':') {
+            end -= 1;
+        }
+        if (end - begin < 3) {
+            return false;
+        }
+        return std::all_of(cell.begin() + static_cast<std::ptrdiff_t>(begin), cell.begin() + static_cast<std::ptrdiff_t>(end), [](char ch) {
+            return ch == '-';
+        });
+    });
+}
+
+static std::string markdown_table_cell_to_plain_text(const std::string & cell) {
+    return strip_telegram_html_tags(convert_markdown_inline_to_telegram_html(cell));
+}
+
+static std::string render_markdown_table_to_telegram_html(
+        const std::vector<std::string> & header_cells,
+        const std::vector<std::vector<std::string>> & body_rows) {
+    std::vector<std::vector<std::string>> plain_rows;
+    plain_rows.reserve(1 + body_rows.size());
+    plain_rows.push_back({});
+    for (const auto & cell : header_cells) {
+        plain_rows.back().push_back(markdown_table_cell_to_plain_text(cell));
+    }
+    for (const auto & row : body_rows) {
+        plain_rows.push_back({});
+        for (const auto & cell : row) {
+            plain_rows.back().push_back(markdown_table_cell_to_plain_text(cell));
+        }
+    }
+
+    std::vector<size_t> widths(header_cells.size(), 0);
+    for (const auto & row : plain_rows) {
+        for (size_t index = 0; index < row.size(); ++index) {
+            widths[index] = std::max(widths[index], row[index].size());
+        }
+    }
+
+    const auto render_row = [&](const std::vector<std::string> & row) {
+        std::ostringstream rendered;
+        rendered << "|";
+        for (size_t index = 0; index < row.size(); ++index) {
+            rendered << " " << row[index];
+            if (widths[index] > row[index].size()) {
+                rendered << std::string(widths[index] - row[index].size(), ' ');
+            }
+            rendered << " |";
+        }
+        return rendered.str();
+    };
+
+    std::ostringstream border;
+    border << "+";
+    for (const size_t width : widths) {
+        border << std::string(width + 2, '-') << "+";
+    }
+
+    std::ostringstream table;
+    table << border.str() << "\n";
+    table << render_row(plain_rows.front()) << "\n";
+    table << border.str();
+    for (size_t index = 1; index < plain_rows.size(); ++index) {
+        table << "\n" << render_row(plain_rows[index]);
+    }
+    table << "\n" << border.str();
+    return "<pre>" + telegram_html_escape(table.str()) + "</pre>";
+}
+
+static std::string convert_markdownish_to_telegram_html(const std::string & markdown) {
+    std::vector<std::string> blocks;
+    std::vector<std::string> paragraph_lines;
+
+    const auto flush_paragraph = [&]() {
+        if (paragraph_lines.empty()) {
+            return;
+        }
+        std::ostringstream paragraph;
+        for (size_t index = 0; index < paragraph_lines.size(); ++index) {
+            if (index > 0) {
+                paragraph << "\n";
+            }
+            paragraph << render_markdown_paragraph_line_to_telegram_html(paragraph_lines[index]);
+        }
+        blocks.push_back(paragraph.str());
+        paragraph_lines.clear();
+    };
+
+    std::istringstream stream(markdown);
+    std::string line;
+    while (std::getline(stream, line)) {
+        const std::string trimmed = trim_copy(line);
+        if (trimmed.empty()) {
+            flush_paragraph();
+            continue;
+        }
+
+        if (trimmed.rfind("```", 0) == 0) {
+            flush_paragraph();
+            const std::string language = sanitize_telegram_code_language(trim_copy(trimmed.substr(3)));
+            std::ostringstream code;
+            bool closed = false;
+            while (std::getline(stream, line)) {
+                if (trim_copy(line).rfind("```", 0) == 0) {
+                    closed = true;
+                    break;
+                }
+                if (code.tellp() > 0) {
+                    code << "\n";
+                }
+                code << line;
+            }
+            const std::string escaped_code = telegram_html_escape(code.str());
+            if (!language.empty()) {
+                blocks.push_back("<pre><code class=\"language-" + language + "\">" + escaped_code + "</code></pre>");
+            } else {
+                blocks.push_back("<pre>" + escaped_code + "</pre>");
+            }
+            if (!closed) {
+                break;
+            }
+            continue;
+        }
+
+        const std::vector<std::string> table_header_cells = parse_markdown_table_cells(line);
+        if (table_header_cells.size() >= 2 && stream.good()) {
+            const std::streampos header_checkpoint = stream.tellg();
+            std::string separator_line;
+            if (std::getline(stream, separator_line)) {
+                if (is_markdown_table_separator_row(separator_line)) {
+                    flush_paragraph();
+                    std::vector<std::vector<std::string>> body_rows;
+                    while (true) {
+                        const std::streampos row_checkpoint = stream.tellg();
+                        std::string row_line;
+                        if (!std::getline(stream, row_line)) {
+                            break;
+                        }
+                        const std::vector<std::string> row_cells = parse_markdown_table_cells(row_line);
+                        if (row_cells.size() != table_header_cells.size() || is_markdown_table_separator_row(row_line)) {
+                            if (row_checkpoint != std::streampos(-1)) {
+                                stream.seekg(row_checkpoint);
+                            }
+                            break;
+                        }
+                        body_rows.push_back(row_cells);
+                    }
+                    blocks.push_back(render_markdown_table_to_telegram_html(table_header_cells, body_rows));
+                    continue;
+                }
+                if (header_checkpoint != std::streampos(-1)) {
+                    stream.seekg(header_checkpoint);
+                }
+            }
+        }
+
+        if (is_markdown_divider_line(trimmed)) {
+            flush_paragraph();
+            blocks.push_back("\xE2\x94\x81\xE2\x94\x81\xE2\x94\x81\xE2\x94\x81\xE2\x94\x81\xE2\x94\x81\xE2\x94\x81\xE2\x94\x81\xE2\x94\x81\xE2\x94\x81\xE2\x94\x81\xE2\x94\x81");
+            continue;
+        }
+
+        size_t heading_markers = 0;
+        while (heading_markers < trimmed.size() && trimmed[heading_markers] == '#') {
+            heading_markers += 1;
+        }
+        if (heading_markers > 0 && heading_markers <= 6 &&
+                heading_markers < trimmed.size() &&
+                std::isspace(static_cast<unsigned char>(trimmed[heading_markers])) != 0) {
+            flush_paragraph();
+            blocks.push_back("<b>" + convert_markdown_inline_to_telegram_html(trim_copy(trimmed.substr(heading_markers))) + "</b>");
+            continue;
+        }
+
+        if (trimmed.rfind("> ", 0) == 0 || trimmed == ">") {
+            flush_paragraph();
+            std::ostringstream quote;
+            std::string current = trimmed;
+            bool first_line = true;
+            while (true) {
+                std::string quote_body = current.size() > 1 ? trim_copy(current.substr(1)) : std::string();
+                if (!first_line) {
+                    quote << "\n";
+                }
+                quote << convert_markdown_inline_to_telegram_html(quote_body);
+                first_line = false;
+
+                std::streampos checkpoint = stream.tellg();
+                std::string next_line;
+                if (!std::getline(stream, next_line)) {
+                    break;
+                }
+                const std::string next_trimmed = trim_copy(next_line);
+                if (!(next_trimmed.rfind("> ", 0) == 0 || next_trimmed == ">")) {
+                    if (checkpoint != std::streampos(-1)) {
+                        stream.seekg(checkpoint);
+                    }
+                    break;
+                }
+                current = next_trimmed;
+            }
+            blocks.push_back("<blockquote>" + quote.str() + "</blockquote>");
+            continue;
+        }
+
+        paragraph_lines.push_back(line);
+    }
+
+    flush_paragraph();
+
+    std::ostringstream joined;
+    for (size_t index = 0; index < blocks.size(); ++index) {
+        if (index > 0) {
+            joined << "\n\n";
+        }
+        joined << blocks[index];
+    }
+    return joined.str();
 }
 
 static server_rich_plan_response parse_rich_plan_response(const std::string & raw_text) {
@@ -4230,15 +6118,23 @@ static bool execute_telegram_delivery_for_bridge_request(
             return true;
         }
         result->rich_response = rich_plan_response_to_json(rich_response);
+        const bool markdown_format = rich_response.format == "markdown";
+        const std::string rendered_body = markdown_format
+                ? convert_markdownish_to_telegram_html(rich_response.body)
+                : rich_response.body;
         item.chat_scope = context.chat_scope;
         item.reply_to_message_id = context.reply_to_message_id;
-        item.text = rich_response.body;
+        item.text = rendered_body;
         item.telegram_method = "sendMessage";
-        item.telegram_payload = json{{"text", rich_response.body}};
-        if (rich_response.format == "html") {
+        item.telegram_payload = json{{"text", rendered_body}};
+        if (rich_response.format == "html" || markdown_format) {
             item.telegram_payload["parse_mode"] = "HTML";
-        } else if (rich_response.format == "markdown") {
-            item.telegram_payload["parse_mode"] = "MarkdownV2";
+        }
+        if (markdown_format && trace_context) {
+            runtime_request_trace_log(*trace_context, "telegram_delivery", "rich_plan_markdown_normalized_html", {
+                {"requested_format", "markdown"},
+                {"effective_format", "html"},
+            });
         }
         if (rich_response.disable_web_page_preview) {
             item.telegram_payload["disable_web_page_preview"] = true;
@@ -4499,6 +6395,697 @@ static size_t find_leading_system_message_boundary(const json & messages) {
     return index;
 }
 
+static std::string runtime_state_root_from_env() {
+    if (const char * value = std::getenv("VICUNA_STATE_ROOT")) {
+        const std::string parsed = trim_copy(value);
+        if (!parsed.empty()) {
+            return parsed;
+        }
+    }
+    return "/var/lib/vicuna";
+}
+
+static std::string runtime_host_shell_root_from_env() {
+    if (const char * value = std::getenv("VICUNA_HOST_SHELL_ROOT")) {
+        const std::string parsed = trim_copy(value);
+        if (!parsed.empty()) {
+            return parsed;
+        }
+    }
+    return "/home/vicuna/home";
+}
+
+static std::string runtime_hard_memory_dir_from_env() {
+    if (const char * value = std::getenv("VICUNA_HARD_MEMORY_DIR")) {
+        const std::string parsed = trim_copy(value);
+        if (!parsed.empty()) {
+            return parsed;
+        }
+    }
+    if (const char * value = std::getenv("VICUNA_HOST_SHELL_ROOT")) {
+        const std::string parsed = trim_copy(value);
+        if (!parsed.empty()) {
+            return parsed + "/memories";
+        }
+    }
+    if (std::filesystem::exists("/home/vicuna/home")) {
+        return "/home/vicuna/home/memories";
+    }
+    return runtime_state_root_from_env() + "/memories";
+}
+
+static std::string runtime_skills_dir_from_env() {
+    if (const char * value = std::getenv("VICUNA_SKILLS_DIR")) {
+        const std::string parsed = trim_copy(value);
+        if (!parsed.empty()) {
+            return parsed;
+        }
+    }
+    return runtime_host_shell_root_from_env() + "/skills";
+}
+
+static bool runtime_mode_supports_post_response_memory_capture(const std::string & mode_label) {
+    return mode_label == "foreground" ||
+            mode_label == "telegram_bridge" ||
+            mode_label == "telegram_bridge_budget_synthesis";
+}
+
+static std::string slugify_runtime_identifier(const std::string & value, const std::string & fallback) {
+    std::string slug;
+    slug.reserve(value.size());
+    bool previous_dash = false;
+    for (const unsigned char raw : value) {
+        const char ch = static_cast<char>(std::tolower(raw));
+        if (std::isalnum(raw) != 0) {
+            slug.push_back(ch);
+            previous_dash = false;
+            continue;
+        }
+        if (!previous_dash) {
+            slug.push_back('-');
+            previous_dash = true;
+        }
+    }
+    while (!slug.empty() && slug.front() == '-') {
+        slug.erase(slug.begin());
+    }
+    while (!slug.empty() && slug.back() == '-') {
+        slug.pop_back();
+    }
+    if (slug.empty()) {
+        return fallback;
+    }
+    if (slug.size() > 80) {
+        slug.resize(80);
+        while (!slug.empty() && slug.back() == '-') {
+            slug.pop_back();
+        }
+    }
+    return slug.empty() ? fallback : slug;
+}
+
+static std::vector<std::string> list_markdown_file_names(
+        const std::string & directory_path,
+        size_t limit,
+        bool * out_truncated = nullptr,
+        std::string * out_error = nullptr) {
+    if (out_truncated) {
+        *out_truncated = false;
+    }
+    if (out_error) {
+        *out_error = std::string();
+    }
+
+    std::vector<std::string> names;
+    std::error_code error;
+    if (!std::filesystem::exists(directory_path, error)) {
+        return names;
+    }
+    if (error) {
+        if (out_error) {
+            *out_error = error.message();
+        }
+        return names;
+    }
+
+    std::filesystem::directory_iterator iterator(directory_path, error);
+    if (error) {
+        if (out_error) {
+            *out_error = error.message();
+        }
+        return names;
+    }
+
+    for (const auto & entry : iterator) {
+        std::error_code status_error;
+        if (!entry.is_regular_file(status_error) || status_error) {
+            continue;
+        }
+        const std::string filename = entry.path().filename().string();
+        if (entry.path().extension() == ".md" && !filename.empty()) {
+            names.push_back(filename);
+        }
+    }
+    std::sort(names.begin(), names.end());
+    if (limit > 0 && names.size() > limit) {
+        if (out_truncated) {
+            *out_truncated = true;
+        }
+        names.resize(limit);
+    }
+    return names;
+}
+
+static bool conversation_explicitly_requests_skill_creation(const json & messages) {
+    if (!messages.is_array()) {
+        return false;
+    }
+
+    for (const auto & item : messages) {
+        if (!item.is_object() || json_value(item, "role", std::string()) != "user") {
+            continue;
+        }
+        const std::string text = to_lower_copy(item.contains("content") ?
+                request_content_to_text(item.at("content")) :
+                std::string());
+        if (text.empty()) {
+            continue;
+        }
+        const bool mentions_skill =
+                text.find("skill") != std::string::npos ||
+                text.find("skill file") != std::string::npos ||
+                text.find("skill md") != std::string::npos;
+        const bool requests_creation =
+                text.find("create") != std::string::npos ||
+                text.find("update") != std::string::npos ||
+                text.find("write") != std::string::npos ||
+                text.find("add") != std::string::npos ||
+                text.find("make") != std::string::npos ||
+                text.find("draft") != std::string::npos ||
+                text.find("edit") != std::string::npos;
+        if (mentions_skill && requests_creation) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::string build_named_prompt_index_section(
+        const std::string & title,
+        const std::vector<std::string> & names,
+        bool truncated,
+        const std::string & error_message) {
+    std::ostringstream out;
+    out << title << ":\n";
+    if (!error_message.empty()) {
+        out << "- unavailable (" << error_message << ")";
+        return out.str();
+    }
+    if (names.empty()) {
+        out << "- none";
+        return out.str();
+    }
+    for (const auto & name : names) {
+        out << "- " << name << "\n";
+    }
+    if (truncated) {
+        out << "- ... more files are present";
+    } else {
+        std::string built = out.str();
+        if (!built.empty() && built.back() == '\n') {
+            built.pop_back();
+        }
+        return built;
+    }
+    return out.str();
+}
+
+static json inject_skill_and_memory_prompt_indexes(
+        const json & body,
+        const runtime_request_trace_context * trace_context = nullptr) {
+    if (!body.contains("messages") || !body.at("messages").is_array()) {
+        return body;
+    }
+
+    const std::string skills_dir = runtime_skills_dir_from_env();
+    const std::string memories_dir = runtime_hard_memory_dir_from_env();
+    bool skills_truncated = false;
+    bool memories_truncated = false;
+    std::string skills_error;
+    std::string memories_error;
+    const std::vector<std::string> skill_names = list_markdown_file_names(
+            skills_dir, 32, &skills_truncated, &skills_error);
+    const std::vector<std::string> memory_names = list_markdown_file_names(
+            memories_dir, 32, &memories_truncated, &memories_error);
+    const bool skill_create_allowed = conversation_explicitly_requests_skill_creation(body.at("messages"));
+
+    std::ostringstream content;
+    content << build_named_prompt_index_section("SKILLS", skill_names, skills_truncated, skills_error)
+            << "\n\n"
+            << build_named_prompt_index_section("MEMORIES", memory_names, memories_truncated, memories_error)
+            << "\n\n"
+            << "Read a skill or memory file explicitly when you need its contents. "
+            << "Do not infer file bodies from file names alone.\n"
+            << "skill_create may only be used when the user directly asks to create or update a skill in this conversation.\n"
+            << "Current skill_create authorization: "
+            << (skill_create_allowed ? "allowed" : "not allowed");
+
+    json messages = body.at("messages");
+    const size_t insertion_index = find_leading_system_message_boundary(messages);
+    messages.insert(messages.begin() + static_cast<json::difference_type>(insertion_index), json{
+        {"role", "system"},
+        {"content", content.str()},
+    });
+
+    if (trace_context) {
+        runtime_request_trace_log(*trace_context, "prompt_context", "skill_memory_indexes_injected", {
+            {"skills_dir", skills_dir},
+            {"memories_dir", memories_dir},
+            {"skill_count", static_cast<int64_t>(skill_names.size())},
+            {"memory_count", static_cast<int64_t>(memory_names.size())},
+            {"skills_truncated", skills_truncated},
+            {"memories_truncated", memories_truncated},
+            {"skill_create_allowed", skill_create_allowed},
+            {"skills_error", skills_error.empty() ? json(nullptr) : json(skills_error)},
+            {"memories_error", memories_error.empty() ? json(nullptr) : json(memories_error)},
+        });
+    }
+
+    json augmented = body;
+    augmented["messages"] = std::move(messages);
+    return augmented;
+}
+
+static std::string summarize_visible_session_transcript(
+        const json & body,
+        const deepseek_chat_result & result,
+        size_t max_messages = 10,
+        size_t max_chars = 6000) {
+    std::ostringstream out;
+    size_t appended_messages = 0;
+    if (body.contains("messages") && body.at("messages").is_array()) {
+        const auto & messages = body.at("messages");
+        const size_t begin = messages.size() > max_messages ? messages.size() - max_messages : 0;
+        for (size_t index = begin; index < messages.size(); ++index) {
+            const auto & item = messages.at(index);
+            if (!item.is_object()) {
+                continue;
+            }
+            const std::string role = json_value(item, "role", std::string());
+            if (role.empty() || role == "system") {
+                continue;
+            }
+            std::string text;
+            if (role == "assistant" && item.contains("tool_calls") && item.at("tool_calls").is_array()) {
+                std::vector<std::string> names;
+                for (const auto & tool_call : item.at("tool_calls")) {
+                    if (!tool_call.is_object()) {
+                        continue;
+                    }
+                    const json function = tool_call.value("function", json::object());
+                    const std::string name = trim_copy(json_value(function, "name", std::string()));
+                    if (!name.empty()) {
+                        names.push_back(name);
+                    }
+                }
+                if (!names.empty()) {
+                    std::ostringstream names_out;
+                    for (size_t i = 0; i < names.size(); ++i) {
+                        if (i > 0) {
+                            names_out << ", ";
+                        }
+                        names_out << names[i];
+                    }
+                    text = "tool_calls: " + names_out.str();
+                }
+            }
+            if (text.empty() && item.contains("content")) {
+                text = trim_copy(request_content_to_text(item.at("content")));
+            }
+            if (text.empty()) {
+                continue;
+            }
+            out << role << ": " << text << "\n";
+            ++appended_messages;
+        }
+    }
+
+    const std::string assistant_reply = trim_copy(result.content);
+    if (!assistant_reply.empty()) {
+        out << "assistant_final: " << assistant_reply << "\n";
+        ++appended_messages;
+    }
+
+    std::string transcript = trim_copy(out.str());
+    if (transcript.size() > max_chars) {
+        transcript = transcript.substr(transcript.size() - max_chars);
+    }
+    if (appended_messages == 0) {
+        return std::string();
+    }
+    return transcript;
+}
+
+static bool contains_secret_like_material(const std::string & value) {
+    const std::string lowered = to_lower_copy(value);
+    return lowered.find("api key") != std::string::npos ||
+            lowered.find("token") != std::string::npos ||
+            lowered.find("password") != std::string::npos ||
+            lowered.find("secret") != std::string::npos ||
+            lowered.find("bearer ") != std::string::npos ||
+            lowered.find("sk-") != std::string::npos;
+}
+
+static std::string format_memory_frontmatter_scalar(const std::string & value) {
+    return json(value).dump();
+}
+
+static std::string format_memory_frontmatter_scalar(float value) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(3) << value;
+    std::string rendered = out.str();
+    while (!rendered.empty() && rendered.back() == '0') {
+        rendered.pop_back();
+    }
+    if (!rendered.empty() && rendered.back() == '.') {
+        rendered.pop_back();
+    }
+    return rendered.empty() ? "0" : rendered;
+}
+
+static std::string format_memory_timestamp_iso(int64_t epoch_ms) {
+    return iso_from_epoch_ms(epoch_ms);
+}
+
+static std::string build_session_memory_markdown(
+        const runtime_session_memory_candidate & candidate,
+        const std::string & record_id,
+        const std::string & runtime_identity,
+        const std::string & created_at,
+        const std::string & updated_at) {
+    std::ostringstream out;
+    out << "---\n";
+    out << "record_id: " << format_memory_frontmatter_scalar(record_id) << "\n";
+    out << "title: " << format_memory_frontmatter_scalar(candidate.title) << "\n";
+    if (!candidate.key.empty()) {
+        out << "key: " << format_memory_frontmatter_scalar(candidate.key) << "\n";
+    }
+    out << "kind: " << format_memory_frontmatter_scalar(candidate.kind) << "\n";
+    out << "domain: " << format_memory_frontmatter_scalar(candidate.domain.empty() ? std::string("project") : candidate.domain) << "\n";
+    out << "importance: " << format_memory_frontmatter_scalar(candidate.importance) << "\n";
+    out << "confidence: " << format_memory_frontmatter_scalar(candidate.confidence) << "\n";
+    out << "runtime_identity: " << format_memory_frontmatter_scalar(runtime_identity) << "\n";
+    out << "created_at: " << format_memory_frontmatter_scalar(created_at) << "\n";
+    out << "updated_at: " << format_memory_frontmatter_scalar(updated_at) << "\n";
+    out << "tags:\n";
+    for (const auto & tag : candidate.tags) {
+        out << "  - " << json(tag).dump() << "\n";
+    }
+    out << "---\n\n";
+    out << trim_copy(candidate.content) << "\n";
+    return out.str();
+}
+
+static std::string runtime_hard_memory_identity_from_env() {
+    if (const char * value = std::getenv("VICUNA_HARD_MEMORY_RUNTIME_IDENTITY")) {
+        const std::string parsed = trim_copy(value);
+        if (!parsed.empty()) {
+            return parsed;
+        }
+    }
+    return "vicuna";
+}
+
+static bool persist_runtime_session_memory_candidate(
+        const std::string & memory_dir,
+        const runtime_session_memory_candidate & candidate,
+        std::string * out_path,
+        bool * out_updated,
+        std::string * out_error) {
+    if (out_path) {
+        *out_path = std::string();
+    }
+    if (out_updated) {
+        *out_updated = false;
+    }
+    const std::string content = trim_copy(candidate.content);
+    if (content.empty()) {
+        if (out_error) {
+            *out_error = "memory candidate content was empty";
+        }
+        return false;
+    }
+    if (contains_secret_like_material(candidate.title) ||
+            contains_secret_like_material(candidate.key) ||
+            contains_secret_like_material(content)) {
+        if (out_error) {
+            *out_error = "memory candidate contained secret-like material";
+        }
+        return false;
+    }
+
+    std::error_code error;
+    std::filesystem::create_directories(memory_dir, error);
+    if (error) {
+        if (out_error) {
+            *out_error = error.message();
+        }
+        return false;
+    }
+
+    const int64_t now_ms = runtime_now_epoch_ms();
+    const std::string stem_source = !candidate.key.empty() ? candidate.key : candidate.title;
+    const std::string stem = slugify_runtime_identifier(
+            stem_source,
+            std::to_string(now_ms) + "-session-memory");
+    const std::filesystem::path path = std::filesystem::path(memory_dir) / (stem + ".md");
+    std::string created_at = format_memory_timestamp_iso(now_ms);
+    if (std::filesystem::exists(path)) {
+        if (out_updated) {
+            *out_updated = true;
+        }
+        try {
+            std::ifstream existing(path);
+            std::ostringstream buffer;
+            buffer << existing.rdbuf();
+            const std::string current = buffer.str();
+            const size_t created_at_pos = current.find("created_at:");
+            if (created_at_pos != std::string::npos) {
+                const size_t line_end = current.find('\n', created_at_pos);
+                const std::string raw_value = trim_copy(current.substr(
+                        created_at_pos + std::string("created_at:").size(),
+                        line_end == std::string::npos ? std::string::npos : line_end - created_at_pos - std::string("created_at:").size()));
+                const std::string parsed = trim_quotes_copy(raw_value);
+                if (!parsed.empty()) {
+                    created_at = parsed;
+                }
+            }
+        } catch (...) {
+        }
+    }
+
+    const std::string record_id = "memory_" + stem;
+    const std::string updated_at = format_memory_timestamp_iso(now_ms);
+    const std::string markdown = build_session_memory_markdown(
+            candidate,
+            record_id,
+            runtime_hard_memory_identity_from_env(),
+            created_at,
+            updated_at);
+    const std::filesystem::path temp_path = path.string() + ".tmp";
+    {
+        std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+        if (!out.good()) {
+            if (out_error) {
+                *out_error = "unable to open temp memory file for writing";
+            }
+            return false;
+        }
+        out << markdown;
+        out.close();
+    }
+    std::filesystem::rename(temp_path, path, error);
+    if (error) {
+        std::filesystem::remove(temp_path);
+        if (out_error) {
+            *out_error = error.message();
+        }
+        return false;
+    }
+    if (out_path) {
+        *out_path = path.string();
+    }
+    return true;
+}
+
+static bool text_looks_like_durable_preference(const std::string & text) {
+    const std::string lowered = to_lower_copy(text);
+    return lowered.find("always") != std::string::npos ||
+            lowered.find("never") != std::string::npos ||
+            lowered.find("do not") != std::string::npos ||
+            lowered.find("don't") != std::string::npos ||
+            lowered.find("should only") != std::string::npos ||
+            lowered.find("must") != std::string::npos ||
+            lowered.find("manual reading") != std::string::npos ||
+            lowered.find("speed doesn't matter") != std::string::npos ||
+            lowered.find("speed does not matter") != std::string::npos ||
+            lowered.find("there should only ever be") != std::string::npos ||
+            lowered.find("only valid option") != std::string::npos;
+}
+
+static bool text_looks_like_verified_fix_or_fact(const std::string & text) {
+    const std::string lowered = to_lower_copy(text);
+    return lowered.find("root cause") != std::string::npos ||
+            lowered.find("verified") != std::string::npos ||
+            lowered.find("confirmed") != std::string::npos ||
+            lowered.find("fixed") != std::string::npos ||
+            lowered.find("resolved") != std::string::npos ||
+            lowered.find("healthy") != std::string::npos ||
+            lowered.find("active") != std::string::npos ||
+            lowered.find("gpu-backed") != std::string::npos;
+}
+
+static runtime_session_memory_capture_decision extract_local_post_response_memory_decision(
+        const json & request_body,
+        const deepseek_chat_result & result) {
+    runtime_session_memory_capture_decision decision = {};
+    std::set<std::string> seen;
+    auto append_candidate = [&decision, &seen](runtime_session_memory_candidate candidate) {
+        const std::string identifier = slugify_runtime_identifier(
+                !candidate.key.empty() ? candidate.key : candidate.title,
+                std::string());
+        if (identifier.empty() || !seen.insert(identifier).second) {
+            return;
+        }
+        decision.memories.push_back(std::move(candidate));
+    };
+
+    if (request_body.contains("messages") && request_body.at("messages").is_array()) {
+        const auto & messages = request_body.at("messages");
+        const size_t begin = messages.size() > 6 ? messages.size() - 6 : 0;
+        for (size_t index = begin; index < messages.size(); ++index) {
+            const auto & item = messages.at(index);
+            if (!item.is_object() || json_value(item, "role", std::string()) != "user" || !item.contains("content")) {
+                continue;
+            }
+            const std::string text = trim_copy(request_content_to_text(item.at("content")));
+            if (text.empty() || contains_secret_like_material(text) || !text_looks_like_durable_preference(text)) {
+                continue;
+            }
+            runtime_session_memory_candidate candidate = {};
+            candidate.kind = "preference";
+            candidate.domain = "user";
+            candidate.title = "User preference";
+            candidate.key = "preference-" + slugify_runtime_identifier(text.substr(0, std::min<size_t>(64, text.size())), "user-preference");
+            candidate.tags = {"preference", "user_confirmed"};
+            candidate.content = text;
+            candidate.importance = 0.85f;
+            candidate.confidence = 0.95f;
+            append_candidate(std::move(candidate));
+            if (decision.memories.size() >= 2) {
+                break;
+            }
+        }
+    }
+
+    if (decision.memories.size() < 2) {
+        const std::string reply = trim_copy(result.content);
+        if (!reply.empty() && !contains_secret_like_material(reply) && text_looks_like_verified_fix_or_fact(reply)) {
+            const std::string lowered_reply = to_lower_copy(reply);
+            runtime_session_memory_candidate candidate = {};
+            candidate.kind =
+                    (lowered_reply.find("root cause") != std::string::npos ||
+                     lowered_reply.find("fixed") != std::string::npos ||
+                     lowered_reply.find("resolved") != std::string::npos) ? "fix" : "fact";
+            candidate.domain = "project";
+            candidate.title = candidate.kind == "fix" ? "Verified reusable fix" : "Verified runtime fact";
+            candidate.key = candidate.kind + "-" + slugify_runtime_identifier(reply.substr(0, std::min<size_t>(64, reply.size())), "session-note");
+            candidate.tags = candidate.kind == "fix" ?
+                    std::vector<std::string>{"fix", "verified"} :
+                    std::vector<std::string>{"fact", "verified"};
+            candidate.content = reply;
+            candidate.importance = 0.75f;
+            candidate.confidence = 0.85f;
+            append_candidate(std::move(candidate));
+        }
+    }
+
+    if (!decision.memories.empty()) {
+        decision.write = true;
+        decision.reason = "local_durable_memory_match";
+    } else {
+        decision.reason = "no_durable_memory_match";
+    }
+    return decision;
+}
+
+static void maybe_capture_post_response_session_memory(
+        const deepseek_runtime_config & /*config*/,
+        const json & request_body,
+        const deepseek_chat_result & result,
+        bool cognitive_replay,
+        const std::string & mode_label,
+        const runtime_request_trace_context * trace_context) {
+    if (!trace_context) {
+        return;
+    }
+    if (cognitive_replay) {
+        runtime_request_trace_log(*trace_context, "post_response_memory", "skipped", {
+            {"reason", "cognitive_replay"},
+        });
+        return;
+    }
+    if (!runtime_mode_supports_post_response_memory_capture(mode_label)) {
+        runtime_request_trace_log(*trace_context, "post_response_memory", "skipped", {
+            {"reason", "mode_not_supported"},
+            {"mode_label", mode_label},
+        });
+        return;
+    }
+    if (!result.tool_calls.empty()) {
+        runtime_request_trace_log(*trace_context, "post_response_memory", "skipped", {
+            {"reason", "tool_call_response"},
+        });
+        return;
+    }
+    if (result.finish_reason != "stop") {
+        runtime_request_trace_log(*trace_context, "post_response_memory", "skipped", {
+            {"reason", "non_terminal_finish_reason"},
+            {"finish_reason", result.finish_reason},
+        });
+        return;
+    }
+    const std::string transcript = summarize_visible_session_transcript(request_body, result);
+    if (transcript.empty()) {
+        runtime_request_trace_log(*trace_context, "post_response_memory", "skipped", {
+            {"reason", "visible_transcript_empty"},
+        });
+        return;
+    }
+    runtime_request_trace_log(*trace_context, "post_response_memory", "evaluated", {
+        {"transcript_chars", static_cast<int64_t>(transcript.size())},
+    });
+    runtime_session_memory_capture_decision decision = extract_local_post_response_memory_decision(request_body, result);
+
+    if (!decision.write || decision.memories.empty()) {
+        runtime_request_trace_log(*trace_context, "post_response_memory", "skipped", {
+            {"reason", decision.reason.empty() ? std::string("model_declined") : decision.reason},
+        });
+        return;
+    }
+
+    const std::string memory_dir = runtime_hard_memory_dir_from_env();
+    json writes = json::array();
+    for (const auto & candidate : decision.memories) {
+        std::string path;
+        bool updated = false;
+        std::string error_message;
+        if (!persist_runtime_session_memory_candidate(memory_dir, candidate, &path, &updated, &error_message)) {
+            writes.push_back({
+                {"title", candidate.title},
+                {"ok", false},
+                {"error", error_message},
+            });
+            continue;
+        }
+        writes.push_back({
+            {"title", candidate.title},
+            {"ok", true},
+            {"path", path},
+            {"updated", updated},
+        });
+    }
+
+    const bool any_written = std::any_of(writes.begin(), writes.end(), [](const json & item) {
+        return item.is_object() && json_value(item, "ok", false);
+    });
+    runtime_request_trace_log(*trace_context, "post_response_memory", any_written ? "written" : "failed", {
+        {"reason", decision.reason},
+        {"write_count", static_cast<int64_t>(decision.memories.size())},
+        {"writes", writes},
+    });
+}
+
 static active_tool_continuation_span find_active_tool_continuation_span(const json & messages) {
     active_tool_continuation_span span;
     if (!messages.is_array() || messages.empty()) {
@@ -4541,6 +7128,34 @@ static active_tool_continuation_span find_active_tool_continuation_span(const js
     }
 
     return span;
+}
+
+static json strip_stale_assistant_reasoning_from_request(const json & body) {
+    if (!body.contains("messages") || !body.at("messages").is_array()) {
+        return body;
+    }
+    json messages = body.at("messages");
+    if (find_active_tool_continuation_span(messages).valid) {
+        return body;
+    }
+
+    bool changed = false;
+    for (auto & item : messages) {
+        if (!item.is_object() || json_value(item, "role", std::string()) != "assistant") {
+            continue;
+        }
+        if (item.contains("reasoning_content")) {
+            item.erase("reasoning_content");
+            changed = true;
+        }
+    }
+    if (!changed) {
+        return body;
+    }
+
+    json adjusted = body;
+    adjusted["messages"] = std::move(messages);
+    return adjusted;
 }
 
 static std::string normalize_guidance_text(const std::string & text) {
@@ -4683,12 +7298,18 @@ static std::string build_metacognitive_control_guidance(const server_metacogniti
     out << std::fixed << std::setprecision(2);
     out << "Metacognitive control policy: mode=" << policy.selected_mode
         << "; reasoning_depth=" << policy.reasoning_depth
+        << "; thinking_mode=" << policy.thinking_mode
         << "; tool_aggression=" << policy.tool_aggression
         << "; tool_parallelism_cap=" << policy.tool_parallelism_cap
         << "; interrupt_allowed=" << (policy.interrupt_allowed ? "true" : "false")
         << "; replan_required=" << (policy.replan_required ? "true" : "false")
         << "; early_stop_ok=" << (policy.early_stop_ok ? "true" : "false")
         << "; force_synthesis=" << (policy.force_synthesis ? "true" : "false")
+        << "; prefix_profile=" << policy.prefix_profile
+        << "; stop_profile=" << policy.stop_profile
+        << "; sampling_profile=" << policy.sampling_profile
+        << "; repetition_profile=" << policy.repetition_profile
+        << "; tool_choice_profile=" << policy.tool_choice_profile
         << ".";
     if (!policy.prompt_hints.empty()) {
         out << " Guidance: ";
@@ -4856,12 +7477,18 @@ static json inject_additive_runtime_guidance(
                 {"policy_version", policy_decision->policy_version},
                 {"selected_mode", policy_decision->selected_mode},
                 {"reasoning_depth", policy_decision->reasoning_depth},
+                {"thinking_mode", policy_decision->thinking_mode},
                 {"tool_aggression", policy_decision->tool_aggression},
                 {"tool_parallelism_cap", policy_decision->tool_parallelism_cap},
                 {"interrupt_allowed", policy_decision->interrupt_allowed},
                 {"replan_required", policy_decision->replan_required},
                 {"early_stop_ok", policy_decision->early_stop_ok},
                 {"force_synthesis", policy_decision->force_synthesis},
+                {"prefix_profile", policy_decision->prefix_profile},
+                {"stop_profile", policy_decision->stop_profile},
+                {"sampling_profile", policy_decision->sampling_profile},
+                {"repetition_profile", policy_decision->repetition_profile},
+                {"tool_choice_profile", policy_decision->tool_choice_profile},
                 {"heuristic_biases", policy_decision->heuristic_biases},
             } : json(nullptr)},
             {"policy_guidance", policy_guidance.empty() ? json(nullptr) : json(policy_guidance)},
@@ -4912,6 +7539,121 @@ static json inject_additive_runtime_guidance(
     json augmented = body;
     augmented["messages"] = std::move(messages);
     return augmented;
+}
+
+static json build_bridge_round_budget_synthesis_body(const json & body, int32_t max_rounds) {
+    json synthesis_body = body;
+    json messages = json::array();
+    if (body.contains("messages") && body.at("messages").is_array()) {
+        messages = body.at("messages");
+    }
+    messages.push_back({
+        {"role", "system"},
+        {"content", server_string_format(
+                "Runtime note: the bridge-scoped Telegram runtime tool round budget (%d rounds) is exhausted. "
+                "Do not call any more tools. Reply directly to the user using only the tool observations already "
+                "present in the conversation. If the request is still ambiguous or unsupported, briefly explain "
+                "what you found and ask one concise clarifying question.",
+                max_rounds)},
+    });
+    synthesis_body["messages"] = std::move(messages);
+    synthesis_body.erase("tools");
+    synthesis_body.erase("tool_choice");
+    synthesis_body["parallel_tool_calls"] = false;
+    return synthesis_body;
+}
+
+static deepseek_chat_result build_bridge_round_budget_local_fallback_result() {
+    deepseek_chat_result result;
+    result.finish_reason = "stop";
+    result.content =
+            "I hit the runtime lookup limit before I could finish that cleanly. "
+            "Please confirm the exact title, author, or other key detail you want me to use, and I'll continue from there.";
+    result.reasoning_content =
+            "Bridge-scoped Telegram runtime tool round budget exhausted; returned a local clarification fallback.";
+    return result;
+}
+
+static bool request_candidate_policy_action(
+        const std::string & request_id,
+        const std::string & rollout_mode,
+        const server_policy_observation & observation,
+        const server_policy_action_mask & action_mask,
+        server_policy_action * out_action,
+        std::string * out_policy_version,
+        std::string * out_policy_alias,
+        bool * out_confidence_present,
+        float * out_confidence,
+        std::string * out_error) {
+    const auto & config = policy_runtime_config_instance();
+    if (!out_action) {
+        if (out_error) {
+            *out_error = "candidate action output must not be null";
+        }
+        return false;
+    }
+    if (!config.enabled || !policy_runtime_requests_candidate(config.mode)) {
+        if (out_error) {
+            *out_error = "policy runtime candidate lookup not enabled";
+        }
+        return false;
+    }
+    if (config.candidate_url.empty()) {
+        if (out_error) {
+            *out_error = "candidate policy URL not configured";
+        }
+        return false;
+    }
+
+    try {
+        auto [client, parts] = server_http_client(config.candidate_url);
+        client.set_connection_timeout(std::chrono::milliseconds(config.timeout_ms));
+        client.set_read_timeout(std::chrono::milliseconds(config.timeout_ms));
+        client.set_write_timeout(std::chrono::milliseconds(config.timeout_ms));
+
+        const httplib::Headers headers = {
+            {"Accept", "application/json"},
+            {"X-Client-Request-Id", request_id},
+        };
+        const json request_body = {
+            {"policy_mode", config.mode},
+            {"rollout_mode", rollout_mode},
+            {"behavior_policy_version", "control_surface_v2"},
+            {"observation", server_policy_observation_to_json(observation)},
+            {"action_mask", server_policy_action_mask_to_json(action_mask)},
+        };
+        const std::string path = join_url_path(parts, "/v1/policy/propose");
+        auto response = client.Post(path.c_str(), headers, request_body.dump(), "application/json");
+        if (!response) {
+            if (out_error) {
+                *out_error = "candidate policy request failed before a response was received";
+            }
+            return false;
+        }
+        if (response->status < 200 || response->status >= 300) {
+            if (out_error) {
+                *out_error = server_string_format(
+                        "candidate policy request failed with HTTP %d",
+                        response->status);
+            }
+            return false;
+        }
+
+        const json payload = response->body.empty() ? json::object() : json::parse(response->body);
+        return parse_candidate_policy_action(
+                payload,
+                out_action,
+                out_policy_version,
+                out_policy_alias,
+                out_confidence_present,
+                out_confidence,
+                out_error);
+    } catch (const std::exception & e) {
+        if (out_error) {
+            *out_error = e.what();
+        }
+        return false;
+    }
 }
 
 static bool execute_deepseek_chat_with_emotive(
@@ -4994,77 +7736,218 @@ static bool execute_deepseek_chat_with_emotive(
     control_state.cognitive_replay = cognitive_replay;
     control_state.suppress_replay_admission = suppress_replay_admission;
     control_state.heuristic = heuristic_decision;
-    const server_metacognitive_policy_decision policy_decision =
+    const std::string policy_request_id = trace_context ? trace_context->request_id : generate_runtime_trace_request_id();
+    const std::string policy_decision_id = generate_policy_decision_id();
+    const server_metacognitive_policy_decision native_policy_decision =
             emotive_runtime.compute_control_policy(control_state);
+    const server_policy_action native_policy_action = build_policy_action_from_native(native_policy_decision);
+    const server_policy_action_mask policy_action_mask = default_policy_action_mask();
+    const server_policy_observation policy_observation = build_policy_observation(
+            policy_request_id,
+            policy_decision_id,
+            std::string(),
+            mode_label,
+            control_state,
+            heuristic_decision,
+            body);
+    server_policy_safety_guard_result policy_safety_guard = {};
+    server_policy_action candidate_policy_action = {};
+    server_policy_action shielded_candidate_action = {};
+    bool have_candidate_policy_action = false;
+    bool candidate_policy_failure = false;
+    std::string candidate_policy_version;
+    std::string candidate_policy_alias;
+    bool candidate_confidence_present = false;
+    float candidate_confidence = 0.0f;
+    std::string candidate_policy_error;
+    server_policy_rollout_decision rollout_decision = {};
+    server_policy_action executed_policy_action = native_policy_action;
+    server_metacognitive_policy_decision effective_policy_decision = native_policy_decision;
+    const auto & policy_runtime_config = policy_runtime_config_instance();
+    if (policy_runtime_config.enabled && policy_runtime_config.mode == "canary_live") {
+        auto & policy_state = policy_runtime_state_instance();
+        std::lock_guard<std::mutex> lock(policy_state.mutex);
+        rollout_decision.rollout_mode = policy_runtime_config.mode;
+        rollout_decision.rollout_step_index = policy_state.current_rollout_step_index;
+        rollout_decision.canary_share_percent = policy_runtime_current_canary_share_percent_locked(
+                policy_runtime_config, policy_state);
+        if (policy_state.rollout_rolled_back) {
+            rollout_decision.reason = "rollback_active";
+        }
+    }
     if (trace_context) {
         runtime_request_trace_log(*trace_context, "control_policy", "policy_computed", {
-            {"policy_version", policy_decision.policy_version},
-            {"selected_mode", policy_decision.selected_mode},
-            {"reasoning_depth", policy_decision.reasoning_depth},
+            {"policy_version", native_policy_decision.policy_version},
+            {"selected_mode", native_policy_decision.selected_mode},
+            {"reasoning_depth", native_policy_decision.reasoning_depth},
+            {"thinking_mode", native_policy_decision.thinking_mode},
             {"score_breakdown", {
-                {"direct", policy_decision.direct_score},
-                {"reflective", policy_decision.reflective_score},
-                {"tool_light", policy_decision.tool_light_score},
-                {"tool_heavy", policy_decision.tool_heavy_score},
-                {"background_defer", policy_decision.background_defer_score},
+                {"direct", native_policy_decision.direct_score},
+                {"reflective", native_policy_decision.reflective_score},
+                {"tool_light", native_policy_decision.tool_light_score},
+                {"tool_heavy", native_policy_decision.tool_heavy_score},
+                {"background_defer", native_policy_decision.background_defer_score},
             }},
-            {"reasoning_score", policy_decision.reasoning_score},
-            {"tool_aggression", policy_decision.tool_aggression},
-            {"interrupt_score", policy_decision.interrupt_score},
-            {"tool_parallelism_cap", policy_decision.tool_parallelism_cap},
-            {"interrupt_allowed", policy_decision.interrupt_allowed},
-            {"replan_required", policy_decision.replan_required},
-            {"early_stop_ok", policy_decision.early_stop_ok},
-            {"force_synthesis", policy_decision.force_synthesis},
-            {"heuristic_biases", policy_decision.heuristic_biases},
+            {"reasoning_score", native_policy_decision.reasoning_score},
+            {"tool_aggression", native_policy_decision.tool_aggression},
+            {"interrupt_score", native_policy_decision.interrupt_score},
+            {"tool_parallelism_cap", native_policy_decision.tool_parallelism_cap},
+            {"interrupt_allowed", native_policy_decision.interrupt_allowed},
+            {"replan_required", native_policy_decision.replan_required},
+            {"early_stop_ok", native_policy_decision.early_stop_ok},
+            {"force_synthesis", native_policy_decision.force_synthesis},
+            {"prefix_profile", native_policy_decision.prefix_profile},
+            {"stop_profile", native_policy_decision.stop_profile},
+            {"sampling_profile", native_policy_decision.sampling_profile},
+            {"repetition_profile", native_policy_decision.repetition_profile},
+            {"tool_choice_profile", native_policy_decision.tool_choice_profile},
+            {"heuristic_biases", native_policy_decision.heuristic_biases},
             {"heuristic_matched", heuristic_decision.matched},
             {"heuristic_id", heuristic_decision.heuristic_id.empty() ? json(nullptr) : json(heuristic_decision.heuristic_id)},
         });
     }
+    if (policy_runtime_config.enabled &&
+            policy_runtime_requests_candidate(policy_runtime_config.mode) &&
+            rollout_decision.reason != "rollback_active") {
+        if (request_candidate_policy_action(
+                    policy_request_id,
+                    policy_runtime_config.mode,
+                    policy_observation,
+                    policy_action_mask,
+                    &candidate_policy_action,
+                    &candidate_policy_version,
+                    &candidate_policy_alias,
+                    &candidate_confidence_present,
+                    &candidate_confidence,
+                    &candidate_policy_error)) {
+            have_candidate_policy_action = true;
+            candidate_policy_action.proposal_source =
+                    policy_runtime_config.mode == "shadow" ? "shadow_candidate" : "rollout_candidate";
+            policy_safety_guard = shield_candidate_policy_action(
+                    policy_action_mask,
+                    native_policy_action,
+                    candidate_policy_action,
+                    &shielded_candidate_action);
+            shielded_candidate_action.proposal_source = candidate_policy_action.proposal_source;
+        } else {
+            candidate_policy_failure = true;
+            policy_safety_guard.candidate_present = false;
+            policy_safety_guard.allowed = false;
+            policy_safety_guard.fallback_to_native = true;
+            policy_safety_guard.reason = candidate_policy_error.empty() ?
+                    std::string("candidate policy unavailable") :
+                    candidate_policy_error;
+        }
+        {
+            auto & policy_state = policy_runtime_state_instance();
+            std::lock_guard<std::mutex> lock(policy_state.mutex);
+            rollout_decision = decide_policy_rollout_action(
+                    policy_runtime_config,
+                    policy_state,
+                    policy_request_id,
+                    have_candidate_policy_action,
+                    candidate_policy_failure,
+                    candidate_confidence_present,
+                    candidate_confidence,
+                    policy_safety_guard);
+        }
+        if (rollout_decision.execute_candidate_live) {
+            executed_policy_action = shielded_candidate_action;
+            effective_policy_decision = apply_policy_action_to_decision(native_policy_decision, executed_policy_action);
+        }
+        if (trace_context) {
+            runtime_request_trace_log(*trace_context, "policy_runtime", "candidate_evaluated", {
+                {"mode", policy_runtime_config.mode},
+                {"rollout_mode", rollout_decision.rollout_mode},
+                {"rollout_sampled", rollout_decision.rollout_sampled},
+                {"candidate_executed_live", rollout_decision.execute_candidate_live},
+                {"rollout_decision_reason", rollout_decision.reason},
+                {"canary_share_percent", rollout_decision.canary_share_percent},
+                {"candidate_policy_version", candidate_policy_version.empty() ? json(nullptr) : json(candidate_policy_version)},
+                {"candidate_policy_alias", candidate_policy_alias.empty() ? json(nullptr) : json(candidate_policy_alias)},
+                {"candidate_failure", candidate_policy_failure},
+                {"candidate_error", candidate_policy_error.empty() ? json(nullptr) : json(candidate_policy_error)},
+                {"candidate_confidence", candidate_confidence_present ? json(candidate_confidence) : json(nullptr)},
+                {"candidate_confidence_passed", rollout_decision.candidate_confidence_passed},
+                {"candidate_action", have_candidate_policy_action ? server_policy_action_to_json(candidate_policy_action) : json(nullptr)},
+                {"shield_result", server_policy_safety_guard_result_to_json(policy_safety_guard)},
+                {"disagrees_with_native", have_candidate_policy_action ? policy_actions_differ(shielded_candidate_action, native_policy_action) : false},
+            });
+        }
+    }
+
+    if (policy_runtime_config.enabled && !policy_runtime_requests_candidate(policy_runtime_config.mode)) {
+        rollout_decision.rollout_mode = policy_runtime_config.mode;
+        rollout_decision.reason = policy_runtime_config.mode == "capture" ? "capture_only" : policy_runtime_config.mode;
+    }
 
     json adjusted_body = body;
+    adjusted_body = strip_stale_assistant_reasoning_from_request(adjusted_body);
+    adjusted_body = inject_skill_and_memory_prompt_indexes(adjusted_body, trace_context);
     if (!adjusted_body.contains("parallel_tool_calls")) {
-        adjusted_body["parallel_tool_calls"] = policy_decision.tool_parallelism_cap > 1;
+        adjusted_body["parallel_tool_calls"] = executed_policy_action.tool_parallelism_cap > 1;
     }
     if (!adjusted_body.contains("x-vicuna-provider-max-tokens-override") &&
             !adjusted_body.contains("max_tokens") &&
             !adjusted_body.contains("max_output_tokens") &&
             !adjusted_body.contains("max_completion_tokens")) {
-        adjusted_body["x-vicuna-provider-max-tokens-override"] =
-                metacognitive_token_budget_for_depth(policy_decision.reasoning_depth);
+        adjusted_body["x-vicuna-provider-max-tokens-override"] = executed_policy_action.token_budget_bucket;
     }
 
-    const json provider_body = inject_additive_runtime_guidance(
+    const json provider_guidance_body = inject_additive_runtime_guidance(
             adjusted_body,
             turn_builder.get(),
             &emotive_runtime,
-            &policy_decision,
+            &effective_policy_decision,
             &heuristic_decision,
             heuristic_guidance.empty() ? nullptr : &heuristic_guidance,
             enable_heuristic_guidance && !cognitive_replay,
             trace_context);
+    server_policy_applied_provider_controls applied_provider_controls = {};
+    const json provider_body = apply_policy_provider_controls(
+            provider_guidance_body,
+            executed_policy_action,
+            &applied_provider_controls);
+    if (trace_context) {
+        runtime_request_trace_log(*trace_context, "policy_runtime", "provider_controls_applied", {
+            {"executed_action", server_policy_action_to_json(executed_policy_action)},
+            {"applied_provider_controls", server_policy_applied_provider_controls_to_json(applied_provider_controls)},
+        });
+    }
     if (turn_builder) {
         turn_builder->set_final_policy({
-            {"policy_version", policy_decision.policy_version},
-            {"selected_mode", policy_decision.selected_mode},
-            {"reasoning_depth", policy_decision.reasoning_depth},
+            {"policy_version", effective_policy_decision.policy_version},
+            {"selected_mode", effective_policy_decision.selected_mode},
+            {"reasoning_depth", effective_policy_decision.reasoning_depth},
+            {"thinking_mode", effective_policy_decision.thinking_mode},
+            {"behavior_policy_version", native_policy_decision.policy_version},
+            {"proposal_source", executed_policy_action.proposal_source},
+            {"rollout_mode", rollout_decision.rollout_mode},
+            {"rollout_decision_reason", rollout_decision.reason},
+            {"candidate_executed_live", rollout_decision.execute_candidate_live},
             {"score_breakdown", {
-                {"direct", policy_decision.direct_score},
-                {"reflective", policy_decision.reflective_score},
-                {"tool_light", policy_decision.tool_light_score},
-                {"tool_heavy", policy_decision.tool_heavy_score},
-                {"background_defer", policy_decision.background_defer_score},
+                {"direct", native_policy_decision.direct_score},
+                {"reflective", native_policy_decision.reflective_score},
+                {"tool_light", native_policy_decision.tool_light_score},
+                {"tool_heavy", native_policy_decision.tool_heavy_score},
+                {"background_defer", native_policy_decision.background_defer_score},
             }},
-            {"reasoning_score", policy_decision.reasoning_score},
-            {"tool_aggression", policy_decision.tool_aggression},
-            {"interrupt_score", policy_decision.interrupt_score},
-            {"tool_parallelism_cap", policy_decision.tool_parallelism_cap},
-            {"interrupt_allowed", policy_decision.interrupt_allowed},
-            {"replan_required", policy_decision.replan_required},
-            {"early_stop_ok", policy_decision.early_stop_ok},
-            {"force_synthesis", policy_decision.force_synthesis},
-            {"heuristic_biases", policy_decision.heuristic_biases},
-            {"prompt_hints", policy_decision.prompt_hints},
+            {"reasoning_score", native_policy_decision.reasoning_score},
+            {"tool_aggression", native_policy_decision.tool_aggression},
+            {"interrupt_score", native_policy_decision.interrupt_score},
+            {"tool_parallelism_cap", effective_policy_decision.tool_parallelism_cap},
+            {"interrupt_allowed", effective_policy_decision.interrupt_allowed},
+            {"replan_required", effective_policy_decision.replan_required},
+            {"early_stop_ok", effective_policy_decision.early_stop_ok},
+            {"force_synthesis", effective_policy_decision.force_synthesis},
+            {"prefix_profile", effective_policy_decision.prefix_profile},
+            {"stop_profile", effective_policy_decision.stop_profile},
+            {"sampling_profile", effective_policy_decision.sampling_profile},
+            {"repetition_profile", effective_policy_decision.repetition_profile},
+            {"tool_choice_profile", effective_policy_decision.tool_choice_profile},
+            {"applied_provider_controls", server_policy_applied_provider_controls_to_json(applied_provider_controls)},
+            {"heuristic_biases", native_policy_decision.heuristic_biases},
+            {"prompt_hints", native_policy_decision.prompt_hints},
         });
         turn_builder->set_heuristic_retrieval({
             {"matched", heuristic_decision.matched},
@@ -5096,33 +7979,46 @@ static bool execute_deepseek_chat_with_emotive(
         return false;
     }
 
+    server_emotive_trace final_trace = {};
     if (turn_builder) {
         turn_builder->observe_runtime_event(
                 "provider_finish:" + (out_result->finish_reason.empty() ? std::string("stop") : out_result->finish_reason));
-        server_emotive_trace trace = turn_builder->finalize();
-        trace.final_policy = {
-            {"policy_version", policy_decision.policy_version},
-            {"selected_mode", policy_decision.selected_mode},
-            {"reasoning_depth", policy_decision.reasoning_depth},
+        final_trace = turn_builder->finalize();
+        final_trace.final_policy = {
+            {"policy_version", effective_policy_decision.policy_version},
+            {"selected_mode", effective_policy_decision.selected_mode},
+            {"reasoning_depth", effective_policy_decision.reasoning_depth},
+            {"thinking_mode", effective_policy_decision.thinking_mode},
+            {"behavior_policy_version", native_policy_decision.policy_version},
+            {"proposal_source", executed_policy_action.proposal_source},
+            {"rollout_mode", rollout_decision.rollout_mode},
+            {"rollout_decision_reason", rollout_decision.reason},
+            {"candidate_executed_live", rollout_decision.execute_candidate_live},
             {"score_breakdown", {
-                {"direct", policy_decision.direct_score},
-                {"reflective", policy_decision.reflective_score},
-                {"tool_light", policy_decision.tool_light_score},
-                {"tool_heavy", policy_decision.tool_heavy_score},
-                {"background_defer", policy_decision.background_defer_score},
+                {"direct", native_policy_decision.direct_score},
+                {"reflective", native_policy_decision.reflective_score},
+                {"tool_light", native_policy_decision.tool_light_score},
+                {"tool_heavy", native_policy_decision.tool_heavy_score},
+                {"background_defer", native_policy_decision.background_defer_score},
             }},
-            {"reasoning_score", policy_decision.reasoning_score},
-            {"tool_aggression", policy_decision.tool_aggression},
-            {"interrupt_score", policy_decision.interrupt_score},
-            {"tool_parallelism_cap", policy_decision.tool_parallelism_cap},
-            {"interrupt_allowed", policy_decision.interrupt_allowed},
-            {"replan_required", policy_decision.replan_required},
-            {"early_stop_ok", policy_decision.early_stop_ok},
-            {"force_synthesis", policy_decision.force_synthesis},
-            {"heuristic_biases", policy_decision.heuristic_biases},
-            {"prompt_hints", policy_decision.prompt_hints},
+            {"reasoning_score", native_policy_decision.reasoning_score},
+            {"tool_aggression", native_policy_decision.tool_aggression},
+            {"interrupt_score", native_policy_decision.interrupt_score},
+            {"tool_parallelism_cap", effective_policy_decision.tool_parallelism_cap},
+            {"interrupt_allowed", effective_policy_decision.interrupt_allowed},
+            {"replan_required", effective_policy_decision.replan_required},
+            {"early_stop_ok", effective_policy_decision.early_stop_ok},
+            {"force_synthesis", effective_policy_decision.force_synthesis},
+            {"prefix_profile", effective_policy_decision.prefix_profile},
+            {"stop_profile", effective_policy_decision.stop_profile},
+            {"sampling_profile", effective_policy_decision.sampling_profile},
+            {"repetition_profile", effective_policy_decision.repetition_profile},
+            {"tool_choice_profile", effective_policy_decision.tool_choice_profile},
+            {"applied_provider_controls", server_policy_applied_provider_controls_to_json(applied_provider_controls)},
+            {"heuristic_biases", native_policy_decision.heuristic_biases},
+            {"prompt_hints", native_policy_decision.prompt_hints},
         };
-        trace.heuristic_retrieval = {
+        final_trace.heuristic_retrieval = {
             {"matched", heuristic_decision.matched},
             {"record_id", heuristic_decision.record_id},
             {"heuristic_id", heuristic_decision.heuristic_id},
@@ -5133,10 +8029,130 @@ static bool execute_deepseek_chat_with_emotive(
             {"threshold", heuristic_decision.threshold},
             {"control_biases", heuristic_decision.control_biases},
         };
-        out_result->emotive_trace = server_emotive_trace_to_json(trace);
+        out_result->emotive_trace = server_emotive_trace_to_json(final_trace);
         if (out_trace) {
-            *out_trace = trace;
+            *out_trace = final_trace;
         }
+    }
+
+    maybe_capture_post_response_session_memory(
+            config,
+            body,
+            *out_result,
+            cognitive_replay,
+            mode_label,
+            trace_context);
+
+    if (policy_runtime_config.enabled) {
+        server_policy_observation next_observation = build_policy_observation(
+                policy_request_id,
+                policy_decision_id,
+                final_trace.valid ? final_trace.trace_id : std::string(),
+                mode_label,
+                control_state,
+                heuristic_decision,
+                body);
+        if (final_trace.valid) {
+            next_observation.trace_id = final_trace.trace_id;
+            next_observation.moment = final_trace.final_moment;
+            next_observation.vad = final_trace.final_vad;
+        }
+
+        const int64_t latency_ms = trace_context ? runtime_now_epoch_ms() - trace_context->started_at_ms : 0;
+        const server_policy_reward_model reward_model = policy_runtime_config.reward_model;
+        const server_policy_reward_breakdown reward_breakdown = compute_policy_reward_breakdown(
+                reward_model,
+                policy_observation,
+                next_observation,
+                *out_result,
+                latency_ms,
+                candidate_policy_failure);
+
+        std::vector<server_policy_reward_event> reward_events = {
+            {"desired_state_progress", reward_breakdown.progress_reward, 1.0f, "desired_state_potential"},
+            {"desired_state_terminal_closeness", reward_breakdown.terminal_closeness_reward, 1.0f, "desired_state_alignment"},
+            {"completion_quality", reward_breakdown.completion_quality_reward, 1.0f, "provider_finish_reason"},
+            {"latency_cost", reward_breakdown.latency_cost, 1.0f, "request_latency_ms"},
+            {"token_cost", reward_breakdown.token_cost, 1.0f, "provider_usage_tokens"},
+        };
+        if (reward_breakdown.tool_success_reward != 0.0f) {
+            reward_events.push_back({"tool_success", reward_breakdown.tool_success_reward, 1.0f, "provider_tool_call"});
+        }
+        if (reward_breakdown.candidate_failure_penalty != 0.0f) {
+            reward_events.push_back({
+                    "candidate_failure_penalty",
+                    reward_breakdown.candidate_failure_penalty,
+                    1.0f,
+                    "candidate_policy_failure"});
+        }
+
+        server_policy_transition transition = {};
+        transition.transition_id = generate_policy_transition_id();
+        transition.request_id = policy_request_id;
+        transition.decision_id = policy_decision_id;
+        transition.policy_mode = policy_runtime_config.mode;
+        transition.rollout_mode = rollout_decision.rollout_mode.empty() ? policy_runtime_config.mode : rollout_decision.rollout_mode;
+        transition.behavior_policy_version = native_policy_action.policy_version;
+        transition.candidate_policy_version = candidate_policy_version;
+        transition.candidate_policy_alias = candidate_policy_alias;
+        transition.observation = policy_observation;
+        transition.action_mask = policy_action_mask;
+        transition.has_candidate_action = have_candidate_policy_action;
+        transition.candidate_action = have_candidate_policy_action ? shielded_candidate_action : server_policy_action();
+        transition.executed_action = executed_policy_action;
+        transition.rollout_sampled = rollout_decision.rollout_sampled;
+        transition.candidate_executed_live = rollout_decision.execute_candidate_live;
+        transition.candidate_confidence_present = candidate_confidence_present;
+        transition.candidate_confidence = candidate_confidence;
+        transition.candidate_confidence_passed = rollout_decision.candidate_confidence_passed;
+        transition.rollout_decision_reason = rollout_decision.reason;
+        transition.canary_share_percent = rollout_decision.canary_share_percent;
+        transition.rollout_step_index = rollout_decision.rollout_step_index;
+        transition.safety_guard = policy_safety_guard;
+        transition.applied_provider_controls = applied_provider_controls;
+        transition.reward_model = reward_model;
+        transition.reward_events = std::move(reward_events);
+        transition.reward_breakdown = reward_breakdown;
+        transition.reward_total = reward_breakdown.total;
+        transition.next_observation = next_observation;
+        transition.terminated = true;
+        transition.termination_reason = out_result->finish_reason.empty() ? std::string("request_completed") : out_result->finish_reason;
+        transition.latency_ms = latency_ms;
+        transition.provider_finish_reason = out_result->finish_reason.empty() ? "stop" : out_result->finish_reason;
+        transition.created_at_ms = runtime_now_epoch_ms();
+        policy_runtime_record_transition(transition);
+
+        auto & policy_state = policy_runtime_state_instance();
+        std::lock_guard<std::mutex> lock(policy_state.mutex);
+        policy_state.behavior_policy_version = native_policy_action.policy_version;
+        if (policy_runtime_config.mode == "shadow") {
+            ++policy_state.shadow_request_count;
+        }
+        if (!candidate_policy_version.empty()) {
+            policy_state.candidate_policy_version = candidate_policy_version;
+        }
+        if (!candidate_policy_alias.empty()) {
+            policy_state.candidate_policy_alias = candidate_policy_alias;
+        }
+        if (candidate_policy_failure) {
+            ++policy_state.candidate_failure_count;
+            policy_state.last_candidate_error = candidate_policy_error;
+        } else {
+            policy_state.last_candidate_error.clear();
+        }
+        if (have_candidate_policy_action && policy_actions_differ(shielded_candidate_action, native_policy_action)) {
+            ++policy_state.shadow_disagreement_count;
+        }
+        if (policy_safety_guard.candidate_present &&
+                (!policy_safety_guard.blocked_fields.empty() || !policy_safety_guard.clipped_fields.empty())) {
+            ++policy_state.safety_guard_hit_count;
+        }
+        policy_runtime_update_rollout_after_request_locked(
+                policy_state,
+                policy_runtime_config,
+                rollout_decision,
+                candidate_policy_failure,
+                policy_safety_guard);
     }
 
     return true;
@@ -5488,10 +8504,51 @@ static bool execute_bridge_scoped_telegram_request(
         current_body["messages"] = std::move(messages);
     }
 
-    if (out_error) {
-        *out_error = format_error_response("bridge-scoped Telegram tool loop exceeded its maximum round budget", ERROR_TYPE_SERVER);
+    if (trace_context) {
+        runtime_request_trace_log(*trace_context, "runtime", "bridge_round_budget_synthesis_started", {
+            {"max_rounds", std::max<int32_t>(1, adapter_config.max_rounds)},
+        });
     }
-    return false;
+    const json synthesis_body =
+            build_bridge_round_budget_synthesis_body(current_body, std::max<int32_t>(1, adapter_config.max_rounds));
+    deepseek_chat_result synthesis_result;
+    json synthesis_error;
+    const bool synthesized = execute_deepseek_chat_with_emotive(
+            config,
+            emotive_runtime,
+            synthesis_body,
+            &synthesis_result,
+            &synthesis_error,
+            nullptr,
+            false,
+            std::string(),
+            true,
+            false,
+            0.0f,
+            "telegram_bridge_budget_synthesis",
+            trace_context);
+    if (synthesized && synthesis_result.tool_calls.empty()) {
+        if (trace_context) {
+            runtime_request_trace_log(*trace_context, "runtime", "bridge_round_budget_synthesis_completed", {
+                {"content_chars", static_cast<int64_t>(synthesis_result.content.size())},
+                {"finish_reason", synthesis_result.finish_reason},
+            });
+        }
+        *out_result = std::move(synthesis_result);
+        return true;
+    }
+
+    if (trace_context) {
+        runtime_request_trace_log(*trace_context, "runtime", "bridge_round_budget_synthesis_fell_back", {
+            {"synthesized", synthesized},
+            {"message", synthesized ?
+                    std::string("provider returned tool calls after tool-free synthesis request") :
+                    json_value(synthesis_error, "message", std::string("tool-free synthesis request failed"))},
+            {"tool_call_count", synthesized ? static_cast<int64_t>(synthesis_result.tool_calls.size()) : 0},
+        });
+    }
+    *out_result = build_bridge_round_budget_local_fallback_result();
+    return true;
 }
 
 static server_http_res_ptr handle_deepseek_chat(
@@ -6351,6 +9408,12 @@ int main(int argc, char ** argv) {
     const deepseek_runtime_config deepseek_config = deepseek_runtime_config_from_env();
     const server_emotive_runtime_config emotive_config = server_emotive_runtime_config_from_env();
     const server_ongoing_task_config ongoing_task_config = server_ongoing_task_config_from_env();
+    const server_policy_runtime_config policy_runtime_config = server_policy_runtime_config_from_env();
+    if (!policy_runtime_config.config_error.empty()) {
+        LOG_ERR("%s: %s\n", __func__, policy_runtime_config.config_error.c_str());
+        return 1;
+    }
+    configure_policy_runtime(policy_runtime_config);
     server_emotive_runtime emotive_runtime(emotive_config);
     json config_error;
     if (!deepseek_validate_runtime_config(deepseek_config, &config_error)) {
@@ -6393,11 +9456,10 @@ int main(int argc, char ** argv) {
             {"delivery_contract", "rich_plan_response_v1"},
         };
         payload["request_traces"] = runtime_request_trace_health_json();
+        payload["policy_runtime"] = policy_runtime_health_json();
         payload["emotive_runtime"] = emotive_runtime.health_json();
         payload["emotive_runtime"]["cognitive_replay"]["worker"] =
                 cognitive_replay_worker_json(replay_worker_state, request_activity);
-        payload["emotive_runtime"]["ongoing_tasks"] =
-                ongoing_task_worker_json(ongoing_worker_state, request_activity, ongoing_task_config);
         return make_json_response(payload);
     };
 
@@ -6419,16 +9481,16 @@ int main(int argc, char ** argv) {
         return make_json_response(emotive_runtime.heuristic_memory_json());
     };
 
-    const auto get_ongoing_tasks =
-            [&request_activity, &ongoing_task_config, &ongoing_worker_state](const server_http_req &) {
-        return make_json_response({
-            {"object", "vicuna.emotive.ongoing_tasks"},
-            {"worker", ongoing_task_worker_json(ongoing_worker_state, request_activity, ongoing_task_config)},
-        });
-    };
-
     const auto get_request_traces = [](const server_http_req & req) {
         return make_json_response(runtime_request_trace_read_json(req));
+    };
+
+    const auto get_policy_status = [](const server_http_req &) {
+        return make_json_response(policy_runtime_status_json());
+    };
+
+    const auto get_policy_transitions = [](const server_http_req & req) {
+        return make_json_response(policy_runtime_transitions_json(req));
     };
 
     const auto post_chat_completions = [&deepseek_config, &emotive_runtime, &telegram_outbox](const server_http_req & req) {
@@ -6507,7 +9569,8 @@ int main(int argc, char ** argv) {
     ctx_http.get("/v1/emotive/trace/latest", ex_wrapper(get_latest_emotive_trace));
     ctx_http.get("/v1/emotive/cognitive-replay", ex_wrapper(get_cognitive_replay));
     ctx_http.get("/v1/emotive/heuristics", ex_wrapper(get_heuristic_memory));
-    ctx_http.get("/v1/emotive/ongoing-tasks", ex_wrapper(get_ongoing_tasks));
+    ctx_http.get("/v1/policy/status", ex_wrapper(get_policy_status));
+    ctx_http.get("/v1/policy/transitions", ex_wrapper(get_policy_transitions));
     ctx_http.get("/v1/debug/request-traces", ex_wrapper(get_request_traces));
     ctx_http.post("/v1/chat/completions", ex_wrapper(post_chat_completions, &request_activity));
     ctx_http.post("/v1/completions", ex_wrapper(post_completions, &request_activity));
@@ -6532,7 +9595,7 @@ int main(int argc, char ** argv) {
     ctx_http.is_ready.store(true);
 
     std::thread replay_worker_thread;
-    if (emotive_runtime.config().cognitive_replay.enabled || ongoing_task_config.enabled) {
+    if (emotive_runtime.config().cognitive_replay.enabled) {
         replay_worker_thread = std::thread(
                 cognitive_replay_worker_loop,
                 &replay_worker_stop,

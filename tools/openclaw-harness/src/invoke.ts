@@ -57,6 +57,186 @@ function cloneJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+function positiveIntegerOrUndefined(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function parseMediaBackend(
+  mediaKind: unknown,
+  backendHint: unknown,
+  allowParsedDocuments: boolean
+): "radarr" | "sonarr" | "chaptarr" | "parsed_documents" {
+  const normalizedKind = String(mediaKind ?? "").trim();
+  const normalizedHint = String(backendHint ?? "auto").trim() || "auto";
+  const defaultBackend =
+    normalizedKind === "movie"
+      ? "radarr"
+      : normalizedKind === "series"
+        ? "sonarr"
+        : normalizedKind === "book"
+          ? "chaptarr"
+          : normalizedKind === "document"
+            ? "parsed_documents"
+            : "";
+  if (!defaultBackend) {
+    throw new Error(`unsupported media_kind: ${normalizedKind}`);
+  }
+  if (normalizedHint === "auto") {
+    return defaultBackend as "radarr" | "sonarr" | "chaptarr" | "parsed_documents";
+  }
+  if (!allowParsedDocuments && normalizedHint === "parsed_documents") {
+    throw new Error("parsed_documents backend is only valid for media_kind=document");
+  }
+  const normalized =
+    normalizedHint === "radarr" || normalizedHint === "sonarr" || normalizedHint === "chaptarr" || normalizedHint === "parsed_documents"
+      ? normalizedHint
+      : "";
+  if (!normalized) {
+    throw new Error(`unsupported backend_hint: ${normalizedHint}`);
+  }
+  if (normalizedKind === "movie" && normalized !== "radarr") {
+    throw new Error("media_kind=movie only supports auto or radarr backend_hint");
+  }
+  if (normalizedKind === "series" && normalized !== "sonarr") {
+    throw new Error("media_kind=series only supports auto or sonarr backend_hint");
+  }
+  if (normalizedKind === "book" && normalized !== "chaptarr") {
+    throw new Error("media_kind=book only supports auto or chaptarr backend_hint");
+  }
+  if (normalizedKind === "document" && normalized !== "parsed_documents") {
+    throw new Error("media_kind=document only supports auto or parsed_documents backend_hint");
+  }
+  return normalized as "radarr" | "sonarr" | "chaptarr" | "parsed_documents";
+}
+
+function buildFlattenedPayload(
+  capability: CapabilityDescriptor,
+  mergedArguments: Record<string, unknown>
+): { backend: "radarr" | "sonarr" | "chaptarr" | "parsed_documents" | "ongoing_tasks"; payload: Record<string, unknown> } {
+  switch (capability.dispatch_backend) {
+    case "flattened_media_read": {
+      const backend = parseMediaBackend(mergedArguments.media_kind, mergedArguments.backend_hint, true);
+      if (backend === "parsed_documents") {
+        return {
+          backend,
+          payload: {
+            query: mergedArguments.query,
+            ...(positiveIntegerOrUndefined(mergedArguments.limit) ? { limit: positiveIntegerOrUndefined(mergedArguments.limit) } : {}),
+          }
+        };
+      }
+      const query = String(mergedArguments.query ?? "").trim();
+      const statusFilter = String(mergedArguments.status_filter ?? "all").trim() || "all";
+      const action =
+        statusFilter === "downloaded"
+          ? backend === "radarr"
+            ? "list_downloaded_movies"
+            : backend === "sonarr"
+              ? "list_downloaded_series"
+              : "list_downloaded_books"
+          : backend === "radarr"
+            ? "list_movies"
+            : backend === "sonarr"
+              ? "list_series"
+              : "list_books";
+      return {
+        backend,
+        payload: statusFilter === "downloaded"
+          ? { action }
+          : action.startsWith("list_") && query
+            ? { action, term: query }
+            : { action }
+      };
+    }
+    case "flattened_media_download": {
+      const backend = parseMediaBackend(mergedArguments.media_kind, mergedArguments.backend_hint, false);
+      const query = String(mergedArguments.query ?? "").trim();
+      const idHint = String(mergedArguments.id_hint ?? "").trim();
+      if (backend === "radarr") {
+        return {
+          backend,
+          payload: {
+            action: "download_movie",
+            term: query,
+            ...(idHint && /^\d+$/.test(idHint) ? { tmdb_id: Number.parseInt(idHint, 10) } : {}),
+          }
+        };
+      }
+      if (backend === "sonarr") {
+        return {
+          backend,
+          payload: {
+            action: "download_series",
+            term: query,
+            ...(idHint && /^\d+$/.test(idHint) ? { tvdb_id: Number.parseInt(idHint, 10), tmdb_id: Number.parseInt(idHint, 10) } : {}),
+          }
+        };
+      }
+      return {
+        backend,
+        payload: {
+          action: "download_book",
+          term: query,
+          ...(idHint && /^\d+$/.test(idHint) ? { foreign_book_id: Number.parseInt(idHint, 10) } : {}),
+        }
+      };
+    }
+    case "flattened_media_delete": {
+      const backend = parseMediaBackend(mergedArguments.media_kind, mergedArguments.backend_hint, false);
+      const query = String(mergedArguments.query ?? "").trim();
+      const deleteFiles = mergedArguments.delete_files === undefined ? true : Boolean(mergedArguments.delete_files);
+      return {
+        backend,
+        payload:
+          backend === "radarr"
+            ? { action: "delete_movies", term: query, delete_files: deleteFiles }
+            : backend === "sonarr"
+              ? { action: "delete_series", term: query, delete_files: deleteFiles }
+              : { action: "delete_books", term: query, delete_files: deleteFiles }
+      };
+    }
+    case "flattened_ongoing_task_create": {
+      const interval = positiveIntegerOrUndefined(mergedArguments.interval);
+      if (!interval) {
+        throw new Error("ongoing_task_create requires a positive integer interval");
+      }
+      const unit = String(mergedArguments.unit ?? "").trim();
+      const normalizedUnit =
+        unit === "minute"
+          ? "minutes"
+          : unit === "hour"
+            ? "hours"
+            : unit === "day"
+              ? "days"
+              : unit === "week"
+                ? "weeks"
+                : "";
+      if (!normalizedUnit) {
+        throw new Error("ongoing_task_create unit must be one of minute, hour, day, or week");
+      }
+      return {
+        backend: "ongoing_tasks",
+        payload: {
+          action: "create",
+          task_text: mergedArguments.task_text,
+          interval,
+          unit: normalizedUnit,
+        }
+      };
+    }
+    case "flattened_ongoing_task_delete":
+      return {
+        backend: "ongoing_tasks",
+        payload: {
+          action: "delete",
+          task_id: mergedArguments.task_id,
+        }
+      };
+    default:
+      throw new Error(`unsupported flattened dispatch backend: ${capability.dispatch_backend}`);
+  }
+}
+
 function normalizedRootDescription(capability: CapabilityDescriptor): string {
   return (
     capability.description?.trim() ||
@@ -162,13 +342,18 @@ function runtimeDispatchCommand(
   mergedArguments: Record<string, unknown>,
   paths: OpenClawPaths
 ): { command: string; args: string[] } {
-  const payloadBase64 = Buffer.from(JSON.stringify(mergedArguments), "utf8").toString("base64");
-  const payloadArgs = [
-    `--payload-base64=${payloadBase64}`,
-    `--secrets-path=${paths.secretsPath}`,
-  ];
+  let dispatchFamily = capability.tool_family_id ?? "";
+  let dispatchArguments = mergedArguments;
+  if (String(capability.dispatch_backend).startsWith("flattened_")) {
+    const flattened = buildFlattenedPayload(capability, mergedArguments);
+    dispatchFamily = flattened.backend;
+    dispatchArguments = flattened.payload;
+  }
 
-  switch (capability.tool_family_id) {
+  const payloadBase64 = Buffer.from(JSON.stringify(dispatchArguments), "utf8").toString("base64");
+  const payloadArgs = [`--payload-base64=${payloadBase64}`, `--secrets-path=${paths.secretsPath}`];
+
+  switch (dispatchFamily) {
     case "radarr":
       return { command: paths.radarrWrapperPath, args: payloadArgs };
     case "sonarr":
@@ -179,10 +364,16 @@ function runtimeDispatchCommand(
       return { command: paths.ongoingTasksWrapperPath, args: payloadArgs };
     case "parsed_documents":
       return { command: paths.parsedDocumentsWrapperPath, args: payloadArgs };
+    case "hard_memory":
+      return { command: paths.hardMemoryWrapperPath, args: payloadArgs };
+    case "skills":
+      return { command: paths.skillsWrapperPath, args: payloadArgs };
     case "telegram":
       return { command: paths.telegramRelayWrapperPath, args: payloadArgs };
+    case "host_shell":
+      return { command: paths.hostShellWrapperPath, args: payloadArgs };
     case "web_search": {
-      const query = mergedArguments.query;
+      const query = dispatchArguments.query;
       if (typeof query !== "string" || query.trim() === "") {
         throw new Error("web_search requires a non-empty query string");
       }
@@ -190,30 +381,30 @@ function runtimeDispatchCommand(
         `--query-url=${encodeURIComponent(query.trim())}`,
         `--secrets-path=${paths.secretsPath}`,
       ];
-      if (typeof mergedArguments.topic === "string" && mergedArguments.topic.trim()) {
-        args.push(`--topic=${mergedArguments.topic.trim()}`);
+      if (typeof dispatchArguments.topic === "string" && dispatchArguments.topic.trim()) {
+        args.push(`--topic=${dispatchArguments.topic.trim()}`);
       }
-      if (typeof mergedArguments.search_depth === "string" && mergedArguments.search_depth.trim()) {
-        args.push(`--search-depth=${mergedArguments.search_depth.trim()}`);
+      if (typeof dispatchArguments.search_depth === "string" && dispatchArguments.search_depth.trim()) {
+        args.push(`--search-depth=${dispatchArguments.search_depth.trim()}`);
       }
-      if (typeof mergedArguments.max_results === "number" && Number.isInteger(mergedArguments.max_results)) {
-        args.push(`--max-results=${mergedArguments.max_results}`);
+      if (typeof dispatchArguments.max_results === "number" && Number.isInteger(dispatchArguments.max_results)) {
+        args.push(`--max-results=${dispatchArguments.max_results}`);
       }
-      if (typeof mergedArguments.time_range === "string" && mergedArguments.time_range.trim()) {
-        args.push(`--time-range=${mergedArguments.time_range.trim()}`);
+      if (typeof dispatchArguments.time_range === "string" && dispatchArguments.time_range.trim()) {
+        args.push(`--time-range=${dispatchArguments.time_range.trim()}`);
       }
-      if (Array.isArray(mergedArguments.include_domains) && mergedArguments.include_domains.length > 0) {
+      if (Array.isArray(dispatchArguments.include_domains) && dispatchArguments.include_domains.length > 0) {
         args.push(
-          `--include-domains=${mergedArguments.include_domains.map((item) => encodeURIComponent(String(item))).join(",")}`
+          `--include-domains=${dispatchArguments.include_domains.map((item) => encodeURIComponent(String(item))).join(",")}`
         );
       }
-      if (Array.isArray(mergedArguments.exclude_domains) && mergedArguments.exclude_domains.length > 0) {
+      if (Array.isArray(dispatchArguments.exclude_domains) && dispatchArguments.exclude_domains.length > 0) {
         args.push(
-          `--exclude-domains=${mergedArguments.exclude_domains.map((item) => encodeURIComponent(String(item))).join(",")}`
+          `--exclude-domains=${dispatchArguments.exclude_domains.map((item) => encodeURIComponent(String(item))).join(",")}`
         );
       }
-      if (typeof mergedArguments.country === "string" && mergedArguments.country.trim()) {
-        args.push(`--country=${encodeURIComponent(mergedArguments.country.trim())}`);
+      if (typeof dispatchArguments.country === "string" && dispatchArguments.country.trim()) {
+        args.push(`--country=${encodeURIComponent(dispatchArguments.country.trim())}`);
       }
       return { command: paths.tavilyWrapperPath, args };
     }
@@ -257,4 +448,3 @@ export async function invokeRuntimeCapability(
     observation,
   };
 }
-

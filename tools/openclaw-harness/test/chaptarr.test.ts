@@ -80,6 +80,9 @@ test("handleChaptarr adds a new book and requests an immediate search", async ()
         }
       ]), { status: 200, headers: { "content-type": "application/json" } });
     }
+    if (url.endsWith("/api/v1/book") && method === "GET") {
+      return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } });
+    }
     if (url.endsWith("/api/v1/book") && method === "POST") {
       return new Response(JSON.stringify({
         id: 55,
@@ -117,6 +120,7 @@ test("handleChaptarr adds a new book and requests an immediate search", async ()
         foreign_book_id: "hc:42",
         path: undefined,
       },
+      resolved_via: "search",
       search_command: {
         id: 99,
         name: "BookSearch",
@@ -213,6 +217,7 @@ test("handleChaptarr repairs an existing tracked book and triggers BookSearch", 
         foreign_book_id: "hc:42",
         path: undefined,
       },
+      resolved_via: "search",
       search_command: {
         id: 100,
         name: "BookSearch",
@@ -227,7 +232,7 @@ test("handleChaptarr repairs an existing tracked book and triggers BookSearch", 
   }
 });
 
-test("handleChaptarr reports queued legal-import fallback when direct ebook acquisition is unavailable", async () => {
+test("handleChaptarr keeps tracked-book downloads on BookSearch when mixed search falls back to book lookup", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
@@ -236,12 +241,116 @@ test("handleChaptarr reports queued legal-import fallback when direct ebook acqu
     if (url.includes("/api/v1/search")) {
       return new Response(JSON.stringify([
         {
-          book: {
-            title: "The Hobbit",
-            foreignBookId: "hc:42",
-            mediaType: "audiobook",
-            bookFiles: [{ path: "/books/the-hobbit.m4b" }],
-            author: { id: 12, authorName: "J.R.R. Tolkien" }
+          author: {
+            id: 12,
+            authorName: "J.R.R. Tolkien",
+          }
+        }
+      ]), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.includes("/api/v1/book/lookup")) {
+      return new Response(JSON.stringify([
+        {
+          id: 55,
+          title: "The Hobbit",
+          foreignBookId: "hc:42",
+          mediaType: "audiobook",
+          lastSelectedMediaType: "audiobook",
+          author: { id: 12, authorName: "J.R.R. Tolkien" }
+        }
+      ]), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/book/55") && method === "GET") {
+      return new Response(JSON.stringify({
+        id: 55,
+        title: "The Hobbit",
+        foreignBookId: "hc:42",
+        authorId: 12,
+        author: { id: 12, authorName: "J.R.R. Tolkien" }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/author/12") && method === "GET") {
+      return new Response(JSON.stringify({
+        id: 12,
+        authorName: "J.R.R. Tolkien"
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/author/12") && method === "PUT") {
+      return new Response(JSON.stringify({
+        id: 12,
+        authorName: "J.R.R. Tolkien"
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/book/55") && method === "PUT") {
+      return new Response(JSON.stringify({
+        id: 55,
+        title: "The Hobbit",
+        foreignBookId: "hc:42",
+        author: { id: 12, authorName: "J.R.R. Tolkien" }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/book/monitor")) {
+      return new Response(JSON.stringify([{ id: 55 }]), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.endsWith("/api/v1/command")) {
+      return new Response(JSON.stringify({ id: 100, name: "BookSearch" }), {
+        status: 201,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }) as typeof fetch;
+
+  try {
+    const response = await handleChaptarr({
+      service: "chaptarr",
+      config: { service: "chaptarr", baseUrl: DEFAULT_CHAPTARR_BASE_URL, apiKey: "test-key" },
+      payload: { action: "download_book", term: "The Hobbit" }
+    });
+
+    assert.equal(response.ok, true);
+    assert.deepEqual(response.data, {
+      mode: "existing_book_search_started",
+      message: "Started a Chaptarr search for 'The Hobbit'.",
+      book: {
+        id: 55,
+        title: "The Hobbit",
+        author_name: "J.R.R. Tolkien",
+        downloaded: false,
+        foreign_book_id: "hc:42",
+        path: undefined,
+      },
+      resolved_via: "book_lookup",
+      initial_search_error_kind: "lookup_no_match",
+      search_command: {
+        id: 100,
+        name: "BookSearch",
+        status: undefined,
+        state: undefined,
+        body: undefined,
+        message: undefined,
+      }
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleChaptarr adds a new book from book lookup and still requests BookSearch", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+
+    if (url.includes("/api/v1/search")) {
+      return new Response(JSON.stringify([
+        {
+          author: {
+            id: 12,
+            authorName: "J.R.R. Tolkien",
           }
         }
       ]), { status: 200, headers: { "content-type": "application/json" } });
@@ -251,9 +360,14 @@ test("handleChaptarr reports queued legal-import fallback when direct ebook acqu
         {
           title: "The Hobbit",
           foreignBookId: "hc:42",
+          mediaType: "audiobook",
+          lastSelectedMediaType: "audiobook",
           author: { id: 12, authorName: "J.R.R. Tolkien" }
         }
       ]), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/book") && method === "GET") {
+      return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } });
     }
     if (url.endsWith("/api/v1/book") && method === "POST") {
       return new Response(JSON.stringify({
@@ -263,6 +377,12 @@ test("handleChaptarr reports queued legal-import fallback when direct ebook acqu
         author: { id: 12, authorName: "J.R.R. Tolkien" }
       }), { status: 201, headers: { "content-type": "application/json" } });
     }
+    if (url.endsWith("/api/v1/command")) {
+      return new Response(JSON.stringify({ id: 99, name: "BookSearch" }), {
+        status: 201,
+        headers: { "content-type": "application/json" }
+      });
+    }
     throw new Error(`unexpected fetch ${url}`);
   }) as typeof fetch;
 
@@ -270,18 +390,13 @@ test("handleChaptarr reports queued legal-import fallback when direct ebook acqu
     const response = await handleChaptarr({
       service: "chaptarr",
       config: { service: "chaptarr", baseUrl: DEFAULT_CHAPTARR_BASE_URL, apiKey: "test-key" },
-      payload: { action: "download_book", term: "The Hobbit" },
-      legalImporterRunner: async () => ({
-        status: "queued_for_scheduler",
-        triggered_immediately: false,
-        waited_for_completion: false,
-        message: "Queued The Hobbit in Chaptarr's missing/wanted list for legal-importer pickup.",
-      })
+      payload: { action: "download_book", term: "The Hobbit" }
     });
 
     assert.equal(response.ok, true);
     assert.deepEqual(response.data, {
-      mode: "new_book_missing_fallback",
+      mode: "new_book_added_and_search_requested",
+      message: "Added 'The Hobbit' to Chaptarr and requested an immediate search.",
       book: {
         id: 55,
         title: "The Hobbit",
@@ -290,8 +405,254 @@ test("handleChaptarr reports queued legal-import fallback when direct ebook acqu
         foreign_book_id: "hc:42",
         path: undefined,
       },
-      importer_status: undefined,
-      message: "Queued The Hobbit in Chaptarr's missing/wanted list for legal-importer pickup.",
+      resolved_via: "book_lookup",
+      initial_search_error_kind: "lookup_no_match",
+      search_command: {
+        id: 99,
+        name: "BookSearch",
+        status: undefined,
+        state: undefined,
+        body: undefined,
+        message: undefined,
+      }
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleChaptarr accepts lookup candidates with audiobook-defaulted flags when no concrete audio signals exist", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+
+    if (url.includes("/api/v1/search")) {
+      return new Response(JSON.stringify([
+        {
+          author: {
+            id: 12,
+            authorName: "Ruby Dixon",
+          }
+        }
+      ]), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.includes("/api/v1/book/lookup")) {
+      return new Response(JSON.stringify([
+        {
+          title: "By the Horns",
+          foreignBookId: "hc:42",
+          pageCount: 0,
+          mediaType: "audiobook",
+          lastSelectedMediaType: "audiobook",
+          narratorNames: [],
+          availableNarrators: [],
+          editions: [
+            {
+              foreignEditionId: "ed-1",
+              title: "By the Horns",
+              isEbook: false,
+              pageCount: 368
+            }
+          ],
+          author: { id: 12, authorName: "Ruby Dixon" }
+        }
+      ]), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/book") && method === "GET") {
+      return new Response(JSON.stringify([]), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/book") && method === "POST") {
+      return new Response(JSON.stringify({
+        id: 55,
+        title: "By the Horns",
+        foreignBookId: "hc:42",
+        author: { id: 12, authorName: "Ruby Dixon" }
+      }), { status: 201, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/command")) {
+      return new Response(JSON.stringify({ id: 101, name: "BookSearch" }), {
+        status: 201,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }) as typeof fetch;
+
+  try {
+    const response = await handleChaptarr({
+      service: "chaptarr",
+      config: { service: "chaptarr", baseUrl: DEFAULT_CHAPTARR_BASE_URL, apiKey: "test-key" },
+      payload: { action: "download_book", term: "By the Horns Ruby Dixon" }
+    });
+
+    assert.equal(response.ok, true);
+    assert.deepEqual(response.data, {
+      mode: "new_book_added_and_search_requested",
+      message: "Added 'By the Horns Ruby Dixon' to Chaptarr and requested an immediate search.",
+      book: {
+        id: 55,
+        title: "By the Horns",
+        author_name: "Ruby Dixon",
+        downloaded: false,
+        foreign_book_id: "hc:42",
+        path: undefined,
+      },
+      resolved_via: "book_lookup",
+      initial_search_error_kind: "lookup_no_match",
+      search_command: {
+        id: 101,
+        name: "BookSearch",
+        status: undefined,
+        state: undefined,
+        body: undefined,
+        message: undefined,
+      }
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleChaptarr reconciles lookup candidates without local ids to tracked books before adding duplicates", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+
+    if (url.includes("/api/v1/search")) {
+      return new Response(JSON.stringify([
+        {
+          author: {
+            id: 12,
+            authorName: "Ruby Dixon",
+          }
+        }
+      ]), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.includes("/api/v1/book/lookup")) {
+      return new Response(JSON.stringify([
+        {
+          title: "By the Horns (Royal Artifactual Guild, #2)",
+          foreignBookId: "222175386",
+          localBookId: "0",
+          pageCount: 0,
+          mediaType: "audiobook",
+          narratorNames: [],
+          availableNarrators: [],
+          editions: [
+            {
+              foreignEditionId: "ed-1",
+              title: "By the Horns (Royal Artifactual Guild, #2)",
+              isEbook: false,
+              pageCount: 368,
+              narratorNames: [],
+            }
+          ],
+          author: { id: 12, authorName: "Ruby Dixon" }
+        }
+      ]), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/book") && method === "GET") {
+      return new Response(JSON.stringify([
+        {
+          id: 91,
+          localBookId: "91",
+          title: "By the Horns",
+          foreignBookId: "1785068",
+          ebookMonitored: true,
+          audiobookMonitored: false,
+          mediaType: "ebook",
+          author: { id: 12, authorName: "Ruby Dixon" }
+        },
+        {
+          id: 143,
+          localBookId: "143",
+          title: "By the Horns - Verliebt bis uber beide Horner",
+          foreignBookId: "",
+          ebookMonitored: false,
+          audiobookMonitored: false,
+          mediaType: "ebook",
+          author: { id: 12, authorName: "Ruby Dixon" }
+        }
+      ]), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/book/91") && method === "GET") {
+      return new Response(JSON.stringify({
+        id: 91,
+        title: "By the Horns",
+        foreignBookId: "1785068",
+        authorId: 12,
+        author: { id: 12, authorName: "Ruby Dixon" }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/author/12") && method === "GET") {
+      return new Response(JSON.stringify({
+        id: 12,
+        authorName: "Ruby Dixon"
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/author/12") && method === "PUT") {
+      return new Response(JSON.stringify({
+        id: 12,
+        authorName: "Ruby Dixon"
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/book/91") && method === "PUT") {
+      return new Response(JSON.stringify({
+        id: 91,
+        title: "By the Horns",
+        foreignBookId: "1785068",
+        author: { id: 12, authorName: "Ruby Dixon" }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.endsWith("/api/v1/book/monitor")) {
+      return new Response(JSON.stringify([{ id: 91 }]), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.endsWith("/api/v1/command")) {
+      return new Response(JSON.stringify({ id: 102, name: "BookSearch" }), {
+        status: 201,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.endsWith("/api/v1/book") && method === "POST") {
+      throw new Error("unexpected duplicate add");
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }) as typeof fetch;
+
+  try {
+    const response = await handleChaptarr({
+      service: "chaptarr",
+      config: { service: "chaptarr", baseUrl: DEFAULT_CHAPTARR_BASE_URL, apiKey: "test-key" },
+      payload: { action: "download_book", term: "By the Horns Ruby Dixon" }
+    });
+
+    assert.equal(response.ok, true);
+    assert.deepEqual(response.data, {
+      mode: "existing_book_search_started",
+      message: "Started a Chaptarr search for 'By the Horns'.",
+      book: {
+        id: 91,
+        title: "By the Horns",
+        author_name: "Ruby Dixon",
+        downloaded: false,
+        foreign_book_id: "1785068",
+        path: undefined,
+      },
+      resolved_via: "book_lookup",
+      initial_search_error_kind: "lookup_no_match",
+      search_command: {
+        id: 102,
+        name: "BookSearch",
+        status: undefined,
+        state: undefined,
+        body: undefined,
+        message: undefined,
+      }
     });
   } finally {
     globalThis.fetch = originalFetch;

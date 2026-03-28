@@ -180,7 +180,7 @@ struct server_cognitive_replay_result {
 
 struct server_heuristic_memory_config {
     bool enabled = true;
-    std::string path = "vicuna-heuristic-memory.json";
+    std::string path = "/home/vicuna/home/heuristics/vicuna-heuristic-memory.json";
     int32_t max_records = 64;
     int32_t top_k_semantic = 6;
     float semantic_threshold = 0.55f;
@@ -267,9 +267,15 @@ struct server_metacognitive_control_state {
 
 struct server_metacognitive_policy_decision {
     bool valid = false;
-    std::string policy_version = "control_surface_v1";
+    std::string policy_version = "control_surface_v2";
     std::string selected_mode = "direct";
     std::string reasoning_depth = "short";
+    std::string thinking_mode = "enabled";
+    std::string prefix_profile = "none";
+    std::string stop_profile = "none";
+    std::string sampling_profile = "provider_default";
+    std::string repetition_profile = "none";
+    std::string tool_choice_profile = "caller_default";
     float direct_score = 0.0f;
     float reflective_score = 0.0f;
     float tool_light_score = 0.0f;
@@ -287,6 +293,177 @@ struct server_metacognitive_policy_decision {
     std::vector<std::string> prompt_hints;
 };
 
+struct server_policy_observation {
+    std::string schema_version = "policy_observation_v1";
+    std::string request_id;
+    std::string trace_id;
+    std::string decision_id;
+    std::string mode_label;
+    bool bridge_scoped = false;
+    bool cognitive_replay = false;
+    float ongoing_task_due = 0.0f;
+    server_emotive_vector moment;
+    server_emotive_vad vad;
+    bool heuristic_matched = false;
+    std::string heuristic_id;
+    int32_t available_tool_count = 0;
+    bool parallel_tool_calls_requested = false;
+    int32_t input_message_count = 0;
+};
+
+struct server_policy_action {
+    std::string schema_version = "policy_action_v2";
+    std::string policy_version = "control_surface_v2";
+    std::string selected_mode = "direct";
+    std::string reasoning_depth = "short";
+    int64_t token_budget_bucket = 512;
+    int32_t tool_parallelism_cap = 0;
+    bool interrupt_allowed = false;
+    bool replan_required = false;
+    bool early_stop_ok = false;
+    bool force_synthesis = false;
+    std::string thinking_mode = "enabled";
+    std::string prefix_profile = "none";
+    std::string stop_profile = "none";
+    std::string sampling_profile = "provider_default";
+    std::string repetition_profile = "none";
+    std::string tool_choice_profile = "caller_default";
+    std::string proposal_source = "native";
+};
+
+struct server_policy_action_mask {
+    std::vector<std::string> allowed_modes;
+    std::vector<std::string> allowed_reasoning_depths;
+    std::vector<std::string> allowed_thinking_modes;
+    std::vector<std::string> allowed_prefix_profiles;
+    std::vector<std::string> allowed_stop_profiles;
+    std::vector<std::string> allowed_sampling_profiles;
+    std::vector<std::string> allowed_repetition_profiles;
+    std::vector<std::string> allowed_tool_choice_profiles;
+    int32_t max_tool_parallelism_cap = 0;
+    bool allow_interrupt = true;
+    bool allow_replan = true;
+    bool allow_early_stop = true;
+    bool allow_force_synthesis = true;
+};
+
+struct server_policy_applied_provider_controls {
+    bool thinking_enabled = false;
+    std::string prefix_profile = "none";
+    std::string stop_profile = "none";
+    std::string sampling_profile = "provider_default";
+    std::string repetition_profile = "none";
+    std::string tool_choice_profile = "caller_default";
+    bool prefix_used = false;
+    bool temperature_present = false;
+    double temperature = 0.0;
+    bool top_p_present = false;
+    double top_p = 0.0;
+    bool frequency_penalty_present = false;
+    double frequency_penalty = 0.0;
+    bool presence_penalty_present = false;
+    double presence_penalty = 0.0;
+    std::string tool_choice;
+    std::vector<std::string> stop_sequences;
+    std::vector<std::string> suppressed_fields;
+    std::vector<std::string> defaulted_fields;
+    std::map<std::string, std::string> field_sources;
+    std::string beta_routing_reason;
+};
+
+struct server_policy_reward_event {
+    std::string kind;
+    float value = 0.0f;
+    float weight = 1.0f;
+    std::string source;
+};
+
+struct server_policy_vad_axes {
+    float valence = 0.0f;
+    float arousal = 0.0f;
+    float dominance = 0.0f;
+};
+
+struct server_policy_reward_model {
+    std::string schema_version = "policy_reward_model_v1";
+    std::string model_version = "desired_state_reward_v1";
+    server_emotive_vector target_moment;
+    server_policy_vad_axes target_vad;
+    server_emotive_vector moment_weights;
+    server_policy_vad_axes vad_weights;
+    float progress_weight = 0.65f;
+    float terminal_closeness_weight = 0.35f;
+    float shaping_gamma = 1.0f;
+    float completion_stop_reward = 0.20f;
+    float completion_non_stop_reward = 0.05f;
+    float latency_cost_cap = 0.25f;
+    float latency_ms_scale = 4000.0f;
+    float token_cost_cap = 0.25f;
+    float token_scale = 4096.0f;
+    float tool_success_bonus = 0.05f;
+    float candidate_failure_penalty = 0.05f;
+};
+
+struct server_policy_reward_breakdown {
+    std::string schema_version = "policy_reward_breakdown_v1";
+    std::string model_version = "desired_state_reward_v1";
+    float before_score = 0.0f;
+    float after_score = 0.0f;
+    float progress_reward = 0.0f;
+    float terminal_closeness_reward = 0.0f;
+    float completion_quality_reward = 0.0f;
+    float latency_cost = 0.0f;
+    float token_cost = 0.0f;
+    float tool_success_reward = 0.0f;
+    float candidate_failure_penalty = 0.0f;
+    float total = 0.0f;
+};
+
+struct server_policy_safety_guard_result {
+    bool candidate_present = false;
+    bool allowed = false;
+    std::vector<std::string> blocked_fields;
+    std::vector<std::string> clipped_fields;
+    bool fallback_to_native = true;
+    std::string reason;
+};
+
+struct server_policy_transition {
+    std::string transition_id;
+    std::string request_id;
+    std::string decision_id;
+    std::string policy_mode = "disabled";
+    std::string rollout_mode = "disabled";
+    std::string behavior_policy_version = "control_surface_v2";
+    std::string candidate_policy_version;
+    std::string candidate_policy_alias;
+    server_policy_observation observation;
+    server_policy_action_mask action_mask;
+    bool has_candidate_action = false;
+    server_policy_action candidate_action;
+    server_policy_action executed_action;
+    bool rollout_sampled = false;
+    bool candidate_executed_live = false;
+    bool candidate_confidence_present = false;
+    float candidate_confidence = 0.0f;
+    bool candidate_confidence_passed = false;
+    std::string rollout_decision_reason;
+    int32_t canary_share_percent = 0;
+    int32_t rollout_step_index = 0;
+    server_policy_safety_guard_result safety_guard;
+    server_policy_applied_provider_controls applied_provider_controls;
+    server_policy_reward_model reward_model;
+    std::vector<server_policy_reward_event> reward_events;
+    server_policy_reward_breakdown reward_breakdown;
+    float reward_total = 0.0f;
+    server_policy_observation next_observation;
+    bool terminated = false;
+    std::string termination_reason;
+    int64_t latency_ms = 0;
+    std::string provider_finish_reason = "stop";
+    int64_t created_at_ms = 0;
+};
+
 struct server_emotive_runtime_config {
     bool enabled = true;
     int32_t block_max_chars = 320;
@@ -302,6 +479,16 @@ struct server_emotive_runtime_config {
 server_emotive_runtime_config server_emotive_runtime_config_from_env();
 
 json server_emotive_trace_to_json(const server_emotive_trace & trace);
+json server_policy_observation_to_json(const server_policy_observation & observation);
+json server_policy_action_to_json(const server_policy_action & action);
+json server_policy_action_mask_to_json(const server_policy_action_mask & mask);
+json server_policy_applied_provider_controls_to_json(const server_policy_applied_provider_controls & controls);
+json server_policy_vad_axes_to_json(const server_policy_vad_axes & axes);
+json server_policy_reward_model_to_json(const server_policy_reward_model & model);
+json server_policy_reward_event_to_json(const server_policy_reward_event & event);
+json server_policy_reward_breakdown_to_json(const server_policy_reward_breakdown & breakdown);
+json server_policy_safety_guard_result_to_json(const server_policy_safety_guard_result & result);
+json server_policy_transition_to_json(const server_policy_transition & transition);
 
 class server_emotive_runtime;
 

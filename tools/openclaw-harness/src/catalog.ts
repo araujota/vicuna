@@ -63,6 +63,14 @@ function hardMemoryCapability(): CapabilityDescriptor {
           type: "string",
           description:
             "The retrieval query to run against Vicuña hard memory when looking for relevant durable memories or prior tool observations."
+        },
+        limit: {
+          type: "integer",
+          description: "Optional result cap."
+        },
+        domain: {
+          type: "string",
+          description: "Optional domain filter."
         }
       }
     },
@@ -81,7 +89,7 @@ function hardMemoryCapability(): CapabilityDescriptor {
     ),
     latency_class: 1,
     max_steps_reserved: 2,
-    dispatch_backend: "legacy_hard_memory"
+    dispatch_backend: "markdown_hard_memory"
   };
 }
 
@@ -97,7 +105,7 @@ function hardMemoryWriteCapability(): CapabilityDescriptor {
     tool_family_description: "Read from or write durable memory primitives in Vicuña hard memory.",
     method_name: "write",
     method_description: "Archive a batch of durable memory primitives.",
-    description: "Archive explicit durable memories to Vicuña hard memory and Supermemory",
+    description: "Archive explicit durable memories to Vicuña markdown hard memory",
     input_schema_json: {
       type: "object",
       required: ["memories"],
@@ -105,7 +113,7 @@ function hardMemoryWriteCapability(): CapabilityDescriptor {
         memories: {
           type: "array",
           description:
-            "The batch of durable memory primitives to archive into Vicuña hard memory and Supermemory.",
+            "The batch of durable memory primitives to archive into Vicuña markdown hard memory.",
           minItems: 1,
           items: {
             type: "object",
@@ -185,7 +193,98 @@ function hardMemoryWriteCapability(): CapabilityDescriptor {
     ),
     latency_class: 2,
     max_steps_reserved: 3,
-    dispatch_backend: "legacy_hard_memory"
+    dispatch_backend: "markdown_hard_memory"
+  };
+}
+
+function skillReadCapability(): CapabilityDescriptor {
+  return {
+    capability_id: "openclaw.vicuna.skill_read",
+    tool_surface_id: "vicuna.skills.read",
+    capability_kind: "tool",
+    owner_plugin_id: "vicuna-skills",
+    tool_name: "skill_read",
+    tool_family_id: "skills",
+    tool_family_name: "Skills",
+    tool_family_description: "Read or create host-owned skill markdown files through explicit runtime tools.",
+    method_name: "read",
+    method_description: "Read one skill markdown file by name.",
+    description: "Read one host-owned skill markdown file by name so the runtime can load detailed instructions on demand instead of auto-injecting them.",
+    input_schema_json: {
+      type: "object",
+      required: ["name"],
+      properties: {
+        name: {
+          type: "string",
+          description: "The skill file name or file stem to read."
+        }
+      }
+    },
+    output_contract: "completed_result",
+    side_effect_class: "filesystem_read",
+    execution_safety_class: "read_only",
+    approval_mode: "none",
+    execution_modes: ["sync"],
+    provenance_namespace: "openclaw/vicuna-runtime/tool/skill_read",
+    tool_kind: 4,
+    tool_flags: combineToolFlags(
+      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      COG_TOOL_FLAG_DMN_ELIGIBLE,
+      COG_TOOL_FLAG_SIMULATION_SAFE,
+      COG_TOOL_FLAG_REMEDIATION_SAFE
+    ),
+    latency_class: 1,
+    max_steps_reserved: 2,
+    dispatch_backend: "skills"
+  };
+}
+
+function skillCreateCapability(): CapabilityDescriptor {
+  return {
+    capability_id: "openclaw.vicuna.skill_create",
+    tool_surface_id: "vicuna.skills.create",
+    capability_kind: "tool",
+    owner_plugin_id: "vicuna-skills",
+    tool_name: "skill_create",
+    tool_family_id: "skills",
+    tool_family_name: "Skills",
+    tool_family_description: "Read or create host-owned skill markdown files through explicit runtime tools.",
+    method_name: "create",
+    method_description: "Create or update one skill markdown file by name.",
+    description: "Create or update one host-owned skill markdown file. Only use this tool when the user directly asks to create or update a skill.",
+    input_schema_json: {
+      type: "object",
+      required: ["name", "content"],
+      properties: {
+        name: {
+          type: "string",
+          description: "The requested skill name to write as a markdown file."
+        },
+        content: {
+          type: "string",
+          description: "The full markdown body to store in the skill file."
+        },
+        overwrite: {
+          type: "boolean",
+          description: "Whether an existing skill file may be updated in place."
+        }
+      }
+    },
+    output_contract: "completed_result",
+    side_effect_class: "filesystem_write",
+    execution_safety_class: "approval_required",
+    approval_mode: "none",
+    execution_modes: ["sync"],
+    provenance_namespace: "openclaw/vicuna-runtime/tool/skill_create",
+    tool_kind: 4,
+    tool_flags: combineToolFlags(
+      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      COG_TOOL_FLAG_DMN_ELIGIBLE,
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+    ),
+    latency_class: 1,
+    max_steps_reserved: 2,
+    dispatch_backend: "skills"
   };
 }
 
@@ -967,11 +1066,11 @@ function parsedDocumentsSearchCapability(): CapabilityDescriptor {
     tool_family_id: "parsed_documents",
     tool_family_name: "Parsed Documents",
     tool_family_description:
-      "Search stored parsed-document chunks derived from Telegram-uploaded files and return compact labeled matches.",
+      "Search locally stored parsed-document chunks derived from Telegram-uploaded files and return compact labeled matches.",
     method_name: "search_chunks",
-    method_description: "Search stored parsed-document chunks by semantic query.",
+    method_description: "Search locally stored parsed-document chunks by explicit lexical query.",
     description:
-      "Search the stored parsed-document chunk index and return only the compact matching chunks the system needs, labeled with their source document titles.",
+      "Search the local parsed-document chunk store under the Vicuña docs directory and return only the compact matching chunks the system needs, labeled with their source document titles.",
     input_schema_json: {
       type: "object",
       required: ["query"],
@@ -1372,15 +1471,332 @@ export function buildCatalog(options: CatalogOptions = {}): CapabilityCatalog {
 
 export function buildRuntimeCatalog(options: RuntimeCatalogOptions = {}): CapabilityCatalog {
   const capabilities: CapabilityDescriptor[] = [
-    ...mediaRuntimeCapabilities(),
-    parsedDocumentsSearchCapability(),
-    telegramRelayCapability(),
-    ...ongoingTaskRuntimeCapabilities(),
+    {
+      capability_id: "openclaw.vicuna.media.read",
+      tool_surface_id: "vicuna.media.read",
+      capability_kind: "tool",
+      owner_plugin_id: "vicuna-runtime",
+      tool_name: "media_read",
+      tool_family_id: "media",
+      tool_family_name: "Media",
+      tool_family_description: "Read from the media server or parsed-document store through one direct tool.",
+      method_name: "read",
+      method_description: "Read movie, series, book, or document state through one direct tool call.",
+      description: "Read media-server or parsed-document state through one direct tool call. Use movie, series, or book for library/media lookup and document for parsed-document retrieval.",
+      input_schema_json: {
+        type: "object",
+        required: ["media_kind", "query"],
+        properties: {
+          media_kind: {
+            type: "string",
+            enum: ["movie", "series", "book", "document"],
+            description: "Which media domain to inspect."
+          },
+          query: {
+            type: "string",
+            description: "Natural-language lookup text."
+          },
+          backend_hint: {
+            type: "string",
+            enum: ["auto", "radarr", "sonarr", "chaptarr", "parsed_documents"],
+            description: "Optional backend preference. Use auto unless you have a concrete reason to override."
+          },
+          limit: {
+            type: "integer",
+            description: "Optional result cap for read responses."
+          },
+          status_filter: {
+            type: "string",
+            enum: ["all", "downloaded", "missing", "upcoming"],
+            description: "Optional status filter that narrows the read behavior."
+          }
+        }
+      },
+      output_contract: "completed_result",
+      side_effect_class: "service_read",
+      execution_safety_class: "read_only",
+      approval_mode: "none",
+      execution_modes: ["sync"],
+      provenance_namespace: "openclaw/vicuna-runtime/tool/media_read",
+      tool_kind: 4,
+      tool_flags: combineToolFlags(
+        COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+        COG_TOOL_FLAG_DMN_ELIGIBLE,
+        COG_TOOL_FLAG_SIMULATION_SAFE,
+        COG_TOOL_FLAG_REMEDIATION_SAFE
+      ),
+      latency_class: 1,
+      max_steps_reserved: 2,
+      dispatch_backend: "flattened_media_read"
+    },
+    {
+      capability_id: "openclaw.vicuna.media.download",
+      tool_surface_id: "vicuna.media.download",
+      capability_kind: "tool",
+      owner_plugin_id: "vicuna-runtime",
+      tool_name: "media_download",
+      tool_family_id: "media",
+      tool_family_name: "Media",
+      tool_family_description: "Start media acquisition through one direct tool.",
+      method_name: "download",
+      method_description: "Start movie, series, or book acquisition through one direct tool call.",
+      description: "Start movie, series, or ebook acquisition through one direct tool call.",
+      input_schema_json: {
+        type: "object",
+        required: ["media_kind", "query"],
+        properties: {
+          media_kind: {
+            type: "string",
+            enum: ["movie", "series", "book"],
+            description: "Which media domain to modify."
+          },
+          query: {
+            type: "string",
+            description: "Natural-language title or search string."
+          },
+          backend_hint: {
+            type: "string",
+            enum: ["auto", "radarr", "sonarr", "chaptarr"],
+            description: "Optional backend preference. Use auto unless you need an explicit backend."
+          },
+          id_hint: {
+            type: "string",
+            description: "Optional external identifier used to disambiguate the selected item."
+          }
+        }
+      },
+      output_contract: "completed_result",
+      side_effect_class: "service_acquisition",
+      execution_safety_class: "approval_required",
+      approval_mode: "policy_driven",
+      execution_modes: ["sync"],
+      provenance_namespace: "openclaw/vicuna-runtime/tool/media_download",
+      tool_kind: 4,
+      tool_flags: combineToolFlags(
+        COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+        COG_TOOL_FLAG_DMN_ELIGIBLE,
+        COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+      ),
+      latency_class: 1,
+      max_steps_reserved: 3,
+      dispatch_backend: "flattened_media_download"
+    },
+    {
+      capability_id: "openclaw.vicuna.media.delete",
+      tool_surface_id: "vicuna.media.delete",
+      capability_kind: "tool",
+      owner_plugin_id: "vicuna-runtime",
+      tool_name: "media_delete",
+      tool_family_id: "media",
+      tool_family_name: "Media",
+      tool_family_description: "Delete tracked media through one direct tool.",
+      method_name: "delete",
+      method_description: "Delete a movie, series, or book through one direct tool call.",
+      description: "Delete tracked media through one direct tool call while keeping runtime-side validation explicit.",
+      input_schema_json: {
+        type: "object",
+        required: ["media_kind", "query"],
+        properties: {
+          media_kind: {
+            type: "string",
+            enum: ["movie", "series", "book"],
+            description: "Which media domain to modify."
+          },
+          query: {
+            type: "string",
+            description: "Natural-language title or identifier hint."
+          },
+          backend_hint: {
+            type: "string",
+            enum: ["auto", "radarr", "sonarr", "chaptarr"],
+            description: "Optional backend preference. Use auto unless you need an explicit backend."
+          },
+          delete_files: {
+            type: "boolean",
+            description: "Whether files should also be deleted."
+          }
+        }
+      },
+      output_contract: "completed_result",
+      side_effect_class: "service_api",
+      execution_safety_class: "approval_required",
+      approval_mode: "policy_driven",
+      execution_modes: ["sync"],
+      provenance_namespace: "openclaw/vicuna-runtime/tool/media_delete",
+      tool_kind: 4,
+      tool_flags: combineToolFlags(
+        COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+        COG_TOOL_FLAG_DMN_ELIGIBLE,
+        COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+      ),
+      latency_class: 1,
+      max_steps_reserved: 3,
+      dispatch_backend: "flattened_media_delete"
+    },
+    {
+      ...hardMemoryCapability(),
+      capability_id: "openclaw.vicuna.hard_memory_read",
+      tool_surface_id: "vicuna.memory.hard_read",
+      tool_name: "hard_memory_read",
+      method_name: "read",
+      method_description: "Read Vicuña hard memory with a retrieval query.",
+      description: "Read durable memory primitives from Vicuña hard memory.",
+      provenance_namespace: "openclaw/vicuna-memory/memory_adapter/hard_memory_read"
+    },
+    {
+      ...hardMemoryWriteCapability(),
+      capability_id: "openclaw.vicuna.hard_memory_write_flattened",
+      tool_surface_id: "vicuna.memory.hard_write",
+      tool_name: "hard_memory_write",
+      method_name: "write",
+      method_description: "Archive one batch of durable memory primitives.",
+      description: "Archive explicit durable memories to Vicuña markdown hard memory through one direct tool call.",
+      provenance_namespace: "openclaw/vicuna-memory/memory_adapter/hard_memory_write_flattened"
+    },
+    skillReadCapability(),
+    skillCreateCapability(),
+    {
+      capability_id: "openclaw.vicuna.host_shell",
+      tool_surface_id: "vicuna.host.shell",
+      capability_kind: "tool",
+      owner_plugin_id: "vicuna-runtime",
+      tool_name: "host_shell",
+      tool_family_id: "host_shell",
+      tool_family_name: "Host Shell",
+      tool_family_description: "A last-resort host shell fallback for direct file or shell manipulation in the runtime's own workspace when specialized tools do not fit.",
+      method_name: "execute",
+      method_description: "Run one bounded shell command in the runtime's host workspace and return a structured observation.",
+      description: "Last-resort host shell fallback for direct file or shell manipulation in the runtime's own host workspace. Prefer media_read, media_download, media_delete, hard_memory_read, hard_memory_write, skill_read, skill_create, ongoing_task_create, ongoing_task_delete, and web_search whenever they fit the task. Use host_shell only when you need direct host-side file or shell operations that those specialized tools do not provide.",
+      input_schema_json: {
+        type: "object",
+        description: "Payload for one bounded host shell invocation rooted in the runtime's dedicated host workspace.",
+        required: ["command", "purpose"],
+        properties: {
+          command: {
+            type: "string",
+            description: "The shell command to execute."
+          },
+          purpose: {
+            type: "string",
+            description: "A short description of why this host-shell command is needed."
+          },
+          working_directory: {
+            type: "string",
+            description: "Optional relative subdirectory under the host shell workspace to use as the starting directory."
+          },
+          timeout_ms: {
+            type: "integer",
+            description: "Optional timeout in milliseconds for the shell command."
+          }
+        }
+      },
+      output_contract: "completed_result",
+      side_effect_class: "filesystem_write",
+      execution_safety_class: "approval_required",
+      approval_mode: "policy_driven",
+      execution_modes: ["sync"],
+      provenance_namespace: "openclaw/vicuna-runtime/tool/host_shell",
+      tool_kind: 4,
+      tool_flags: combineToolFlags(
+        COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+        COG_TOOL_FLAG_DMN_ELIGIBLE,
+        COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+      ),
+      latency_class: 1,
+      max_steps_reserved: 3,
+      dispatch_backend: "host_shell"
+    },
   ];
   const tavilyApiKey = options.secrets?.tools?.tavily?.api_key?.trim();
   if (tavilyApiKey) {
     capabilities.push(tavilyWebSearchCapability());
   }
+  capabilities.push({
+    capability_id: "openclaw.vicuna.ongoing-task.create",
+    tool_surface_id: "vicuna.tasks.ongoing.create",
+    capability_kind: "tool",
+    owner_plugin_id: "vicuna-ongoing-tasks",
+    tool_name: "ongoing_task_create",
+    tool_family_id: "ongoing_task",
+    tool_family_name: "Ongoing Task",
+    tool_family_description: "Create or delete one recurring host cron task through a direct tool.",
+    method_name: "create",
+    method_description: "Create one recurring host cron task for the vicuna runtime.",
+    description: "Create one recurring host cron task with explicit text and cadence so the stored prompt runs later as a system message.",
+    input_schema_json: {
+      type: "object",
+      required: ["task_text", "interval", "unit"],
+      properties: {
+        task_text: {
+          type: "string",
+          description: "The exact recurring task wording that will later be sent as a system message."
+        },
+        interval: {
+          type: "integer",
+          minimum: 1,
+          description: "Positive recurrence interval."
+        },
+        unit: {
+          type: "string",
+          enum: ["minute", "hour", "day", "week"],
+          description: "Cadence unit."
+        }
+      }
+    },
+    output_contract: "completed_result",
+    side_effect_class: "memory_write",
+    execution_safety_class: "approval_required",
+    approval_mode: "none",
+    execution_modes: ["sync"],
+    provenance_namespace: "openclaw/vicuna-ongoing-tasks/tool/ongoing_task_create",
+    tool_kind: 4,
+    tool_flags: combineToolFlags(
+      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      COG_TOOL_FLAG_DMN_ELIGIBLE,
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+    ),
+    latency_class: 1,
+    max_steps_reserved: 2,
+    dispatch_backend: "flattened_ongoing_task_create"
+  });
+  capabilities.push({
+    capability_id: "openclaw.vicuna.ongoing-task.delete",
+    tool_surface_id: "vicuna.tasks.ongoing.delete",
+    capability_kind: "tool",
+    owner_plugin_id: "vicuna-ongoing-tasks",
+    tool_name: "ongoing_task_delete",
+    tool_family_id: "ongoing_task",
+    tool_family_name: "Ongoing Task",
+    tool_family_description: "Create or delete one recurring host cron task through a direct tool.",
+    method_name: "delete",
+    method_description: "Delete one recurring host cron task by task id.",
+    description: "Delete one recurring host cron task by task id.",
+    input_schema_json: {
+      type: "object",
+      required: ["task_id"],
+      properties: {
+        task_id: {
+          type: "string",
+          description: "Stable recurring cron task identifier."
+        }
+      }
+    },
+    output_contract: "completed_result",
+    side_effect_class: "memory_write",
+    execution_safety_class: "approval_required",
+    approval_mode: "none",
+    execution_modes: ["sync"],
+    provenance_namespace: "openclaw/vicuna-ongoing-tasks/tool/ongoing_task_delete",
+    tool_kind: 4,
+    tool_flags: combineToolFlags(
+      COG_TOOL_FLAG_ACTIVE_ELIGIBLE,
+      COG_TOOL_FLAG_DMN_ELIGIBLE,
+      COG_TOOL_FLAG_EXTERNAL_SIDE_EFFECT
+    ),
+    latency_class: 1,
+    max_steps_reserved: 2,
+    dispatch_backend: "flattened_ongoing_task_delete"
+  });
   return assertCapabilityCatalog({
     catalog_version: 1,
     capabilities

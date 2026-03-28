@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+REPO_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/../../.." && pwd)"
+DEFAULT_SECRETS_PATH="${VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH:-$REPO_ROOT/.cache/vicuna/openclaw-tool-secrets.json}"
+NODE_BIN="${VICUNA_OPENCLAW_NODE_BIN:-${TELEGRAM_BRIDGE_NODE_BIN:-node}}"
 
-exec node "$REPO_ROOT/tools/openclaw-harness/dist/tavily-search.js" \
-  --secrets-path="$REPO_ROOT/.cache/vicuna/openclaw-tool-secrets.json" \
-  "$@"
+ARGS=("$@")
+HAS_SECRETS_PATH=0
+for arg in "${ARGS[@]}"; do
+  if [[ "$arg" == --secrets-path=* ]]; then
+    HAS_SECRETS_PATH=1
+    break
+  fi
+done
+if [[ "$HAS_SECRETS_PATH" -eq 0 ]]; then
+  ARGS=("--secrets-path=$DEFAULT_SECRETS_PATH" "${ARGS[@]}")
+fi
+
+exec "$NODE_BIN" "$REPO_ROOT/tools/openclaw-harness/dist/tavily-search.js" "${ARGS[@]}"

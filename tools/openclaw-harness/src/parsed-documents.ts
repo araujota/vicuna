@@ -1,6 +1,8 @@
 import { Buffer } from "node:buffer";
+import fs from "node:fs";
+import path from "node:path";
 
-import { loadToolSecrets } from "./config.js";
+import { defaultDocsDir, defaultRepoRoot, loadToolSecrets } from "./config.js";
 
 export type ParsedDocumentsInvocation = {
   query?: unknown;
@@ -9,10 +11,7 @@ export type ParsedDocumentsInvocation = {
 };
 
 export type ParsedDocumentsConfig = {
-  baseUrl: string;
-  authToken?: string;
-  containerTag: string;
-  runtimeIdentity: string;
+  docsDir: string;
   defaultThreshold: number;
   shortQueryThreshold: number;
   maxResults: number;
@@ -24,6 +23,7 @@ export type ParsedDocumentSearchResult = {
   similarity: number;
   chunk_index: number;
   link_key?: string;
+  source_path?: string;
 };
 
 export type ParsedDocumentsResponseEnvelope = {
@@ -53,9 +53,6 @@ export class ParsedDocumentsToolError extends Error {
 
 type JsonRecord = Record<string, unknown>;
 
-const DEFAULT_HARD_MEMORY_BASE_URL = "https://api.supermemory.ai";
-const DEFAULT_CONTAINER_TAG = "vicuna-telegram-documents";
-const DEFAULT_RUNTIME_IDENTITY = "vicuna";
 const DEFAULT_MAX_RESULTS = 5;
 const MAX_RESULTS = 8;
 const DEFAULT_THRESHOLD = 0.58;
@@ -64,10 +61,6 @@ const DEFAULT_SHORT_QUERY_THRESHOLD = 0.68;
 function trimString(value: string | undefined | null): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
-}
-
-function normalizeBaseUrl(baseUrl: string): string {
-  return baseUrl.trim().replace(/\/+$/, "");
 }
 
 function asRecord(value: unknown): JsonRecord | undefined {
@@ -111,11 +104,7 @@ function queryTokenCount(query: string): number {
   return query.split(/\s+/).filter(Boolean).length;
 }
 
-function effectiveThreshold(
-  query: string,
-  override: number | undefined,
-  config: ParsedDocumentsConfig
-): number {
+function effectiveThreshold(query: string, override: number | undefined, config: ParsedDocumentsConfig): number {
   if (override !== undefined) {
     return override;
   }
@@ -130,13 +119,99 @@ function boundedLimit(requested: number | undefined, configuredMax: number): num
   return Math.max(1, Math.min(requested ?? DEFAULT_MAX_RESULTS, configuredMax, MAX_RESULTS));
 }
 
-function searchFilters() {
-  return {
-    AND: [
-      { key: "contentKind", value: "parsed_chunk", filterType: "metadata" },
-      { key: "source", value: "telegram_bridge", filterType: "metadata" },
-    ],
-  };
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/i)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function lexicalScore(query: string, chunkText: string): number {
+  const queryTokens = tokenize(query);
+  if (queryTokens.length === 0) {
+    return 0;
+  }
+  const chunkTokens = new Set(tokenize(chunkText));
+  let matched = 0;
+  for (const token of queryTokens) {
+    if (chunkTokens.has(token)) {
+      matched += 1;
+    }
+  }
+  const tokenScore = matched / queryTokens.length;
+  const phraseBonus = chunkText.toLowerCase().includes(query.toLowerCase()) ? 0.25 : 0;
+  return Math.min(1, Number((tokenScore + phraseBonus).toFixed(4)));
+}
+
+type StoredParsedChunk = {
+  chunk_index: number;
+  contextual_text: string;
+  source_text: string | undefined;
+  document_title: string;
+  link_key: string | undefined;
+};
+
+type StoredBundle = {
+  sourcePath?: string;
+  chunks: StoredParsedChunk[];
+};
+
+function readJsonFile(filePath: string): unknown {
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function readBundle(bundleDir: string): StoredBundle {
+  const metadataPath = path.join(bundleDir, "metadata.json");
+  const chunksPath = path.join(bundleDir, "chunks.json");
+  const metadata = fs.existsSync(metadataPath) ? asRecord(readJsonFile(metadataPath)) : undefined;
+  const sourcePath =
+    trimString(typeof metadata?.source_path === "string" ? metadata.source_path : undefined) ??
+    trimString(typeof metadata?.sourcePath === "string" ? metadata.sourcePath : undefined);
+  if (!fs.existsSync(chunksPath)) {
+    return { sourcePath, chunks: [] };
+  }
+  const rawChunks = readJsonFile(chunksPath);
+  const chunksArray = Array.isArray(rawChunks) ? rawChunks : [];
+  const chunks = chunksArray
+    .map((entry, index) => {
+      const record = asRecord(entry);
+      if (!record) {
+        return null;
+      }
+      const contextualText =
+        trimString(typeof record.contextual_text === "string" ? record.contextual_text : undefined) ??
+        trimString(typeof record.contextualText === "string" ? record.contextualText : undefined) ??
+        trimString(typeof record.chunk_text === "string" ? record.chunk_text : undefined) ??
+        trimString(typeof record.chunkText === "string" ? record.chunkText : undefined);
+      if (!contextualText) {
+        return null;
+      }
+      const chunkIndexRaw = record.chunk_index ?? record.chunkIndex ?? index;
+      const chunkIndex =
+        typeof chunkIndexRaw === "number" && Number.isInteger(chunkIndexRaw) && chunkIndexRaw >= 0
+          ? chunkIndexRaw
+          : index;
+      const documentTitle =
+        trimString(typeof record.document_title === "string" ? record.document_title : undefined) ??
+        trimString(typeof record.documentTitle === "string" ? record.documentTitle : undefined) ??
+        trimString(typeof metadata?.document_title === "string" ? metadata.document_title : undefined) ??
+        trimString(typeof metadata?.documentTitle === "string" ? metadata.documentTitle : undefined) ??
+        path.basename(bundleDir);
+      return {
+        chunk_index: chunkIndex,
+        contextual_text: contextualText,
+        source_text:
+          trimString(typeof record.source_text === "string" ? record.source_text : undefined) ??
+          trimString(typeof record.sourceText === "string" ? record.sourceText : undefined),
+        document_title: documentTitle,
+        link_key:
+          trimString(typeof record.link_key === "string" ? record.link_key : undefined) ??
+          trimString(typeof record.linkKey === "string" ? record.linkKey : undefined),
+      } satisfies StoredParsedChunk;
+    })
+    .filter((entry): entry is StoredParsedChunk => entry !== null);
+  return { sourcePath, chunks };
 }
 
 export function parseCliInvocation(argv: string[]): { payload: ParsedDocumentsInvocation; secretsPath: string } {
@@ -179,22 +254,12 @@ export function parseCliInvocation(argv: string[]): { payload: ParsedDocumentsIn
 export function resolveParsedDocumentsConfig(secretsPath: string): ParsedDocumentsConfig {
   const secrets = loadToolSecrets(secretsPath);
   const configured = secrets.tools?.parsed_documents;
-  const runtimeIdentity =
-    trimString(configured?.runtime_identity) ??
-    trimString(process.env.VICUNA_HARD_MEMORY_RUNTIME_IDENTITY) ??
-    DEFAULT_RUNTIME_IDENTITY;
+  const repoRoot = defaultRepoRoot();
   return {
-    baseUrl: normalizeBaseUrl(
-      trimString(configured?.base_url) ??
-        trimString(process.env.SUPERMEMORY_BASE_URL) ??
-        DEFAULT_HARD_MEMORY_BASE_URL
-    ),
-    authToken: trimString(configured?.auth_token) ?? trimString(process.env.SUPERMEMORY_API_KEY),
-    containerTag:
-      trimString(configured?.container_tag) ??
-      trimString(process.env.TELEGRAM_BRIDGE_DOCUMENT_CONTAINER_TAG) ??
-      DEFAULT_CONTAINER_TAG,
-    runtimeIdentity,
+    docsDir:
+      trimString(configured?.docs_dir) ??
+      trimString(process.env.VICUNA_DOCS_DIR) ??
+      defaultDocsDir(repoRoot),
     defaultThreshold:
       typeof configured?.default_threshold === "number" && Number.isFinite(configured.default_threshold)
         ? configured.default_threshold
@@ -210,122 +275,59 @@ export function resolveParsedDocumentsConfig(secretsPath: string): ParsedDocumen
   };
 }
 
-async function hardMemoryRequest(
-  config: ParsedDocumentsConfig,
-  path: string,
-  body: unknown
-): Promise<JsonRecord> {
-  if (!config.authToken) {
-    throw new ParsedDocumentsToolError(
-      "missing_auth_token",
-      "missing parsed-documents auth token in OpenClaw tool secrets or SUPERMEMORY_API_KEY"
-    );
-  }
-
-  let response: Response;
-  try {
-    response = await fetch(new URL(path, `${config.baseUrl}/`), {
-      method: "POST",
-      headers: {
-        accept: "application/json",
-        "content-type": "application/json",
-        Authorization: `Bearer ${config.authToken}`,
-        "x-supermemory-api-key": config.authToken,
-      },
-      body: JSON.stringify(body),
-    });
-  } catch (error) {
-    throw new ParsedDocumentsToolError("network_error", `failed to reach parsed-documents backend: ${(error as Error).message}`, {
-      base_url: config.baseUrl,
-      path,
-    });
-  }
-
-  const responseText = await response.text();
-  if (!response.ok) {
-    throw new ParsedDocumentsToolError("http_error", `parsed-documents request failed with HTTP ${response.status}`, {
-      status: response.status,
-      body: responseText.slice(0, 400),
-      path,
-    });
-  }
-
-  try {
-    return JSON.parse(responseText) as JsonRecord;
-  } catch (error) {
-    throw new ParsedDocumentsToolError("invalid_json", "parsed-documents backend returned non-JSON content", {
-      body: responseText.slice(0, 400),
-      parse_error: (error as Error).message,
-      path,
-    });
-  }
-}
-
-function projectSearchResult(result: unknown, threshold: number): ParsedDocumentSearchResult | null {
-  const record = asRecord(result);
-  const metadata = asRecord(record?.metadata);
-  if (metadata?.contentKind !== "parsed_chunk" || metadata?.source !== "telegram_bridge") {
-    return null;
-  }
-  const similarity = typeof record?.similarity === "number" && Number.isFinite(record.similarity)
-    ? record.similarity
-    : NaN;
-  if (!Number.isFinite(similarity) || similarity < threshold) {
-    return null;
-  }
-
-  const documentTitle =
-    trimString(typeof metadata?.documentTitle === "string" ? metadata.documentTitle : undefined) ??
-    trimString(typeof metadata?.telegramFileName === "string" ? metadata.telegramFileName : undefined);
-  const chunkText =
-    trimString(typeof record?.memory === "string" ? record.memory : undefined) ??
-    trimString(typeof record?.chunk === "string" ? record.chunk : undefined);
-  if (!documentTitle || !chunkText) {
-    return null;
-  }
-
-  return {
-    document_title: documentTitle,
-    chunk_text: chunkText,
-    similarity,
-    chunk_index:
-      typeof metadata?.chunkIndex === "number" && Number.isInteger(metadata.chunkIndex)
-        ? metadata.chunkIndex
-        : 0,
-    link_key: trimString(typeof metadata?.linkKey === "string" ? metadata.linkKey : undefined),
-  };
-}
-
-function isSearchResult(value: ParsedDocumentSearchResult | null): value is ParsedDocumentSearchResult {
-  return value !== null;
-}
-
 export async function handleParsedDocuments(
   payload: ParsedDocumentsInvocation,
-  config: ParsedDocumentsConfig
+  config: ParsedDocumentsConfig,
 ): Promise<ParsedDocumentsResponseEnvelope> {
   const query = requireQuery(payload);
-  const requestedLimit = optionalInteger(payload.limit, "limit");
-  const thresholdOverride = optionalThreshold(payload.threshold, "threshold");
-  const threshold = effectiveThreshold(query, thresholdOverride, config);
-  const limit = boundedLimit(requestedLimit, config.maxResults);
+  const limit = boundedLimit(optionalInteger(payload.limit, "limit"), config.maxResults);
+  const threshold = effectiveThreshold(query, optionalThreshold(payload.threshold, "threshold"), config);
+  if (!fs.existsSync(config.docsDir)) {
+    return {
+      family: "parsed_documents",
+      action: "search_chunks",
+      ok: true,
+      count: 0,
+      items: [],
+      threshold,
+    };
+  }
 
-  const response = await hardMemoryRequest(config, "/v4/search", {
-    q: query,
-    containerTag: config.containerTag,
-    filters: searchFilters(),
-    limit: Math.max(limit * 2, limit + 2),
-    rerank: true,
-    rewriteQuery: queryTokenCount(query) >= 4,
-    searchMode: "memories",
-    threshold,
+  const bundleDirs = fs
+    .readdirSync(config.docsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(config.docsDir, entry.name));
+
+  const matches: ParsedDocumentSearchResult[] = [];
+  for (const bundleDir of bundleDirs) {
+    const bundle = readBundle(bundleDir);
+    for (const chunk of bundle.chunks) {
+      const similarity = lexicalScore(query, chunk.contextual_text);
+      if (similarity < threshold) {
+        continue;
+      }
+      matches.push({
+        document_title: chunk.document_title,
+        chunk_text: chunk.contextual_text,
+        similarity,
+        chunk_index: chunk.chunk_index,
+        ...(chunk.link_key ? { link_key: chunk.link_key } : {}),
+        ...(bundle.sourcePath ? { source_path: bundle.sourcePath } : {}),
+      });
+    }
+  }
+
+  matches.sort((lhs, rhs) => {
+    if (rhs.similarity !== lhs.similarity) {
+      return rhs.similarity - lhs.similarity;
+    }
+    if (lhs.document_title !== rhs.document_title) {
+      return lhs.document_title.localeCompare(rhs.document_title);
+    }
+    return lhs.chunk_index - rhs.chunk_index;
   });
-  const results = Array.isArray(response.results) ? response.results : [];
-  const items = results
-    .map((result) => projectSearchResult(result, threshold))
-    .filter(isSearchResult)
-    .slice(0, limit);
 
+  const items = matches.slice(0, limit);
   return {
     family: "parsed_documents",
     action: "search_chunks",

@@ -4,6 +4,13 @@ import { fileURLToPath } from "node:url";
 
 export type OpenClawToolSecrets = {
   tools?: {
+    hard_memory?: {
+      memory_dir?: string;
+      runtime_identity?: string;
+    };
+    skills?: {
+      skills_dir?: string;
+    };
     tavily?: {
       api_key?: string;
     };
@@ -23,19 +30,18 @@ export type OpenClawToolSecrets = {
       legal_importer_poll_ms?: number;
     };
     ongoing_tasks?: {
-      base_url?: string;
-      auth_token?: string;
-      container_tag?: string;
-      runtime_identity?: string;
-      registry_key?: string;
-      registry_title?: string;
-      query_threshold?: number;
+      task_dir?: string;
+      runner_script?: string;
+      crontab_bin?: string;
+      flock_bin?: string;
+      temp_dir?: string;
+      runtime_url?: string;
+      runtime_model?: string;
+      runtime_api_key?: string;
+      host_user?: string;
     };
     parsed_documents?: {
-      base_url?: string;
-      auth_token?: string;
-      container_tag?: string;
-      runtime_identity?: string;
+      docs_dir?: string;
       default_threshold?: number;
       short_query_threshold?: number;
       max_results?: number;
@@ -53,6 +59,14 @@ export type OpenClawPaths = {
   stateDir: string;
   secretsPath: string;
   runtimeCatalogPath: string;
+  hardMemoryDir: string;
+  skillsDir: string;
+  ongoingTasksDir: string;
+  docsDir: string;
+  hostShellRoot: string;
+  hardMemoryWrapperPath: string;
+  skillsWrapperPath: string;
+  hostShellWrapperPath: string;
   tavilyWrapperPath: string;
   radarrWrapperPath: string;
   sonarrWrapperPath: string;
@@ -77,19 +91,90 @@ export function defaultRepoRoot(): string {
   return path.resolve(moduleDir(), "../../..");
 }
 
+export function defaultHostShellRoot(repoRoot = defaultRepoRoot()): string {
+  const configured = process.env.VICUNA_HOST_SHELL_ROOT?.trim();
+  if (configured) {
+    return configured;
+  }
+
+  const hostPath = "/home/vicuna/home";
+  if (fs.existsSync(hostPath)) {
+    return hostPath;
+  }
+
+  return path.join(repoRoot, ".cache", "vicuna", "host-shell-home");
+}
+
+export function defaultStateRoot(repoRoot = defaultRepoRoot()): string {
+  const configured = process.env.VICUNA_STATE_ROOT?.trim();
+  if (configured) {
+    return configured;
+  }
+
+  if ((process.env.VICUNA_SYSTEMD_SCOPE?.trim() || "") === "system" || fs.existsSync("/var/lib/vicuna")) {
+    return "/var/lib/vicuna";
+  }
+
+  return path.join(repoRoot, ".cache", "vicuna");
+}
+
+export function defaultHardMemoryDir(repoRoot = defaultRepoRoot()): string {
+  const configured = process.env.VICUNA_HARD_MEMORY_DIR?.trim();
+  if (configured) {
+    return configured;
+  }
+
+  return path.join(defaultHostShellRoot(repoRoot), "memories");
+}
+
+export function defaultSkillsDir(repoRoot = defaultRepoRoot()): string {
+  const configured = process.env.VICUNA_SKILLS_DIR?.trim();
+  if (configured) {
+    return configured;
+  }
+
+  return path.join(defaultHostShellRoot(repoRoot), "skills");
+}
+
+export function defaultOngoingTasksDir(repoRoot = defaultRepoRoot()): string {
+  const configured = process.env.VICUNA_ONGOING_TASKS_DIR?.trim();
+  if (configured) {
+    return configured;
+  }
+
+  return path.join(defaultStateRoot(repoRoot), "ongoing-tasks");
+}
+
+export function defaultDocsDir(repoRoot = defaultRepoRoot()): string {
+  const configured = process.env.VICUNA_DOCS_DIR?.trim();
+  if (configured) {
+    return configured;
+  }
+
+  return path.join(defaultHostShellRoot(repoRoot), "docs");
+}
+
 export function defaultPaths(repoRoot = defaultRepoRoot()): OpenClawPaths {
-  const stateDir = path.join(repoRoot, ".cache", "vicuna");
+  const stateDir = defaultStateRoot(repoRoot);
   const secretsPath =
     process.env.VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH?.trim() ||
-    path.join(stateDir, "openclaw-tool-secrets.json");
+    path.join(defaultStateRoot(repoRoot), "openclaw-tool-secrets.json");
   const runtimeCatalogPath =
     process.env.VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH?.trim() ||
-    path.join(stateDir, "openclaw-catalog.json");
+    path.join(defaultStateRoot(repoRoot), "openclaw-catalog.json");
   return {
     repoRoot,
     stateDir,
     secretsPath,
     runtimeCatalogPath,
+    hardMemoryDir: defaultHardMemoryDir(repoRoot),
+    skillsDir: defaultSkillsDir(repoRoot),
+    ongoingTasksDir: defaultOngoingTasksDir(repoRoot),
+    docsDir: defaultDocsDir(repoRoot),
+    hostShellRoot: defaultHostShellRoot(repoRoot),
+    hardMemoryWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "hard-memory-api"),
+    skillsWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "skills-api"),
+    hostShellWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "host-shell-api"),
     tavilyWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "tavily-web-search"),
     radarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "radarr-api"),
     sonarrWrapperPath: path.join(repoRoot, "tools", "openclaw-harness", "bin", "sonarr-api"),

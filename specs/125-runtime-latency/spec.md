@@ -3,7 +3,7 @@
 **Feature Branch**: `125-runtime-latency`  
 **Created**: 2026-03-25  
 **Status**: Draft  
-**Input**: User description: "reuse one deepseek http client forever if possible. tighten bridge polling intervals considerably. then implement caching of the telegram runtime tool catalog in memory, along with caching of the further method/payload contract stuff. declare temperature at 0.2 throughout the application on all turns."
+**Input**: User description: "reuse one deepseek http client forever if possible. tighten bridge polling intervals considerably. then implement caching of the telegram runtime tool catalog in memory, along with caching of the further method/payload contract stuff. declare temperature at 0.2 throughout the application on all turns." Follow-up: "reduce the fixed outbound max token cap to 256 on all turns."
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -104,6 +104,32 @@ surface.
    provider turn, **When** the server emits the outbound provider request,
    **Then** it includes `temperature: 0.2`.
 
+---
+
+### User Story 5 - Every Provider Turn Uses One Explicit Max Token Cap (Priority: P1)
+
+As an operator, I want every DeepSeek-bound turn to use an explicit
+`max_tokens: 256` cap so staged selectors, bridge-scoped turns, background
+work, and direct requests stay bounded tightly enough to avoid runaway
+reasoning and long stalled turns.
+
+**Why this priority**: The system relies on many provider touches, so a loose
+per-turn completion ceiling multiplies latency and failure surface across the
+active loop.
+
+**Independent Test**: Run provider-mode unit coverage and bridge request-shape
+tests and verify every outbound request path uses `256` rather than the prior
+`1024` ceiling.
+
+**Acceptance Scenarios**:
+
+1. **Given** a direct provider request that supplies a larger completion cap,
+   **When** the DeepSeek adapter builds the outbound request, **Then** it emits
+   `max_tokens: 256`.
+2. **Given** a staged family, method, payload, bridge-scoped, or
+   background/internal provider turn, **When** the server emits the outbound
+   provider request, **Then** it emits `max_tokens: 256`.
+
 ### Edge Cases
 
 - What happens when the DeepSeek base URL changes at runtime? The runtime must
@@ -119,6 +145,9 @@ surface.
 - What happens when a caller supplies a different temperature? The runtime must
   still emit `temperature: 0.2` on DeepSeek requests so all turns share one
   explicit policy.
+- What happens when a caller supplies a larger completion cap? The runtime must
+  still emit `max_tokens: 256` so direct, staged, bridge-scoped, and
+  background turns share one bounded policy.
 
 ## Requirements *(mandatory)*
 
@@ -145,9 +174,15 @@ surface.
 - **FR-008**: The DeepSeek adapter MUST emit `temperature: 0.2` on every
   outbound DeepSeek request, including direct, staged, bridge-scoped, and
   background/internal turns.
-- **FR-009**: Documentation MUST describe the new caching, transport reuse, and
-  explicit temperature policy, along with any operator-visible polling policy
-  change.
+- **FR-009**: The DeepSeek adapter MUST emit `max_tokens: 256` on every
+  outbound DeepSeek request, including direct, staged, bridge-scoped, and
+  background/internal turns.
+- **FR-010**: Bridge-scoped request construction MUST also cap its
+  OpenAI-compatible request body at `max_tokens: 256` so transport-level
+  request shapes match the runtime policy.
+- **FR-011**: Documentation MUST describe the new caching, transport reuse, and
+  explicit temperature plus max-token policies, along with any
+  operator-visible polling policy change.
 
 ### Key Entities *(include if feature involves data)*
 
@@ -161,6 +196,8 @@ surface.
   for outbox polling, self-emit reconnect, and watchdog checks.
 - **Provider Sampling Policy**: The fixed `temperature: 0.2` value applied to
   every outbound DeepSeek request.
+- **Provider Completion Policy**: The fixed `max_tokens: 256` cap applied to
+  every outbound DeepSeek request and bridge-scoped request body.
 
 ## Success Criteria *(mandatory)*
 
@@ -175,5 +212,7 @@ surface.
   for retained outbox and self-emit reconnect loops.
 - **SC-004**: Provider-mode tests confirm `100%` of outbound DeepSeek requests
   include `temperature: 0.2`.
-- **SC-005**: Existing provider and bridge automated suites remain green after
+- **SC-005**: Provider-mode and bridge tests confirm `100%` of outbound
+  provider requests use `max_tokens: 256`.
+- **SC-006**: Existing provider and bridge automated suites remain green after
   the latency changes.

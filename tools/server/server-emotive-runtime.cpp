@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <sstream>
@@ -59,6 +60,36 @@ static float sigmoid_unit(float value) {
 
 static float centered_unit(float value) {
     return clamp_signed(2.0f * clamp_unit(value) - 1.0f);
+}
+
+static std::string trim_copy_local(const char * value) {
+    if (!value) {
+        return std::string();
+    }
+    std::string parsed = value;
+    auto first = std::find_if_not(parsed.begin(), parsed.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    });
+    auto last = std::find_if_not(parsed.rbegin(), parsed.rend(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }).base();
+    if (first >= last) {
+        return std::string();
+    }
+    return std::string(first, last);
+}
+
+static std::string default_heuristic_memory_path() {
+    if (const char * value = std::getenv("VICUNA_HOST_SHELL_ROOT")) {
+        const std::string parsed = trim_copy_local(value);
+        if (!parsed.empty()) {
+            return parsed + "/heuristics/vicuna-heuristic-memory.json";
+        }
+    }
+    if (std::filesystem::exists("/home/vicuna/home")) {
+        return "/home/vicuna/home/heuristics/vicuna-heuristic-memory.json";
+    }
+    return "vicuna-heuristic-memory.json";
 }
 
 static std::string kind_label(server_emotive_block_kind kind) {
@@ -787,6 +818,8 @@ server_emotive_runtime_config server_emotive_runtime_config_from_env() {
     config.heuristic_memory.enabled = env_to_bool("VICUNA_HEURISTIC_MEMORY_ENABLED", config.heuristic_memory.enabled);
     if (const char * value = std::getenv("VICUNA_HEURISTIC_MEMORY_PATH")) {
         config.heuristic_memory.path = value;
+    } else {
+        config.heuristic_memory.path = default_heuristic_memory_path();
     }
     config.heuristic_memory.max_records = env_to_int(
             "VICUNA_HEURISTIC_MEMORY_MAX_RECORDS",
@@ -1094,6 +1127,12 @@ static json metacognitive_policy_to_json(const server_metacognitive_policy_decis
         {"policy_version", decision.policy_version},
         {"selected_mode", decision.selected_mode},
         {"reasoning_depth", decision.reasoning_depth},
+        {"thinking_mode", decision.thinking_mode},
+        {"prefix_profile", decision.prefix_profile},
+        {"stop_profile", decision.stop_profile},
+        {"sampling_profile", decision.sampling_profile},
+        {"repetition_profile", decision.repetition_profile},
+        {"tool_choice_profile", decision.tool_choice_profile},
         {"score_breakdown", {
             {"direct", decision.direct_score},
             {"reflective", decision.reflective_score},
@@ -1114,6 +1153,202 @@ static json metacognitive_policy_to_json(const server_metacognitive_policy_decis
     };
 }
 
+json server_policy_observation_to_json(const server_policy_observation & observation) {
+    return {
+        {"schema_version", observation.schema_version},
+        {"request_id", observation.request_id},
+        {"trace_id", observation.trace_id.empty() ? json(nullptr) : json(observation.trace_id)},
+        {"decision_id", observation.decision_id},
+        {"mode_label", observation.mode_label},
+        {"bridge_scoped", observation.bridge_scoped},
+        {"cognitive_replay", observation.cognitive_replay},
+        {"ongoing_task_due", observation.ongoing_task_due},
+        {"moment", vector_to_json(observation.moment)},
+        {"vad", vad_to_json(observation.vad)},
+        {"heuristic", {
+            {"matched", observation.heuristic_matched},
+            {"heuristic_id", observation.heuristic_id.empty() ? json(nullptr) : json(observation.heuristic_id)},
+        }},
+        {"tool_context", {
+            {"available_tool_count", observation.available_tool_count},
+            {"parallel_tool_calls_requested", observation.parallel_tool_calls_requested},
+        }},
+        {"recent_runtime", {
+            {"input_message_count", observation.input_message_count},
+        }},
+    };
+}
+
+json server_policy_action_to_json(const server_policy_action & action) {
+    return {
+        {"schema_version", action.schema_version},
+        {"policy_version", action.policy_version},
+        {"selected_mode", action.selected_mode},
+        {"reasoning_depth", action.reasoning_depth},
+        {"token_budget_bucket", action.token_budget_bucket},
+        {"tool_parallelism_cap", action.tool_parallelism_cap},
+        {"interrupt_allowed", action.interrupt_allowed},
+        {"replan_required", action.replan_required},
+        {"early_stop_ok", action.early_stop_ok},
+        {"force_synthesis", action.force_synthesis},
+        {"thinking_mode", action.thinking_mode},
+        {"prefix_profile", action.prefix_profile},
+        {"stop_profile", action.stop_profile},
+        {"sampling_profile", action.sampling_profile},
+        {"repetition_profile", action.repetition_profile},
+        {"tool_choice_profile", action.tool_choice_profile},
+        {"proposal_source", action.proposal_source},
+    };
+}
+
+json server_policy_action_mask_to_json(const server_policy_action_mask & mask) {
+    return {
+        {"allowed_modes", mask.allowed_modes},
+        {"allowed_reasoning_depths", mask.allowed_reasoning_depths},
+        {"allowed_thinking_modes", mask.allowed_thinking_modes},
+        {"allowed_prefix_profiles", mask.allowed_prefix_profiles},
+        {"allowed_stop_profiles", mask.allowed_stop_profiles},
+        {"allowed_sampling_profiles", mask.allowed_sampling_profiles},
+        {"allowed_repetition_profiles", mask.allowed_repetition_profiles},
+        {"allowed_tool_choice_profiles", mask.allowed_tool_choice_profiles},
+        {"max_tool_parallelism_cap", mask.max_tool_parallelism_cap},
+        {"allow_interrupt", mask.allow_interrupt},
+        {"allow_replan", mask.allow_replan},
+        {"allow_early_stop", mask.allow_early_stop},
+        {"allow_force_synthesis", mask.allow_force_synthesis},
+    };
+}
+
+json server_policy_applied_provider_controls_to_json(const server_policy_applied_provider_controls & controls) {
+    return {
+        {"thinking_enabled", controls.thinking_enabled},
+        {"prefix_profile", controls.prefix_profile},
+        {"stop_profile", controls.stop_profile},
+        {"sampling_profile", controls.sampling_profile},
+        {"repetition_profile", controls.repetition_profile},
+        {"tool_choice_profile", controls.tool_choice_profile},
+        {"prefix_used", controls.prefix_used},
+        {"temperature", controls.temperature_present ? json(controls.temperature) : json(nullptr)},
+        {"top_p", controls.top_p_present ? json(controls.top_p) : json(nullptr)},
+        {"frequency_penalty", controls.frequency_penalty_present ? json(controls.frequency_penalty) : json(nullptr)},
+        {"presence_penalty", controls.presence_penalty_present ? json(controls.presence_penalty) : json(nullptr)},
+        {"tool_choice", controls.tool_choice.empty() ? json(nullptr) : json(controls.tool_choice)},
+        {"stop_sequences", controls.stop_sequences},
+        {"suppressed_fields", controls.suppressed_fields},
+        {"defaulted_fields", controls.defaulted_fields},
+        {"field_sources", controls.field_sources},
+        {"beta_routing_reason", controls.beta_routing_reason.empty() ? json(nullptr) : json(controls.beta_routing_reason)},
+    };
+}
+
+json server_policy_reward_event_to_json(const server_policy_reward_event & event) {
+    return {
+        {"kind", event.kind},
+        {"value", event.value},
+        {"weight", event.weight},
+        {"source", event.source},
+    };
+}
+
+json server_policy_vad_axes_to_json(const server_policy_vad_axes & axes) {
+    return {
+        {"valence", axes.valence},
+        {"arousal", axes.arousal},
+        {"dominance", axes.dominance},
+    };
+}
+
+json server_policy_reward_model_to_json(const server_policy_reward_model & model) {
+    return {
+        {"schema_version", model.schema_version},
+        {"model_version", model.model_version},
+        {"target_moment", vector_to_json(model.target_moment)},
+        {"target_vad", server_policy_vad_axes_to_json(model.target_vad)},
+        {"moment_weights", vector_to_json(model.moment_weights)},
+        {"vad_weights", server_policy_vad_axes_to_json(model.vad_weights)},
+        {"progress_weight", model.progress_weight},
+        {"terminal_closeness_weight", model.terminal_closeness_weight},
+        {"shaping_gamma", model.shaping_gamma},
+        {"completion_stop_reward", model.completion_stop_reward},
+        {"completion_non_stop_reward", model.completion_non_stop_reward},
+        {"latency_cost_cap", model.latency_cost_cap},
+        {"latency_ms_scale", model.latency_ms_scale},
+        {"token_cost_cap", model.token_cost_cap},
+        {"token_scale", model.token_scale},
+        {"tool_success_bonus", model.tool_success_bonus},
+        {"candidate_failure_penalty", model.candidate_failure_penalty},
+    };
+}
+
+json server_policy_reward_breakdown_to_json(const server_policy_reward_breakdown & breakdown) {
+    return {
+        {"schema_version", breakdown.schema_version},
+        {"model_version", breakdown.model_version},
+        {"before_score", breakdown.before_score},
+        {"after_score", breakdown.after_score},
+        {"progress_reward", breakdown.progress_reward},
+        {"terminal_closeness_reward", breakdown.terminal_closeness_reward},
+        {"completion_quality_reward", breakdown.completion_quality_reward},
+        {"latency_cost", breakdown.latency_cost},
+        {"token_cost", breakdown.token_cost},
+        {"tool_success_reward", breakdown.tool_success_reward},
+        {"candidate_failure_penalty", breakdown.candidate_failure_penalty},
+        {"total", breakdown.total},
+    };
+}
+
+json server_policy_safety_guard_result_to_json(const server_policy_safety_guard_result & result) {
+    return {
+        {"candidate_present", result.candidate_present},
+        {"allowed", result.allowed},
+        {"blocked_fields", result.blocked_fields},
+        {"clipped_fields", result.clipped_fields},
+        {"fallback_to_native", result.fallback_to_native},
+        {"reason", result.reason},
+    };
+}
+
+json server_policy_transition_to_json(const server_policy_transition & transition) {
+    json reward_events = json::array();
+    for (const auto & event : transition.reward_events) {
+        reward_events.push_back(server_policy_reward_event_to_json(event));
+    }
+
+    return {
+        {"transition_id", transition.transition_id},
+        {"request_id", transition.request_id},
+        {"decision_id", transition.decision_id},
+        {"policy_mode", transition.policy_mode},
+        {"rollout_mode", transition.rollout_mode},
+        {"behavior_policy_version", transition.behavior_policy_version},
+        {"candidate_policy_version", transition.candidate_policy_version.empty() ? json(nullptr) : json(transition.candidate_policy_version)},
+        {"candidate_policy_alias", transition.candidate_policy_alias.empty() ? json(nullptr) : json(transition.candidate_policy_alias)},
+        {"observation", server_policy_observation_to_json(transition.observation)},
+        {"action_mask", server_policy_action_mask_to_json(transition.action_mask)},
+        {"candidate_action", transition.has_candidate_action ? server_policy_action_to_json(transition.candidate_action) : json(nullptr)},
+        {"executed_action", server_policy_action_to_json(transition.executed_action)},
+        {"rollout_sampled", transition.rollout_sampled},
+        {"candidate_executed_live", transition.candidate_executed_live},
+        {"candidate_confidence", transition.candidate_confidence_present ? json(transition.candidate_confidence) : json(nullptr)},
+        {"candidate_confidence_passed", transition.candidate_confidence_passed},
+        {"rollout_decision_reason", transition.rollout_decision_reason.empty() ? json(nullptr) : json(transition.rollout_decision_reason)},
+        {"canary_share_percent", transition.canary_share_percent},
+        {"rollout_step_index", transition.rollout_step_index},
+        {"safety_guard", server_policy_safety_guard_result_to_json(transition.safety_guard)},
+        {"applied_provider_controls", server_policy_applied_provider_controls_to_json(transition.applied_provider_controls)},
+        {"reward_model", server_policy_reward_model_to_json(transition.reward_model)},
+        {"reward_events", std::move(reward_events)},
+        {"reward_breakdown", server_policy_reward_breakdown_to_json(transition.reward_breakdown)},
+        {"reward_total", transition.reward_total},
+        {"next_observation", server_policy_observation_to_json(transition.next_observation)},
+        {"terminated", transition.terminated},
+        {"termination_reason", transition.termination_reason},
+        {"latency_ms", transition.latency_ms},
+        {"provider_finish_reason", transition.provider_finish_reason},
+        {"created_at_ms", transition.created_at_ms},
+    };
+}
+
 static bool save_heuristic_memory_records(
         const std::string & path,
         const std::deque<server_heuristic_memory_record> & records,
@@ -1125,6 +1360,18 @@ static bool save_heuristic_memory_records(
     };
     for (const auto & record : records) {
         payload["records"].push_back(heuristic_memory_record_to_json(record));
+    }
+
+    std::error_code error;
+    const std::filesystem::path output_path(path);
+    if (!output_path.parent_path().empty()) {
+        std::filesystem::create_directories(output_path.parent_path(), error);
+        if (error) {
+            if (out_error) {
+                *out_error = "failed to create heuristic memory directory";
+            }
+            return false;
+        }
     }
 
     const std::string temp_path = path + ".tmp";
@@ -1582,7 +1829,7 @@ json server_emotive_runtime::health_json() const {
     }
     return {
         {"enabled", config_.enabled},
-        {"control_policy_version", "control_surface_v1"},
+        {"control_policy_version", "control_surface_v2"},
         {"block_max_chars", config_.block_max_chars},
         {"max_blocks_per_turn", config_.max_blocks_per_turn},
         {"max_turn_history", config_.max_turn_history},
@@ -2170,6 +2417,7 @@ server_metacognitive_policy_decision server_emotive_runtime::compute_control_pol
     const float dominance_n = clamp_unit((state.vad.dominance + 1.0f) * 0.5f);
     server_metacognitive_policy_decision decision = {};
     decision.valid = true;
+    decision.policy_version = "control_surface_v2";
 
     std::map<std::string, float> bias_by_target;
     for (const auto & item : state.heuristic.control_biases) {
@@ -2327,6 +2575,61 @@ server_metacognitive_policy_decision server_emotive_runtime::compute_control_pol
             m.stall >= std::max(0.0f, 0.70f - with_bias("force_synthesis_gate", 0.0f)) &&
             m.confidence >= 0.40f;
 
+    const bool low_deliberation_ready =
+            decision.selected_mode == "direct" &&
+            decision.reasoning_depth != "deep" &&
+            m.epistemic_pressure <= 0.45f &&
+            m.contradiction_pressure <= 0.35f &&
+            m.stall <= 0.55f;
+    if (decision.reasoning_depth == "none" || decision.force_synthesis || decision.early_stop_ok ||
+            low_deliberation_ready) {
+        decision.thinking_mode = "disabled";
+    } else {
+        decision.thinking_mode = "enabled";
+    }
+
+    if (decision.replan_required) {
+        decision.prefix_profile = "replan_outline";
+    } else if (decision.force_synthesis || decision.early_stop_ok) {
+        decision.prefix_profile = "bounded_answer";
+    } else {
+        decision.prefix_profile = "none";
+    }
+
+    if (decision.prefix_profile == "bounded_answer" && (decision.early_stop_ok || decision.force_synthesis)) {
+        decision.stop_profile = "concise_answer";
+    } else {
+        decision.stop_profile = "none";
+    }
+
+    if (m.stall >= 0.80f || (m.stall >= 0.60f && m.frustration >= 0.55f)) {
+        decision.repetition_profile = "anti_stall_hard";
+    } else if (m.stall >= 0.55f || m.frustration >= 0.55f) {
+        decision.repetition_profile = "anti_stall_soft";
+    } else if (m.curiosity >= 0.60f && m.semantic_novelty >= 0.50f) {
+        decision.repetition_profile = "novelty_soft";
+    } else {
+        decision.repetition_profile = "none";
+    }
+
+    if (decision.force_synthesis || decision.early_stop_ok || decision.selected_mode == "direct") {
+        decision.sampling_profile = "deterministic";
+    } else if (m.curiosity >= 0.65f && m.semantic_novelty >= 0.55f && decision.selected_mode == "reflective") {
+        decision.sampling_profile = "creative";
+    } else if (decision.selected_mode == "reflective" || decision.selected_mode == "background_defer") {
+        decision.sampling_profile = "balanced";
+    } else {
+        decision.sampling_profile = "provider_default";
+    }
+
+    if (decision.selected_mode == "tool_heavy") {
+        decision.tool_choice_profile = "required";
+    } else if (decision.selected_mode == "tool_light") {
+        decision.tool_choice_profile = "auto";
+    } else {
+        decision.tool_choice_profile = "caller_default";
+    }
+
     if (decision.selected_mode == "tool_heavy" || decision.selected_mode == "tool_light") {
         decision.prompt_hints.push_back("Prefer direct tool calls over speculative free-text answers.");
     }
@@ -2341,6 +2644,9 @@ server_metacognitive_policy_decision server_emotive_runtime::compute_control_pol
     }
     if (decision.early_stop_ok) {
         decision.prompt_hints.push_back("Conclude once the answer is sufficient; avoid gratuitous extra steps.");
+    }
+    if (decision.thinking_mode == "disabled") {
+        decision.prompt_hints.push_back("Prefer a direct answer path and avoid unnecessary hidden deliberation.");
     }
     if (state.cognitive_replay) {
         decision.prompt_hints.push_back("Stay grounded in the replay window and prefer concrete corrective actions.");

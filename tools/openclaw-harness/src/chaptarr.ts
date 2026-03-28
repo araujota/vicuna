@@ -47,6 +47,11 @@ type BookMediaAnalysis = {
   ebookFormats: string[];
   ebookFileExtensions: string[];
 };
+type DownloadBookResolution = {
+  candidate: ChaptarrRecord;
+  resolvedVia: "search" | "book_lookup";
+  initialSearchErrorKind?: "lookup_no_match" | "no_ebook_match";
+};
 type LegalImporterWantedItem = {
   author?: string;
   book_name?: string;
@@ -111,19 +116,19 @@ function recordBoolean(record: ChaptarrRecord, key: string): boolean | undefined
 }
 
 function resolveTrackedAuthorId(record: ChaptarrRecord): number | undefined {
-  return (
+  const resolved =
     recordIntegerLike(record, "id") ??
     recordIntegerLike(record, "authorId") ??
-    recordIntegerLike(record, "localAuthorId")
-  );
+    recordIntegerLike(record, "localAuthorId");
+  return typeof resolved === "number" && resolved > 0 ? resolved : undefined;
 }
 
 function resolveTrackedBookId(record: ChaptarrRecord): number | undefined {
-  return (
+  const resolved =
     recordIntegerLike(record, "id") ??
     recordIntegerLike(record, "bookId") ??
-    recordIntegerLike(record, "localBookId")
-  );
+    recordIntegerLike(record, "localBookId");
+  return typeof resolved === "number" && resolved > 0 ? resolved : undefined;
 }
 
 function recordObject(record: ChaptarrRecord, key: string): ChaptarrRecord | undefined {
@@ -153,6 +158,17 @@ function cloneRecordArray(value: unknown): ChaptarrRecord[] {
 
 function recordArray(record: ChaptarrRecord, key: string): ChaptarrRecord[] {
   return cloneRecordArray(record[key]);
+}
+
+function recordStringArray(record: ChaptarrRecord, key: string): string[] {
+  const value = record[key];
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((entry) => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
 }
 
 function sortStrings(values: string[]): string[] {
@@ -193,7 +209,6 @@ function isEbookEdition(edition: ChaptarrRecord): boolean {
 
 function isAudiobookEdition(edition: ChaptarrRecord): boolean {
   return (
-    edition.isEbook === false ||
     recordString(edition, "mediaType") === "audiobook" ||
     matchesFormatPattern(recordString(edition, "format"), AUDIOBOOK_FILE_EXTENSIONS)
   );
@@ -212,7 +227,6 @@ function isEbookFile(file: ChaptarrRecord): boolean {
 function isAudiobookFile(file: ChaptarrRecord): boolean {
   const extension = recordPathExtension(file);
   return (
-    recordBoolean(file, "isEbook") === false ||
     recordString(file, "mediaType") === "audiobook" ||
     (extension !== undefined && AUDIOBOOK_FILE_EXTENSIONS.has(extension)) ||
     matchesFormatPattern(recordString(file, "format"), AUDIOBOOK_FILE_EXTENSIONS)
@@ -231,6 +245,26 @@ function analyzeBookMedia(book: ChaptarrRecord): BookMediaAnalysis {
   const audiobookFiles = files.filter(isAudiobookFile);
   const mediaType = recordString(book, "mediaType");
   const lastSelectedMediaType = recordString(book, "lastSelectedMediaType");
+  const narratorNames = recordStringArray(book, "narratorNames");
+  const rootPageCount = recordIntegerLike(book, "pageCount") ?? 0;
+  const editionPageCount = editions.reduce(
+    (best, edition) => Math.max(best, recordIntegerLike(edition, "pageCount") ?? 0),
+    0
+  );
+  const pageCount = Math.max(rootPageCount, editionPageCount);
+  const hasNarratorSignals =
+    narratorNames.length > 0 ||
+    recordArray(book, "availableNarrators").length > 0 ||
+    recordBoolean(book, "isWantedNarrator") === true;
+  const hasEditionAudiobookSignals = editions.some((edition) =>
+    recordString(edition, "mediaType") === "audiobook" ||
+    matchesFormatPattern(recordString(edition, "format"), AUDIOBOOK_FILE_EXTENSIONS) ||
+    recordStringArray(edition, "narratorNames").length > 0
+  );
+  const hasConcreteAudiobookSignals =
+    hasNarratorSignals ||
+    hasEditionAudiobookSignals ||
+    audiobookFiles.length > 0;
   const explicitEbook =
     mediaType === FIXED_CHAPTARR_MEDIA_TYPE ||
     lastSelectedMediaType === FIXED_CHAPTARR_MEDIA_TYPE ||
@@ -238,12 +272,19 @@ function analyzeBookMedia(book: ChaptarrRecord): BookMediaAnalysis {
     ebookEditions.length > 0 ||
     ebookFiles.length > 0;
   const explicitAudiobook =
-    mediaType === "audiobook" ||
-    lastSelectedMediaType === "audiobook" ||
     book.audiobookMonitored === true ||
-    (editions.length > 0 && ebookEditions.length === 0 && audiobookEditions.length > 0) ||
-    (files.length > 0 && ebookFiles.length === 0 && audiobookFiles.length > 0);
-  const eligible = explicitEbook || (!explicitAudiobook && editions.length === 0 && files.length === 0);
+    hasConcreteAudiobookSignals ||
+    ((mediaType === "audiobook" || lastSelectedMediaType === "audiobook") &&
+      (hasConcreteAudiobookSignals || files.length > 0));
+  const printLikeFallbackCandidate =
+    !explicitAudiobook &&
+    ebookEditions.length === 0 &&
+    ebookFiles.length === 0 &&
+    pageCount > 0;
+  const eligible =
+    explicitEbook ||
+    printLikeFallbackCandidate ||
+    (!explicitAudiobook && editions.length === 0 && files.length === 0);
 
   return {
     eligible,
@@ -809,6 +850,22 @@ function queryMatchesText(query: string, text: string | undefined): boolean {
   return queryTerms.every((term) => normalizedText.includes(` ${term} `));
 }
 
+function normalizedCoreTitle(value: string | undefined): string {
+  if (!value) {
+    return "";
+  }
+  return normalizeQueryText(
+    value
+      .replace(/\([^)]*\)/g, " ")
+      .replace(/\s+-\s+.*$/, " ")
+  ).join(" ");
+}
+
+function unmatchedTokenCount(reference: string, value: string | undefined): number {
+  const referenceTokens = new Set(normalizeQueryText(reference));
+  return normalizeQueryText(value ?? "").filter((token) => !referenceTokens.has(token)).length;
+}
+
 function formatBookLabel(book: ChaptarrRecord): string {
   const title = recordString(book, "title") ?? "Unknown book";
   const localBookId = recordIntegerLike(book, "localBookId") ?? recordIntegerLike(book, "id");
@@ -957,6 +1014,38 @@ function selectLookupBookCandidate(
     () => true,
   ]);
   return selected;
+}
+
+async function resolveDownloadBookCandidate(
+  config: ChaptarrCliContext["config"],
+  term: string,
+  foreignBookId: string | undefined,
+  foreignEditionId: string | undefined
+): Promise<DownloadBookResolution> {
+  const searchResults = await chaptarrRequestJson(config, "GET", "/api/v1/search", {
+    term,
+    provider: DEFAULT_CHAPTARR_SEARCH_PROVIDER,
+  });
+
+  try {
+    return {
+      candidate: selectSearchBookCandidate(searchResults, term, foreignBookId, foreignEditionId),
+      resolvedVia: "search",
+    };
+  } catch (error) {
+    if (
+      !(error instanceof ChaptarrToolError) ||
+      (error.kind !== "no_ebook_match" && error.kind !== "lookup_no_match")
+    ) {
+      throw error;
+    }
+    const lookupResults = await chaptarrRequestJson(config, "GET", "/api/v1/book/lookup", { term });
+    return {
+      candidate: selectLookupBookCandidate(lookupResults, term, foreignBookId, foreignEditionId),
+      resolvedVia: "book_lookup",
+      initialSearchErrorKind: error.kind,
+    };
+  }
 }
 
 function pickPreferredBookEditions(book: ChaptarrRecord, foreignEditionId: string | undefined, monitored: boolean): ChaptarrRecord[] {
@@ -1146,6 +1235,106 @@ function resolveDeleteBookTarget(
   throw new ChaptarrToolError("lookup_no_match", `no tracked Chaptarr book matched '${term}'`);
 }
 
+function resolveExistingTrackedBookCandidate(
+  books: unknown,
+  term: string,
+  candidate: ChaptarrRecord
+): ChaptarrRecord | undefined {
+  if (!Array.isArray(books)) {
+    throw new ChaptarrToolError("invalid_response", "Chaptarr book list did not return an array");
+  }
+
+  const trackedBooks = books
+    .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+    .map((entry) => cloneRecord(entry));
+  if (trackedBooks.length === 0) {
+    return undefined;
+  }
+
+  const candidateAuthor =
+    typeof candidate.author === "object" && candidate.author && !Array.isArray(candidate.author)
+      ? cloneRecord(candidate.author as ChaptarrRecord)
+      : {};
+  const candidateForeignBookIds = new Set(
+    [
+      recordString(candidate, "foreignBookId"),
+      recordString(candidate, "hardcoverBookId"),
+      recordString(candidate, "goodreadsBookId"),
+      recordString(candidate, "goodreadsWorkId"),
+    ].filter((value): value is string => typeof value === "string" && value.length > 0)
+  );
+  const candidateText =
+    `${recordString(candidate, "title") ?? ""} ${recordString(candidateAuthor, "authorName") ?? ""}`.trim();
+  const candidateCoreTitle = normalizedCoreTitle(recordString(candidate, "title"));
+
+  const matches = trackedBooks.flatMap((entry) => {
+    const author = recordObject(entry, "author") ?? {};
+    const trackedIds = [
+      recordString(entry, "foreignBookId"),
+      recordString(entry, "hardcoverBookId"),
+      recordString(entry, "goodreadsBookId"),
+      recordString(entry, "goodreadsWorkId"),
+    ].filter((value): value is string => typeof value === "string" && value.length > 0);
+    const foreignIdMatch = trackedIds.some((value) => candidateForeignBookIds.has(value));
+    const broadMatch =
+      queryMatchesText(term, `${recordString(entry, "title") ?? ""} ${recordString(author, "authorName") ?? ""}`) ||
+      (candidateText.length > 0 &&
+        queryMatchesText(candidateText, `${recordString(entry, "title") ?? ""} ${recordString(author, "authorName") ?? ""}`));
+    if (!foreignIdMatch && !broadMatch) {
+      return [];
+    }
+    return [{
+      entry,
+      score: {
+        foreignIdMatch,
+        coreTitleMatch:
+          candidateCoreTitle.length > 0 &&
+          normalizedCoreTitle(recordString(entry, "title")) === candidateCoreTitle,
+        monitored: entry.monitored === true,
+        ebookMonitored: entry.ebookMonitored === true,
+        extraTitleTokens: unmatchedTokenCount(candidateCoreTitle || candidateText, recordString(entry, "title")),
+      }
+    }];
+  });
+
+  if (matches.length === 0) {
+    return undefined;
+  }
+  matches.sort((left, right) => {
+    if (left.score.foreignIdMatch !== right.score.foreignIdMatch) {
+      return left.score.foreignIdMatch ? -1 : 1;
+    }
+    if (left.score.coreTitleMatch !== right.score.coreTitleMatch) {
+      return left.score.coreTitleMatch ? -1 : 1;
+    }
+    if (left.score.monitored !== right.score.monitored) {
+      return left.score.monitored ? -1 : 1;
+    }
+    if (left.score.ebookMonitored !== right.score.ebookMonitored) {
+      return left.score.ebookMonitored ? -1 : 1;
+    }
+    return left.score.extraTitleTokens - right.score.extraTitleTokens;
+  });
+  if (
+    matches.length > 1 &&
+    matches[0].score.foreignIdMatch === matches[1].score.foreignIdMatch &&
+    matches[0].score.coreTitleMatch === matches[1].score.coreTitleMatch &&
+    matches[0].score.monitored === matches[1].score.monitored &&
+    matches[0].score.ebookMonitored === matches[1].score.ebookMonitored &&
+    matches[0].score.extraTitleTokens === matches[1].score.extraTitleTokens
+  ) {
+    throw new ChaptarrToolError(
+      "ambiguous_match",
+      "multiple tracked Chaptarr books matched the resolved lookup candidate",
+      {
+        term,
+        matches: matches.slice(0, 10).map(({ entry }) => formatBookLabel(entry)),
+      }
+    );
+  }
+  return matches[0].entry;
+}
+
 function collectDeleteBookTargets(
   books: unknown,
   payload: ChaptarrInvocation
@@ -1272,27 +1461,20 @@ export async function handleChaptarr(context: ChaptarrExecutionContext) {
     const foreignEditionId = optionalString(payload, "foreign_edition_id");
     const monitored = true;
     const rootFolderPath = FIXED_CHAPTARR_ROOT_FOLDER_PATH;
-    const searchResults = await chaptarrRequestJson(config, "GET", "/api/v1/search", {
-      term,
-      provider: DEFAULT_CHAPTARR_SEARCH_PROVIDER,
-    });
-    let candidate: ChaptarrRecord;
-    let fallbackReason: string | undefined;
-    try {
-      candidate = selectSearchBookCandidate(searchResults, term, foreignBookId, foreignEditionId);
-    } catch (error) {
-      if (
-        !(error instanceof ChaptarrToolError) ||
-        (error.kind !== "no_ebook_match" && error.kind !== "lookup_no_match")
-      ) {
-        throw error;
-      }
-      const lookupResults = await chaptarrRequestJson(config, "GET", "/api/v1/book/lookup", { term });
-      candidate = selectLookupBookCandidate(lookupResults, term, foreignBookId, foreignEditionId);
-      fallbackReason = error.kind;
-    }
+    const resolution = await resolveDownloadBookCandidate(config, term, foreignBookId, foreignEditionId);
+    const candidate = resolution.candidate;
 
-    const existingBookId = resolveTrackedBookId(candidate);
+    const trackedFallbackBook =
+      resolveTrackedBookId(candidate) === undefined
+        ? resolveExistingTrackedBookCandidate(
+            await chaptarrRequestJson(config, "GET", "/api/v1/book"),
+            term,
+            candidate
+          )
+        : undefined;
+    const existingBookId =
+      resolveTrackedBookId(candidate) ??
+      (trackedFallbackBook ? resolveTrackedBookId(trackedFallbackBook) : undefined);
     if (existingBookId !== undefined) {
       const existingBook = await fetchBookRecord(config, existingBookId);
       const existingBookAuthor =
@@ -1314,33 +1496,11 @@ export async function handleChaptarr(context: ChaptarrExecutionContext) {
         cloneRecord(updatedAuthor),
         foreignEditionId,
         true,
-        fallbackReason === undefined
+        true
       );
       const updatedBook = await updateBookRecord(config, existingBookId, repairedBook);
       const updatedBookRecord = cloneRecord(updatedBook);
       await updateBookMonitorState(config, [existingBookId], true);
-      if (fallbackReason !== undefined) {
-        const bookSummary = summarizeChaptarrBookRecord(updatedBookRecord) as {
-          id?: number;
-          title?: string;
-          author_name?: string;
-        };
-        const legalImport = await triggerLegalImporter(context, {
-          ...bookSummary,
-          id: existingBookId,
-        });
-        return successEnvelope(action, config.baseUrl, "PUT", "/api/v1/book/monitor", { term, provider: DEFAULT_CHAPTARR_SEARCH_PROVIDER }, {
-          mode:
-            legalImport.status === "legal_import_completed"
-              ? "existing_book_legal_import_completed"
-              : legalImport.status === "legal_import_started"
-                ? "existing_book_legal_import_started"
-                : "existing_book_missing_fallback",
-          book: bookSummary,
-          importer_status: legalImport.importer_status,
-          message: legalImport.message,
-        });
-      }
       const command = await triggerChaptarrCommand(config, {
         name: "BookSearch",
         bookIds: [existingBookId],
@@ -1349,6 +1509,8 @@ export async function handleChaptarr(context: ChaptarrExecutionContext) {
         mode: "existing_book_search_started",
         message: `Started a Chaptarr search for '${recordString(updatedBookRecord, "title") ?? term}'.`,
         book: summarizeChaptarrBookRecord(updatedBookRecord),
+        resolved_via: resolution.resolvedVia,
+        ...(resolution.initialSearchErrorKind ? { initial_search_error_kind: resolution.initialSearchErrorKind } : {}),
         search_command: summarizeChaptarrCommandResult(command),
       });
     }
@@ -1388,7 +1550,7 @@ export async function handleChaptarr(context: ChaptarrExecutionContext) {
       },
       addOptions: {
         ...(typeof candidate.addOptions === "object" && candidate.addOptions ? (candidate.addOptions as Record<string, unknown>) : {}),
-        searchForNewBook: fallbackReason === undefined,
+        searchForNewBook: true,
       }
     };
     delete requestBody.id;
@@ -1399,29 +1561,6 @@ export async function handleChaptarr(context: ChaptarrExecutionContext) {
     try {
       const data = await chaptarrRequestJson(config, "POST", "/api/v1/book", undefined, requestBody);
       const addedBook = cloneRecord(data);
-      if (fallbackReason !== undefined) {
-        const addedBookId = resolveTrackedBookId(addedBook);
-        const bookSummary = summarizeChaptarrBookRecord(addedBook) as {
-          id?: number;
-          title?: string;
-          author_name?: string;
-        };
-        const legalImport = await triggerLegalImporter(context, {
-          ...bookSummary,
-          ...(addedBookId !== undefined ? { id: addedBookId } : {}),
-        });
-        return successEnvelope(action, config.baseUrl, "POST", "/api/v1/book", { term, provider: DEFAULT_CHAPTARR_SEARCH_PROVIDER }, {
-          mode:
-            legalImport.status === "legal_import_completed"
-              ? "new_book_legal_import_completed"
-              : legalImport.status === "legal_import_started"
-                ? "new_book_legal_import_started"
-                : "new_book_missing_fallback",
-          book: bookSummary,
-          importer_status: legalImport.importer_status,
-          message: legalImport.message,
-        });
-      }
       const addedBookId = resolveTrackedBookId(addedBook);
       if (addedBookId === undefined) {
         throw new ChaptarrToolError("invalid_response", "newly added Chaptarr book did not include an id for BookSearch");
@@ -1434,6 +1573,8 @@ export async function handleChaptarr(context: ChaptarrExecutionContext) {
         mode: "new_book_added_and_search_requested",
         message: `Added '${term}' to Chaptarr and requested an immediate search.`,
         book: summarizeChaptarrBookRecord(addedBook),
+        resolved_via: resolution.resolvedVia,
+        ...(resolution.initialSearchErrorKind ? { initial_search_error_kind: resolution.initialSearchErrorKind } : {}),
         search_command: summarizeChaptarrCommandResult(command),
       });
     } catch (error) {

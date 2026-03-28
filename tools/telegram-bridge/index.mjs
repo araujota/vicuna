@@ -7,14 +7,18 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import Supermemory, { toFile } from 'supermemory';
 import {
   buildEmotiveAnimationRenderPlan,
+  extractEmotiveAnimationTerminalMoment,
+  prependEmotiveAnimationStartMoment,
   renderEmotiveAnimationMp4,
 } from './emotive-animation-render.mjs';
+import { renderEmotiveAnimationViaWebglService } from './emotive-webgl-renderer-client.mjs';
 import {
   appendProactiveId,
   appendChatTranscriptMessage,
+  buildTelegramAnimationDeliveryPlan,
+  buildTelegramSpoilerVideoPayload,
   buildTelegramChatCompletionRequest,
   buildTelegramFileUrl,
   bootstrapTelegramOutboxOffset,
@@ -28,6 +32,7 @@ import {
   isTelegramReplyTargetErrorMessage,
   isTelegramTerminalDeliveryErrorMessage,
   loadState,
+  normalizeTelegramRichTextPayload,
   normalizeTelegramOutboxItem,
   parseInteger,
   parseSseChunk,
@@ -37,6 +42,8 @@ import {
   resolveTelegramConversationForMessage,
   resolveTelegramConversationForOutbound,
   saveState,
+  getTelegramEmotiveAnimationState,
+  setTelegramEmotiveAnimationState,
   setTelegramOutboxCheckpoint,
   setPendingOptionPrompt,
   shouldBootstrapTelegramOutboxOffset,
@@ -67,9 +74,11 @@ const env = {
   selfEmitAfter: Math.max(0, parseInteger(process.env.TELEGRAM_BRIDGE_SELF_EMIT_AFTER, 0)),
   replayRetainedOutbox: String(process.env.TELEGRAM_BRIDGE_REPLAY_RETAINED_OUTBOX ?? '').trim() === '1',
   vicunaApiKey: process.env.VICUNA_API_KEY ?? '',
-  supermemoryApiKey: process.env.SUPERMEMORY_API_KEY ?? '',
-  supermemoryBaseUrl: (process.env.SUPERMEMORY_BASE_URL ?? 'https://api.supermemory.ai').replace(/\/+$/, ''),
   hardMemoryRuntimeIdentity: (process.env.VICUNA_HARD_MEMORY_RUNTIME_IDENTITY ?? 'vicuna').trim() || 'vicuna',
+  docsRoot: (
+    process.env.VICUNA_DOCS_DIR ??
+    path.join(process.env.VICUNA_HOST_SHELL_ROOT ?? '/home/vicuna/home', 'docs')
+  ).trim(),
   documentContainerTag: (
     process.env.TELEGRAM_BRIDGE_DOCUMENT_CONTAINER_TAG ??
     `${(process.env.VICUNA_HARD_MEMORY_RUNTIME_IDENTITY ?? 'vicuna').trim() || 'vicuna'}-telegram-documents`
@@ -78,6 +87,9 @@ const env = {
   doclingParserScriptPath:
     process.env.TELEGRAM_BRIDGE_DOCLING_PARSER_SCRIPT_PATH ?? path.join(bridgeDir, 'docling-parse.py'),
   ffmpegBin: process.env.TELEGRAM_BRIDGE_FFMPEG_BIN ?? 'ffmpeg',
+  ffmpegVideoEncoder: process.env.TELEGRAM_BRIDGE_FFMPEG_VIDEO_ENCODER ?? 'h264_nvenc',
+  renderBackend: (process.env.TELEGRAM_BRIDGE_RENDER_BACKEND ?? 'cpu_canvas').trim() || 'cpu_canvas',
+  webglRendererUrl: (process.env.VICUNA_WEBGL_RENDERER_URL ?? 'http://127.0.0.1:8091').replace(/\/+$/, ''),
 };
 
 if (!env.telegramBotToken) {
@@ -93,7 +105,6 @@ let selfEmitGeneration = 0;
 const telegramBaseUrl = `https://api.telegram.org/bot${env.telegramBotToken}`;
 const vicunaUrl = new URL(env.vicunaBaseUrl);
 const sseHttpModule = vicunaUrl.protocol === 'https:' ? https : http;
-let supermemoryClient = null;
 
 function log(message, extra = undefined) {
   const prefix = '[telegram-bridge]';
@@ -155,17 +166,25 @@ async function postVicunaJson(pathname, payload, options = {}) {
 
 async function telegramRequest(method, payload, options = {}) {
   const multipart = options.multipart === true;
-  const response = await fetch(`${telegramBaseUrl}/${method}`, {
-    method: 'POST',
-    ...(multipart
-      ? { body: payload }
-      : {
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-      }),
-  });
+  let response;
+  try {
+    response = await fetch(`${telegramBaseUrl}/${method}`, {
+      method: 'POST',
+      ...(multipart
+        ? { body: payload }
+        : {
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        }),
+    });
+  } catch (error) {
+    const causeCode = typeof error?.cause?.code === 'string' && error.cause.code.trim()
+      ? ` (${error.cause.code.trim()})`
+      : '';
+    throw new Error(`telegram ${method} transport failed: ${String(error?.message ?? error)}${causeCode}`);
+  }
   const body = await response.json();
   if (!response.ok || !body.ok) {
     throw new Error(`telegram ${method} failed: ${response.status} ${JSON.stringify(body)}`);
@@ -173,17 +192,32 @@ async function telegramRequest(method, payload, options = {}) {
   return body.result;
 }
 
-function getSupermemoryClient() {
-  if (!env.supermemoryApiKey) {
-    return null;
+function isTelegramTransportFailureMessage(message) {
+  const value = String(message ?? '').trim();
+  return value.startsWith('telegram sendVideo transport failed:') || value === 'fetch failed';
+}
+
+async function telegramSendVideoRequestWithRetry(buildForm, context = {}) {
+  const maxAttempts = 3;
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await telegramRequest('sendVideo', buildForm(), { multipart: true });
+    } catch (error) {
+      lastError = error;
+      if (!isTelegramTransportFailureMessage(error?.message) || attempt >= maxAttempts) {
+        throw error;
+      }
+      log('Telegram video upload transport failed; retrying', {
+        ...context,
+        attempt,
+        maxAttempts,
+        error: String(error?.message ?? error),
+      });
+      await delay(250 * attempt);
+    }
   }
-  if (!supermemoryClient) {
-    supermemoryClient = new Supermemory({
-      apiKey: env.supermemoryApiKey,
-      baseURL: env.supermemoryBaseUrl,
-    });
-  }
-  return supermemoryClient;
+  throw lastError ?? new Error('telegram sendVideo transport failed: retry budget exhausted');
 }
 
 async function downloadTelegramFile(filePath) {
@@ -234,43 +268,22 @@ async function parseTelegramDocumentWithDocling(fileBuffer, descriptor) {
   }
 }
 
-async function writeSupermemoryMemories(payload) {
-  if (!env.supermemoryApiKey) {
-    throw new Error('SUPERMEMORY_API_KEY is required for parsed chunk persistence.');
-  }
-  const response = await fetch(`${env.supermemoryBaseUrl}/v4/memories`, {
-    method: 'POST',
-    headers: {
-      accept: 'application/json',
-      'content-type': 'application/json',
-      Authorization: `Bearer ${env.supermemoryApiKey}`,
-      'x-supermemory-api-key': env.supermemoryApiKey,
-    },
-    body: JSON.stringify(payload),
-  });
-  const body = await response.text();
-  if (!response.ok) {
-    throw new Error(`Supermemory chunk write failed with HTTP ${response.status}: ${body.slice(0, 400)}`);
-  }
-  if (!body.trim()) {
-    return {};
-  }
-  try {
-    return JSON.parse(body);
-  } catch {
-    return {};
-  }
-}
-
 async function sendTelegramMessage(chatId, text, extra = {}) {
   const messageText = String(text ?? '').trim();
   if (!messageText) {
     return;
   }
+  const normalized = normalizeTelegramRichTextPayload({
+    telegramMethod: 'sendMessage',
+    telegramPayload: {
+      ...extra,
+      text: messageText,
+    },
+    text: messageText,
+  });
   return await telegramRequest('sendMessage', {
     chat_id: chatId,
-    text: messageText,
-    ...extra,
+    ...normalized.payload,
   });
 }
 
@@ -319,7 +332,11 @@ function getTelegramResultMessageId(result) {
 }
 
 async function sendTelegramOutboxMessage(chatId, method, payload, replyToMessageId = 0) {
-  const deliveryPayload = cloneTelegramPayload(payload);
+  const normalizedPayload = normalizeTelegramRichTextPayload({
+    telegramMethod: method,
+    telegramPayload: payload,
+  }).payload;
+  const deliveryPayload = cloneTelegramPayload(normalizedPayload);
   deliveryPayload.chat_id = chatId;
 
   const requestedReplyToMessageId = getTelegramReplyAnchorId(deliveryPayload, replyToMessageId);
@@ -359,7 +376,7 @@ async function sendTelegramOutboxMessage(chatId, method, payload, replyToMessage
       error: fallbackError,
     });
     const sent = await telegramRequest(method, withoutTelegramReplyAnchor(deliveryPayload));
-    return {
+  return {
       sent,
       deliveryMode: 'fallback_no_reply',
       requestedReplyToMessageId,
@@ -368,17 +385,26 @@ async function sendTelegramOutboxMessage(chatId, method, payload, replyToMessage
   }
 }
 
-async function sendTelegramVideoAttachment(chatId, videoPath, replyToMessageId = 0) {
-  const requestedReplyToMessageId = Math.max(0, Number(replyToMessageId ?? 0) || 0);
+async function sendTelegramVideoAttachment(chatId, videoPath, payload = {}, replyToMessageId = 0) {
+  const deliveryPayload = cloneTelegramPayload(payload);
+  deliveryPayload.chat_id = chatId;
+  if (deliveryPayload.supports_streaming === undefined) {
+    deliveryPayload.supports_streaming = true;
+  }
+
+  const requestedReplyToMessageId = getTelegramReplyAnchorId(deliveryPayload, replyToMessageId);
+  if (requestedReplyToMessageId > 0 && deliveryPayload.reply_to_message_id === undefined && deliveryPayload.reply_parameters === undefined) {
+    deliveryPayload.reply_parameters = {
+      message_id: requestedReplyToMessageId,
+    };
+  }
   const videoBuffer = await readFile(videoPath);
   const fileName = path.basename(videoPath) || 'emotive-animation.mp4';
 
-  const buildForm = (replyAnchor) => {
+  const buildForm = (requestPayload) => {
     const form = new FormData();
-    appendTelegramMultipartField(form, 'chat_id', chatId);
-    appendTelegramMultipartField(form, 'supports_streaming', true);
-    if (replyAnchor > 0) {
-      appendTelegramMultipartField(form, 'reply_to_message_id', replyAnchor);
+    for (const [key, value] of Object.entries(requestPayload)) {
+      appendTelegramMultipartField(form, key, value);
     }
     form.set('video', new Blob([videoBuffer], { type: 'video/mp4' }), fileName);
     return form;
@@ -386,7 +412,10 @@ async function sendTelegramVideoAttachment(chatId, videoPath, replyToMessageId =
 
   if (requestedReplyToMessageId <= 0) {
     try {
-      const sent = await telegramRequest('sendVideo', buildForm(0), { multipart: true });
+      const sent = await telegramSendVideoRequestWithRetry(
+        () => buildForm(deliveryPayload),
+        { chatId: String(chatId), replyToMessageId: 0 },
+      );
       return {
         sent,
         deliveryMode: 'no_reply',
@@ -400,7 +429,10 @@ async function sendTelegramVideoAttachment(chatId, videoPath, replyToMessageId =
   }
 
   try {
-    const sent = await telegramRequest('sendVideo', buildForm(requestedReplyToMessageId), { multipart: true });
+    const sent = await telegramSendVideoRequestWithRetry(
+      () => buildForm(deliveryPayload),
+      { chatId: String(chatId), replyToMessageId: requestedReplyToMessageId },
+    );
     return {
       sent,
       deliveryMode: 'reply',
@@ -419,7 +451,10 @@ async function sendTelegramVideoAttachment(chatId, videoPath, replyToMessageId =
       error: fallbackError,
     });
     try {
-      const sent = await telegramRequest('sendVideo', buildForm(0), { multipart: true });
+      const sent = await telegramSendVideoRequestWithRetry(
+        () => buildForm(withoutTelegramReplyAnchor(deliveryPayload)),
+        { chatId: String(chatId), replyToMessageId: 0, fallbackFromReplyAnchor: true },
+      );
       return {
         sent,
         deliveryMode: 'fallback_no_reply',
@@ -437,10 +472,16 @@ async function renderTelegramEmotiveAnimation(bundle) {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vicuna-telegram-animation-'));
   const outputPath = path.join(tempDir, 'emotive-animation.mp4');
   try {
-    const result = await renderEmotiveAnimationMp4(bundle, {
-      ffmpegBin: env.ffmpegBin,
-      outputPath,
-    });
+    const result = env.renderBackend === 'chromium_webgl'
+      ? await renderEmotiveAnimationViaWebglService(bundle, {
+        serviceUrl: env.webglRendererUrl,
+        outputPath,
+      })
+      : await renderEmotiveAnimationMp4(bundle, {
+        ffmpegBin: env.ffmpegBin,
+        videoEncoder: env.ffmpegVideoEncoder,
+        outputPath,
+      });
     return {
       ...result,
       tempDir,
@@ -800,10 +841,7 @@ async function handleTelegramMessage(message) {
       resolveTelegramFile: (fileId) => telegramRequest('getFile', { file_id: fileId }),
       downloadTelegramFile,
       parseDocument: ({ fileBuffer, descriptor }) => parseTelegramDocumentWithDocling(fileBuffer, descriptor),
-      supermemoryClient: getSupermemoryClient(),
-      toFileFactory: (buffer, fileName) => toFile(buffer, fileName),
-      writeChunkMemories: writeSupermemoryMemories,
-      runtimeIdentity: env.hardMemoryRuntimeIdentity,
+      docsRoot: env.docsRoot,
       documentContainerTag: env.documentContainerTag,
     });
 
@@ -1077,10 +1115,179 @@ async function pollTelegramAskOutboxLoop() {
               replyToMessageId,
             });
             state = resolvedConversation.state;
-            const delivery = await sendTelegramOutboxMessage(chatId, telegramMethod, telegramPayload, replyToMessageId);
-            const sent = delivery.sent;
-            const telegramMessageId = getTelegramResultMessageId(sent);
+            let delivery;
+            let sent;
+            let telegramMessageId = 0;
+            let deliveredTelegramMethod = telegramMethod;
             let animationReceipt = null;
+            let textDelivery = null;
+            const priorAnimationState = getTelegramEmotiveAnimationState(state, chatId, {
+              conversationId: resolvedConversation.conversationId,
+            });
+            const renderBundle = emotiveAnimation
+              ? prependEmotiveAnimationStartMoment(emotiveAnimation, priorAnimationState?.lastMoment)
+              : null;
+            const normalizedMessagePayload = telegramMethod === 'sendMessage'
+              ? normalizeTelegramRichTextPayload({
+                telegramMethod,
+                telegramPayload,
+                text,
+              }).payload
+              : telegramPayload;
+
+            if (emotiveAnimation && telegramMethod === 'sendMessage') {
+              const renderPlan = buildEmotiveAnimationRenderPlan(renderBundle);
+              const animationDeliveryPlan = buildTelegramAnimationDeliveryPlan({
+                telegramMethod,
+                telegramPayload: normalizedMessagePayload,
+                text,
+              });
+              if (!animationDeliveryPlan.ok) {
+                animationReceipt = {
+                  requested: true,
+                  status: 'failed',
+                  stage: 'caption',
+                  keyframeCount: renderPlan?.keyframeCount ?? 0,
+                  durationSeconds: renderPlan?.durationSeconds ?? 0,
+                  failureReason:
+                    `emotive animation primary sendVideo payload was unsupported: ${animationDeliveryPlan.reason}`,
+                };
+                log('Telegram emotive animation spoiler-video fallback preserved text delivery', {
+                  chatId,
+                  conversationId: resolvedConversation.conversationId,
+                  sequenceNumber,
+                  stage: animationReceipt.stage,
+                  error: animationReceipt.failureReason,
+                  keyframeCount: animationReceipt.keyframeCount,
+                  durationSeconds: animationReceipt.durationSeconds,
+                });
+                delivery = await sendTelegramOutboxMessage(
+                  chatId,
+                  telegramMethod,
+                  animationDeliveryPlan.messagePayload ?? normalizedMessagePayload,
+                  replyToMessageId,
+                );
+                sent = delivery.sent;
+                telegramMessageId = getTelegramResultMessageId(sent);
+              } else {
+                let renderResult = null;
+                const renderPromise = renderTelegramEmotiveAnimation(renderBundle);
+                try {
+                  if (animationDeliveryPlan.strategy === 'split_text_and_video') {
+                    textDelivery = await sendTelegramOutboxMessage(
+                      chatId,
+                      telegramMethod,
+                      animationDeliveryPlan.messagePayload,
+                      replyToMessageId,
+                    );
+                    delivery = textDelivery;
+                    sent = textDelivery.sent;
+                    telegramMessageId = getTelegramResultMessageId(sent);
+                    renderResult = await renderPromise;
+                    const videoReplyAnchorId = telegramMessageId > 0 ? telegramMessageId : replyToMessageId;
+                    const videoDelivery = await sendTelegramVideoAttachment(
+                      chatId,
+                      renderResult.outputPath,
+                      animationDeliveryPlan.videoPayload,
+                      videoReplyAnchorId,
+                    );
+                    deliveredTelegramMethod = 'sendMessage+sendVideo';
+                    animationReceipt = {
+                      requested: true,
+                      status: 'sent',
+                      stage: 'complete',
+                      keyframeCount: renderResult.keyframeCount,
+                      durationSeconds: renderResult.durationSeconds,
+                      telegramMessageId: getTelegramResultMessageId(videoDelivery.sent),
+                      deliveryMode: videoDelivery.deliveryMode,
+                    };
+                    log('delivered Telegram emotive animation as split text plus spoilered video', {
+                      chatId,
+                      conversationId: resolvedConversation.conversationId,
+                      sequenceNumber,
+                      textDeliveryMode: textDelivery.deliveryMode,
+                      telegramMessageId,
+                      videoTelegramMessageId: animationReceipt.telegramMessageId,
+                      keyframeCount: renderResult.keyframeCount,
+                      durationSeconds: renderResult.durationSeconds,
+                      fallbackError: videoDelivery.fallbackError || undefined,
+                    });
+                  } else {
+                    renderResult = await renderPromise;
+                    delivery = await sendTelegramVideoAttachment(
+                      chatId,
+                      renderResult.outputPath,
+                      animationDeliveryPlan.videoPayload,
+                      replyToMessageId,
+                    );
+                    sent = delivery.sent;
+                    telegramMessageId = getTelegramResultMessageId(sent);
+                    deliveredTelegramMethod = 'sendVideo';
+                    animationReceipt = {
+                      requested: true,
+                      status: 'sent',
+                      stage: 'complete',
+                      keyframeCount: renderResult.keyframeCount,
+                      durationSeconds: renderResult.durationSeconds,
+                      telegramMessageId,
+                    };
+                    log('delivered Telegram emotive animation as primary spoilered video', {
+                      chatId,
+                      conversationId: resolvedConversation.conversationId,
+                      sequenceNumber,
+                      deliveryMode: delivery.deliveryMode,
+                      telegramMessageId,
+                      keyframeCount: renderResult.keyframeCount,
+                      durationSeconds: renderResult.durationSeconds,
+                      fallbackError: delivery.fallbackError || undefined,
+                    });
+                  }
+                } catch (error) {
+                  const stage = error?.stage === 'encode' ? 'encode' : error?.stage === 'upload' ? 'upload' : 'render';
+                  animationReceipt = {
+                    requested: true,
+                    status: 'failed',
+                    stage,
+                    keyframeCount: renderPlan?.keyframeCount ?? 0,
+                    durationSeconds: renderPlan?.durationSeconds ?? 0,
+                    failureReason: String(error?.message ?? error),
+                  };
+                  log('Telegram emotive animation spoiler-video fallback preserved text delivery', {
+                    chatId,
+                    conversationId: resolvedConversation.conversationId,
+                    sequenceNumber,
+                    stage,
+                    error: animationReceipt.failureReason,
+                    keyframeCount: animationReceipt.keyframeCount,
+                    durationSeconds: animationReceipt.durationSeconds,
+                  });
+                  if (!textDelivery) {
+                    delivery = await sendTelegramOutboxMessage(
+                      chatId,
+                      telegramMethod,
+                      animationDeliveryPlan.messagePayload,
+                      replyToMessageId,
+                    );
+                    sent = delivery.sent;
+                    telegramMessageId = getTelegramResultMessageId(sent);
+                  }
+                } finally {
+                  if (renderResult?.tempDir) {
+                    await rm(renderResult.tempDir, { recursive: true, force: true });
+                  }
+                }
+              }
+            } else {
+              delivery = await sendTelegramOutboxMessage(
+                chatId,
+                telegramMethod,
+                normalizedMessagePayload,
+                replyToMessageId,
+              );
+              sent = delivery.sent;
+              telegramMessageId = getTelegramResultMessageId(sent);
+            }
+
             state = appendChatTranscriptMessage(
               state,
               chatId,
@@ -1097,64 +1304,6 @@ async function pollTelegramAskOutboxLoop() {
               Math.max(state.telegramOutboxOffset, sequenceNumber),
               { maxHistoryMessages: env.maxHistoryMessages },
             );
-            if (emotiveAnimation) {
-              const renderPlan = buildEmotiveAnimationRenderPlan(emotiveAnimation);
-              animationReceipt = {
-                requested: true,
-                status: 'failed',
-                stage: 'render',
-                keyframeCount: renderPlan?.keyframeCount ?? 0,
-                durationSeconds: renderPlan?.durationSeconds ?? 0,
-                failureReason: 'emotive animation render did not run',
-              };
-              let renderResult = null;
-              try {
-                renderResult = await renderTelegramEmotiveAnimation(emotiveAnimation);
-                const videoDelivery = await sendTelegramVideoAttachment(chatId, renderResult.outputPath, telegramMessageId);
-                animationReceipt = {
-                  requested: true,
-                  status: 'sent',
-                  stage: 'complete',
-                  keyframeCount: renderResult.keyframeCount,
-                  durationSeconds: renderResult.durationSeconds,
-                  telegramMessageId: getTelegramResultMessageId(videoDelivery.sent),
-                };
-                log('delivered Telegram emotive animation', {
-                  chatId,
-                  conversationId: resolvedConversation.conversationId,
-                  sequenceNumber,
-                  replyToMessageId: telegramMessageId,
-                  deliveryMode: videoDelivery.deliveryMode,
-                  telegramMessageId: animationReceipt.telegramMessageId,
-                  keyframeCount: renderResult.keyframeCount,
-                  durationSeconds: renderResult.durationSeconds,
-                  fallbackError: videoDelivery.fallbackError || undefined,
-                });
-              } catch (error) {
-                const stage = error?.stage === 'encode' ? 'encode' : error?.stage === 'upload' ? 'upload' : 'render';
-                animationReceipt = {
-                  requested: true,
-                  status: 'failed',
-                  stage,
-                  keyframeCount: renderPlan?.keyframeCount ?? 0,
-                  durationSeconds: renderPlan?.durationSeconds ?? 0,
-                  failureReason: String(error?.message ?? error),
-                };
-                log('Telegram emotive animation fallback preserved text delivery', {
-                  chatId,
-                  conversationId: resolvedConversation.conversationId,
-                  sequenceNumber,
-                  stage,
-                  error: animationReceipt.failureReason,
-                  keyframeCount: animationReceipt.keyframeCount,
-                  durationSeconds: animationReceipt.durationSeconds,
-                });
-              } finally {
-                if (renderResult?.tempDir) {
-                  await rm(renderResult.tempDir, { recursive: true, force: true });
-                }
-              }
-            }
             state = recordTelegramOutboxDeliveryReceipt(state, {
               sequenceNumber,
               chatId,
@@ -1164,12 +1313,22 @@ async function pollTelegramAskOutboxLoop() {
               deliveredAtMs: Date.now(),
               ...(animationReceipt ? { animation: animationReceipt } : {}),
             }, { maxHistoryMessages: env.maxHistoryMessages });
+            if (animationReceipt?.status === 'sent' && renderBundle) {
+              const terminalMoment = extractEmotiveAnimationTerminalMoment(renderBundle);
+              state = setTelegramEmotiveAnimationState(state, chatId, {
+                lastMoment: terminalMoment,
+                lastRenderedAtMs: Date.now(),
+              }, {
+                maxHistoryMessages: env.maxHistoryMessages,
+                conversationId: resolvedConversation.conversationId,
+              });
+            }
             await persistState();
             log('delivered Telegram follow-up message', {
               chatId,
               conversationId: resolvedConversation.conversationId,
               sequenceNumber,
-              telegramMethod,
+              telegramMethod: deliveredTelegramMethod,
               replyToMessageId,
               deliveryMode: delivery.deliveryMode,
               telegramMessageId,
@@ -1472,6 +1631,9 @@ async function main() {
   await persistState();
   log(`starting bridge with state ${env.statePath}`);
   log(`vicuna base url ${env.vicunaBaseUrl}`);
+  log(`emotive render backend ${env.renderBackend}`, env.renderBackend === 'chromium_webgl'
+    ? { webglRendererUrl: env.webglRendererUrl }
+    : undefined);
   log(`bridge transcript settings history=${env.maxHistoryMessages} max_tokens=${env.maxTokens < 0 ? 'unlimited' : env.maxTokens}`, {
     chatCount: state.chatIds.length,
     sessionCount: Object.keys(state.chatSessions ?? {}).length,

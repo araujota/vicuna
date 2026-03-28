@@ -5,6 +5,7 @@
 
 #include <cctype>
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <ctime>
 #include <functional>
@@ -137,6 +138,24 @@ static bool deepseek_request_uses_strict_tools(const json & provider_body) {
     return false;
 }
 
+static bool deepseek_request_uses_prefix_completion(const json & provider_body) {
+    if (!provider_body.contains("messages") || !provider_body.at("messages").is_array() ||
+            provider_body.at("messages").empty()) {
+        return false;
+    }
+    const json & last_message = provider_body.at("messages").back();
+    return last_message.is_object() &&
+            json_value(last_message, "role", std::string()) == "assistant" &&
+            json_value(last_message, "prefix", false);
+}
+
+static bool deepseek_request_thinking_enabled(const json & body, bool default_enabled) {
+    if (!body.contains("thinking") || !body.at("thinking").is_object()) {
+        return default_enabled;
+    }
+    return json_value(body.at("thinking"), "type", std::string()) == "enabled";
+}
+
 static json deepseek_build_provider_messages(const json & body) {
     json messages = json::array();
     if (body.contains("messages")) {
@@ -168,10 +187,13 @@ static json deepseek_build_provider_messages(const json & body) {
             if (item.contains("tool_calls")) {
                 provider_message["tool_calls"] = deepseek_normalize_outbound_tool_calls(item.at("tool_calls"));
             }
-            if (role == "assistant" && item.contains("tool_calls")) {
+            if (role == "assistant") {
                 const auto reasoning_it = item.find("reasoning_content");
                 if (reasoning_it != item.end() && reasoning_it->is_string()) {
                     provider_message["reasoning_content"] = reasoning_it->get<std::string>();
+                }
+                if (item.contains("prefix") && item.at("prefix").is_boolean()) {
+                    provider_message["prefix"] = item.at("prefix").get<bool>();
                 }
             }
             const std::string tool_call_id = json_value(item, "tool_call_id", std::string());
@@ -290,13 +312,19 @@ static json deepseek_transport_health_json() {
 }
 
 static json deepseek_build_provider_body(const deepseek_runtime_config & config, const json & body) {
+    const int64_t outbound_max_tokens = json_value(body, "x-vicuna-provider-max-tokens-override", VICUNA_OUTBOUND_MAX_TOKENS);
+    const bool thinking_enabled = deepseek_request_thinking_enabled(body, config.default_thinking_enabled);
     json provider_body = {
         {"model", config.model},
         {"messages", deepseek_build_provider_messages(body)},
         {"stream", true},
-        {"max_tokens", VICUNA_OUTBOUND_MAX_TOKENS},
-        {"temperature", VICUNA_OUTBOUND_TEMPERATURE},
+        {"max_tokens", outbound_max_tokens},
     };
+    if (body.contains("temperature")) {
+        provider_body["temperature"] = body.at("temperature");
+    } else if (!thinking_enabled && !body.contains("top_p")) {
+        provider_body["temperature"] = VICUNA_OUTBOUND_TEMPERATURE;
+    }
     if (body.contains("top_p")) {
         provider_body["top_p"] = body.at("top_p");
     }
@@ -321,6 +349,15 @@ static json deepseek_build_provider_body(const deepseek_runtime_config & config,
     if (body.contains("response_format")) {
         provider_body["response_format"] = body.at("response_format");
     }
+    if (body.contains("stop")) {
+        provider_body["stop"] = body.at("stop");
+    }
+    if (body.contains("logprobs")) {
+        provider_body["logprobs"] = body.at("logprobs");
+    }
+    if (body.contains("top_logprobs")) {
+        provider_body["top_logprobs"] = body.at("top_logprobs");
+    }
     if (body.contains("thinking")) {
         provider_body["thinking"] = body.at("thinking");
     } else if (config.default_thinking_enabled) {
@@ -332,7 +369,10 @@ static json deepseek_build_provider_body(const deepseek_runtime_config & config,
     return provider_body;
 }
 
-static bool deepseek_finalize_tool_calls(deepseek_chat_result * out_result, json * out_error) {
+static bool deepseek_finalize_tool_calls(
+        deepseek_chat_result * out_result,
+        json * out_error,
+        const deepseek_request_trace * trace = nullptr) {
     for (auto & tool_call : out_result->tool_calls) {
         if (tool_call.name.empty()) {
             if (out_error) {
@@ -359,6 +399,15 @@ static bool deepseek_finalize_tool_calls(deepseek_chat_result * out_result, json
             }
             tool_call.arguments_json = parsed.dump();
         } catch (const std::exception & e) {
+            if (trace) {
+                deepseek_emit_trace_event(trace, "provider_tool_arguments_parse_failed", {
+                    {"provider", "deepseek"},
+                    {"tool_name", tool_call.name.empty() ? json(nullptr) : json(tool_call.name)},
+                    {"tool_call_id", tool_call.id.empty() ? json(nullptr) : json(tool_call.id)},
+                    {"raw_arguments", tool_call.arguments_json},
+                    {"message", std::string("DeepSeek provider returned malformed tool arguments JSON: ") + e.what()},
+                });
+            }
             if (out_error) {
                 *out_error = format_error_response(
                         std::string("DeepSeek provider returned malformed tool arguments JSON: ") + e.what(),
@@ -424,6 +473,169 @@ static void deepseek_apply_usage(const json & response_body, deepseek_chat_resul
     const json & usage = response_body.at("usage");
     out_result->prompt_tokens = json_value(usage, "prompt_tokens", out_result->prompt_tokens);
     out_result->completion_tokens = json_value(usage, "completion_tokens", out_result->completion_tokens);
+}
+
+static std::string deepseek_decode_dsml_text(const std::string & value) {
+    std::string decoded = value;
+    const std::pair<const char *, const char *> replacements[] = {
+        {"&quot;", "\""},
+        {"&apos;", "'"},
+        {"&gt;", ">"},
+        {"&lt;", "<"},
+        {"&amp;", "&"},
+    };
+    for (const auto & replacement : replacements) {
+        size_t cursor = 0;
+        while ((cursor = decoded.find(replacement.first, cursor)) != std::string::npos) {
+            decoded.replace(cursor, std::strlen(replacement.first), replacement.second);
+            cursor += std::strlen(replacement.second);
+        }
+    }
+    return decoded;
+}
+
+static std::string deepseek_extract_dsml_attr(const std::string & tag, const std::string & name) {
+    const std::string needle = name + "=\"";
+    const size_t begin = tag.find(needle);
+    if (begin == std::string::npos) {
+        return std::string();
+    }
+    const size_t value_begin = begin + needle.size();
+    const size_t value_end = tag.find('"', value_begin);
+    if (value_end == std::string::npos) {
+        return std::string();
+    }
+    return deepseek_decode_dsml_text(tag.substr(value_begin, value_end - value_begin));
+}
+
+static json deepseek_parse_dsml_parameter_value(const std::string & raw_value, bool force_string) {
+    const std::string decoded = deepseek_decode_dsml_text(raw_value);
+    if (force_string) {
+        return decoded;
+    }
+
+    const std::string trimmed = trim_ascii_copy_local(decoded);
+    if (trimmed.empty()) {
+        return std::string();
+    }
+    try {
+        return json::parse(trimmed);
+    } catch (...) {
+        return decoded;
+    }
+}
+
+static bool deepseek_recover_dsml_tool_calls_from_content(
+        deepseek_chat_result * out_result,
+        const deepseek_request_trace * trace) {
+    if (!out_result || !out_result->tool_calls.empty()) {
+        return false;
+    }
+
+    static const std::string function_calls_open = u8"<｜DSML｜function_calls>";
+    static const std::string function_calls_close = u8"</｜DSML｜function_calls>";
+    static const std::string invoke_open = u8"<｜DSML｜invoke";
+    static const std::string invoke_close = u8"</｜DSML｜invoke>";
+    static const std::string parameter_open = u8"<｜DSML｜parameter";
+    static const std::string parameter_close = u8"</｜DSML｜parameter>";
+
+    const size_t block_begin = out_result->content.find(function_calls_open);
+    if (block_begin == std::string::npos) {
+        return false;
+    }
+    const size_t block_end = out_result->content.find(function_calls_close, block_begin + function_calls_open.size());
+    if (block_end == std::string::npos) {
+        return false;
+    }
+
+    const std::string dsml_block = out_result->content.substr(
+            block_begin + function_calls_open.size(),
+            block_end - (block_begin + function_calls_open.size()));
+    std::vector<deepseek_tool_call> recovered;
+    size_t cursor = 0;
+    while (true) {
+        const size_t invoke_begin = dsml_block.find(invoke_open, cursor);
+        if (invoke_begin == std::string::npos) {
+            break;
+        }
+        const size_t invoke_tag_end = dsml_block.find('>', invoke_begin);
+        const size_t invoke_end = dsml_block.find(invoke_close, invoke_tag_end == std::string::npos ? invoke_begin : invoke_tag_end + 1);
+        if (invoke_tag_end == std::string::npos || invoke_end == std::string::npos) {
+            return false;
+        }
+
+        const std::string invoke_tag = dsml_block.substr(invoke_begin, invoke_tag_end - invoke_begin + 1);
+        const std::string tool_name = trim_ascii_copy_local(deepseek_extract_dsml_attr(invoke_tag, "name"));
+        if (tool_name.empty()) {
+            return false;
+        }
+
+        json arguments = json::object();
+        const std::string invoke_body = dsml_block.substr(invoke_tag_end + 1, invoke_end - (invoke_tag_end + 1));
+        size_t parameter_cursor = 0;
+        while (true) {
+            const size_t parameter_begin = invoke_body.find(parameter_open, parameter_cursor);
+            if (parameter_begin == std::string::npos) {
+                break;
+            }
+            const size_t parameter_tag_end = invoke_body.find('>', parameter_begin);
+            const size_t parameter_end = invoke_body.find(
+                    parameter_close,
+                    parameter_tag_end == std::string::npos ? parameter_begin : parameter_tag_end + 1);
+            if (parameter_tag_end == std::string::npos || parameter_end == std::string::npos) {
+                return false;
+            }
+
+            const std::string parameter_tag = invoke_body.substr(
+                    parameter_begin,
+                    parameter_tag_end - parameter_begin + 1);
+            const std::string parameter_name = trim_ascii_copy_local(
+                    deepseek_extract_dsml_attr(parameter_tag, "name"));
+            if (parameter_name.empty()) {
+                return false;
+            }
+            const std::string parameter_string = trim_ascii_copy_local(
+                    deepseek_extract_dsml_attr(parameter_tag, "string"));
+            const std::string parameter_value = invoke_body.substr(
+                    parameter_tag_end + 1,
+                    parameter_end - (parameter_tag_end + 1));
+            arguments[parameter_name] = deepseek_parse_dsml_parameter_value(
+                    parameter_value,
+                    parameter_string == "true");
+            parameter_cursor = parameter_end + parameter_close.size();
+        }
+
+        deepseek_tool_call tool_call;
+        tool_call.name = tool_name;
+        tool_call.arguments_json = arguments.dump();
+        recovered.push_back(std::move(tool_call));
+        cursor = invoke_end + invoke_close.size();
+    }
+
+    if (recovered.empty()) {
+        return false;
+    }
+
+    const std::string prefix = trim_ascii_copy_local(out_result->content.substr(0, block_begin));
+    const std::string suffix = trim_ascii_copy_local(out_result->content.substr(block_end + function_calls_close.size()));
+    if (prefix.empty()) {
+        out_result->content = suffix;
+    } else if (suffix.empty()) {
+        out_result->content = prefix;
+    } else {
+        out_result->content = prefix + "\n\n" + suffix;
+    }
+    out_result->tool_calls = std::move(recovered);
+    out_result->finish_reason = "tool_calls";
+
+    if (trace) {
+        deepseek_emit_trace_event(trace, "provider_dsml_tool_calls_recovered", {
+            {"provider", "deepseek"},
+            {"tool_call_count", static_cast<int64_t>(out_result->tool_calls.size())},
+            {"remaining_content", out_result->content},
+        });
+    }
+    return true;
 }
 
 static void deepseek_append_delta_text(
@@ -524,7 +736,7 @@ static bool deepseek_merge_tool_calls(
     }
 
     if (finalize) {
-        return deepseek_finalize_tool_calls(out_result, out_error);
+        return deepseek_finalize_tool_calls(out_result, out_error, nullptr);
     }
 
     return true;
@@ -534,7 +746,8 @@ static bool deepseek_parse_response_json(
         const json & response_body,
         deepseek_chat_result * out_result,
         const deepseek_stream_observer * observer,
-        json * out_error) {
+        json * out_error,
+        const deepseek_request_trace * trace = nullptr) {
     if (!response_body.contains("choices") || !response_body.at("choices").is_array() ||
             response_body.at("choices").empty()) {
         if (out_error) {
@@ -573,9 +786,12 @@ static bool deepseek_parse_response_json(
             !deepseek_merge_tool_calls(payload.at("tool_calls"), out_result, finalize_tool_calls, out_error)) {
         return false;
     }
+    if (!payload.contains("tool_calls")) {
+        deepseek_recover_dsml_tool_calls_from_content(out_result, trace);
+    }
 
     const std::string finish_reason = json_value(choice, "finish_reason", std::string());
-    if (!finish_reason.empty()) {
+    if (!finish_reason.empty() && out_result->tool_calls.empty()) {
         out_result->finish_reason = finish_reason;
     }
 
@@ -587,14 +803,15 @@ static bool deepseek_consume_sse_event(
         const std::string & raw_event,
         deepseek_chat_result * out_result,
         const deepseek_stream_observer * observer,
-        json * out_error) {
+        json * out_error,
+        const deepseek_request_trace * trace = nullptr) {
     const std::string event = trim_ascii_copy_local(raw_event);
     if (event.empty() || event == "[DONE]") {
         return true;
     }
 
     try {
-        return deepseek_parse_response_json(json::parse(event), out_result, observer, out_error);
+        return deepseek_parse_response_json(json::parse(event), out_result, observer, out_error, trace);
     } catch (const std::exception & e) {
         if (out_error) {
             *out_error = format_error_response(
@@ -701,7 +918,9 @@ bool deepseek_complete_chat(
         }
         return false;
     }
-    const bool use_beta_endpoint = deepseek_request_uses_strict_tools(provider_body);
+    const bool use_strict_tools = deepseek_request_uses_strict_tools(provider_body);
+    const bool use_prefix_completion = deepseek_request_uses_prefix_completion(provider_body);
+    const bool use_beta_endpoint = use_strict_tools || use_prefix_completion;
     const std::string request_url = deepseek_chat_completions_url(config, use_beta_endpoint);
 
     const auto request_started_at = std::chrono::steady_clock::now();
@@ -713,10 +932,13 @@ bool deepseek_complete_chat(
         {"tool_count", provider_body.contains("tools") && provider_body.at("tools").is_array() ?
                 static_cast<int64_t>(provider_body.at("tools").size()) : 0},
         {"max_tokens", json_value(provider_body, "max_tokens", int64_t(0))},
-        {"temperature", json_value(provider_body, "temperature", 0.0)},
+        {"temperature", provider_body.contains("temperature") ? provider_body.at("temperature") : json(nullptr)},
+        {"top_p", provider_body.contains("top_p") ? provider_body.at("top_p") : json(nullptr)},
         {"thinking", provider_body.contains("thinking") ? provider_body.at("thinking") : json(nullptr)},
         {"response_format", provider_body.contains("response_format") ? provider_body.at("response_format") : json(nullptr)},
-        {"strict_tools", use_beta_endpoint},
+        {"stop", provider_body.contains("stop") ? provider_body.at("stop") : json(nullptr)},
+        {"strict_tools", use_strict_tools},
+        {"prefix_completion", use_prefix_completion},
         {"system_messages", deepseek_collect_system_messages(provider_body)},
         {"endpoint", server_http_show_masked_url(server_http_parse_url(request_url))},
     });
@@ -745,7 +967,7 @@ bool deepseek_complete_chat(
             }
 
             saw_stream_event = true;
-            const bool ok = deepseek_consume_sse_event(event_data, out_result, observer, &stream_error);
+            const bool ok = deepseek_consume_sse_event(event_data, out_result, observer, &stream_error, trace);
             event_data.clear();
             return ok;
         };
@@ -896,7 +1118,7 @@ bool deepseek_complete_chat(
         if (!saw_stream_event) {
             try {
                 const json response_body = json::parse(raw_body);
-                if (!deepseek_parse_response_json(response_body, out_result, observer, out_error)) {
+                if (!deepseek_parse_response_json(response_body, out_result, observer, out_error, trace)) {
                     deepseek_emit_trace_event(trace, "provider_request_error", {
                         {"provider", "deepseek"},
                         {"status", response->status},
@@ -924,7 +1146,7 @@ bool deepseek_complete_chat(
                 return false;
             }
         }
-        if (!deepseek_finalize_tool_calls(out_result, out_error)) {
+        if (!deepseek_finalize_tool_calls(out_result, out_error, trace)) {
             deepseek_emit_trace_event(trace, "provider_request_error", {
                 {"provider", "deepseek"},
                 {"status", response->status},

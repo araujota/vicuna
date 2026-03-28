@@ -16,8 +16,10 @@ preserved_env_vars=(
     TELEGRAM_BRIDGE_MAX_TOKENS
     TELEGRAM_BRIDGE_MAX_DOCUMENT_CHARS
     TELEGRAM_BRIDGE_NODE_BIN
-    SUPERMEMORY_API_KEY
-    SUPERMEMORY_BASE_URL
+    TELEGRAM_BRIDGE_FFMPEG_BIN
+    TELEGRAM_BRIDGE_FFMPEG_VIDEO_ENCODER
+    TELEGRAM_BRIDGE_RENDER_BACKEND
+    VICUNA_WEBGL_RENDERER_URL
     TAVILY_API_KEY
     RADARR_API_KEY
     RADARR_BASE_URL
@@ -103,7 +105,32 @@ resolve_node_bin() {
     return 1
 }
 
+resolve_ffmpeg_bin() {
+    if [[ -n "${TELEGRAM_BRIDGE_FFMPEG_BIN:-}" && -x "${TELEGRAM_BRIDGE_FFMPEG_BIN:-}" ]]; then
+        printf '%s\n' "$TELEGRAM_BRIDGE_FFMPEG_BIN"
+        return 0
+    fi
+
+    local candidate
+    for candidate in /usr/bin/ffmpeg /opt/homebrew/bin/ffmpeg; do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    if command -v ffmpeg >/dev/null 2>&1; then
+        command -v ffmpeg
+        return 0
+    fi
+
+    printf '[telegram-bridge] error: ffmpeg is required; set TELEGRAM_BRIDGE_FFMPEG_BIN or install ffmpeg.\n' >&2
+    return 1
+}
+
 NODE_BIN="$(resolve_node_bin)"
+FFMPEG_BIN="$(resolve_ffmpeg_bin)"
+export TELEGRAM_BRIDGE_FFMPEG_BIN="$FFMPEG_BIN"
 "$REPO_ROOT/tools/ops/sync-openclaw-runtime-state.sh"
 
 exec "$NODE_BIN" "$REPO_ROOT/tools/telegram-bridge/index.mjs"

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$SCRIPT_REPO_ROOT"
 # shellcheck disable=SC1091
 source "$REPO_ROOT/tools/ops/runtime-env.sh"
 
@@ -11,9 +12,12 @@ if [[ -r "$SYSTEM_ENV_FILE" ]]; then
     source "$SYSTEM_ENV_FILE"
 fi
 
-SYSTEMD_SCOPE="${VICUNA_SYSTEMD_SCOPE:-user}"
+CURRENT_REPO_ROOT="$SCRIPT_REPO_ROOT"
+CONFIGURED_REPO_ROOT="${VICUNA_REPO_ROOT:-${REPO_ROOT:-$CURRENT_REPO_ROOT}}"
+SYSTEMD_SCOPE="${VICUNA_SYSTEMD_SCOPE:-}"
 RUNTIME_SERVICE="${VICUNA_RUNTIME_SERVICE_NAME:-vicuna-runtime.service}"
 BRIDGE_SERVICE="${VICUNA_TELEGRAM_BRIDGE_SERVICE_NAME:-vicuna-telegram-bridge.service}"
+WEBGL_RENDERER_SERVICE="${VICUNA_WEBGL_RENDERER_SERVICE_NAME:-vicuna-webgl-renderer.service}"
 BUILD_DIR="${VICUNA_RUNTIME_BUILD_DIR:-build-host-cuda-128}"
 PORT="${VICUNA_RUNTIME_PORT:-8080}"
 DRY_RUN=0
@@ -30,6 +34,11 @@ log() {
     printf '[vicuna-rebuild] %s\n' "$*"
 }
 
+die() {
+    printf '[vicuna-rebuild] error: %s\n' "$*" >&2
+    exit 1
+}
+
 run_cmd() {
     if (( DRY_RUN )); then
         printf '[vicuna-rebuild] dry-run:'
@@ -38,6 +47,72 @@ run_cmd() {
         return 0
     fi
     "$@"
+}
+
+scope_unit_cat() {
+    local scope="$1"
+    local service_name="$2"
+    if [[ "$scope" == "system" ]]; then
+        systemctl cat "$service_name" 2>/dev/null
+        return
+    fi
+    systemctl --user cat "$service_name" 2>/dev/null
+}
+
+scope_has_service() {
+    local scope="$1"
+    local service_name="$2"
+    scope_unit_cat "$scope" "$service_name" >/dev/null
+}
+
+extract_unit_repo_root() {
+    local scope="$1"
+    local service_name="$2"
+    local rendered
+    rendered="$(scope_unit_cat "$scope" "$service_name" || true)"
+    [[ -n "$rendered" ]] || return 0
+    local working_directory
+    working_directory="$(printf '%s\n' "$rendered" | awk -F= '/^WorkingDirectory=/ { print $2; exit }')"
+    if [[ -n "$working_directory" ]]; then
+        printf '%s\n' "$working_directory"
+        return 0
+    fi
+    printf '%s\n' "$rendered" |
+        sed -n 's|^ExecStart=\([^[:space:]]*\)/tools/ops/.*$|\1|p' |
+        head -n 1
+}
+
+resolve_systemd_scope() {
+    if [[ -n "$SYSTEMD_SCOPE" ]]; then
+        case "$SYSTEMD_SCOPE" in
+            system|user)
+                printf '%s\n' "$SYSTEMD_SCOPE"
+                return 0
+                ;;
+            *)
+                die "unsupported VICUNA_SYSTEMD_SCOPE=$SYSTEMD_SCOPE"
+                ;;
+        esac
+    fi
+
+    local have_system=0
+    local have_user=0
+    scope_has_service system "$RUNTIME_SERVICE" && have_system=1
+    scope_has_service user "$RUNTIME_SERVICE" && have_user=1
+
+    if (( have_system && have_user )); then
+        die "both system and user Vicuña runtime units are installed; run install-vicuna-system-service.sh to converge the host first"
+    fi
+    if (( have_system )); then
+        printf 'system\n'
+        return 0
+    fi
+    if (( have_user )); then
+        printf 'user\n'
+        return 0
+    fi
+
+    die "could not determine the installed Vicuña service scope; set VICUNA_SYSTEMD_SCOPE explicitly or install the system services first"
 }
 
 systemctl_cmd() {
@@ -52,6 +127,60 @@ systemctl_cmd() {
     systemctl --user "$@"
 }
 
+assert_repo_root_alignment() {
+    if [[ "$CURRENT_REPO_ROOT" != "$CONFIGURED_REPO_ROOT" ]]; then
+        die "this checkout is $CURRENT_REPO_ROOT but the configured live repo root is $CONFIGURED_REPO_ROOT; run rebuild from the configured root or reinstall the system services"
+    fi
+
+    local runtime_root bridge_root renderer_root
+    runtime_root="$(extract_unit_repo_root "$SYSTEMD_SCOPE" "$RUNTIME_SERVICE")"
+    bridge_root="$(extract_unit_repo_root "$SYSTEMD_SCOPE" "$BRIDGE_SERVICE")"
+    renderer_root="$(extract_unit_repo_root "$SYSTEMD_SCOPE" "$WEBGL_RENDERER_SERVICE")"
+
+    [[ -n "$runtime_root" ]] || die "could not resolve installed repo root for $RUNTIME_SERVICE"
+    [[ "$runtime_root" == "$CONFIGURED_REPO_ROOT" ]] ||
+        die "$RUNTIME_SERVICE is installed from $runtime_root but the configured repo root is $CONFIGURED_REPO_ROOT; run install-vicuna-system-service.sh to converge the host"
+
+    if [[ -n "$bridge_root" && "$bridge_root" != "$CONFIGURED_REPO_ROOT" ]]; then
+        die "$BRIDGE_SERVICE is installed from $bridge_root but the configured repo root is $CONFIGURED_REPO_ROOT; run install-vicuna-system-service.sh to converge the host"
+    fi
+
+    if [[ -n "$renderer_root" && "$renderer_root" != "$CONFIGURED_REPO_ROOT" ]]; then
+        die "$WEBGL_RENDERER_SERVICE is installed from $renderer_root but the configured repo root is $CONFIGURED_REPO_ROOT; run install-vicuna-system-service.sh to converge the host"
+    fi
+}
+
+assert_scope_convergence() {
+    if [[ "$SYSTEMD_SCOPE" == "system" ]] &&
+            (scope_has_service user "$RUNTIME_SERVICE" ||
+             scope_has_service user "$BRIDGE_SERVICE" ||
+             scope_has_service user "$WEBGL_RENDERER_SERVICE"); then
+        die "stale user-scoped Vicuña units are still installed; run install-vicuna-system-service.sh to remove them before rebuilding the system deployment"
+    fi
+}
+
+runtime_port_listeners() {
+    ss -ltnp 2>/dev/null | awk -v port=":""$PORT" '$4 ~ (port "$") { print }'
+}
+
+ensure_port_released() {
+    if (( DRY_RUN )); then
+        return 0
+    fi
+
+    local attempts=10
+    local listeners=""
+    for ((i = 0; i < attempts; ++i)); do
+        listeners="$(runtime_port_listeners || true)"
+        if [[ -z "$listeners" ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    die "runtime port $PORT is still owned after stopping $RUNTIME_SERVICE: $listeners"
+}
+
 restart_bridge_if_present() {
     if (( DRY_RUN )); then
         run_cmd systemctl_cmd try-restart "$BRIDGE_SERVICE"
@@ -60,6 +189,17 @@ restart_bridge_if_present() {
 
     if systemctl_cmd status "$BRIDGE_SERVICE" >/dev/null 2>&1; then
         systemctl_cmd try-restart "$BRIDGE_SERVICE" || true
+    fi
+}
+
+restart_webgl_renderer_if_present() {
+    if (( DRY_RUN )); then
+        run_cmd systemctl_cmd try-restart "$WEBGL_RENDERER_SERVICE"
+        return 0
+    fi
+
+    if systemctl_cmd status "$WEBGL_RENDERER_SERVICE" >/dev/null 2>&1; then
+        systemctl_cmd try-restart "$WEBGL_RENDERER_SERVICE" || true
     fi
 }
 
@@ -84,28 +224,31 @@ while (($# > 0)); do
             exit 0
             ;;
         *)
-            printf '[vicuna-rebuild] error: unknown option: %s\n' "$1" >&2
-            exit 1
+            die "unknown option: $1"
             ;;
     esac
     shift
 done
 
-log "repo=$REPO_ROOT service=$RUNTIME_SERVICE build_dir=$BUILD_DIR"
+SYSTEMD_SCOPE="$(resolve_systemd_scope)"
+assert_scope_convergence
+assert_repo_root_alignment
+
+log "repo=$CONFIGURED_REPO_ROOT scope=$SYSTEMD_SCOPE service=$RUNTIME_SERVICE build_dir=$BUILD_DIR"
 run_cmd systemctl_cmd stop "$RUNTIME_SERVICE"
-run_cmd cmake -S "$REPO_ROOT" -B "$REPO_ROOT/$BUILD_DIR" -G Ninja -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a
-run_cmd cmake --build "$REPO_ROOT/$BUILD_DIR" --target llama-server -j 12
+ensure_port_released
+run_cmd cmake -S "$CONFIGURED_REPO_ROOT" -B "$CONFIGURED_REPO_ROOT/$BUILD_DIR" -G Ninja -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a
+run_cmd cmake --build "$CONFIGURED_REPO_ROOT/$BUILD_DIR" --target llama-server -j 12
+run_cmd "$CONFIGURED_REPO_ROOT/tools/ops/sync-openclaw-runtime-state.sh"
 run_cmd systemctl_cmd reset-failed "$RUNTIME_SERVICE"
 run_cmd systemctl_cmd start "$RUNTIME_SERVICE"
+restart_webgl_renderer_if_present
 restart_bridge_if_present
 
 if (( DRY_RUN )); then
     exit 0
 fi
 
-wait_for_health || {
-    printf '[vicuna-rebuild] error: runtime health endpoint did not recover after restart\n' >&2
-    exit 1
-}
+wait_for_health || die "runtime health endpoint did not recover after restart"
 
 log "rebuild complete"

@@ -1,0 +1,11 @@
+[Unit]
+Description=Vicuña Policy Nightly Offline Batch Timer
+
+[Timer]
+OnCalendar=*-*-* 02:15:00
+RandomizedDelaySec=900
+Persistent=true
+Unit=vicuna-policy-nightly.service
+
+[Install]
+WantedBy=timers.target

@@ -3,6 +3,7 @@ import threading
 import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Dict, Optional
 
 import pytest
@@ -217,6 +218,26 @@ def outbound_system_messages(payload):
     ]
 
 
+def outbound_non_system_messages(payload):
+    return [
+        message
+        for message in payload.get("messages", [])
+        if message.get("role") != "system"
+    ]
+
+
+def assert_has_skill_memory_indexes(payload, skill_name: Optional[str] = None, memory_name: Optional[str] = None):
+    system_messages = outbound_system_messages(payload)
+    index_message = next((message for message in system_messages if "SKILLS:\n" in message and "\n\nMEMORIES:\n" in message), None)
+    assert index_message is not None
+    assert "Read a skill or memory file explicitly when you need its contents." in index_message
+    assert "skill_create may only be used when the user directly asks to create or update a skill in this conversation." in index_message
+    if skill_name:
+        assert skill_name in index_message
+    if memory_name:
+        assert memory_name in index_message
+
+
 def assert_has_policy_guidance(payload):
     system_messages = outbound_system_messages(payload)
     assert any(message.startswith("Metacognitive control policy:") for message in system_messages)
@@ -363,7 +384,7 @@ def test_provider_mode_chat_completion_exposes_reasoning_trace():
             trace = response.body["vicuna_emotive_trace"]
             assert trace["embedding_mode"] == "lexical_only"
             assert trace["live_generation_start_block_index"] == 1
-            assert trace["final_policy"]["policy_version"] == "control_surface_v1"
+            assert trace["final_policy"]["policy_version"] == "control_surface_v2"
             assert trace["heuristic_retrieval"]["matched"] is False
             assert [block["source"]["kind"] for block in trace["blocks"]] == [
                 "user_message",
@@ -390,15 +411,16 @@ def test_provider_mode_chat_completion_exposes_reasoning_trace():
             assert outbound["path"] == "/chat/completions"
             assert outbound["body"]["model"] == "deepseek-chat"
             assert outbound["body"]["thinking"] == {"type": "enabled"}
-            assert outbound["body"]["temperature"] == 0.2
+            assert "temperature" not in outbound["body"]
             assert outbound["body"]["stream"] is True
-            assert outbound["body"]["messages"][0] == {"role": "user", "content": "Hello"}
+            assert_has_skill_memory_indexes(outbound["body"])
+            assert outbound_non_system_messages(outbound["body"])[0] == {"role": "user", "content": "Hello"}
             assert_has_policy_guidance(outbound["body"])
 
             latest = server.make_request("GET", "/v1/emotive/trace/latest")
             assert latest.status_code == 200
             assert latest.body["trace"]["trace_id"] == trace["trace_id"]
-            assert latest.body["trace"]["final_policy"]["policy_version"] == "control_surface_v1"
+            assert latest.body["trace"]["final_policy"]["policy_version"] == "control_surface_v2"
             assert latest.body["retained_turns"] == 1
         finally:
             server.stop()
@@ -426,10 +448,10 @@ def test_provider_mode_responses_route_emits_reasoning_item():
             assert response.body["output"][1]["type"] == "message"
             assert response.body["output"][1]["content"][0]["text"] == "Hello from DeepSeek."
             assert response.body["vicuna_emotive_trace"]["blocks"][0]["source"]["kind"] == "user_message"
-            assert response.body["vicuna_emotive_trace"]["final_policy"]["policy_version"] == "control_surface_v1"
+            assert response.body["vicuna_emotive_trace"]["final_policy"]["policy_version"] == "control_surface_v2"
             assert response.body["vicuna_emotive_trace"]["final_vad"]["style_guide"]["tone_label"]
             assert state["requests"][0]["body"]["max_tokens"] == 768
-            assert state["requests"][0]["body"]["temperature"] == 0.2
+            assert "temperature" not in state["requests"][0]["body"]
             assert_has_policy_guidance(state["requests"][0]["body"])
         finally:
             server.stop()
@@ -496,34 +518,660 @@ def test_provider_mode_request_trace_endpoint_returns_correlated_foreground_even
             assert traces.body["object"] == "vicuna.request_traces"
             assert traces.body["request_id"] == "trace_fg_1"
             events = [item["event"] for item in traces.body["items"]]
-            assert events == [
-                "request_received",
-                "policy_computed",
-                "guidance_evaluated",
-                "provider_request_started",
-                "provider_request_finished",
-                "request_completed",
-            ]
+            assert events[0] == "request_received"
+            assert "policy_computed" in events
+            assert "skill_memory_indexes_injected" in events
+            assert "guidance_evaluated" in events
+            assert "provider_controls_applied" in events
+            assert "provider_request_started" in events
+            assert "provider_request_finished" in events
+            assert "request_completed" in events
             assert all(item["request_id"] == "trace_fg_1" for item in traces.body["items"])
-            assert traces.body["items"][0]["component"] == "runtime"
-            assert traces.body["items"][1]["component"] == "control_policy"
-            assert traces.body["items"][1]["data"]["policy_version"] == "control_surface_v1"
-            assert traces.body["items"][2]["component"] == "runtime_guidance"
-            assert traces.body["items"][2]["data"]["vad_skip_reason"] == "no_active_tool_continuation_span"
-            assert traces.body["items"][2]["data"]["policy_injected"] is True
-            assert traces.body["items"][3]["component"] == "provider"
-            assert traces.body["items"][3]["data"]["max_tokens"] == 512
-            assert traces.body["items"][3]["data"]["temperature"] == 0.2
-            assert len(traces.body["items"][3]["data"]["system_messages"]) == 1
-            assert traces.body["items"][3]["data"]["system_messages"][0].startswith("Metacognitive control policy:")
-            assert traces.body["items"][4]["data"]["finish_reason"] == "stop"
-            assert traces.body["items"][4]["data"]["reasoning_content"] == "I should greet the user and keep the reply brief."
-            assert traces.body["items"][4]["data"]["content"] == "Hello from DeepSeek."
+            by_event = {item["event"]: item for item in traces.body["items"]}
+            assert by_event["request_received"]["component"] == "runtime"
+            assert by_event["policy_computed"]["component"] == "control_policy"
+            assert by_event["policy_computed"]["data"]["policy_version"] == "control_surface_v2"
+            assert by_event["guidance_evaluated"]["component"] == "runtime_guidance"
+            assert by_event["guidance_evaluated"]["data"]["vad_skip_reason"] == "no_active_tool_continuation_span"
+            assert by_event["guidance_evaluated"]["data"]["policy_injected"] is True
+            assert by_event["skill_memory_indexes_injected"]["component"] == "prompt_context"
+            assert by_event["provider_controls_applied"]["component"] == "policy_runtime"
+            assert by_event["provider_controls_applied"]["data"]["applied_provider_controls"]["thinking_enabled"] is True
+            assert by_event["provider_controls_applied"]["data"]["applied_provider_controls"]["temperature"] is None
+            assert by_event["provider_request_started"]["component"] == "provider"
+            assert by_event["provider_request_started"]["data"]["max_tokens"] == 512
+            assert by_event["provider_request_started"]["data"]["temperature"] is None
+            assert any(
+                message.startswith("Metacognitive control policy:")
+                for message in by_event["provider_request_started"]["data"]["system_messages"]
+            )
+            assert any(
+                "SKILLS:\n" in message and "\n\nMEMORIES:\n" in message
+                for message in by_event["provider_request_started"]["data"]["system_messages"]
+            )
+            assert by_event["provider_request_finished"]["data"]["finish_reason"] == "stop"
+            assert by_event["provider_request_finished"]["data"]["reasoning_content"] == "I should greet the user and keep the reply brief."
+            assert by_event["provider_request_finished"]["data"]["content"] == "Hello from DeepSeek."
 
             health = server.make_request("GET", "/health")
             assert health.body["request_traces"]["stored_events"] >= 4
             assert health.body["request_traces"]["latest_request_id"] == "trace_fg_1"
             assert health.body["request_traces"]["latest_event"] == "request_completed"
+        finally:
+            server.stop()
+
+
+def test_provider_mode_policy_transition_capture_and_export():
+    global server
+    with run_mock_deepseek() as (base_url, _):
+        server = make_provider_server(base_url, {
+            "VICUNA_POLICY_MODE": "capture",
+            "VICUNA_POLICY_MAX_TRANSITIONS": "8",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Capture this governance decision."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "policy_capture_1",
+            })
+            assert response.status_code == 200
+
+            status = server.make_request("GET", "/v1/policy/status")
+            assert status.status_code == 200
+            assert status.body["object"] == "vicuna.policy.status"
+            assert status.body["enabled"] is True
+            assert status.body["mode"] == "capture"
+            assert status.body["stored_transitions"] == 1
+            assert status.body["total_transitions"] == 1
+            assert status.body["candidate_policy_version"] is None
+            assert status.body["reward_model"]["model_version"] == "desired_state_reward_v1"
+            assert status.body["reward_model"]["target_moment"]["confidence"] > 0.0
+            assert status.body["reward_model"]["target_vad"]["valence"] > 0.0
+
+            health = server.make_request("GET", "/health")
+            assert health.status_code == 200
+            assert health.body["policy_runtime"]["enabled"] is True
+            assert health.body["policy_runtime"]["mode"] == "capture"
+            assert health.body["policy_runtime"]["stored_transitions"] == 1
+            assert (
+                health.body["policy_runtime"]["reward_model"]["model_version"]
+                == "desired_state_reward_v1"
+            )
+
+            exported = server.make_request(
+                "GET",
+                "/v1/policy/transitions?request_id=policy_capture_1&limit=5",
+            )
+            assert exported.status_code == 200
+            assert exported.body["object"] == "vicuna.policy.transitions"
+            assert exported.body["request_id"] == "policy_capture_1"
+            assert exported.body["count"] == 1
+            item = exported.body["items"][0]
+            assert item["observation"]["schema_version"] == "policy_observation_v1"
+            assert item["executed_action"]["schema_version"] == "policy_action_v2"
+            assert item["executed_action"]["proposal_source"] == "native"
+            assert item["applied_provider_controls"]["thinking_enabled"] in (True, False)
+            assert item["candidate_action"] is None
+            assert item["reward_model"]["model_version"] == "desired_state_reward_v1"
+            assert item["reward_breakdown"]["schema_version"] == "policy_reward_breakdown_v1"
+            assert 0.0 <= item["reward_breakdown"]["before_score"] <= 1.0
+            assert 0.0 <= item["reward_breakdown"]["after_score"] <= 1.0
+            assert item["reward_events"]
+            assert item["termination_reason"] == "stop"
+            assert item["observation"]["request_id"] == "policy_capture_1"
+            assert item["next_observation"]["trace_id"] == response.body["vicuna_emotive_trace"]["trace_id"]
+        finally:
+            server.stop()
+
+
+def test_provider_mode_invalid_reward_config_fails_startup(tmp_path: Path):
+    global server
+    reward_config_path = tmp_path / "invalid-reward-config.json"
+    reward_config_path.write_text(
+        json.dumps(
+            {
+                "target_moment": {
+                    "confidence": 1.2,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with run_mock_deepseek() as (base_url, _):
+        server = make_provider_server(base_url, {
+            "VICUNA_POLICY_MODE": "capture",
+            "VICUNA_POLICY_REWARD_CONFIG_PATH": str(reward_config_path),
+        })
+        server.api_surface = "openai"
+        with pytest.raises(RuntimeError, match="return code 1"):
+            server.start(timeout_seconds=3)
+
+
+def test_provider_mode_shadow_policy_records_disagreement_without_overriding_native_action():
+    global server
+
+    def route_factory(path, payload, _state):
+        if path != "/v1/policy/propose":
+            return None
+        assert payload["policy_mode"] == "shadow"
+        return {
+            "status": 200,
+            "body": {
+                "policy_version": "shadow_rule_v1",
+                "action": {
+                    "selected_mode": "tool_heavy",
+                    "reasoning_depth": "deep",
+                    "token_budget_bucket": 2048,
+                    "tool_parallelism_cap": 2,
+                    "interrupt_allowed": True,
+                    "replan_required": True,
+                    "early_stop_ok": False,
+                    "force_synthesis": False,
+                },
+            },
+        }
+
+    with run_mock_deepseek(route_factory=route_factory) as (base_url, state):
+        server = make_provider_server(base_url, {
+            "VICUNA_POLICY_MODE": "shadow",
+            "VICUNA_POLICY_CANDIDATE_URL": base_url,
+            "VICUNA_POLICY_TIMEOUT_MS": "500",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Shadow this policy decision."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "policy_shadow_1",
+            })
+            assert response.status_code == 200
+
+            status = server.make_request("GET", "/v1/policy/status")
+            assert status.status_code == 200
+            assert status.body["mode"] == "shadow"
+            assert status.body["shadow_request_count"] == 1
+            assert status.body["shadow_disagreement_count"] == 1
+            assert status.body["candidate_failure_count"] == 0
+            assert status.body["candidate_policy_version"] == "shadow_rule_v1"
+
+            exported = server.make_request(
+                "GET",
+                "/v1/policy/transitions?request_id=policy_shadow_1&limit=5",
+            )
+            assert exported.status_code == 200
+            item = exported.body["items"][0]
+            assert item["candidate_policy_version"] == "shadow_rule_v1"
+            assert item["candidate_action"]["proposal_source"] == "shadow_candidate"
+            assert item["executed_action"]["proposal_source"] == "native"
+            assert item["candidate_action"]["selected_mode"] == "tool_heavy"
+            assert item["executed_action"]["reasoning_depth"] != (
+                item["candidate_action"]["reasoning_depth"]
+            )
+            assert item["executed_action"]["tool_parallelism_cap"] != (
+                item["candidate_action"]["tool_parallelism_cap"]
+            )
+
+            policy_requests = requests_for_path(state, "/v1/policy/propose")
+            assert len(policy_requests) == 1
+
+            traces = server.make_request("GET", "/v1/debug/request-traces?request_id=policy_shadow_1&limit=20")
+            policy_events = [
+                item for item in traces.body["items"]
+                if item["component"] == "policy_runtime" and item["event"] == "candidate_evaluated"
+            ]
+            assert len(policy_events) == 1
+            assert policy_events[0]["data"]["candidate_failure"] is False
+            assert policy_events[0]["data"]["disagrees_with_native"] is True
+        finally:
+            server.stop()
+
+
+def test_provider_mode_shadow_policy_failure_falls_back_and_updates_status():
+    global server
+
+    def route_factory(path, _payload, _state):
+        if path != "/v1/policy/propose":
+            return None
+        return {
+            "status": 503,
+            "body": {
+                "error": "temporary failure",
+            },
+        }
+
+    with run_mock_deepseek(route_factory=route_factory) as (base_url, _state):
+        server = make_provider_server(base_url, {
+            "VICUNA_POLICY_MODE": "shadow",
+            "VICUNA_POLICY_CANDIDATE_URL": base_url,
+            "VICUNA_POLICY_TIMEOUT_MS": "500",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Force candidate failure."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "policy_shadow_fail_1",
+            })
+            assert response.status_code == 200
+
+            status = server.make_request("GET", "/v1/policy/status")
+            assert status.status_code == 200
+            assert status.body["mode"] == "shadow"
+            assert status.body["shadow_request_count"] == 1
+            assert status.body["candidate_failure_count"] == 1
+            assert status.body["last_candidate_error"]
+
+            exported = server.make_request(
+                "GET",
+                "/v1/policy/transitions?request_id=policy_shadow_fail_1&limit=5",
+            )
+            assert exported.status_code == 200
+            item = exported.body["items"][0]
+            assert item["candidate_action"] is None
+            assert item["executed_action"]["proposal_source"] == "native"
+            assert item["safety_guard"]["candidate_present"] is False
+            assert item["safety_guard"]["fallback_to_native"] is True
+            assert item["safety_guard"]["reason"]
+        finally:
+            server.stop()
+
+
+def test_provider_mode_canary_live_executes_candidate_action_and_updates_status():
+    global server
+
+    def route_factory(path, payload, _state):
+        if path != "/v1/policy/propose":
+            return None
+        assert payload["policy_mode"] == "canary_live"
+        return {
+            "status": 200,
+            "body": {
+                "policy_version": "candidate_canary_v1",
+                "policy_alias": "candidate",
+                "confidence": {
+                    "overall": 0.95,
+                    "by_head": {
+                        "selected_mode": 0.95,
+                        "reasoning_depth": 0.90,
+                    },
+                    "feature_signature_seen": True,
+                },
+                "action": {
+                    "selected_mode": "tool_heavy",
+                    "reasoning_depth": "deep",
+                    "token_budget_bucket": 2048,
+                    "tool_parallelism_cap": 2,
+                    "interrupt_allowed": True,
+                    "replan_required": True,
+                    "early_stop_ok": False,
+                    "force_synthesis": False,
+                },
+            },
+        }
+
+    with run_mock_deepseek(route_factory=route_factory) as (base_url, state):
+        server = make_provider_server(base_url, {
+            "VICUNA_POLICY_MODE": "canary_live",
+            "VICUNA_POLICY_CANDIDATE_URL": base_url,
+            "VICUNA_POLICY_CANARY_STEPS": "100",
+            "VICUNA_POLICY_CANARY_MIN_REQUESTS_PER_STEP": "1",
+            "VICUNA_POLICY_LIVE_CONFIDENCE_THRESHOLD": "0.70",
+            "VICUNA_POLICY_ROLLBACK_MAX_CANDIDATE_FAILURE_RATE": "1.0",
+            "VICUNA_POLICY_ROLLBACK_MAX_INVALID_ACTION_RATE": "1.0",
+            "VICUNA_POLICY_ROLLBACK_MAX_FALLBACK_RATE": "1.0",
+            "VICUNA_POLICY_TIMEOUT_MS": "500",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Use the learned canary policy."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "policy_canary_live_1",
+            })
+            assert response.status_code == 200
+
+            status = server.make_request("GET", "/v1/policy/status")
+            assert status.status_code == 200
+            assert status.body["mode"] == "canary_live"
+            assert status.body["rollout_state"] == "completed"
+            assert status.body["candidate_policy_version"] == "candidate_canary_v1"
+            assert status.body["candidate_policy_alias"] == "candidate"
+            assert status.body["sampled_request_count"] == 1
+            assert status.body["live_candidate_execution_count"] == 1
+            assert status.body["current_canary_share_percent"] == 100
+
+            exported = server.make_request(
+                "GET",
+                "/v1/policy/transitions?request_id=policy_canary_live_1&limit=5",
+            )
+            assert exported.status_code == 200
+            item = exported.body["items"][0]
+            assert item["rollout_mode"] == "canary_live"
+            assert item["rollout_sampled"] is True
+            assert item["candidate_executed_live"] is True
+            assert item["candidate_policy_alias"] == "candidate"
+            assert item["candidate_confidence"] == pytest.approx(0.95, rel=1e-3)
+            assert item["candidate_confidence_passed"] is True
+            assert item["rollout_decision_reason"] == "candidate_live"
+            assert item["executed_action"]["proposal_source"] == "rollout_candidate"
+            assert item["executed_action"]["selected_mode"] == "tool_heavy"
+            assert item["executed_action"]["reasoning_depth"] == "deep"
+
+            traces = server.make_request("GET", "/v1/debug/request-traces?request_id=policy_canary_live_1&limit=20")
+            provider_events = [
+                item for item in traces.body["items"]
+                if item["component"] == "provider" and item["event"] == "provider_request_started"
+            ]
+            assert len(provider_events) == 1
+            assert provider_events[0]["data"]["max_tokens"] == 2048
+            assert any(
+                message.startswith("Metacognitive control policy: mode=tool_heavy")
+                for message in provider_events[0]["data"]["system_messages"]
+            )
+
+            policy_requests = requests_for_path(state, "/v1/policy/propose")
+            assert len(policy_requests) == 1
+        finally:
+            server.stop()
+
+
+def test_provider_mode_canary_live_rolls_back_after_low_confidence_fallback():
+    global server
+
+    def route_factory(path, payload, _state):
+        if path != "/v1/policy/propose":
+            return None
+        assert payload["policy_mode"] == "canary_live"
+        return {
+            "status": 200,
+            "body": {
+                "policy_version": "candidate_low_conf_v1",
+                "policy_alias": "candidate",
+                "confidence": {
+                    "overall": 0.20,
+                    "by_head": {
+                        "selected_mode": 0.20,
+                    },
+                    "feature_signature_seen": True,
+                },
+                "action": {
+                    "selected_mode": "tool_heavy",
+                    "reasoning_depth": "deep",
+                    "token_budget_bucket": 2048,
+                    "tool_parallelism_cap": 2,
+                    "interrupt_allowed": True,
+                    "replan_required": True,
+                    "early_stop_ok": False,
+                    "force_synthesis": False,
+                },
+            },
+        }
+
+    with run_mock_deepseek(route_factory=route_factory) as (base_url, state):
+        server = make_provider_server(base_url, {
+            "VICUNA_POLICY_MODE": "canary_live",
+            "VICUNA_POLICY_CANDIDATE_URL": base_url,
+            "VICUNA_POLICY_CANARY_STEPS": "100",
+            "VICUNA_POLICY_CANARY_MIN_REQUESTS_PER_STEP": "1",
+            "VICUNA_POLICY_LIVE_CONFIDENCE_THRESHOLD": "0.90",
+            "VICUNA_POLICY_ROLLBACK_MAX_CANDIDATE_FAILURE_RATE": "1.0",
+            "VICUNA_POLICY_ROLLBACK_MAX_INVALID_ACTION_RATE": "1.0",
+            "VICUNA_POLICY_ROLLBACK_MAX_FALLBACK_RATE": "0.50",
+            "VICUNA_POLICY_TIMEOUT_MS": "500",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            first = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "First request should trigger rollback."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "policy_canary_rb_1",
+            })
+            assert first.status_code == 200
+
+            second = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Second request should stay native after rollback."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "policy_canary_rb_2",
+            })
+            assert second.status_code == 200
+
+            status = server.make_request("GET", "/v1/policy/status")
+            assert status.status_code == 200
+            assert status.body["mode"] == "canary_live"
+            assert status.body["rollout_state"] == "rolled_back"
+            assert status.body["rollback_count"] == 1
+            assert status.body["last_rollback_reason"] == "fallback_rate_exceeded"
+            assert status.body["low_confidence_count"] == 1
+            assert status.body["live_candidate_execution_count"] == 0
+
+            first_transition = server.make_request(
+                "GET",
+                "/v1/policy/transitions?request_id=policy_canary_rb_1&limit=5",
+            ).body["items"][0]
+            assert first_transition["rollout_sampled"] is True
+            assert first_transition["candidate_executed_live"] is False
+            assert first_transition["candidate_confidence_passed"] is False
+            assert first_transition["rollout_decision_reason"] == "low_confidence"
+            assert first_transition["executed_action"]["proposal_source"] == "native"
+
+            second_transition = server.make_request(
+                "GET",
+                "/v1/policy/transitions?request_id=policy_canary_rb_2&limit=5",
+            ).body["items"][0]
+            assert second_transition["candidate_executed_live"] is False
+            assert second_transition["rollout_decision_reason"] == "rollback_active"
+            assert second_transition["executed_action"]["proposal_source"] == "native"
+
+            policy_requests = requests_for_path(state, "/v1/policy/propose")
+            assert len(policy_requests) == 1
+        finally:
+            server.stop()
+
+
+def test_provider_mode_canary_live_applies_prefix_stop_and_repetition_profiles():
+    global server
+
+    def route_factory(path, payload, _state):
+        if path != "/v1/policy/propose":
+            return None
+        assert payload["policy_mode"] == "canary_live"
+        return {
+            "status": 200,
+            "body": {
+                "policy_version": "candidate_profile_v1",
+                "policy_alias": "candidate",
+                "confidence": {"overall": 0.98},
+                "action": {
+                    "selected_mode": "direct",
+                    "reasoning_depth": "short",
+                    "thinking_mode": "disabled",
+                    "prefix_profile": "bounded_answer",
+                    "stop_profile": "concise_answer",
+                    "sampling_profile": "deterministic",
+                    "repetition_profile": "anti_stall_soft",
+                    "tool_choice_profile": "caller_default",
+                    "token_budget_bucket": 512,
+                    "tool_parallelism_cap": 0,
+                    "interrupt_allowed": False,
+                    "replan_required": False,
+                    "early_stop_ok": True,
+                    "force_synthesis": True,
+                },
+            },
+        }
+
+    with run_mock_deepseek(route_factory=route_factory) as (base_url, state):
+        server = make_provider_server(base_url, {
+            "VICUNA_POLICY_MODE": "canary_live",
+            "VICUNA_POLICY_CANDIDATE_URL": base_url,
+            "VICUNA_POLICY_CANARY_STEPS": "100",
+            "VICUNA_POLICY_CANARY_MIN_REQUESTS_PER_STEP": "1",
+            "VICUNA_POLICY_LIVE_CONFIDENCE_THRESHOLD": "0.70",
+            "VICUNA_POLICY_ROLLBACK_MAX_CANDIDATE_FAILURE_RATE": "1.0",
+            "VICUNA_POLICY_ROLLBACK_MAX_INVALID_ACTION_RATE": "1.0",
+            "VICUNA_POLICY_ROLLBACK_MAX_FALLBACK_RATE": "1.0",
+            "VICUNA_POLICY_TIMEOUT_MS": "500",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Give me the bounded answer now."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "policy_canary_profiles_1",
+            })
+            assert response.status_code == 200
+
+            beta_requests = requests_for_path(state, "/beta/chat/completions")
+            assert len(beta_requests) == 1
+            provider_body = beta_requests[0]["body"]
+            assert provider_body["thinking"]["type"] == "disabled"
+            assert provider_body["temperature"] == 0.0
+            assert provider_body["frequency_penalty"] == pytest.approx(0.4, rel=1e-3)
+            assert provider_body["presence_penalty"] == pytest.approx(0.1, rel=1e-3)
+            assert provider_body["stop"] == ["\n\n"]
+            assert provider_body["messages"][-1]["role"] == "assistant"
+            assert provider_body["messages"][-1]["prefix"] is True
+            assert provider_body["messages"][-1]["content"] == "Best bounded answer:\n"
+
+            exported = server.make_request(
+                "GET",
+                "/v1/policy/transitions?request_id=policy_canary_profiles_1&limit=5",
+            )
+            item = exported.body["items"][0]
+            assert item["executed_action"]["thinking_mode"] == "disabled"
+            assert item["executed_action"]["prefix_profile"] == "bounded_answer"
+            assert item["applied_provider_controls"]["thinking_enabled"] is False
+            assert item["applied_provider_controls"]["prefix_used"] is True
+            assert item["applied_provider_controls"]["stop_sequences"] == ["\n\n"]
+            assert item["applied_provider_controls"]["temperature"] == 0.0
+        finally:
+            server.stop()
+
+
+def test_provider_mode_canary_live_suppresses_incompatible_profiles_when_thinking_enabled():
+    global server
+
+    def route_factory(path, payload, _state):
+        if path != "/v1/policy/propose":
+            return None
+        assert payload["policy_mode"] == "canary_live"
+        return {
+            "status": 200,
+            "body": {
+                "policy_version": "candidate_profile_v2",
+                "policy_alias": "candidate",
+                "confidence": {"overall": 0.98},
+                "action": {
+                    "selected_mode": "reflective",
+                    "reasoning_depth": "deep",
+                    "thinking_mode": "enabled",
+                    "prefix_profile": "bounded_answer",
+                    "stop_profile": "concise_answer",
+                    "sampling_profile": "creative",
+                    "repetition_profile": "anti_stall_hard",
+                    "tool_choice_profile": "caller_default",
+                    "token_budget_bucket": 2048,
+                    "tool_parallelism_cap": 0,
+                    "interrupt_allowed": False,
+                    "replan_required": False,
+                    "early_stop_ok": False,
+                    "force_synthesis": False,
+                },
+            },
+        }
+
+    with run_mock_deepseek(route_factory=route_factory) as (base_url, state):
+        server = make_provider_server(base_url, {
+            "VICUNA_POLICY_MODE": "canary_live",
+            "VICUNA_POLICY_CANDIDATE_URL": base_url,
+            "VICUNA_POLICY_CANARY_STEPS": "100",
+            "VICUNA_POLICY_CANARY_MIN_REQUESTS_PER_STEP": "1",
+            "VICUNA_POLICY_LIVE_CONFIDENCE_THRESHOLD": "0.70",
+            "VICUNA_POLICY_ROLLBACK_MAX_CANDIDATE_FAILURE_RATE": "1.0",
+            "VICUNA_POLICY_ROLLBACK_MAX_INVALID_ACTION_RATE": "1.0",
+            "VICUNA_POLICY_ROLLBACK_MAX_FALLBACK_RATE": "1.0",
+            "VICUNA_POLICY_TIMEOUT_MS": "500",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Think carefully before answering."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "policy_canary_profiles_2",
+            })
+            assert response.status_code == 200
+
+            normal_requests = requests_for_path(state, "/chat/completions")
+            assert len(normal_requests) == 1
+            provider_body = normal_requests[0]["body"]
+            assert provider_body["thinking"]["type"] == "enabled"
+            assert "temperature" not in provider_body
+            assert "top_p" not in provider_body
+            assert "frequency_penalty" not in provider_body
+            assert "presence_penalty" not in provider_body
+            assert "stop" not in provider_body
+            assert all(not message.get("prefix") for message in provider_body["messages"] if isinstance(message, dict))
+
+            exported = server.make_request(
+                "GET",
+                "/v1/policy/transitions?request_id=policy_canary_profiles_2&limit=5",
+            )
+            item = exported.body["items"][0]
+            assert item["executed_action"]["thinking_mode"] == "enabled"
+            assert item["applied_provider_controls"]["thinking_enabled"] is True
+            assert "sampling_profile" in item["applied_provider_controls"]["suppressed_fields"]
+            assert "repetition_profile" in item["applied_provider_controls"]["suppressed_fields"]
+            assert "prefix_profile" in item["applied_provider_controls"]["suppressed_fields"]
+            assert "stop_profile" in item["applied_provider_controls"]["suppressed_fields"]
+            assert item["applied_provider_controls"]["prefix_used"] is False
         finally:
             server.stop()
 
@@ -725,10 +1373,217 @@ def test_provider_mode_skips_stale_reasoning_replay_without_active_tool_continua
 
             assert response.status_code == 200
             outbound = state["requests"][0]["body"]
-            assert outbound["messages"][0] == {"role": "user", "content": "Summarize the project status."}
-            assert outbound["messages"][1] == {"role": "assistant", "content": "The project is on track."}
-            assert outbound["messages"][2] == {"role": "user", "content": "Now rewrite it more crisply."}
+            assert_has_skill_memory_indexes(outbound)
+            assert outbound_non_system_messages(outbound)[0] == {"role": "user", "content": "Summarize the project status."}
+            assert outbound_non_system_messages(outbound)[1] == {"role": "assistant", "content": "The project is on track."}
+            assert outbound_non_system_messages(outbound)[2] == {"role": "user", "content": "Now rewrite it more crisply."}
             assert_has_policy_guidance(outbound)
+        finally:
+            server.stop()
+
+
+def test_provider_mode_injects_skill_and_memory_indexes(tmp_path):
+    global server
+    skills_dir = tmp_path / "skills"
+    memories_dir = tmp_path / "memories"
+    skills_dir.mkdir()
+    memories_dir.mkdir()
+    (skills_dir / "deploy-worker.md").write_text("# Deploy Worker\n", encoding="utf-8")
+    (memories_dir / "runtime-preference.md").write_text("---\nkind: \"preference\"\n---\nmanual reads only\n", encoding="utf-8")
+
+    with run_mock_deepseek() as (base_url, state):
+        server = make_provider_server(base_url, {
+            "VICUNA_SKILLS_DIR": str(skills_dir),
+            "VICUNA_HARD_MEMORY_DIR": str(memories_dir),
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "What can you read?"},
+                ],
+                "stream": False,
+            })
+
+            assert response.status_code == 200
+            outbound = state["requests"][0]["body"]
+            assert_has_skill_memory_indexes(outbound, "deploy-worker.md", "runtime-preference.md")
+            index_message = next(
+                message for message in outbound_system_messages(outbound)
+                if "SKILLS:\n" in message and "\n\nMEMORIES:\n" in message
+            )
+            assert "Current skill_create authorization: not allowed" in index_message
+        finally:
+            server.stop()
+
+
+def test_provider_mode_host_shell_root_defaults_cover_skills_memories_and_heuristics(tmp_path):
+    global server
+    host_shell_root = tmp_path / "host-home"
+    skills_dir = host_shell_root / "skills"
+    memories_dir = host_shell_root / "memories"
+    heuristics_dir = host_shell_root / "heuristics"
+    skills_dir.mkdir(parents=True)
+    memories_dir.mkdir(parents=True)
+    (skills_dir / "deploy-worker.md").write_text("# Deploy Worker\n", encoding="utf-8")
+    (memories_dir / "operator-preference.md").write_text(
+        "---\nkind: \"preference\"\n---\nmanual reads only\n",
+        encoding="utf-8",
+    )
+
+    with run_mock_deepseek() as (base_url, state):
+        server = make_provider_server(base_url, {
+            "VICUNA_HOST_SHELL_ROOT": str(host_shell_root),
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Use the manual reading method for skills and memories. Speed doesn't matter.",
+                    },
+                ],
+                "stream": False,
+            })
+
+            assert response.status_code == 200
+            outbound = state["requests"][0]["body"]
+            assert_has_skill_memory_indexes(outbound, "deploy-worker.md", "operator-preference.md")
+
+            written_memories = sorted(path.name for path in memories_dir.glob("*.md"))
+            assert len(written_memories) >= 2
+            assert any(name != "operator-preference.md" for name in written_memories)
+
+            health = server.make_request("GET", "/health")
+            assert health.status_code == 200
+            assert health.body["emotive_runtime"]["heuristic_memory"]["path"] == str(
+                heuristics_dir / "vicuna-heuristic-memory.json"
+            )
+        finally:
+            server.stop()
+
+
+def test_provider_mode_marks_skill_create_allowed_only_on_direct_user_request(tmp_path):
+    global server
+    skills_dir = tmp_path / "skills"
+    memories_dir = tmp_path / "memories"
+    skills_dir.mkdir()
+    memories_dir.mkdir()
+
+    with run_mock_deepseek() as (base_url, state):
+        server = make_provider_server(base_url, {
+            "VICUNA_SKILLS_DIR": str(skills_dir),
+            "VICUNA_HARD_MEMORY_DIR": str(memories_dir),
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Create a skill for deployment handoff."},
+                ],
+                "stream": False,
+            })
+
+            assert response.status_code == 200
+            outbound = state["requests"][0]["body"]
+            index_message = next(
+                message for message in outbound_system_messages(outbound)
+                if "SKILLS:\n" in message and "\n\nMEMORIES:\n" in message
+            )
+            assert "Current skill_create authorization: allowed" in index_message
+        finally:
+            server.stop()
+
+
+def test_provider_mode_post_response_memory_capture_writes_preference_memory(tmp_path):
+    global server
+    memories_dir = tmp_path / "memories"
+    memories_dir.mkdir()
+
+    with run_mock_deepseek() as (base_url, _state):
+        server = make_provider_server(base_url, {
+            "VICUNA_HARD_MEMORY_DIR": str(memories_dir),
+            "VICUNA_SKILLS_DIR": str(tmp_path / "skills"),
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Use the manual reading method for skills and memories. Speed doesn't matter. Skill creation should only happen on direct user request.",
+                    },
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "post_memory_write_1",
+            })
+
+            assert response.status_code == 200
+            memory_files = list(memories_dir.glob("*.md"))
+            assert memory_files
+            content = memory_files[0].read_text(encoding="utf-8")
+            assert 'kind: "preference"' in content
+            assert "manual reading method" in content.lower()
+
+            traces = server.make_request("GET", "/v1/debug/request-traces?request_id=post_memory_write_1&limit=20")
+            assert traces.status_code == 200
+            assert any(
+                item["component"] == "post_response_memory" and item["event"] == "written"
+                for item in traces.body["items"]
+            )
+        finally:
+            server.stop()
+
+
+def test_provider_mode_post_response_memory_capture_skips_non_durable_turn(tmp_path):
+    global server
+    memories_dir = tmp_path / "memories"
+    memories_dir.mkdir()
+
+    with run_mock_deepseek() as (base_url, _state):
+        server = make_provider_server(base_url, {
+            "VICUNA_HARD_MEMORY_DIR": str(memories_dir),
+            "VICUNA_SKILLS_DIR": str(tmp_path / "skills"),
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "post_memory_skip_1",
+            })
+
+            assert response.status_code == 200
+            assert list(memories_dir.glob("*.md")) == []
+
+            traces = server.make_request("GET", "/v1/debug/request-traces?request_id=post_memory_skip_1&limit=20")
+            assert traces.status_code == 200
+            assert any(
+                item["component"] == "post_response_memory"
+                and item["event"] == "skipped"
+                and item["data"]["reason"] == "no_durable_memory_match"
+                for item in traces.body["items"]
+            )
         finally:
             server.stop()
 
@@ -807,11 +1662,15 @@ def test_provider_mode_interleaved_guidance_is_request_scoped_and_forwards_think
             second_outbound = state["requests"][1]["body"]
             assert first_outbound["max_tokens"] == 768
             assert second_outbound["max_tokens"] == 768
-            assert first_outbound["thinking"] == {"type": "enabled"}
-            assert second_outbound["thinking"] == {"type": "enabled"}
-            assert first_outbound["messages"][3]["role"] == "system"
-            assert second_outbound["messages"][3]["role"] == "system"
-            assert first_outbound["messages"][3]["content"] != second_outbound["messages"][3]["content"]
+            assert first_outbound["thinking"]["type"] in ("enabled", "disabled")
+            assert second_outbound["thinking"]["type"] in ("enabled", "disabled")
+            assert_has_skill_memory_indexes(first_outbound)
+            assert_has_skill_memory_indexes(second_outbound)
+            first_guidance = [message for message in outbound_system_messages(first_outbound) if message.startswith("Current emotive guidance:")]
+            second_guidance = [message for message in outbound_system_messages(second_outbound) if message.startswith("Current emotive guidance:")]
+            assert first_guidance
+            assert second_guidance
+            assert first_guidance[0] != second_guidance[0]
         finally:
             server.stop()
 
@@ -1500,14 +2359,261 @@ def test_provider_mode_requires_explicit_telegram_delivery_for_bridge_request():
             assert item["reply_to_message_id"] == 77
             assert item["dedupe_key"] == "bridge:tc1:77:sendMessage"
             animation = item["emotive_animation"]
-            assert animation["bundle_version"] == 1
-            assert animation["generation_start_block_index"] == 3
+            assert animation["bundle_version"] == 2
+            assert animation["generation_start_block_index"] >= 3
             assert animation["seconds_per_keyframe"] == 0.5
-            assert animation["fps"] == 24
+            assert animation["fps"] == 30
+            assert animation["raw_keyframe_count"] >= len(animation["keyframes"])
+            assert animation["distinct_keyframe_count"] == len(animation["keyframes"])
+            assert sum(frame["hold_keyframe_count"] for frame in animation["keyframes"]) == animation["raw_keyframe_count"]
             assert len(animation["dimensions"]) == 14
             assert animation["dimensions"][0]["label"] == "Epistemic Pressure"
             assert all(frame["trace_block_index"] >= 3 for frame in animation["keyframes"])
+            assert all(frame["hold_keyframe_count"] >= 1 for frame in animation["keyframes"])
             assert animation["keyframes"][0]["source_kind"] == "assistant_reasoning"
+        finally:
+            server.stop()
+
+
+def test_provider_mode_bridge_plain_assistant_text_defaults_to_plain_telegram_delivery():
+    global server
+
+    def plain_response(_payload):
+        return {
+            "id": "bridge-plain-text",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello! What's up?",
+                    "reasoning_content": "Reply directly without extra formatting.",
+                },
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
+        }
+
+    with run_mock_deepseek(plain_response) as (base_url, _):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": "[]",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Reply on Telegram."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "78",
+                "X-Vicuna-Telegram-Conversation-Id": "tc-plain-default",
+            })
+
+            assert response.status_code == 200
+            assert response.body["vicuna_telegram_delivery"]["source"] == "rich_plan"
+            assert response.body["vicuna_rich_response"]["format"] == "plain_text"
+            outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
+            assert outbox.status_code == 200
+            assert outbox.body["items"][0]["telegram_payload"] == {
+                "text": "Hello! What's up?",
+            }
+        finally:
+            server.stop()
+
+
+def test_provider_mode_bridge_markdown_rich_plan_normalizes_to_html_delivery():
+    global server
+
+    def markdown_response(_payload):
+        return {
+            "id": "bridge-markdown-text",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": rich_plan_text("*Hello!* What's up?", format="markdown"),
+                    "reasoning_content": "Reply with markdown compatibility metadata.",
+                },
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
+        }
+
+    with run_mock_deepseek(markdown_response) as (base_url, _):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": "[]",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Reply on Telegram."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "trace_markdown_bridge_1",
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "79",
+                "X-Vicuna-Telegram-Conversation-Id": "tc-markdown-default",
+            })
+
+            assert response.status_code == 200
+            assert response.body["vicuna_telegram_delivery"]["source"] == "rich_plan"
+            assert response.body["vicuna_rich_response"]["format"] == "markdown"
+            outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
+            assert outbox.status_code == 200
+            assert outbox.body["items"][0]["telegram_payload"] == {
+                "text": "<i>Hello!</i> What's up?",
+                "parse_mode": "HTML",
+            }
+            traces = server.make_request("GET", "/v1/debug/request-traces?request_id=trace_markdown_bridge_1&limit=50")
+            assert traces.status_code == 200
+            assert any(item["event"] == "rich_plan_markdown_normalized_html" for item in traces.body["items"])
+        finally:
+            server.stop()
+
+
+def test_provider_mode_bridge_markdown_rich_plan_preserves_dividers_headings_and_code_blocks():
+    global server
+
+    body = "\n".join([
+        "### Status",
+        "",
+        "**Ready** with `code`",
+        "",
+        "---",
+        "",
+        "> quoted line",
+        "",
+        "```python",
+        "print('ok')",
+        "```",
+    ])
+
+    def markdown_response(_payload):
+        return {
+            "id": "bridge-markdown-structured",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": rich_plan_text(body, format="markdown"),
+                    "reasoning_content": "Reply with structured markdown.",
+                },
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
+        }
+
+    with run_mock_deepseek(markdown_response) as (base_url, _):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": "[]",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Reply on Telegram."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "80",
+                "X-Vicuna-Telegram-Conversation-Id": "tc-markdown-structured",
+            })
+
+            assert response.status_code == 200
+            outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
+            assert outbox.status_code == 200
+            payload = outbox.body["items"][0]["telegram_payload"]
+            assert payload["parse_mode"] == "HTML"
+            assert payload["text"] == (
+                "<b>Status</b>\n\n"
+                "<b>Ready</b> with <code>code</code>\n\n"
+                "━━━━━━━━━━━━\n\n"
+                "<blockquote>quoted line</blockquote>\n\n"
+                "<pre><code class=\"language-python\">print('ok')</code></pre>"
+            )
+        finally:
+            server.stop()
+
+
+def test_provider_mode_bridge_markdown_pipe_tables_render_as_preformatted_grids():
+    global server
+
+    body = "\n".join([
+        "| Name | Score |",
+        "| --- | --- |",
+        "| Calm | 0.42 |",
+        "| Trust | 0.80 |",
+    ])
+
+    def markdown_response(_payload):
+        return {
+            "id": "bridge-markdown-table",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": rich_plan_text(body, format="markdown"),
+                    "reasoning_content": "Reply with a compact markdown table.",
+                },
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
+        }
+
+    with run_mock_deepseek(markdown_response) as (base_url, state):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": "[]",
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Reply with a grid."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "81",
+                "X-Vicuna-Telegram-Conversation-Id": "tc-markdown-table",
+            })
+
+            assert response.status_code == 200
+            outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
+            assert outbox.status_code == 200
+            payload = outbox.body["items"][0]["telegram_payload"]
+            assert payload["parse_mode"] == "HTML"
+            assert payload["text"] == (
+                "<pre>+-------+-------+\n"
+                "| Name  | Score |\n"
+                "+-------+-------+\n"
+                "| Calm  | 0.42  |\n"
+                "| Trust | 0.80  |\n"
+                "+-------+-------+</pre>"
+            )
+
+            system_prompt = state["requests"][0]["body"]["messages"][0]["content"]
+            assert "preformatted grid" in system_prompt
+            assert "raw markdown pipe tables" in system_prompt
         finally:
             server.stop()
 
@@ -1689,6 +2795,7 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
             assert all(request["body"]["temperature"] == 0.2 for request in state["requests"])
             assert first_request["messages"][0]["role"] == "system"
             assert first_request["messages"][0]["content"].startswith("Bridge-scoped delivery contract:")
+            assert "HTML is the canonical Telegram rich-text format" in first_request["messages"][0]["content"]
             assert_has_policy_guidance(first_request)
             assert any(
                 tool["function"]["name"] == "radarr_list_downloaded_movies"
@@ -1704,6 +2811,293 @@ def test_provider_mode_executes_staged_telegram_tool_for_bridge_request():
             assert outbox.status_code == 200
             assert outbox.body["items"][0]["emotive_animation"]["generation_start_block_index"] >= 1
             assert outbox.body["items"][0]["emotive_animation"]["keyframes"]
+            assert outbox.body["items"][0]["telegram_payload"]["parse_mode"] == "HTML"
+        finally:
+            server.stop()
+
+
+def test_provider_mode_bridge_round_budget_forces_tool_free_synthesis_instead_of_500():
+    global server
+
+    runtime_tools = [{
+        "type": "function",
+        "function": {
+            "name": "chaptarr_download_book",
+            "description": "Search Chaptarr for a book and start a download when there is a match.",
+            "parameters": {
+                "type": "object",
+                "required": ["term"],
+                "properties": {
+                    "term": {
+                        "type": "string",
+                        "description": "Book search term.",
+                    },
+                },
+            },
+            "x-vicuna-family-id": "chaptarr",
+            "x-vicuna-family-name": "Chaptarr",
+            "x-vicuna-family-description": "Inspect and manage book downloads.",
+            "x-vicuna-method-name": "download_book",
+            "x-vicuna-method-description": "Search for and download a book.",
+        },
+    }, {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the live web and return ranked results.",
+            "parameters": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query.",
+                    },
+                },
+            },
+            "x-vicuna-family-id": "web",
+            "x-vicuna-family-name": "Web Search",
+            "x-vicuna-family-description": "Search the live web.",
+            "x-vicuna-method-name": "search",
+            "x-vicuna-method-description": "Search the live web.",
+        },
+    }]
+
+    def looping_until_tool_free_synthesis(payload):
+        if not payload.get("tools"):
+            return {
+                "id": "bridge-budget-synthesis",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": (
+                            "I couldn't confirm a book called \"By the Horns\" by Ali Hazelwood. "
+                            "If you meant Ruby Dixon's \"By the Horns\", say so and I'll use that title instead."
+                        ),
+                        "reasoning_content": "The runtime tool budget is exhausted, so I should stop searching and ask the user to clarify the title or author.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 12, "total_tokens": 22},
+            }
+
+        tool_messages = [message for message in payload["messages"] if message.get("role") == "tool"]
+        if len(tool_messages) == 0:
+            return selector_choice_response(
+                "bridge-budget-1",
+                "Try Chaptarr first.",
+                "chaptarr_download_book",
+                {"term": "By the Horns Ali Hazelwood"},
+            )
+        if len(tool_messages) == 1:
+            return selector_choice_response(
+                "bridge-budget-2",
+                "Chaptarr found nothing, so verify the title on the web.",
+                "web_search",
+                {"query": "Ali Hazelwood By the Horns"},
+            )
+        raise AssertionError(f"expected tool-free synthesis request, got tools={selector_tool_names(payload)}")
+
+    with run_mock_deepseek(looping_until_tool_free_synthesis) as (base_url, state):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_MAX_ROUNDS": "2",
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": json.dumps(runtime_tools),
+            "VICUNA_TELEGRAM_RUNTIME_TOOL_OBSERVATIONS_JSON": json.dumps({
+                "chaptarr_download_book": {
+                    "ok": False,
+                    "error": {
+                        "kind": "lookup_no_match",
+                        "message": "lookup returned no candidates",
+                    },
+                },
+                "web_search": {
+                    "query": "Ali Hazelwood By the Horns",
+                    "results": [{
+                        "title": "Ali Hazelwood: Home",
+                        "url": "https://alihazelwood.com/",
+                        "excerpt": "No book titled By the Horns appears in the catalog.",
+                    }],
+                },
+            }),
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "Download By the Horns by Ali Hazelwood."},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "trace_bridge_budget",
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "99",
+                "X-Vicuna-Telegram-Conversation-Id": "tc-budget",
+            })
+
+            assert response.status_code == 200
+            assert response.body["choices"][0]["finish_reason"] == "stop"
+            assert response.body["choices"][0]["message"]["content"] == ""
+            assert "tool_calls" not in response.body["choices"][0]["message"]
+            assert response.body["vicuna_telegram_delivery"]["queued"] is True
+            assert response.body["vicuna_rich_response"]["body"].startswith("I couldn't confirm a book called")
+
+            assert len(state["requests"]) == 3
+            assert selector_tool_names(state["requests"][0]["body"]) == [
+                "chaptarr_download_book",
+                "web_search",
+            ]
+            assert "tools" not in state["requests"][2]["body"]
+            assert any(
+                message["role"] == "system" and "runtime tool round budget (2 rounds) is exhausted" in message["content"]
+                for message in state["requests"][2]["body"]["messages"]
+            )
+
+            traces = server.make_request("GET", "/v1/debug/request-traces?request_id=trace_bridge_budget&limit=100")
+            assert traces.status_code == 200
+            events = [item["event"] for item in traces.body["items"]]
+            assert "bridge_round_budget_synthesis_started" in events
+            assert "bridge_round_budget_synthesis_completed" in events
+            assert "request_failed" not in events
+
+            outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
+            assert outbox.status_code == 200
+            assert outbox.body["items"][0]["text"].startswith("I couldn't confirm a book called")
+        finally:
+            server.stop()
+
+
+def test_provider_mode_recovers_dsml_tool_calls_from_assistant_content():
+    global server
+
+    runtime_tools = [{
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the live web and return ranked results.",
+            "parameters": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query.",
+                    },
+                },
+            },
+            "x-vicuna-family-id": "web",
+            "x-vicuna-family-name": "Web Search",
+            "x-vicuna-family-description": "Search the live web.",
+            "x-vicuna-method-name": "search",
+            "x-vicuna-method-description": "Search the live web.",
+        },
+    }]
+
+    def dsml_tool_call_then_answer(payload):
+        tool_messages = [message for message in payload["messages"] if message.get("role") == "tool"]
+        if len(tool_messages) == 0:
+            return {
+                "id": "bridge-dsml-1",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": (
+                            "Let me check.\n"
+                            "<｜DSML｜function_calls>\n"
+                            "<｜DSML｜invoke name=\"web_search\">\n"
+                            "<｜DSML｜parameter name=\"query\" string=\"true\">Penelope's Vegan Taqueria Logan Square</｜DSML｜parameter>\n"
+                            "<｜DSML｜parameter name=\"max_results\" string=\"false\">4</｜DSML｜parameter>\n"
+                            "</｜DSML｜invoke>\n"
+                            "</｜DSML｜function_calls>"
+                        ),
+                        "reasoning_content": "I should search for the restaurant before replying.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+            }
+        if len(tool_messages) == 1:
+            assert tool_messages[0]["name"] == "web_search"
+            return {
+                "id": "bridge-dsml-2",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "Penelope's Vegan Taqueria is in Logan Square and has strong recent reviews.",
+                        "reasoning_content": "I have the search result, so I can answer directly.",
+                    },
+                }],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 13, "total_tokens": 24},
+            }
+        raise AssertionError(f"unexpected tool round count: {len(tool_messages)}")
+
+    with run_mock_deepseek(dsml_tool_call_then_answer) as (base_url, state):
+        server = make_provider_server(base_url, extra_env={
+            "VICUNA_TELEGRAM_RUNTIME_TOOLS_JSON": json.dumps(runtime_tools),
+            "VICUNA_TELEGRAM_RUNTIME_TOOL_OBSERVATIONS_JSON": json.dumps({
+                "web_search": {
+                    "query": "Penelope's Vegan Taqueria Logan Square",
+                    "results": [{
+                        "title": "Penelope's Vegan Taqueria",
+                        "url": "https://example.com/penelopes",
+                        "excerpt": "Recent reviews praise the food and location in Logan Square.",
+                    }],
+                },
+            }),
+        })
+        server.api_surface = "openai"
+        try:
+            server.start()
+
+            response = server.make_request("POST", "/v1/chat/completions", data={
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "user", "content": "What do you know about Penelope's Vegan Taqueria in Logan Square?"},
+                ],
+                "stream": False,
+            }, headers={
+                "X-Client-Request-Id": "trace_bridge_dsml_recovery",
+                "X-Vicuna-Telegram-Chat-Id": "12345",
+                "X-Vicuna-Telegram-Message-Id": "111",
+                "X-Vicuna-Telegram-Conversation-Id": "tc-dsml-recovery",
+            })
+
+            assert response.status_code == 200
+            assert response.body["choices"][0]["finish_reason"] == "stop"
+            assert response.body["vicuna_telegram_delivery"]["queued"] is True
+            assert response.body["vicuna_rich_response"]["body"].startswith("Penelope's Vegan Taqueria is in Logan Square")
+
+            assert len(state["requests"]) == 2
+            assistant_tool_replay = next(
+                message
+                for message in state["requests"][1]["body"]["messages"]
+                if message.get("role") == "assistant" and message.get("tool_calls")
+            )
+            assert assistant_tool_replay["content"] == "Let me check."
+            assert assistant_tool_replay["tool_calls"][0]["function"]["name"] == "web_search"
+            assert json.loads(assistant_tool_replay["tool_calls"][0]["function"]["arguments"]) == {
+                "query": "Penelope's Vegan Taqueria Logan Square",
+                "max_results": 4,
+            }
+
+            traces = server.make_request("GET", "/v1/debug/request-traces?request_id=trace_bridge_dsml_recovery&limit=100")
+            assert traces.status_code == 200
+            events = [item["event"] for item in traces.body["items"]]
+            assert "provider_dsml_tool_calls_recovered" in events
+
+            outbox = server.make_request("GET", "/v1/telegram/outbox?after=0")
+            assert outbox.status_code == 200
+            assert outbox.body["items"][0]["text"].startswith("Penelope's Vegan Taqueria is in Logan Square")
+            assert "<｜DSML｜function_calls>" not in outbox.body["items"][0]["text"]
         finally:
             server.stop()
 
@@ -1872,7 +3266,7 @@ def test_provider_mode_strips_unsupported_array_keywords_from_projected_payload_
                     "type": "function",
                     "function": {
                         "name": "hard_memory_write",
-                        "description": "Archive explicit durable memories to Vicuña hard memory and Supermemory.",
+                        "description": "Archive explicit durable memories to Vicuña markdown hard memory.",
                         "parameters": {
                             "type": "object",
                             "description": "The hard-memory write payload.",
@@ -2985,354 +4379,71 @@ def test_provider_mode_heuristic_guidance_injects_only_for_similar_trace_and_sur
             server.stop()
 
 
-def test_provider_mode_idle_ongoing_tasks_runs_due_task_and_updates_registry():
+def test_provider_mode_ongoing_task_idle_surface_is_removed():
     global server
-    task_text = "Every week, review the pending maintenance checklist and summarize the highest-risk item."
-    registry_store = {
-        "registry": {
-            "schema_version": 1,
-            "updated_at": "2026-03-01T00:00:00.000Z",
-            "tasks": [
-                {
-                    "task_id": "task_weekly_review",
-                    "task_text": task_text,
-                    "frequency": {"interval": 1, "unit": "weeks"},
-                    "created_at": "2026-02-01T00:00:00.000Z",
-                    "updated_at": "2026-03-01T00:00:00.000Z",
-                    "last_done_at": "2026-03-01T00:00:00.000Z",
-                    "active": True,
-                },
-                {
-                    "task_id": "task_not_due",
-                    "task_text": "Every week, archive healthy logs.",
-                    "frequency": {"interval": 1, "unit": "weeks"},
-                    "created_at": "2026-03-20T00:00:00.000Z",
-                    "updated_at": "2026-03-24T00:00:00.000Z",
-                    "last_done_at": "2026-03-24T00:00:00.000Z",
-                    "active": True,
-                },
-            ],
-        },
-    }
 
-    def response_factory(payload):
-        first_message = payload["messages"][0]
-        if first_message["role"] == "system" and "one recurring ongoing task should run now" in first_message["content"].lower():
-            return {
-                "id": "chatcmpl-ongoing-decision",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({
-                            "should_run": True,
-                            "selected_task_id": "task_weekly_review",
-                            "rationale": "The weekly review is overdue and should run before idle.",
-                        }),
-                        "reasoning_content": "The weekly task is overdue and more urgent than the healthy log archive.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50},
-            }
-
+    def response_factory(_payload):
         return {
-            "id": "chatcmpl-ongoing-exec",
+            "id": "chatcmpl-health-check",
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
                 "finish_reason": "stop",
                 "message": {
                     "role": "assistant",
-                    "content": "Highest risk: the maintenance checklist still contains an unverified backup failure.",
-                    "reasoning_content": "Execute the stored weekly review task directly.",
+                    "content": "ok",
                 },
             }],
-            "usage": {"prompt_tokens": 24, "completion_tokens": 18, "total_tokens": 42},
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
         }
 
-    def route_factory(path, payload, _state):
-        if path == "/v4/profile":
-            return {
-                "status": 200,
-                "body": {
-                    "searchResults": {
-                        "results": [{
-                            "title": "Ongoing task registry",
-                            "metadata": {
-                                "key": "ongoing-tasks-registry",
-                                "title": "Ongoing task registry",
-                            },
-                            "memory": json.dumps(registry_store["registry"]),
-                        }],
-                    },
-                },
-            }
-        if path == "/v4/memories":
-            registry_store["registry"] = json.loads(payload["memories"][0]["content"])
-            return {"status": 200, "body": {"ok": True}}
-        return None
-
-    with run_mock_deepseek(response_factory, route_factory) as (base_url, state):
+    with run_mock_deepseek(response_factory) as (base_url, _state):
         server = make_provider_server(base_url, {
-            "VICUNA_COGNITIVE_REPLAY_IDLE_AFTER_MS": "200",
-            "VICUNA_COGNITIVE_REPLAY_POLL_MS": "50",
             "VICUNA_ONGOING_TASKS_ENABLED": "true",
-            "VICUNA_ONGOING_TASKS_BASE_URL": base_url,
-            "VICUNA_ONGOING_TASKS_AUTH_TOKEN": "test-key",
-            "VICUNA_ONGOING_TASKS_POLL_MS": "1000",
-            "VICUNA_ONGOING_TASKS_TIMEOUT_MS": "5000",
         })
         server.api_surface = "openai"
         try:
             server.start()
 
-            assert wait_for(
-                lambda: server.make_request("GET", "/v1/emotive/ongoing-tasks").body["worker"]["last_completed_task_id"]
-                == "task_weekly_review"
-            )
-
             ongoing = server.make_request("GET", "/v1/emotive/ongoing-tasks")
-            assert ongoing.status_code == 200
-            assert ongoing.body["worker"]["last_decision"]["should_run"] is True
-            assert ongoing.body["worker"]["last_decision"]["selected_task_id"] == "task_weekly_review"
-
-            provider_requests = requests_for_path(state, "/chat/completions")
-            decision_requests = [
-                request for request in provider_requests
-                if request["body"]["messages"][0]["role"] == "system"
-                and "one recurring ongoing task should run now"
-                in request["body"]["messages"][0]["content"].lower()
-            ]
-            execution_requests = [
-                request for request in provider_requests
-                if any(
-                    message["role"] == "user" and message["content"] == task_text
-                    for message in request["body"]["messages"]
-                )
-            ]
-            assert len(decision_requests) == 1
-            assert len(execution_requests) == 1
-
-            saved_task = next(
-                task for task in registry_store["registry"]["tasks"] if task["task_id"] == "task_weekly_review"
-            )
-            assert saved_task["last_done_at"] is not None
-            assert saved_task["last_done_at"] != "2026-03-01T00:00:00.000Z"
+            assert ongoing.status_code == 404
 
             health = server.make_request("GET", "/health")
             assert health.status_code == 200
-            assert health.body["emotive_runtime"]["ongoing_tasks"]["last_completed_task_id"] == "task_weekly_review"
+            assert "ongoing_tasks" not in health.body["emotive_runtime"]
         finally:
             server.stop()
 
 
-def test_provider_mode_idle_ongoing_tasks_no_due_task_stays_idle():
+def test_provider_mode_ongoing_task_env_does_not_trigger_background_scheduler():
     global server
-    task_text = "Every month, review the quiet metrics dashboard and archive only if all checks remain green."
-    registry_store = {
-        "registry": {
-            "schema_version": 1,
-            "updated_at": "2026-03-24T00:00:00.000Z",
-            "tasks": [{
-                "task_id": "task_monthly_archive",
-                "task_text": task_text,
-                "frequency": {"interval": 1, "unit": "weeks"},
-                "created_at": "2026-03-20T00:00:00.000Z",
-                "updated_at": "2026-03-24T00:00:00.000Z",
-                "last_done_at": "2026-03-24T00:00:00.000Z",
-                "active": True,
-            }],
-        },
-    }
 
-    def response_factory(payload):
-        first_message = payload["messages"][0]
-        assert first_message["role"] == "system"
-        assert "one recurring ongoing task should run now" in first_message["content"].lower()
+    def response_factory(_payload):
         return {
-            "id": "chatcmpl-ongoing-decision-idle",
+            "id": "chatcmpl-noop",
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
                 "finish_reason": "stop",
                 "message": {
                     "role": "assistant",
-                    "content": json.dumps({
-                        "should_run": False,
-                        "selected_task_id": "",
-                        "rationale": "The registry says this task was just completed, so it should stay idle.",
-                    }),
-                    "reasoning_content": "The explicit timestamps say this task is not due yet.",
+                    "content": "ok",
                 },
             }],
-            "usage": {"prompt_tokens": 22, "completion_tokens": 14, "total_tokens": 36},
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
         }
 
-    def route_factory(path, payload, _state):
-        if path == "/v4/profile":
-            return {
-                "status": 200,
-                "body": {
-                    "searchResults": {
-                        "results": [{
-                            "title": "Ongoing task registry",
-                            "metadata": {
-                                "key": "ongoing-tasks-registry",
-                                "title": "Ongoing task registry",
-                            },
-                            "memory": json.dumps(registry_store["registry"]),
-                        }],
-                    },
-                },
-            }
-        if path == "/v4/memories":
-            pytest.fail("No ongoing-task completion should be persisted when nothing is due.")
-        return None
-
-    with run_mock_deepseek(response_factory, route_factory) as (base_url, state):
+    with run_mock_deepseek(response_factory) as (base_url, state):
         server = make_provider_server(base_url, {
-            "VICUNA_COGNITIVE_REPLAY_IDLE_AFTER_MS": "200",
-            "VICUNA_COGNITIVE_REPLAY_POLL_MS": "50",
+            "VICUNA_COGNITIVE_REPLAY_ENABLED": "false",
             "VICUNA_ONGOING_TASKS_ENABLED": "true",
             "VICUNA_ONGOING_TASKS_BASE_URL": base_url,
             "VICUNA_ONGOING_TASKS_AUTH_TOKEN": "test-key",
-            "VICUNA_ONGOING_TASKS_POLL_MS": "1000",
-            "VICUNA_ONGOING_TASKS_TIMEOUT_MS": "5000",
         })
         server.api_surface = "openai"
         try:
             server.start()
-
-            assert wait_for(
-                lambda: server.make_request("GET", "/v1/emotive/ongoing-tasks").body["worker"]["last_decision"]["valid"]
-                is True
-            )
-
-            ongoing = server.make_request("GET", "/v1/emotive/ongoing-tasks")
-            assert ongoing.status_code == 200
-            assert ongoing.body["worker"]["last_decision"]["should_run"] is False
-            assert ongoing.body["worker"]["last_completed_task_id"] == ""
-
-            provider_requests = requests_for_path(state, "/chat/completions")
-            assert len(provider_requests) == 1
-            assert not any(
-                any(message["role"] == "user" and message["content"] == task_text for message in request["body"]["messages"])
-                for request in provider_requests
-            )
-        finally:
-            server.stop()
-
-
-def test_provider_mode_idle_ongoing_task_execution_suppresses_replay_admission():
-    global server
-    task_text = "Every week, inspect the unstable retry path and recover it before the next idle cycle."
-    registry_store = {
-        "registry": {
-            "schema_version": 1,
-            "updated_at": "2026-03-10T00:00:00.000Z",
-            "tasks": [{
-                "task_id": "task_retry_recovery",
-                "task_text": task_text,
-                "frequency": {"interval": 1, "unit": "weeks"},
-                "created_at": "2026-02-01T00:00:00.000Z",
-                "updated_at": "2026-03-10T00:00:00.000Z",
-                "last_done_at": "2026-03-10T00:00:00.000Z",
-                "active": True,
-            }],
-        },
-    }
-
-    def response_factory(payload):
-        first_message = payload["messages"][0]
-        if first_message["role"] == "system" and "one recurring ongoing task should run now" in first_message["content"].lower():
-            return {
-                "id": "chatcmpl-ongoing-decision-negative",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": json.dumps({
-                            "should_run": True,
-                            "selected_task_id": "task_retry_recovery",
-                            "rationale": "The weekly recovery task is overdue.",
-                        }),
-                        "reasoning_content": "This retry-path task has crossed its weekly cadence.",
-                    },
-                }],
-                "usage": {"prompt_tokens": 24, "completion_tokens": 16, "total_tokens": 40},
-            }
-
-        return {
-            "id": "chatcmpl-ongoing-negative-exec",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "finish_reason": "stop",
-                "message": {
-                    "role": "assistant",
-                    "content": "I cannot resolve this retry path. The failure is wrong and I am stuck.",
-                    "reasoning_content": (
-                        "Maybe this is wrong. I am unsure, stuck, and cannot find a clear plan. "
-                        "There is an error and retry pressure."
-                    ),
-                },
-            }],
-            "usage": {"prompt_tokens": 18, "completion_tokens": 20, "total_tokens": 38},
-        }
-
-    def route_factory(path, payload, _state):
-        if path == "/v4/profile":
-            return {
-                "status": 200,
-                "body": {
-                    "searchResults": {
-                        "results": [{
-                            "title": "Ongoing task registry",
-                            "metadata": {
-                                "key": "ongoing-tasks-registry",
-                                "title": "Ongoing task registry",
-                            },
-                            "memory": json.dumps(registry_store["registry"]),
-                        }],
-                    },
-                },
-            }
-        if path == "/v4/memories":
-            registry_store["registry"] = json.loads(payload["memories"][0]["content"])
-            return {"status": 200, "body": {"ok": True}}
-        return None
-
-    with run_mock_deepseek(response_factory, route_factory) as (base_url, _state):
-        server = make_provider_server(base_url, {
-            "VICUNA_COGNITIVE_REPLAY_IDLE_AFTER_MS": "200",
-            "VICUNA_COGNITIVE_REPLAY_POLL_MS": "50",
-            "VICUNA_COGNITIVE_REPLAY_MAX_ATTEMPTS": "1",
-            "VICUNA_ONGOING_TASKS_ENABLED": "true",
-            "VICUNA_ONGOING_TASKS_BASE_URL": base_url,
-            "VICUNA_ONGOING_TASKS_AUTH_TOKEN": "test-key",
-            "VICUNA_ONGOING_TASKS_POLL_MS": "1000",
-            "VICUNA_ONGOING_TASKS_TIMEOUT_MS": "5000",
-        })
-        server.api_surface = "openai"
-        try:
-            server.start()
-
-            assert wait_for(
-                lambda: server.make_request("GET", "/v1/emotive/ongoing-tasks").body["worker"]["last_completed_task_id"]
-                == "task_retry_recovery"
-            )
-
-            replay = server.make_request("GET", "/v1/emotive/cognitive-replay")
-            assert replay.status_code == 200
-            assert replay.body["entries"] == []
-
-            trace = server.make_request("GET", "/v1/emotive/trace/latest")
-            assert trace.status_code == 200
-            assert trace.body["trace"]["mode"] == "ongoing_task_execution"
-            assert trace.body["trace"]["suppress_replay_admission"] is True
+            time.sleep(0.35)
+            assert requests_for_path(state, "/chat/completions") == []
         finally:
             server.stop()

@@ -10,7 +10,7 @@ staged-turn architecture by reusing a persistent DeepSeek HTTP client,
 introducing explicit in-memory caches for the bridge-scoped Telegram runtime
 tool catalog and its derived staged metadata, tightening the bridge's retained
 internal polling loops, and fixing the provider sampling policy at
-`temperature: 0.2` for every outbound turn.
+`temperature: 0.2` plus `max_tokens: 256` for every outbound turn.
 
 ## Technical Context
 
@@ -93,6 +93,9 @@ service or standalone cache layer is justified.
   while keeping Telegram long-poll semantics unchanged.
 - Make the DeepSeek request builder stamp `temperature: 0.2` on every outbound
   provider body regardless of caller surface.
+- Make the DeepSeek request builder stamp `max_tokens: 256` on every outbound
+  provider body regardless of caller surface, and keep bridge-scoped request
+  construction aligned to the same cap.
 
 ## Complexity Tracking
 

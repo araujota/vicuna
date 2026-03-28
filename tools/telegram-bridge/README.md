@@ -44,13 +44,11 @@ Optional variables:
 - `TELEGRAM_BRIDGE_DOCLING_PYTHON_BIN` default: `python3`
 - `TELEGRAM_BRIDGE_DOCLING_PARSER_SCRIPT_PATH` default: repo-local `tools/telegram-bridge/docling-parse.py`
 - `TELEGRAM_BRIDGE_DOCUMENT_CONTAINER_TAG` default: `vicuna-telegram-documents`
+- `VICUNA_DOCS_DIR` default: `"$VICUNA_HOST_SHELL_ROOT/docs"` or `/home/vicuna/home/docs`
 - `TELEGRAM_BRIDGE_REPLAY_RETAINED_OUTBOX` default: `0`
   - when `0`, a fresh or reset bridge state fast-forwards to the newest
     retained runtime outbox sequence instead of replaying historical follow-ups
   - set to `1` only for an explicit operator replay of retained outbox items
-- `SUPERMEMORY_API_KEY` required for Docling-backed document ingestion and linked
-  Supermemory persistence
-- `SUPERMEMORY_BASE_URL` default: `https://api.supermemory.ai`
 - `VICUNA_API_KEY` if the server runs with bearer auth enabled
 
 ## Document Ingestion
@@ -71,9 +69,9 @@ For each supported Telegram document, the bridge:
 
 1. downloads the raw file through Telegram `getFile`
 2. parses the file on the host through Docling
-3. stores the raw file in Supermemory
-4. stores the parsed full-document output in Supermemory as a second linked artifact
-5. stores context-enriched parsed chunks in Supermemory hard memory for later retrieval
+3. stores the raw file under the local Vicuña docs root
+4. stores the parsed full-document output beside it as `parsed.md`
+5. stores context-enriched parsed chunks beside it as `chunks.json`
 6. appends the normalized parsed text to the Telegram chat transcript before
    forwarding the turn to Vicuña
 
@@ -86,9 +84,10 @@ Extraction policy:
 - the same-turn user transcript now includes the exact label
   `Parsed contents of <filename>`
 
-If `SUPERMEMORY_API_KEY` is missing, supported document ingestion is rejected.
-If the configured Python interpreter cannot import Docling, document ingestion
-fails with a direct host requirement error.
+If `VICUNA_DOCS_DIR` is missing, supported document ingestion is rejected. If
+the configured Python interpreter cannot import Docling, document ingestion
+fails with a direct host requirement error after preserving the downloaded
+source file in the local docs bundle.
 
 ## Start
 
@@ -155,8 +154,8 @@ The key runtime variables are:
   runtime can maintain its own bounded last-`N` turn dialogue object instead of
   depending only on bridge-local transcript state
 - supported Docling-backed uploads are parsed on the host and are persisted to
-  Supermemory as a raw file artifact, a parsed-output artifact, and searchable
-  parsed chunks linked by shared metadata
+  the local docs root as a source file, a parsed markdown artifact, and
+  searchable parsed chunks linked by shared metadata
 - each Telegram chat keeps its own bounded persisted transcript keyed by
   Telegram `chat_id`, so follow-up turns reuse recent context after restarts
 - pending inline-option prompts are also kept in bounded persisted bridge state

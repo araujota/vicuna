@@ -22,6 +22,39 @@ export * from "./invoke.js";
 export * from "./ongoing-tasks.js";
 export * from "./runtime-catalog.js";
 export {
+  HardMemoryToolError,
+  errorEnvelope as hardMemoryErrorEnvelope,
+  handleHardMemory,
+  parseCliInvocation as parseHardMemoryCliInvocation,
+  resolveHardMemoryConfig,
+  runHardMemoryCli,
+  type HardMemoryConfig,
+  type HardMemoryInvocation,
+  type HardMemoryQueryResult,
+  type HardMemoryResponseEnvelope,
+} from "./hard-memory.js";
+export {
+  SkillsToolError,
+  handleSkills,
+  parseCliInvocation as parseSkillsCliInvocation,
+  resolveSkillsConfig,
+  runSkillsCli,
+  type SkillsConfig,
+  type SkillsInvocation,
+  type SkillsResponseEnvelope,
+} from "./skills.js";
+export {
+  HostShellToolError,
+  handleHostShell,
+  parseCliInvocation as parseHostShellCliInvocation,
+  resolveHostShellConfig,
+  runHostShellCli,
+  type HostShellConfig,
+  type HostShellInvocation,
+  type HostShellOutputSummary,
+  type HostShellResponseEnvelope,
+} from "./host-shell.js";
+export {
   ParsedDocumentsToolError,
   errorEnvelope as parsedDocumentsErrorEnvelope,
   handleParsedDocuments,

@@ -8,6 +8,7 @@ export const DEFAULT_STATE = {
   telegramOutboxOffset: 0,
   telegramOutboxCheckpointInitialized: false,
   telegramOutboxDeliveryReceipt: null,
+  telegramEmotiveAnimationState: {},
   chatIds: [],
   proactiveResponseIds: [],
   nextConversationOrdinal: 1,
@@ -27,6 +28,7 @@ export const TELEGRAM_BRIDGE_ASK_OUTBOX_POLL_IDLE_MS = 200;
 export const TELEGRAM_BRIDGE_SELF_EMIT_ACTIVE_DELAY_MS = 250;
 export const TELEGRAM_BRIDGE_SELF_EMIT_ERROR_DELAY_MS = 250;
 export const TELEGRAM_BRIDGE_WATCHDOG_DELAY_MS = 1000;
+export const TELEGRAM_VIDEO_CAPTION_LIMIT = 1024;
 export const TELEGRAM_RELAY_ALLOWED_METHODS = [
   'sendMessage',
   'sendPhoto',
@@ -114,6 +116,592 @@ function deriveTelegramSummaryText(method, payload) {
     return 'Telegram sticker sent.';
   }
   return `Telegram ${method} sent.`;
+}
+
+function telegramHtmlEscape(text) {
+  return String(text ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
+function sanitizeTelegramCodeLanguage(language) {
+  return String(language ?? '')
+    .trim()
+    .replace(/[^A-Za-z0-9._+-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 32);
+}
+
+function isMarkdownDividerLine(value) {
+  const trimmed = String(value ?? '').trim();
+  if (trimmed.length < 3) {
+    return false;
+  }
+  const marker = trimmed[0];
+  if (!['-', '*', '_'].includes(marker)) {
+    return false;
+  }
+  return [...trimmed].every((character) => character === marker);
+}
+
+function hasMarkdownishFormatting(text) {
+  const value = String(text ?? '');
+  return (
+    /(^|\n)#{1,6}\s+\S/.test(value) ||
+    /(^|\n)([-*_])\2\2+\s*($|\n)/.test(value) ||
+    /(^|\n)>\s?/.test(value) ||
+    /(^|\n)\|.+\|\s*\n\|(?:\s*:?-{3,}:?\s*\|){1,}\s*($|\n)/.test(value) ||
+    /```/.test(value) ||
+    /\*\*\S[\s\S]*?\S\*\*/.test(value) ||
+    /(^|[^\*])\*\S(?:[\s\S]*?\S)?\*(?!\*)/.test(value) ||
+    /`[^`\n]+`/.test(value)
+  );
+}
+
+function hasTelegramHtmlFormatting(text) {
+  const value = String(text ?? '');
+  return /<(?:\/?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote|tg-spoiler)|a\s+href=|span\s+class="tg-spoiler")(?=[\s>])[^>]*>/i.test(value);
+}
+
+function hasHtmlishFormatting(text) {
+  const value = String(text ?? '');
+  return /<\/?[A-Za-z][^>]*>/.test(value);
+}
+
+function stripTelegramHtmlTags(text) {
+  return decodeBasicHtmlEntities(String(text ?? '').replace(/<[^>]+>/g, ''));
+}
+
+function decodeBasicHtmlEntities(text) {
+  return String(text ?? '')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&lt;', '<')
+    .replaceAll('&amp;', '&');
+}
+
+function normalizeTelegramHtmlishToSupportedHtml(text) {
+  const protectedTags = [];
+  const protect = (value) => {
+    const token = `__VICUNA_TG_HTML_${protectedTags.length}__`;
+    protectedTags.push(value);
+    return token;
+  };
+
+  let html = decodeBasicHtmlEntities(text)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/<\s*span\s+class=(["'])tg-spoiler\1\s*>([\s\S]*?)<\s*\/span\s*>/gi, '<tg-spoiler>$2</tg-spoiler>')
+    .replace(/<\s*br\s*\/?\s*>/gi, '\n')
+    .replace(/<\s*\/p\s*>/gi, '\n\n')
+    .replace(/<\s*p(?:\s[^>]*)?>/gi, '')
+    .replace(/<\s*\/div\s*>/gi, '\n')
+    .replace(/<\s*div(?:\s[^>]*)?>/gi, '')
+    .replace(/<\s*li(?:\s[^>]*)?>/gi, '• ')
+    .replace(/<\s*\/li\s*>/gi, '\n')
+    .replace(/<\s*\/(?:ul|ol)\s*>/gi, '\n')
+    .replace(/<\s*(?:ul|ol)(?:\s[^>]*)?>/gi, '')
+    .replace(/<\s*h([1-6])(?:\s[^>]*)?>/gi, '<b>')
+    .replace(/<\s*\/h([1-6])\s*>/gi, '</b>\n\n')
+    .replace(/<\s*strong(?=[\s>])[^>]*>/gi, '<b>')
+    .replace(/<\s*\/strong\s*>/gi, '</b>')
+    .replace(/<\s*em(?=[\s>])[^>]*>/gi, '<i>')
+    .replace(/<\s*\/em\s*>/gi, '</i>')
+    .replace(/<\s*ins(?=[\s>])[^>]*>/gi, '<u>')
+    .replace(/<\s*\/ins\s*>/gi, '</u>')
+    .replace(/<\s*(?:strike|del)(?=[\s>])[^>]*>/gi, '<s>')
+    .replace(/<\s*\/(?:strike|del)\s*>/gi, '</s>')
+    .replace(/<\s*blockquote(?:\s+expandable)?(?=[\s>])[^>]*>/gi, '<blockquote>');
+
+  html = html.replace(/<\s*code\b([^>]*)>/gi, (_match, attributes) => {
+    const languageMatch = /class\s*=\s*(["'])language-([^"']+)\1/i.exec(attributes);
+    if (!languageMatch) {
+      return '<code>';
+    }
+    const language = sanitizeTelegramCodeLanguage(languageMatch[2]);
+    return language ? `<code class="language-${language}">` : '<code>';
+  });
+  html = html.replace(/<\s*a\b([^>]*)>/gi, (_match, attributes) => {
+    const hrefMatch = /href\s*=\s*(["'])(.*?)\1/i.exec(attributes);
+    if (!hrefMatch) {
+      return '';
+    }
+    const href = telegramHtmlEscape(decodeBasicHtmlEntities(hrefMatch[2]));
+    return `<a href="${href}">`;
+  });
+
+  html = html.replace(/<(?:\/?(?:b|i|u|s|code|pre|blockquote|tg-spoiler)|a\s+href="[^"]*"|\/a|code\s+class="language-[^"]+")>/gi, (match) => protect(match));
+  html = html.replace(/<[^>]+>/g, '');
+  html = telegramHtmlEscape(html);
+  for (const [index, tag] of protectedTags.entries()) {
+    html = html.replaceAll(`__VICUNA_TG_HTML_${index}__`, tag);
+  }
+  return html
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim();
+}
+
+function canonicalizeTelegramTextToHtml(text, parseMode = '') {
+  const sourceText = String(text ?? '').trim();
+  if (!sourceText) {
+    return '';
+  }
+
+  const normalizedParseMode = String(parseMode ?? '').trim().toUpperCase();
+  let rendered = sourceText;
+  if (normalizedParseMode === 'MARKDOWN' || normalizedParseMode === 'MARKDOWNV2' || hasMarkdownishFormatting(rendered)) {
+    rendered = convertMarkdownishToTelegramHtml(rendered);
+  }
+
+  if (normalizedParseMode === 'HTML' || hasTelegramHtmlFormatting(rendered) || hasHtmlishFormatting(rendered)) {
+    return normalizeTelegramHtmlishToSupportedHtml(rendered);
+  }
+
+  return telegramHtmlEscape(rendered);
+}
+
+function convertMarkdownInlineToTelegramHtml(text) {
+  const value = String(text ?? '');
+  let html = '';
+  for (let index = 0; index < value.length;) {
+    if (value.slice(index, index + 3) === '***') {
+      const closing = value.indexOf('***', index + 3);
+      if (closing !== -1 && closing > index + 3) {
+        html += `<b><i>${convertMarkdownInlineToTelegramHtml(value.slice(index + 3, closing))}</i></b>`;
+        index = closing + 3;
+        continue;
+      }
+    }
+    if (value.slice(index, index + 2) === '**') {
+      const closing = value.indexOf('**', index + 2);
+      if (closing !== -1 && closing > index + 2) {
+        html += `<b>${convertMarkdownInlineToTelegramHtml(value.slice(index + 2, closing))}</b>`;
+        index = closing + 2;
+        continue;
+      }
+    }
+    if (value.slice(index, index + 2) === '__') {
+      const closing = value.indexOf('__', index + 2);
+      if (closing !== -1 && closing > index + 2) {
+        html += `<u>${convertMarkdownInlineToTelegramHtml(value.slice(index + 2, closing))}</u>`;
+        index = closing + 2;
+        continue;
+      }
+    }
+    if (value.slice(index, index + 2) === '~~') {
+      const closing = value.indexOf('~~', index + 2);
+      if (closing !== -1 && closing > index + 2) {
+        html += `<s>${convertMarkdownInlineToTelegramHtml(value.slice(index + 2, closing))}</s>`;
+        index = closing + 2;
+        continue;
+      }
+    }
+    if (value[index] === '*') {
+      const closing = value.indexOf('*', index + 1);
+      if (closing !== -1 && closing > index + 1) {
+        html += `<i>${convertMarkdownInlineToTelegramHtml(value.slice(index + 1, closing))}</i>`;
+        index = closing + 1;
+        continue;
+      }
+    }
+    if (value[index] === '`') {
+      const closing = value.indexOf('`', index + 1);
+      if (closing !== -1 && closing > index + 1) {
+        html += `<code>${telegramHtmlEscape(value.slice(index + 1, closing))}</code>`;
+        index = closing + 1;
+        continue;
+      }
+    }
+    html += telegramHtmlEscape(value[index]);
+    index += 1;
+  }
+  return html;
+}
+
+function renderMarkdownParagraphLineToTelegramHtml(line) {
+  const trimmed = String(line ?? '').trim();
+  if (trimmed.startsWith('- ') || trimmed.startsWith('* ')) {
+    return `• ${convertMarkdownInlineToTelegramHtml(trimmed.slice(2))}`;
+  }
+  return convertMarkdownInlineToTelegramHtml(trimmed);
+}
+
+function parseMarkdownTableCells(line) {
+  const trimmed = String(line ?? '').trim();
+  if (!trimmed.includes('|')) {
+    return [];
+  }
+  let inner = trimmed;
+  if (inner.startsWith('|')) {
+    inner = inner.slice(1);
+  }
+  if (inner.endsWith('|')) {
+    inner = inner.slice(0, -1);
+  }
+  const cells = inner.split('|').map((cell) => cell.trim());
+  return cells.length >= 2 ? cells : [];
+}
+
+function isMarkdownTableSeparatorRow(line) {
+  const cells = parseMarkdownTableCells(line);
+  return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function markdownTableCellToPlainText(cell) {
+  return stripTelegramHtmlTags(convertMarkdownInlineToTelegramHtml(String(cell ?? '').trim()));
+}
+
+function renderMarkdownTableToTelegramHtml(headerCells, bodyRows) {
+  const plainRows = [headerCells, ...bodyRows].map((row) => row.map(markdownTableCellToPlainText));
+  const widths = plainRows[0].map((_, index) => (
+    plainRows.reduce((maxWidth, row) => Math.max(maxWidth, String(row[index] ?? '').length), 0)
+  ));
+  const border = `+${widths.map((width) => '-'.repeat(width + 2)).join('+')}+`;
+  const renderRow = (row) => `| ${row.map((cell, index) => String(cell ?? '').padEnd(widths[index], ' ')).join(' | ')} |`;
+  const lines = [border, renderRow(plainRows[0]), border];
+  for (const row of plainRows.slice(1)) {
+    lines.push(renderRow(row));
+  }
+  lines.push(border);
+  return `<pre>${telegramHtmlEscape(lines.join('\n'))}</pre>`;
+}
+
+function convertMarkdownishToTelegramHtml(markdown) {
+  const blocks = [];
+  const paragraphLines = [];
+
+  const flushParagraph = () => {
+    if (paragraphLines.length === 0) {
+      return;
+    }
+    blocks.push(paragraphLines.map(renderMarkdownParagraphLineToTelegramHtml).join('\n'));
+    paragraphLines.length = 0;
+  };
+
+  const lines = String(markdown ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushParagraph();
+      continue;
+    }
+
+    if (trimmed.startsWith('```')) {
+      flushParagraph();
+      const language = sanitizeTelegramCodeLanguage(trimmed.slice(3));
+      const codeLines = [];
+      let closed = false;
+      for (index += 1; index < lines.length; index += 1) {
+        if (lines[index].trim().startsWith('```')) {
+          closed = true;
+          break;
+        }
+        codeLines.push(lines[index]);
+      }
+      const escapedCode = telegramHtmlEscape(codeLines.join('\n'));
+      blocks.push(language
+        ? `<pre><code class="language-${language}">${escapedCode}</code></pre>`
+        : `<pre>${escapedCode}</pre>`);
+      if (!closed) {
+        break;
+      }
+      continue;
+    }
+
+    const tableHeaderCells = parseMarkdownTableCells(line);
+    if (tableHeaderCells.length >= 2 && index + 1 < lines.length && isMarkdownTableSeparatorRow(lines[index + 1])) {
+      flushParagraph();
+      const bodyRows = [];
+      index += 1;
+      while (index + 1 < lines.length) {
+        const nextCells = parseMarkdownTableCells(lines[index + 1]);
+        if (nextCells.length !== tableHeaderCells.length || isMarkdownTableSeparatorRow(lines[index + 1])) {
+          break;
+        }
+        bodyRows.push(nextCells);
+        index += 1;
+      }
+      blocks.push(renderMarkdownTableToTelegramHtml(tableHeaderCells, bodyRows));
+      continue;
+    }
+
+    if (isMarkdownDividerLine(trimmed)) {
+      flushParagraph();
+      blocks.push('━━━━━━━━━━━━');
+      continue;
+    }
+
+    const headingMatch = /^(#{1,6})\s+(.+)$/.exec(trimmed);
+    if (headingMatch) {
+      flushParagraph();
+      blocks.push(`<b>${convertMarkdownInlineToTelegramHtml(headingMatch[2].trim())}</b>`);
+      continue;
+    }
+
+    if (trimmed === '>' || trimmed.startsWith('> ')) {
+      flushParagraph();
+      const quoteLines = [];
+      while (index < lines.length) {
+        const current = lines[index].trim();
+        if (!(current === '>' || current.startsWith('> '))) {
+          index -= 1;
+          break;
+        }
+        quoteLines.push(convertMarkdownInlineToTelegramHtml(current.length > 1 ? current.slice(1).trim() : ''));
+        index += 1;
+      }
+      blocks.push(`<blockquote>${quoteLines.join('\n')}</blockquote>`);
+      continue;
+    }
+
+    paragraphLines.push(line);
+  }
+
+  flushParagraph();
+  return blocks.join('\n\n');
+}
+
+function getTelegramTextFieldForMethod(method) {
+  if (method === 'sendMessage') {
+    return 'text';
+  }
+  if ([
+    'sendPhoto',
+    'sendDocument',
+    'sendAudio',
+    'sendVoice',
+    'sendVideo',
+    'sendAnimation',
+  ].includes(method)) {
+    return 'caption';
+  }
+  return '';
+}
+
+export function normalizeTelegramRichTextPayload({
+  telegramMethod,
+  telegramPayload,
+  text = '',
+  field = '',
+} = {}) {
+  const method = String(telegramMethod ?? '').trim() || 'sendMessage';
+  const targetField = field || getTelegramTextFieldForMethod(method);
+  const payload = telegramPayload && typeof telegramPayload === 'object' && !Array.isArray(telegramPayload)
+    ? cloneJsonValue(telegramPayload)
+    : {};
+  const sourceText = sanitizeAssistantRelayText(String(
+    (typeof text === 'string' && text.trim())
+      ? text
+      : (typeof payload?.[targetField] === 'string' ? payload[targetField] : ''),
+  )).trim();
+
+  if (!targetField || !sourceText) {
+    return {
+      payload,
+      method,
+      field: targetField,
+      sourceText,
+      renderedText: sourceText,
+      textLength: sourceText.length,
+      normalized: false,
+    };
+  }
+
+  payload[targetField] = sourceText;
+
+  const hasEntities = targetField === 'text'
+    ? Array.isArray(payload.entities) && payload.entities.length > 0
+    : Array.isArray(payload.caption_entities) && payload.caption_entities.length > 0;
+  const parseMode = typeof payload.parse_mode === 'string' ? payload.parse_mode.trim() : '';
+  if (hasEntities) {
+    const renderedText = String(payload[targetField] ?? sourceText).trim();
+    const textLength = parseMode.toUpperCase() === 'HTML'
+      ? stripTelegramHtmlTags(renderedText).length
+      : sourceText.length;
+    return {
+      payload,
+      method,
+      field: targetField,
+      sourceText,
+      renderedText,
+      textLength,
+      normalized: false,
+    };
+  }
+  const renderedText = canonicalizeTelegramTextToHtml(sourceText, parseMode);
+  payload[targetField] = renderedText;
+  payload.parse_mode = 'HTML';
+  return {
+    payload,
+    method,
+    field: targetField,
+    sourceText,
+    renderedText,
+    textLength: stripTelegramHtmlTags(renderedText).length,
+    normalized: renderedText !== sourceText || parseMode.toUpperCase() !== 'HTML',
+  };
+}
+
+export function buildTelegramSpoilerVideoPayload({
+  telegramMethod,
+  telegramPayload,
+  text,
+}) {
+  const method = String(telegramMethod ?? '').trim() || 'sendMessage';
+  if (method !== 'sendMessage') {
+    return {
+      ok: false,
+      reason: 'unsupported_method',
+      method,
+    };
+  }
+
+  const payload = telegramPayload && typeof telegramPayload === 'object' && !Array.isArray(telegramPayload)
+    ? telegramPayload
+    : {};
+  const normalizedTextPayload = normalizeTelegramRichTextPayload({
+    telegramMethod: method,
+    telegramPayload: {
+      ...payload,
+      text: String(text ?? '').trim() || deriveTelegramSummaryText(method, payload),
+    },
+    text: String(text ?? '').trim() || deriveTelegramSummaryText(method, payload),
+  });
+  const caption = String(normalizedTextPayload.renderedText ?? '').trim();
+  if (!caption) {
+    return {
+      ok: false,
+      reason: 'missing_caption',
+      method,
+    };
+  }
+
+  if (normalizedTextPayload.textLength > TELEGRAM_VIDEO_CAPTION_LIMIT) {
+    return {
+      ok: false,
+      reason: 'caption_too_long',
+      method,
+      captionLength: normalizedTextPayload.textLength,
+      captionLimit: TELEGRAM_VIDEO_CAPTION_LIMIT,
+    };
+  }
+
+  const nextPayload = {
+    caption,
+    show_caption_above_media: true,
+    has_spoiler: true,
+    supports_streaming: true,
+  };
+  const passthroughKeys = [
+    'business_connection_id',
+    'message_thread_id',
+    'direct_messages_topic_id',
+    'disable_notification',
+    'protect_content',
+    'allow_paid_broadcast',
+    'suggested_post_parameters',
+    'message_effect_id',
+    'reply_markup',
+    'reply_to_message_id',
+    'reply_parameters',
+  ];
+  for (const key of passthroughKeys) {
+    if (Object.prototype.hasOwnProperty.call(payload, key)) {
+      nextPayload[key] = cloneJsonValue(payload[key]);
+    }
+  }
+
+  if (Array.isArray(normalizedTextPayload.payload.entities) && normalizedTextPayload.payload.entities.length > 0) {
+    nextPayload.caption_entities = cloneJsonValue(normalizedTextPayload.payload.entities);
+  } else if (Array.isArray(normalizedTextPayload.payload.caption_entities) && normalizedTextPayload.payload.caption_entities.length > 0) {
+    nextPayload.caption_entities = cloneJsonValue(normalizedTextPayload.payload.caption_entities);
+  } else if (typeof normalizedTextPayload.payload.parse_mode === 'string' && normalizedTextPayload.payload.parse_mode.trim()) {
+    nextPayload.parse_mode = normalizedTextPayload.payload.parse_mode.trim();
+  }
+
+  return {
+    ok: true,
+    method: 'sendVideo',
+    captionLength: normalizedTextPayload.textLength,
+    payload: nextPayload,
+  };
+}
+
+export function buildTelegramAnimationDeliveryPlan({
+  telegramMethod,
+  telegramPayload,
+  text,
+}) {
+  const method = String(telegramMethod ?? '').trim() || 'sendMessage';
+  const sourceText = String(text ?? '').trim()
+    || (
+      telegramPayload && typeof telegramPayload === 'object' && !Array.isArray(telegramPayload)
+        ? String(telegramPayload.text ?? '').trim()
+        : ''
+    );
+  const normalizedMessagePayload = normalizeTelegramRichTextPayload({
+    telegramMethod: method,
+    telegramPayload,
+    text: sourceText,
+  });
+  const spoilerVideoPayload = buildTelegramSpoilerVideoPayload({
+    telegramMethod: method,
+    telegramPayload,
+    text: sourceText,
+  });
+
+  if (spoilerVideoPayload.ok) {
+    return {
+      ok: true,
+      strategy: 'primary_spoiler_video',
+      messagePayload: normalizedMessagePayload.payload,
+      videoPayload: spoilerVideoPayload.payload,
+      captionLength: spoilerVideoPayload.captionLength,
+      captionLimit: TELEGRAM_VIDEO_CAPTION_LIMIT,
+    };
+  }
+
+  if (spoilerVideoPayload.reason === 'caption_too_long') {
+    const followupVideoPayload = {
+      has_spoiler: true,
+      supports_streaming: true,
+    };
+    const passthroughKeys = [
+      'business_connection_id',
+      'message_thread_id',
+      'direct_messages_topic_id',
+      'disable_notification',
+      'protect_content',
+      'allow_paid_broadcast',
+      'suggested_post_parameters',
+      'message_effect_id',
+    ];
+    for (const key of passthroughKeys) {
+      if (Object.prototype.hasOwnProperty.call(normalizedMessagePayload.payload, key)) {
+        followupVideoPayload[key] = cloneJsonValue(normalizedMessagePayload.payload[key]);
+      }
+    }
+    return {
+      ok: true,
+      strategy: 'split_text_and_video',
+      messagePayload: normalizedMessagePayload.payload,
+      videoPayload: followupVideoPayload,
+      captionLength: spoilerVideoPayload.captionLength,
+      captionLimit: spoilerVideoPayload.captionLimit,
+    };
+  }
+
+  return {
+    ok: false,
+    reason: spoilerVideoPayload.reason,
+    method,
+    messagePayload: normalizedMessagePayload.payload,
+  };
 }
 
 export function isTelegramCarryableAssistantMessage(content) {
@@ -433,46 +1021,119 @@ export function normalizeDoclingParsedDocument(parsedDocument, descriptor, optio
   };
 }
 
-export function buildTelegramParsedChunkMemories(options = {}) {
+export function buildTelegramParsedDocumentChunks(options = {}) {
   const {
     descriptor,
     linkage,
     parsedDocument,
-    rawDocumentId = '',
-    parsedDocumentId = '',
-    runtimeIdentity = 'vicuna',
   } = options;
 
   return (parsedDocument?.chunks ?? []).map((chunk, index) => ({
-    content: chunk.contextualText,
+    chunk_index: chunk.chunkIndex,
+    contextual_text: chunk.contextualText,
+    source_text: chunk.sourceText,
+    document_title: parsedDocument.title,
+    link_key: linkage.linkKey,
+    key: `${linkage.chunkKeyPrefix}-${String(index).padStart(4, '0')}`,
+    telegram_chat_id: descriptor.chatId,
+    telegram_message_id: descriptor.messageId,
+    telegram_file_name: descriptor.fileName,
+    telegram_logical_type: descriptor.logicalType,
+    docling_version: parsedDocument.doclingVersion || undefined,
+  }));
+}
+
+export function buildTelegramParsedChunkMemories(options = {}) {
+  return buildTelegramParsedDocumentChunks(options).map((chunk, index) => ({
+    content: chunk.contextual_text,
     isStatic: true,
     metadata: {
       source: 'telegram_bridge',
-      runtimeIdentity,
-      kind: 'tool_observation',
-      domain: 'strategy',
-      key: `${linkage.chunkKeyPrefix}-${String(index).padStart(4, '0')}`,
-      title: `${parsedDocument.title} chunk ${index + 1}`,
+      key: chunk.key,
+      title: `${chunk.document_title} chunk ${index + 1}`,
       tags: ['telegram_document', 'parsed_chunk'],
-      importance: 0.6,
-      confidence: 1,
-      gainBias: 0.1,
-      allostaticRelevance: 0,
-      linkKey: linkage.linkKey,
+      linkKey: chunk.link_key,
       contentKind: 'parsed_chunk',
-      documentTitle: parsedDocument.title,
-      telegramChatId: descriptor.chatId,
-      telegramMessageId: descriptor.messageId,
-      telegramFileName: descriptor.fileName,
-      telegramLogicalType: descriptor.logicalType,
-      rawDocumentId,
-      parsedDocumentId,
-      chunkIndex: chunk.chunkIndex,
-      chunkCount: parsedDocument.chunks.length,
-      sourceText: chunk.sourceText,
-      doclingVersion: parsedDocument.doclingVersion || undefined,
+      documentTitle: chunk.document_title,
+      telegramChatId: chunk.telegram_chat_id,
+      telegramMessageId: chunk.telegram_message_id,
+      telegramFileName: chunk.telegram_file_name,
+      telegramLogicalType: chunk.telegram_logical_type,
+      chunkIndex: chunk.chunk_index,
+      chunkCount: (options.parsedDocument?.chunks ?? []).length,
+      sourceText: chunk.source_text,
+      doclingVersion: chunk.docling_version,
     },
   }));
+}
+
+function sanitizeStoredFileName(fileName) {
+  const baseName = path.basename(String(fileName ?? '').trim() || 'telegram-document');
+  const ext = path.extname(baseName);
+  const stem = ext ? baseName.slice(0, -ext.length) : baseName;
+  const safeStem = sanitizeIdentifierPart(stem, 'telegram-document');
+  const safeExt = ext.replace(/[^A-Za-z0-9.]/g, '').toLowerCase();
+  return `${safeStem}${safeExt}`;
+}
+
+async function persistTelegramDocumentBundle({
+  docsRoot,
+  descriptor,
+  linkage,
+  fileBuffer,
+  parsedDocument,
+  parseError,
+}) {
+  const bundleId = linkage.linkKey;
+  const bundleDir = path.join(docsRoot, bundleId);
+  const sourceDir = path.join(bundleDir, 'source');
+  const sourceFileName = sanitizeStoredFileName(descriptor.fileName);
+  const sourcePath = path.join(sourceDir, sourceFileName);
+  const parsedMarkdownPath = path.join(bundleDir, 'parsed.md');
+  const chunksPath = path.join(bundleDir, 'chunks.json');
+  const metadataPath = path.join(bundleDir, 'metadata.json');
+
+  await mkdir(sourceDir, { recursive: true });
+  await writeFile(sourcePath, fileBuffer);
+
+  const metadata = {
+    bundle_id: bundleId,
+    link_key: linkage.linkKey,
+    document_title: descriptor.fileName,
+    source_path: sourcePath,
+    parsed_markdown_path: parsedDocument ? parsedMarkdownPath : null,
+    chunks_path: parsedDocument ? chunksPath : null,
+    metadata_path: metadataPath,
+    content_kind: parsedDocument ? 'parsed_output' : 'parse_failed',
+    parse_status: parsedDocument ? 'parsed' : 'parse_failed',
+    parse_error: parseError || null,
+    telegram_chat_id: descriptor.chatId,
+    telegram_message_id: descriptor.messageId,
+    telegram_file_id: descriptor.fileId,
+    telegram_file_unique_id: descriptor.fileUniqueId,
+    telegram_file_name: descriptor.fileName,
+    telegram_mime_type: descriptor.mimeType || 'unknown',
+    telegram_logical_type: descriptor.logicalType,
+    docling_version: parsedDocument?.doclingVersion || null,
+    stored_chunk_count: parsedDocument?.chunks?.length ?? 0,
+    updated_at: new Date().toISOString(),
+  };
+
+  if (parsedDocument) {
+    await writeFile(parsedMarkdownPath, `${parsedDocument.parsedMarkdown.trim()}\n`);
+    await writeFile(
+      chunksPath,
+      `${JSON.stringify(buildTelegramParsedDocumentChunks({ descriptor, linkage, parsedDocument }), null, 2)}\n`,
+    );
+  }
+  await writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);
+
+  return {
+    bundleId,
+    sourcePath,
+    parsedMarkdownPath: parsedDocument ? parsedMarkdownPath : null,
+    chunksPath: parsedDocument ? chunksPath : null,
+  };
 }
 
 export async function ingestTelegramDocumentMessage(options) {
@@ -483,10 +1144,7 @@ export async function ingestTelegramDocumentMessage(options) {
     resolveTelegramFile,
     downloadTelegramFile,
     parseDocument,
-    supermemoryClient,
-    toFileFactory,
-    writeChunkMemories,
-    runtimeIdentity = 'vicuna',
+    docsRoot,
     documentContainerTag = DEFAULT_TELEGRAM_DOCUMENT_CONTAINER_TAG,
   } = options ?? {};
 
@@ -499,28 +1157,19 @@ export async function ingestTelegramDocumentMessage(options) {
     };
   }
 
-  if (!supermemoryClient) {
-    return {
-      ok: false,
-      descriptor,
-      userError: 'SUPERMEMORY_API_KEY is required for Telegram document ingestion.',
-    };
-  }
-
   if (typeof resolveTelegramFile !== 'function' || typeof downloadTelegramFile !== 'function') {
     throw new Error('Telegram document ingestion requires file resolution and download helpers.');
   }
   if (typeof parseDocument !== 'function') {
     throw new Error('Telegram document ingestion requires a Docling parse helper.');
   }
-  if (typeof writeChunkMemories !== 'function') {
-    throw new Error('Telegram document ingestion requires a chunk-memory writer.');
+  if (typeof docsRoot !== 'string' || docsRoot.trim().length === 0) {
+    throw new Error('Telegram document ingestion requires a local docs root.');
   }
 
   let linkage = null;
   let normalized = null;
-  let rawDocumentId = '';
-  let parsedDocumentId = '';
+  let bundle = null;
   try {
     const fileInfo = await resolveTelegramFile(descriptor.fileId);
     const filePath = String(fileInfo?.file_path ?? '').trim();
@@ -533,11 +1182,27 @@ export async function ingestTelegramDocumentMessage(options) {
       throw new Error('Telegram document download returned no bytes.');
     }
 
-    const parsedDocument = normalizeDoclingParsedDocument(
-      await parseDocument({ fileBuffer, descriptor }),
-      descriptor,
-      { maxChars: maxDocumentChars, maxChunks: maxDocumentChunks },
-    );
+    linkage = buildTelegramDocumentLinkage(descriptor, {
+      containerTag: documentContainerTag,
+    });
+
+    let parsedDocument;
+    try {
+      parsedDocument = normalizeDoclingParsedDocument(
+        await parseDocument({ fileBuffer, descriptor }),
+        descriptor,
+        { maxChars: maxDocumentChars, maxChunks: maxDocumentChunks },
+      );
+    } catch (error) {
+      bundle = await persistTelegramDocumentBundle({
+        docsRoot: docsRoot.trim(),
+        descriptor,
+        linkage,
+        fileBuffer,
+        parseError: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
     normalized = parsedDocument.transcript;
     if (!normalized.text) {
       return {
@@ -546,54 +1211,21 @@ export async function ingestTelegramDocumentMessage(options) {
         userError: `No extractable text was found in ${descriptor.fileName}.`,
       };
     }
-
-    linkage = buildTelegramDocumentLinkage(descriptor, {
-      containerTag: documentContainerTag,
-    });
-    const rawUploadFile = await toFileFactory(fileBuffer, descriptor.fileName);
-
-    const rawUpload = await supermemoryClient.documents.uploadFile({
-      file: rawUploadFile,
-      metadata: JSON.stringify(linkage.rawMetadata),
-      containerTags: JSON.stringify([linkage.containerTag]),
-    });
-    rawDocumentId = String(rawUpload?.id ?? '').trim();
-    if (!rawDocumentId) {
-      throw new Error('Supermemory raw upload did not return an id.');
-    }
-
-    await supermemoryClient.documents.update(rawDocumentId, {
-      containerTag: linkage.containerTag,
-      customId: linkage.rawCustomId,
-      metadata: linkage.rawMetadata,
-    });
-
-    const parsedUpload = await supermemoryClient.documents.add({
-      content: parsedDocument.parsedMarkdown,
-      containerTag: linkage.containerTag,
-      customId: linkage.parsedCustomId,
-      metadata: linkage.parsedMetadata,
-    });
-    parsedDocumentId = String(parsedUpload?.id ?? '').trim();
-    if (!parsedDocumentId) {
-      throw new Error('Supermemory parsed-output add did not return an id.');
-    }
-
-    const chunkMemories = buildTelegramParsedChunkMemories({
+    const chunks = buildTelegramParsedDocumentChunks({
       descriptor,
       linkage,
       parsedDocument,
-      rawDocumentId,
-      parsedDocumentId,
-      runtimeIdentity,
     });
-    if (chunkMemories.length === 0) {
+    bundle = await persistTelegramDocumentBundle({
+      docsRoot: docsRoot.trim(),
+      descriptor,
+      linkage,
+      fileBuffer,
+      parsedDocument,
+    });
+    if (chunks.length === 0) {
       throw new Error(`Docling produced no searchable chunks for ${descriptor.fileName}.`);
     }
-    await writeChunkMemories({
-      containerTag: linkage.containerTag,
-      memories: chunkMemories,
-    });
 
     return {
       ok: true,
@@ -601,25 +1233,22 @@ export async function ingestTelegramDocumentMessage(options) {
       linkage,
       normalized,
       transcriptText: formatTelegramDocumentTranscript(descriptor, normalized),
-      rawDocumentId,
-      parsedDocumentId,
-      storedChunkCount: chunkMemories.length,
+      bundleId: bundle.bundleId,
+      sourcePath: bundle.sourcePath,
+      parsedMarkdownPath: bundle.parsedMarkdownPath,
+      storedChunkCount: chunks.length,
     };
   } catch (error) {
     const messageText = error instanceof Error ? error.message : String(error);
-    const partialStage = parsedDocumentId
-      ? 'parsed output storage'
-      : rawDocumentId
-        ? 'raw file storage'
-        : '';
+    const partialStage = bundle ? 'local source storage' : '';
     return {
       ok: false,
       descriptor,
       linkage,
       normalized,
-      rawDocumentId,
-      parsedDocumentId,
-      partialFailure: Boolean(rawDocumentId || parsedDocumentId),
+      bundleId: bundle?.bundleId,
+      sourcePath: bundle?.sourcePath,
+      partialFailure: Boolean(bundle),
       userError: partialStage
         ? `Telegram document ingestion partially failed after ${partialStage}: ${messageText}`
         : `Telegram document ingestion failed: ${messageText}`,
@@ -825,6 +1454,53 @@ function normalizeTelegramOutboxDeliveryAnimation(raw) {
   return animation;
 }
 
+function normalizeTelegramEmotiveMoment(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+  const moment = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const id = String(key ?? '').trim();
+    if (!id) {
+      continue;
+    }
+    moment[id] = Math.max(0, Math.min(1, Number(value) || 0));
+  }
+  return Object.keys(moment).length > 0 ? moment : null;
+}
+
+export function buildTelegramEmotiveAnimationScopeKey(chatId, conversationId = '') {
+  const normalizedChatId = String(chatId ?? '').trim();
+  const normalizedConversationId = String(conversationId ?? '').trim();
+  return normalizedConversationId
+    ? `${normalizedChatId}::${normalizedConversationId}`
+    : normalizedChatId;
+}
+
+function normalizeTelegramEmotiveAnimationState(raw) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const normalized = {};
+  for (const value of Object.values(source)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      continue;
+    }
+    const chatId = String(value.chatId ?? '').trim();
+    const conversationId = String(value.conversationId ?? '').trim();
+    const lastMoment = normalizeTelegramEmotiveMoment(value.lastMoment);
+    if (!chatId || !lastMoment) {
+      continue;
+    }
+    const key = buildTelegramEmotiveAnimationScopeKey(chatId, conversationId);
+    normalized[key] = {
+      chatId,
+      ...(conversationId ? { conversationId } : {}),
+      lastMoment,
+      lastRenderedAtMs: Math.max(0, parseInteger(value.lastRenderedAtMs, 0)),
+    };
+  }
+  return normalized;
+}
+
 export function normalizeState(raw, options = {}) {
   const state = raw && typeof raw === 'object' ? raw : {};
   const maxHistoryMessages = Math.max(1, parseInteger(options.maxHistoryMessages, DEFAULT_MAX_HISTORY_MESSAGES));
@@ -832,6 +1508,7 @@ export function normalizeState(raw, options = {}) {
   const maxConversationMessageLinks = Math.max(1, parseInteger(options.maxConversationMessageLinks, DEFAULT_MAX_CONVERSATION_MESSAGE_LINKS));
   const chatSessions = normalizeChatSessions(state.chatSessions, maxHistoryMessages);
   const telegramOutboxDeliveryReceipt = normalizeTelegramOutboxDeliveryReceipt(state.telegramOutboxDeliveryReceipt);
+  const telegramEmotiveAnimationState = normalizeTelegramEmotiveAnimationState(state.telegramEmotiveAnimationState);
   const telegramOutboxOffset = Math.max(0, parseInteger(state.telegramOutboxOffset, 0));
   const checkpointInitialized = typeof state.telegramOutboxCheckpointInitialized === 'boolean'
     ? state.telegramOutboxCheckpointInitialized
@@ -842,6 +1519,7 @@ export function normalizeState(raw, options = {}) {
     telegramOutboxOffset,
     telegramOutboxCheckpointInitialized: checkpointInitialized,
     telegramOutboxDeliveryReceipt,
+    telegramEmotiveAnimationState,
     chatIds: uniqueStrings([...(state.chatIds ?? []), ...Object.keys(chatSessions)]),
     proactiveResponseIds: uniqueStrings(state.proactiveResponseIds).slice(-256),
     nextConversationOrdinal: Math.max(1, parseInteger(state.nextConversationOrdinal, 1)),
@@ -849,6 +1527,38 @@ export function normalizeState(raw, options = {}) {
     chatConversationState: normalizeChatConversationState(state.chatConversationState, maxConversationMessageLinks),
     pendingOptionPrompts: normalizePendingOptionPrompts(state.pendingOptionPrompts, maxPendingPrompts),
   };
+}
+
+export function getTelegramEmotiveAnimationState(state, chatId, { conversationId = '' } = {}) {
+  const normalizedState = normalizeState(state);
+  const key = buildTelegramEmotiveAnimationScopeKey(chatId, conversationId);
+  return normalizedState.telegramEmotiveAnimationState[key] ?? null;
+}
+
+export function setTelegramEmotiveAnimationState(state, chatId, animationState, {
+  conversationId = '',
+  ...options
+} = {}) {
+  const normalizedState = normalizeState(state, options);
+  const key = buildTelegramEmotiveAnimationScopeKey(chatId, conversationId);
+  const nextAnimationState = {
+    ...normalizedState.telegramEmotiveAnimationState,
+  };
+  const lastMoment = normalizeTelegramEmotiveMoment(animationState?.lastMoment);
+  if (!lastMoment) {
+    delete nextAnimationState[key];
+  } else {
+    nextAnimationState[key] = {
+      chatId: String(chatId ?? '').trim(),
+      ...(conversationId ? { conversationId: String(conversationId).trim() } : {}),
+      lastMoment,
+      lastRenderedAtMs: Math.max(0, parseInteger(animationState?.lastRenderedAtMs, Date.now())),
+    };
+  }
+  return normalizeState({
+    ...normalizedState,
+    telegramEmotiveAnimationState: nextAnimationState,
+  }, options);
 }
 
 export function reconcileTelegramOutboxOffset(currentOffset, outboxState) {
@@ -1359,6 +2069,8 @@ export function sanitizeAssistantRelayText(text) {
     /<vicuna_tool_call\b[\s\S]*?<\/vicuna_tool_call>/gi,
     /<minimax:tool_call\b[\s\S]*?<\/minimax:tool_call>/gi,
     /<tool_call\b[\s\S]*?<\/tool_call>/gi,
+    /<｜DSML｜function_calls>[\s\S]*?(?:<\/｜DSML｜function_calls>|$)/g,
+    /<｜DSML｜invoke\b[\s\S]*?(?:<\/｜DSML｜invoke>|$)/g,
   ];
 
   let sanitized = input;

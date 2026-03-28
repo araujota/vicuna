@@ -1,7 +1,7 @@
 [Unit]
 Description=Vicuña Telegram Bridge
-After=network-online.target vicuna-runtime.service
-Wants=network-online.target vicuna-runtime.service
+After=network-online.target vicuna-runtime.service vicuna-webgl-renderer.service
+Wants=network-online.target vicuna-runtime.service vicuna-webgl-renderer.service
 
 [Service]
 Type=simple

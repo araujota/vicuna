@@ -14,9 +14,10 @@ Current scope:
 - Radarr-backed `radarr` wrapper command for movie-library inspection and explicit download-start flows
 - Sonarr-backed `sonarr` wrapper command for series-library inspection and explicit download-start flows
 - Chaptarr-backed `chaptarr` wrapper command for ebook-library inspection, Hardcover-backed search, and explicit ebook download-start flows
-- hard-memory-backed `ongoing_tasks` wrapper command for recurring task CRUD and due polling
-- hard-memory-backed `parsed_documents_search_chunks` wrapper command for semantic retrieval over Docling-parsed Telegram uploads
+- cron-backed `ongoing_tasks` wrapper command for recurring task CRUD and scheduled execution
+- local-filesystem-backed `parsed_documents_search_chunks` wrapper command for retrieval over Docling-parsed Telegram uploads
 - provider-backed `telegram_relay` wrapper command for direct user-facing follow-up messages
+- bounded `host_shell` wrapper command for last-resort host-side file and shell manipulation inside a dedicated workspace
 - exact selector validation on `tool_surface_id` plus `capability_id`
 - simple CLI entrypoint for emitting the catalog and validating invocations
 - registry-style catalog construction so more tools can be added without
@@ -63,6 +64,39 @@ Runtime catalog loading is explicit:
 - `node dist/index.js invoke-runtime --tool-name=... --arguments-base64=...`
   executes one direct provider tool by `tool_name`
 
+The runtime catalog now also exposes `host_shell` as a last-resort fallback.
+Its routing intent is explicit:
+
+- prefer `media_read`, `media_download`, `media_delete`, `web_search`,
+  `hard_memory_read`, `hard_memory_write`, `ongoing_task_create`, and
+  `ongoing_task_delete` whenever those specialized tools fit the task
+- use `host_shell` only when the runtime genuinely needs direct host-side shell
+  or file manipulation that those tools do not provide
+
+`host_shell` executes one bounded `bash -lc` command from a dedicated workspace
+root and returns a structured JSON observation envelope instead of a raw shell
+dump. The envelope summarizes:
+
+- command status and duration
+- bounded stdout/stderr previews with type classification such as `json`,
+  `path`, `path_list`, `text`, or `binary`
+- created, modified, and deleted workspace paths detected before and after the
+  command
+
+Workspace-root policy:
+
+- host deployments should set `VICUNA_HOST_SHELL_ROOT=/home/vicuna/home`
+- local/dev runs fall back to `.cache/vicuna/host-shell-home` when the host
+  path does not exist
+
+Example direct invocation:
+
+```bash
+node dist/index.js invoke-runtime \
+  --tool-name=host_shell \
+  --arguments-base64="$(printf '%s' '{"command":"pwd","purpose":"Inspect the current host-shell workspace."}' | base64)"
+```
+
 When a persisted runtime catalog file exists, it is authoritative for live
 turns. This allows operators to expose a richer installed tool set than the
 repo-default narrowed fallback catalog without changing the bridge contract.
@@ -70,6 +104,37 @@ For host deployments, pair that with a stable catalog path such as
 `/var/lib/vicuna/openclaw-catalog.json` via
 `VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH` so rebuilds and branch switches do
 not discard tool availability.
+
+The wrapper binaries under `tools/openclaw-harness/bin/` honor an explicit
+`--secrets-path=...` argument first, and otherwise default to
+`VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH` before falling back to the repo-local
+`.cache/vicuna/openclaw-tool-secrets.json`. Host services should still set the
+environment variable explicitly.
+
+## Markdown Hard Memory
+
+`hard_memory_read` and `hard_memory_write` now use a local markdown store
+rather than a remote memory service. The source of truth is one `.md` file per
+durable memory primitive.
+
+- host deployments default to `VICUNA_HARD_MEMORY_DIR=/home/vicuna/home/memories`
+- local/dev runs fall back to `.cache/vicuna/host-shell-home/memories`
+- each keyed memory updates the same markdown file over time
+- retrieval stays explicit and local over markdown metadata plus body content
+
+## Markdown Skills
+
+`skill_read` and `skill_create` use the same local-only markdown pattern.
+
+- host deployments default to `VICUNA_SKILLS_DIR=/home/vicuna/home/skills`
+- local/dev runs fall back to `.cache/vicuna/host-shell-home/skills`
+- `skill_read` returns one exact markdown skill file by normalized name
+- `skill_create` writes one markdown skill file, but the server prompt policy
+  only authorizes it when the user directly asks to create or update a skill in
+  the current conversation
+- skill bodies are never auto-injected; the provider server advertises only the
+  available file names under the `SKILLS:` prompt section and requires explicit
+  reads for file contents
 
 For provider-backed execution, that contract primarily reaches the model as
 chat-tool JSON schema plus the staged family/method/contract surfaces used by
@@ -174,6 +239,21 @@ Hardcover-backed search results for add-author and add-book so the emitted
 write payloads carry V5-compatible identifiers and richer edition metadata
 than the older lookup endpoints.
 
+For `chaptarr_download_book`, the wrapper now treats `GET /api/v1/search` as a
+mixed entity surface, not a book-only lookup. If the mixed search response is
+author-first or otherwise lacks a usable book record, the wrapper falls back to
+`GET /api/v1/book/lookup` and still keeps ordinary tracked-book or new-book
+requests on Chaptarr's explicit `BookSearch` path. It no longer treats a
+successful `book/lookup` resolution as an implicit signal to divert into the
+legal importer path.
+
+The wrapper also no longer rejects a candidate as audiobook-only just because
+the upstream lookup/search payload defaulted `mediaType` or `lastSelectedMediaType`
+to `audiobook`. In the current Chaptarr build those flags can appear on plain
+book candidates. The wrapper now requires concrete audiobook signals such as
+audio file formats, audiobook media types on editions/files, or narrator data
+before treating a candidate as audiobook-only.
+
 Chaptarr download flows also keep ebook profile selection on the host side rather
 than the model side:
 
@@ -184,6 +264,20 @@ than the model side:
 
 Those Chaptarr download aliases therefore do not expose `quality_profile_id` or
 `metadata_profile_id` as model-facing arguments.
+
+When diagnosing Chaptarr ebook acquisition problems on a host, the fastest
+useful probes are:
+
+- `GET /api/v1/search?term=...&provider=hardcover`
+- `GET /api/v1/book/lookup?term=...`
+- `POST /api/v1/command {"name":"BookSearch","bookIds":[...]}`
+- `/logfile/chaptarr.txt`
+
+That sequence distinguishes:
+
+- true lookup misses
+- mixed search-response routing problems
+- indexer searches that run but finish with all releases filtered
 
 All media aliases are emitted through the same external OpenClaw runtime
 catalog as `web_search`; there is no second tool registry for media
@@ -207,12 +301,13 @@ planner-facing alias pattern as the media tools:
 - `ongoing_tasks_complete`
 
 These aliases all route through one wrapper, but each alias exposes only the
-fields needed for that one action. The durable state is stored as one
-hard-memory-backed registry document keyed by a stable semantic key. That
-keeps create/edit/delete semantics deterministic even though the hard-memory
-backend itself is append/update oriented.
+fields needed for that one action. The durable state is stored locally under
+`VICUNA_ONGOING_TASKS_DIR`, while the actual scheduler is the `vicuna` user's
+crontab. That keeps create/edit/delete semantics deterministic without a
+server-owned idle polling registry.
 
-The wrapper computes due state locally and returns only compact summaries:
+The wrapper keeps explicit local task metadata and returns only compact
+summaries:
 
 - `task_id`
 - `task_text`
@@ -222,8 +317,8 @@ The wrapper computes due state locally and returns only compact summaries:
 - `due_now`
 - `active`
 
-It does not echo raw `/v4/profile` or `/v4/memories` payloads back into the
-system loop.
+The retained host runner loads the canonical env, acquires a per-task lock, and
+posts the stored task text back to the live runtime as a `system` message.
 
 ## Telegram Relay
 
@@ -253,8 +348,8 @@ The harness now emits one compact parsed-document retrieval capability:
 
 - `parsed_documents_search_chunks`
 
-This wrapper searches only stored parsed-document chunk memories derived from
-Telegram-uploaded files. The current contract is intentionally narrow:
+This wrapper searches only locally stored parsed-document chunk bundles derived
+from Telegram-uploaded files. The current contract is intentionally narrow:
 
 - required:
   - `query`
@@ -295,19 +390,14 @@ Secrets layout:
       "legal_importer_poll_ms": 2000
     },
     "ongoing_tasks": {
-      "base_url": "https://api.supermemory.ai",
-      "auth_token": "supermemory-api-key",
-      "container_tag": "vicuna",
-      "runtime_identity": "vicuna",
-      "registry_key": "ongoing-tasks-registry",
-      "registry_title": "Ongoing task registry",
-      "query_threshold": 0
+      "task_dir": "/var/lib/vicuna/ongoing-tasks",
+      "runner_script": "/home/vicuna/Projects/vicuna/tools/ops/run-ongoing-task-cron.sh",
+      "runtime_url": "http://127.0.0.1:8080/v1/chat/completions",
+      "runtime_model": "deepseek-chat",
+      "host_user": "vicuna"
     },
     "parsed_documents": {
-      "base_url": "https://api.supermemory.ai",
-      "auth_token": "supermemory-api-key",
-      "container_tag": "vicuna-telegram-documents",
-      "runtime_identity": "vicuna",
+      "docs_dir": "/home/vicuna/home/docs",
       "default_threshold": 0.58,
       "short_query_threshold": 0.68,
       "max_results": 5
@@ -333,12 +423,10 @@ catalog, but each invocation returns a typed configuration/auth failure payload
 instead of silently disappearing from the OpenClaw surface.
 
 The `ongoing_tasks` wrapper accepts either the secrets values above or the
-standard `SUPERMEMORY_BASE_URL` / `SUPERMEMORY_API_KEY` environment variables
-as a fallback for hard-memory access.
+standard `VICUNA_ONGOING_TASKS_*` environment variables as fallbacks.
 
 The `parsed_documents` wrapper accepts either the secrets values above or the
-standard `SUPERMEMORY_BASE_URL`, `SUPERMEMORY_API_KEY`, and
-`TELEGRAM_BRIDGE_DOCUMENT_CONTAINER_TAG` environment variables as fallbacks.
+standard `VICUNA_DOCS_DIR` environment variable as a fallback.
 
 The `telegram_relay` wrapper accepts either the secrets values above or the
 standard `TELEGRAM_BRIDGE_VICUNA_BASE_URL`, `VICUNA_API_KEY`, and

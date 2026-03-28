@@ -30,3 +30,16 @@
   after the server has already completed work.
 - Design implication: reduce those fixed sleeps substantially while leaving
   Telegram Bot API long polling unchanged.
+
+## DeepSeek completion ceilings
+
+- DeepSeek's chat-completions documentation treats `max_tokens` as the
+  completion ceiling for the whole generated output, including thinking /
+  reasoning output.
+- The original DeepSeek-V3 release material advertised roughly `60 tokens/s`,
+  but the current API docs do not publish a hard throughput guarantee for
+  DeepSeek-V3.2.
+- Design implication: keep the runtime token ceiling explicit and conservative.
+  For this staged, provider-touch-heavy runtime, reduce the fixed cap from
+  `1024` to `256` so selector turns and ordinary bridge turns cannot spend a
+  full kilotoken budget per provider hop.

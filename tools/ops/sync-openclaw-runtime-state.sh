@@ -7,11 +7,11 @@ REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 source "$REPO_ROOT/tools/ops/runtime-env.sh"
 
 OPENCLAW_INDEX_JS="${VICUNA_OPENCLAW_INDEX_JS:-$REPO_ROOT/tools/openclaw-harness/dist/index.js}"
+OPENCLAW_HARNESS_DIR="${VICUNA_OPENCLAW_HARNESS_DIR:-$REPO_ROOT/tools/openclaw-harness}"
 
-if [[ ! -f "$OPENCLAW_INDEX_JS" ]]; then
-  printf '[vicuna-openclaw-sync] skip: %s is missing\n' "$OPENCLAW_INDEX_JS" >&2
-  exit 0
-fi
+log() {
+  printf '[vicuna-openclaw-sync] %s\n' "$*" >&2
+}
 
 resolve_node_bin() {
   if [[ -n "${VICUNA_OPENCLAW_NODE_BIN:-}" && -x "${VICUNA_OPENCLAW_NODE_BIN:-}" ]]; then
@@ -31,6 +31,95 @@ resolve_node_bin() {
 }
 
 NODE_BIN="$(resolve_node_bin)"
+
+resolve_npm_command() {
+  if [[ -n "${VICUNA_OPENCLAW_NPM_CLI:-}" && -f "${VICUNA_OPENCLAW_NPM_CLI:-}" ]]; then
+    printf '%s\n' "$NODE_BIN"
+    printf '%s\n' "${VICUNA_OPENCLAW_NPM_CLI}"
+    return 0
+  fi
+
+  local node_prefix
+  node_prefix="$(CDPATH='' cd -- "$(dirname -- "$NODE_BIN")/.." && pwd)"
+  local derived_cli="$node_prefix/lib/node_modules/npm/bin/npm-cli.js"
+  if [[ -f "$derived_cli" ]]; then
+    printf '%s\n' "$NODE_BIN"
+    printf '%s\n' "$derived_cli"
+    return 0
+  fi
+
+  if command -v npm >/dev/null 2>&1; then
+    printf '%s\n' "npm"
+    printf '%s\n' ""
+    return 0
+  fi
+
+  printf '[vicuna-openclaw-sync] error: could not resolve an npm CLI for %s\n' "$NODE_BIN" >&2
+  return 1
+}
+
+run_npm() {
+  local command_bin="$1"
+  local command_arg="$2"
+  shift 2
+  if [[ "$command_bin" == "npm" ]]; then
+    npm "$@"
+    return
+  fi
+  "$command_bin" "$command_arg" "$@"
+}
+
+ensure_openclaw_entrypoint() {
+  if [[ -f "$OPENCLAW_INDEX_JS" ]]; then
+    return 0
+  fi
+
+  local expected_dir="$OPENCLAW_HARNESS_DIR/dist"
+  local actual_dir
+  actual_dir="$(dirname "$OPENCLAW_INDEX_JS")"
+  if [[ "$actual_dir" != "$expected_dir" ]]; then
+    printf '[vicuna-openclaw-sync] error: %s is missing and is outside the managed harness dist directory %s\n' \
+      "$OPENCLAW_INDEX_JS" "$expected_dir" >&2
+    return 1
+  fi
+
+  if [[ ! -f "$OPENCLAW_HARNESS_DIR/package.json" ]]; then
+    printf '[vicuna-openclaw-sync] error: %s is missing and %s does not contain package.json\n' \
+      "$OPENCLAW_INDEX_JS" "$OPENCLAW_HARNESS_DIR" >&2
+    return 1
+  fi
+
+  local npm_command
+  local npm_arg
+  local npm_parts
+  npm_parts="$(resolve_npm_command)"
+  npm_command="${npm_parts%%$'\n'*}"
+  npm_arg=""
+  if [[ "$npm_parts" == *$'\n'* ]]; then
+    npm_arg="${npm_parts#*$'\n'}"
+  fi
+  if [[ -z "$npm_command" ]]; then
+    return 1
+  fi
+
+  local install_verb="install"
+  if [[ -f "$OPENCLAW_HARNESS_DIR/package-lock.json" ]]; then
+    install_verb="ci"
+  fi
+
+  log "bootstrapping OpenClaw harness because $OPENCLAW_INDEX_JS is missing"
+  run_npm "$npm_command" "$npm_arg" "$install_verb" --prefix "$OPENCLAW_HARNESS_DIR" >/dev/null
+  run_npm "$npm_command" "$npm_arg" run --prefix "$OPENCLAW_HARNESS_DIR" build >/dev/null
+
+  if [[ ! -f "$OPENCLAW_INDEX_JS" ]]; then
+    printf '[vicuna-openclaw-sync] error: expected harness entrypoint %s after build, but it is still missing\n' \
+      "$OPENCLAW_INDEX_JS" >&2
+    return 1
+  fi
+}
+
+ensure_openclaw_entrypoint
+
 SECRETS_PATH="${VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH:-$REPO_ROOT/.cache/vicuna/openclaw-tool-secrets.json}"
 CATALOG_PATH="${VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH:-$REPO_ROOT/.cache/vicuna/openclaw-catalog.json}"
 mkdir -p "$(dirname "$SECRETS_PATH")" "$(dirname "$CATALOG_PATH")"
@@ -73,18 +162,9 @@ if (!secrets.tools || typeof secrets.tools !== "object") {
   secrets.tools = {};
 }
 
-const supermemoryBaseUrl =
-  trim(process.env.SUPERMEMORY_BASE_URL) ||
-  trim(process.env.VICUNA_ONGOING_TASKS_BASE_URL) ||
-  trim(process.env.VICUNA_PARSED_DOCUMENTS_BASE_URL);
-const supermemoryAuth =
-  trim(process.env.SUPERMEMORY_API_KEY) ||
-  trim(process.env.VICUNA_ONGOING_TASKS_AUTH_TOKEN) ||
-  trim(process.env.VICUNA_PARSED_DOCUMENTS_AUTH_TOKEN);
 const runtimeIdentity = trim(process.env.VICUNA_HARD_MEMORY_RUNTIME_IDENTITY) || "vicuna";
-const ongoingTasksContainerTag = trim(process.env.VICUNA_ONGOING_TASKS_CONTAINER_TAG) || `${runtimeIdentity}-ongoing-tasks`;
-const parsedDocumentsContainerTag =
-  trim(process.env.TELEGRAM_BRIDGE_DOCUMENT_CONTAINER_TAG) || `${runtimeIdentity}-telegram-documents`;
+const stateRoot = trim(process.env.VICUNA_STATE_ROOT) || "/var/lib/vicuna";
+const hostShellRoot = trim(process.env.VICUNA_HOST_SHELL_ROOT) || "/home/vicuna/home";
 
 const upsert = (toolId, fields) => {
   const next = { ...(secrets.tools[toolId] || {}) };
@@ -99,19 +179,19 @@ const upsert = (toolId, fields) => {
 };
 
 upsert("ongoing_tasks", {
-  base_url: supermemoryBaseUrl,
-  auth_token: supermemoryAuth,
-  container_tag: ongoingTasksContainerTag,
-  runtime_identity: trim(process.env.VICUNA_ONGOING_TASKS_RUNTIME_IDENTITY) || runtimeIdentity,
-  registry_key: trim(process.env.VICUNA_ONGOING_TASKS_REGISTRY_KEY),
-  registry_title: trim(process.env.VICUNA_ONGOING_TASKS_REGISTRY_TITLE),
+  task_dir: trim(process.env.VICUNA_ONGOING_TASKS_DIR) || `${stateRoot}/ongoing-tasks`,
+  runner_script: trim(process.env.VICUNA_ONGOING_TASKS_RUNNER_SCRIPT),
+  crontab_bin: trim(process.env.VICUNA_ONGOING_TASKS_CRONTAB_BIN),
+  flock_bin: trim(process.env.VICUNA_ONGOING_TASKS_FLOCK_BIN),
+  temp_dir: trim(process.env.VICUNA_ONGOING_TASKS_TMPDIR) || `${stateRoot}/ongoing-tasks/tmp`,
+  runtime_url: trim(process.env.VICUNA_ONGOING_TASKS_RUNTIME_URL),
+  runtime_model: trim(process.env.VICUNA_ONGOING_TASKS_RUNTIME_MODEL) || trim(process.env.VICUNA_DEEPSEEK_MODEL),
+  runtime_api_key: trim(process.env.VICUNA_API_KEY),
+  host_user: trim(process.env.VICUNA_ONGOING_TASKS_HOST_USER) || "vicuna",
 });
 
 upsert("parsed_documents", {
-  base_url: supermemoryBaseUrl,
-  auth_token: supermemoryAuth,
-  container_tag: parsedDocumentsContainerTag,
-  runtime_identity: runtimeIdentity,
+  docs_dir: trim(process.env.VICUNA_DOCS_DIR) || `${hostShellRoot}/docs`,
 });
 
 upsert("telegram_relay", {
