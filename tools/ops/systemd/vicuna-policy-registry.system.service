@@ -1,0 +1,18 @@
+[Unit]
+Description=Vicuña Policy Registry Proposal Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@VICUNA_SERVICE_USER@
+Group=@VICUNA_SERVICE_GROUP@
+WorkingDirectory=@VICUNA_REPO_ROOT@
+EnvironmentFile=-@VICUNA_ENV_FILE@
+ExecStart=@VICUNA_REPO_ROOT@/tools/ops/run-policy-registry.sh
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

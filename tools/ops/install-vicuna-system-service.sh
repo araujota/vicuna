@@ -24,6 +24,9 @@ SKILLS_DIR="${VICUNA_SKILLS_DIR:-$SYSTEM_HOST_SHELL_ROOT/skills}"
 DOCS_DIR="${VICUNA_DOCS_DIR:-$SYSTEM_HOST_SHELL_ROOT/docs}"
 HEURISTICS_DIR="${VICUNA_HEURISTICS_DIR:-$SYSTEM_HOST_SHELL_ROOT/heuristics}"
 HEURISTIC_MEMORY_PATH="${VICUNA_HEURISTIC_MEMORY_PATH:-$HEURISTICS_DIR/vicuna-heuristic-memory.json}"
+POLICY_DATASET_DIR="${VICUNA_POLICY_DATASET_DIR:-$STATE_ROOT/policy-datasets/nightly}"
+POLICY_REGISTRY_DIR="${VICUNA_POLICY_REGISTRY_DIR:-$STATE_ROOT/policy-registry}"
+POLICY_RUN_ROOT="${VICUNA_POLICY_RUN_ROOT:-$STATE_ROOT/policy-runs}"
 RUNTIME_SERVICE="${VICUNA_RUNTIME_SERVICE_NAME:-vicuna-runtime.service}"
 BRIDGE_SERVICE="${VICUNA_TELEGRAM_BRIDGE_SERVICE_NAME:-vicuna-telegram-bridge.service}"
 WEBGL_RENDERER_SERVICE="${VICUNA_WEBGL_RENDERER_SERVICE_NAME:-vicuna-webgl-renderer.service}"
@@ -416,6 +419,10 @@ write_env_file() {
     local ongoing_tasks_runner_script ongoing_tasks_runtime_url ongoing_tasks_runtime_model
     local openclaw_node_bin tavily_api_key radarr_api_key radarr_base_url sonarr_api_key sonarr_base_url
     local chaptarr_api_key chaptarr_base_url vicuna_api_key
+    local policy_mode policy_candidate_url policy_timeout_ms policy_dataset_dir policy_registry_dir
+    local policy_run_root policy_model_name policy_server_url policy_registry_host policy_registry_port
+    local policy_default_alias policy_fallback_alias policy_limit policy_min_record_count
+    local policy_min_exact_match_rate policy_max_invalid_action_rate policy_min_reward_delta
 
     runtime_build_dir="$(resolved_env_value "VICUNA_RUNTIME_BUILD_DIR" "build-host-cuda-128")"
     runtime_port="$(resolved_env_value "VICUNA_RUNTIME_PORT" "8080")"
@@ -448,6 +455,23 @@ write_env_file() {
     chaptarr_api_key="$(resolved_env_value "CHAPTARR_API_KEY")"
     chaptarr_base_url="$(resolved_env_value "CHAPTARR_BASE_URL" "http://10.0.0.218:8789")"
     vicuna_api_key="$(resolved_env_value "VICUNA_API_KEY")"
+    policy_mode="$(resolved_env_value "VICUNA_POLICY_MODE")"
+    policy_candidate_url="$(resolved_env_value "VICUNA_POLICY_CANDIDATE_URL")"
+    policy_timeout_ms="$(resolved_env_value "VICUNA_POLICY_TIMEOUT_MS" "500")"
+    policy_dataset_dir="$(resolved_env_value "VICUNA_POLICY_DATASET_DIR" "$POLICY_DATASET_DIR")"
+    policy_registry_dir="$(resolved_env_value "VICUNA_POLICY_REGISTRY_DIR" "$POLICY_REGISTRY_DIR")"
+    policy_run_root="$(resolved_env_value "VICUNA_POLICY_RUN_ROOT" "$POLICY_RUN_ROOT")"
+    policy_model_name="$(resolved_env_value "VICUNA_POLICY_MODEL_NAME" "vicuna-governance")"
+    policy_server_url="$(resolved_env_value "VICUNA_POLICY_SERVER_URL" "http://127.0.0.1:${runtime_port}")"
+    policy_registry_host="$(resolved_env_value "VICUNA_POLICY_REGISTRY_HOST" "127.0.0.1")"
+    policy_registry_port="$(resolved_env_value "VICUNA_POLICY_REGISTRY_PORT" "18081")"
+    policy_default_alias="$(resolved_env_value "VICUNA_POLICY_DEFAULT_ALIAS" "candidate")"
+    policy_fallback_alias="$(resolved_env_value "VICUNA_POLICY_FALLBACK_ALIAS" "champion")"
+    policy_limit="$(resolved_env_value "VICUNA_POLICY_LIMIT" "512")"
+    policy_min_record_count="$(resolved_env_value "VICUNA_POLICY_MIN_RECORD_COUNT" "25")"
+    policy_min_exact_match_rate="$(resolved_env_value "VICUNA_POLICY_MIN_EXACT_MATCH_RATE" "0.55")"
+    policy_max_invalid_action_rate="$(resolved_env_value "VICUNA_POLICY_MAX_INVALID_ACTION_RATE" "0.0")"
+    policy_min_reward_delta="$(resolved_env_value "VICUNA_POLICY_MIN_REWARD_DELTA" "0.0")"
 
     run_cmd install -d -m 0755 "$ETC_DIR"
     if (( DRY_RUN )); then
@@ -497,6 +521,23 @@ VICUNA_HOST_SHELL_ROOT=$SYSTEM_HOST_SHELL_ROOT
 VICUNA_SKILLS_DIR=$SKILLS_DIR
 VICUNA_DOCS_DIR=$DOCS_DIR
 VICUNA_HEURISTIC_MEMORY_PATH=$HEURISTIC_MEMORY_PATH
+VICUNA_POLICY_MODE=$policy_mode
+VICUNA_POLICY_CANDIDATE_URL=$policy_candidate_url
+VICUNA_POLICY_TIMEOUT_MS=$policy_timeout_ms
+VICUNA_POLICY_DATASET_DIR=$policy_dataset_dir
+VICUNA_POLICY_REGISTRY_DIR=$policy_registry_dir
+VICUNA_POLICY_RUN_ROOT=$policy_run_root
+VICUNA_POLICY_MODEL_NAME=$policy_model_name
+VICUNA_POLICY_SERVER_URL=$policy_server_url
+VICUNA_POLICY_REGISTRY_HOST=$policy_registry_host
+VICUNA_POLICY_REGISTRY_PORT=$policy_registry_port
+VICUNA_POLICY_DEFAULT_ALIAS=$policy_default_alias
+VICUNA_POLICY_FALLBACK_ALIAS=$policy_fallback_alias
+VICUNA_POLICY_LIMIT=$policy_limit
+VICUNA_POLICY_MIN_RECORD_COUNT=$policy_min_record_count
+VICUNA_POLICY_MIN_EXACT_MATCH_RATE=$policy_min_exact_match_rate
+VICUNA_POLICY_MAX_INVALID_ACTION_RATE=$policy_max_invalid_action_rate
+VICUNA_POLICY_MIN_REWARD_DELTA=$policy_min_reward_delta
 TAVILY_API_KEY=$tavily_api_key
 RADARR_API_KEY=$radarr_api_key
 RADARR_BASE_URL=$radarr_base_url
@@ -555,6 +596,23 @@ VICUNA_HOST_SHELL_ROOT=$SYSTEM_HOST_SHELL_ROOT
 VICUNA_SKILLS_DIR=$SKILLS_DIR
 VICUNA_DOCS_DIR=$DOCS_DIR
 VICUNA_HEURISTIC_MEMORY_PATH=$HEURISTIC_MEMORY_PATH
+VICUNA_POLICY_MODE=$policy_mode
+VICUNA_POLICY_CANDIDATE_URL=$policy_candidate_url
+VICUNA_POLICY_TIMEOUT_MS=$policy_timeout_ms
+VICUNA_POLICY_DATASET_DIR=$policy_dataset_dir
+VICUNA_POLICY_REGISTRY_DIR=$policy_registry_dir
+VICUNA_POLICY_RUN_ROOT=$policy_run_root
+VICUNA_POLICY_MODEL_NAME=$policy_model_name
+VICUNA_POLICY_SERVER_URL=$policy_server_url
+VICUNA_POLICY_REGISTRY_HOST=$policy_registry_host
+VICUNA_POLICY_REGISTRY_PORT=$policy_registry_port
+VICUNA_POLICY_DEFAULT_ALIAS=$policy_default_alias
+VICUNA_POLICY_FALLBACK_ALIAS=$policy_fallback_alias
+VICUNA_POLICY_LIMIT=$policy_limit
+VICUNA_POLICY_MIN_RECORD_COUNT=$policy_min_record_count
+VICUNA_POLICY_MIN_EXACT_MATCH_RATE=$policy_min_exact_match_rate
+VICUNA_POLICY_MAX_INVALID_ACTION_RATE=$policy_max_invalid_action_rate
+VICUNA_POLICY_MIN_REWARD_DELTA=$policy_min_reward_delta
 TAVILY_API_KEY=$tavily_api_key
 RADARR_API_KEY=$radarr_api_key
 RADARR_BASE_URL=$radarr_base_url
@@ -717,7 +775,9 @@ ensure_group
 ensure_user
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_ROOT" "$LOG_ROOT"
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$HARD_MEMORY_DIR"
-run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$ONGOING_TASKS_DIR" "$ONGOING_TASKS_TMPDIR" "$SKILLS_DIR" "$DOCS_DIR" "$HEURISTICS_DIR"
+run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
+    "$ONGOING_TASKS_DIR" "$ONGOING_TASKS_TMPDIR" "$SKILLS_DIR" "$DOCS_DIR" "$HEURISTICS_DIR" \
+    "$POLICY_DATASET_DIR" "$POLICY_REGISTRY_DIR" "$POLICY_RUN_ROOT"
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$(dirname "$TELEGRAM_STATE_PATH")"
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$(dirname "$SYSTEM_HOST_SHELL_ROOT")"
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$SYSTEM_HOST_SHELL_ROOT"
