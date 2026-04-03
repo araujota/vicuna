@@ -1,9 +1,13 @@
 #include "server-common.h"
+#include "server-cvec-generator.h"
+#include "server-decode-controller.h"
 #include "server-deepseek.h"
 #include "server-emotive-runtime.h"
 #include "server-http.h"
+#include "server-local-llama-provider.h"
+#include "server-runpod.h"
 #include "server-runtime.h"
-#include "../../common/base64.hpp"
+#include "base64.h"
 
 #include <algorithm>
 #include <array>
@@ -12,6 +16,7 @@
 #include <clocale>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -36,7 +41,24 @@
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+static const server_provider_runtime_config * g_active_provider_runtime_config = nullptr;
+static server_local_llama_provider * g_active_local_llama_provider = nullptr;
+static std::shared_ptr<server_cvec_generator_artifact> g_active_local_cvec_generator;
+static std::shared_ptr<server_cvec_generator_artifact> g_candidate_local_cvec_generator;
+static std::shared_ptr<server_decode_controller_artifact> g_active_local_decode_controller;
+static std::shared_ptr<server_decode_controller_artifact> g_candidate_local_decode_controller;
+static std::mutex g_runtime_artifact_mutex;
+static std::mutex g_experimental_capture_mutex;
 struct runtime_request_trace_context;
+struct server_policy_rollout_decision;
+struct server_runtime_artifact_rollout_state;
+struct experimental_capture_runtime_config {
+    bool enabled = false;
+    std::filesystem::path root_dir;
+    std::filesystem::path transitions_path;
+    std::filesystem::path decode_traces_path;
+    std::filesystem::path emotive_traces_path;
+};
 static std::string extract_json_object_payload(const std::string & text);
 static bool execute_deepseek_chat_with_emotive(
         const deepseek_runtime_config & config,
@@ -49,12 +71,89 @@ static bool execute_deepseek_chat_with_emotive(
         const std::string & cognitive_replay_entry_id = std::string(),
         bool enable_heuristic_guidance = true,
         bool suppress_replay_admission = false,
-        float ongoing_task_due = 0.0f,
         const std::string & mode_label = std::string(),
+        const server_tool_correctness_signal * tool_correctness_override = nullptr,
         const runtime_request_trace_context * trace_context = nullptr);
+static server_http_res_ptr handle_runpod_inference_request(
+        const deepseek_runtime_config & config,
+        server_emotive_runtime & emotive_runtime,
+        const server_http_req & req,
+        const json & body);
+static void seed_emotive_turn_from_request(const json & body, server_emotive_turn_builder * builder);
+static json build_final_policy_json_local(
+        const server_metacognitive_policy_decision & native_policy_decision,
+        const server_metacognitive_policy_decision & effective_policy_decision,
+        const server_policy_action & executed_policy_action,
+        const server_request_policy_config & request_policy_config,
+        const server_policy_rollout_decision & rollout_decision,
+        const server_policy_applied_provider_controls & applied_provider_controls,
+        const server_heuristic_retrieval_decision & heuristic_decision,
+        const server_decode_control_trace & decode_trace);
+static json build_heuristic_retrieval_json_local(const server_heuristic_retrieval_decision & heuristic_decision);
+static void policy_runtime_record_decode_trace(const server_decode_control_trace & trace);
+static void runtime_artifact_record_decode_trace_metrics(
+        server_runtime_artifact_rollout_state & rollout,
+        const server_decode_control_trace & trace);
+static void runtime_artifact_record_cvec_metrics(
+        server_runtime_artifact_rollout_state & rollout,
+        const server_decode_control_trace & trace);
+static const experimental_capture_runtime_config & experimental_capture_runtime_config_instance();
+static void experimental_capture_append_transition(const server_policy_transition & transition);
+static void experimental_capture_append_decode_trace(const server_decode_control_trace & trace);
+static void experimental_capture_append_emotive_trace(
+        const std::string & request_id,
+        const json & emotive_trace,
+        const json & emotive_animation);
 static int32_t env_to_int_local(const char * name, int32_t default_value);
+static bool env_to_bool_local(const char * name, bool default_value);
 static float env_to_float_local(const char * name, float default_value);
 static std::string iso_from_epoch_ms(int64_t epoch_ms);
+
+static bool local_llama_provider_selected() {
+    return g_active_provider_runtime_config != nullptr &&
+            g_active_provider_runtime_config->kind == server_provider_kind::deepseek &&
+            g_active_local_llama_provider != nullptr &&
+            g_active_local_llama_provider->ready();
+}
+
+static bool deepseek_provider_selected() {
+    return true;
+}
+
+static std::string current_inference_substrate_label() {
+    const auto & runpod_config = runpod_inference_runtime_config_instance();
+    if (runpod_inference_host_relay_enabled(runpod_config)) {
+        return "experimental_runpod";
+    }
+    if (local_llama_provider_selected()) {
+        return "local_llama";
+    }
+    return "deepseek";
+}
+
+static deepseek_runtime_config response_format_runtime_config(const deepseek_runtime_config & config) {
+    deepseek_runtime_config effective = config;
+    const auto & runpod_config = runpod_inference_runtime_config_instance();
+    if (runpod_inference_host_relay_enabled(runpod_config)) {
+        effective.model = runpod_config.resolved_model;
+        return effective;
+    }
+    if (local_llama_provider_selected()) {
+        effective.model = g_active_local_llama_provider->resolved_model();
+    }
+    return effective;
+}
+
+static std::string provider_health_name() {
+    const auto & runpod_config = runpod_inference_runtime_config_instance();
+    if (runpod_inference_host_relay_enabled(runpod_config)) {
+        return "runpod-relay";
+    }
+    if (local_llama_provider_selected()) {
+        return "local_llama";
+    }
+    return "deepseek";
+}
 
 struct runtime_session_memory_candidate {
     std::string title;
@@ -174,6 +273,38 @@ static void append_unique_string_values(json & target, const json & values) {
     }
 }
 
+static int32_t resolve_telegram_emotive_animation_start_block_index(const json & trace) {
+    const json blocks = trace.value("blocks", json::array());
+    if (!blocks.is_array() || blocks.empty()) {
+        return 0;
+    }
+
+    const int32_t total_blocks = static_cast<int32_t>(blocks.size());
+    const int32_t live_start = std::min<int32_t>(
+            std::max<int32_t>(0, json_value(trace, "live_generation_start_block_index", int32_t(0))),
+            total_blocks);
+    const int32_t turn_start = std::min<int32_t>(
+            std::max<int32_t>(0, json_value(trace, "turn_start_block_index", int32_t(0))),
+            live_start);
+    if (turn_start > 0 || json_value(trace, "turn_start_block_index", int32_t(-1)) == 0) {
+        if (live_start > 0 || turn_start > 0) {
+            return turn_start;
+        }
+    }
+
+    for (int32_t index = live_start - 1; index >= 0; --index) {
+        const json & block = blocks.at(static_cast<size_t>(index));
+        if (!block.is_object()) {
+            continue;
+        }
+        const std::string kind = json_value(block.value("source", json::object()), "kind", std::string());
+        if (kind == "user_message") {
+            return index;
+        }
+    }
+    return 0;
+}
+
 static json build_telegram_emotive_animation_bundle(const json & trace) {
     if (!trace.is_object()) {
         return nullptr;
@@ -185,8 +316,12 @@ static json build_telegram_emotive_animation_bundle(const json & trace) {
     }
 
     const int32_t total_blocks = static_cast<int32_t>(blocks.size());
+    const int32_t turn_start = std::min<int32_t>(
+            resolve_telegram_emotive_animation_start_block_index(trace),
+            total_blocks);
     const int32_t requested_start = std::max<int32_t>(0, json_value(trace, "live_generation_start_block_index", int32_t(0)));
     const int32_t live_start = std::min<int32_t>(requested_start, total_blocks);
+    const int32_t animation_start = std::min<int32_t>(turn_start, live_start);
 
     json dimensions = json::array();
     for (size_t index = 0; index < k_telegram_emotive_dimensions.size(); ++index) {
@@ -200,8 +335,15 @@ static json build_telegram_emotive_animation_bundle(const json & trace) {
     }
 
     json keyframes = json::array();
+    json segments = json::array();
     int32_t raw_keyframe_count = 0;
-    for (int32_t block_index = live_start; block_index < total_blocks; ++block_index) {
+    const int64_t fallback_step_ms = 500;
+    int64_t previous_offset_ms = 0;
+    int64_t previous_raw_timestamp_ms = 0;
+    bool have_previous_offset = false;
+    bool have_previous_raw_timestamp = false;
+    static constexpr int64_t k_max_reasonable_timestamp_delta_ms = 60 * 1000;
+    for (int32_t block_index = animation_start; block_index < total_blocks; ++block_index) {
         const json & block = blocks.at(static_cast<size_t>(block_index));
         if (!block.is_object()) {
             continue;
@@ -214,12 +356,43 @@ static json build_telegram_emotive_animation_bundle(const json & trace) {
 
         const int32_t source_block_index = json_value(block, "block_index", block_index);
         const json dominant_dimensions = block.value("vad", json::object()).value("dominant_dimensions", json::array());
+        const bool has_timestamp_ms = block.contains("timestamp_ms") && block["timestamp_ms"].is_number_integer();
+        const int64_t raw_timestamp_ms = has_timestamp_ms
+                ? json_value(block, "timestamp_ms", int64_t(0))
+                : int64_t(0);
+        int64_t block_offset_ms = 0;
+        if (has_timestamp_ms) {
+            if (!have_previous_offset || !have_previous_raw_timestamp) {
+                block_offset_ms = 0;
+            } else {
+                int64_t delta_ms = raw_timestamp_ms - previous_raw_timestamp_ms;
+                if (delta_ms < 0) {
+                    delta_ms = 0;
+                } else if (delta_ms > k_max_reasonable_timestamp_delta_ms) {
+                    delta_ms = fallback_step_ms;
+                }
+                block_offset_ms = previous_offset_ms + delta_ms;
+            }
+            previous_raw_timestamp_ms = raw_timestamp_ms;
+            have_previous_raw_timestamp = true;
+        } else if (have_previous_offset) {
+            block_offset_ms = previous_offset_ms + fallback_step_ms;
+        }
         raw_keyframe_count += 1;
+        previous_offset_ms = block_offset_ms;
+        have_previous_offset = true;
 
         if (!keyframes.empty() &&
                 telegram_emotive_moments_equal(keyframes.back().value("moment", json::object()), moment)) {
             json & previous = keyframes.back();
             previous["hold_keyframe_count"] = json_value(previous, "hold_keyframe_count", int32_t(1)) + 1;
+            previous["end_offset_ms"] = std::max<int64_t>(
+                    json_value(previous, "end_offset_ms", json_value(previous, "start_offset_ms", int64_t(0))),
+                    block_offset_ms);
+            previous["hold_duration_ms"] = std::max<int64_t>(
+                    int64_t(0),
+                    json_value(previous, "end_offset_ms", int64_t(0)) -
+                        json_value(previous, "start_offset_ms", int64_t(0)));
             if (!previous.contains("trace_block_span") ||
                     !previous["trace_block_span"].is_array() ||
                     previous["trace_block_span"].size() != 2) {
@@ -240,6 +413,9 @@ static json build_telegram_emotive_animation_bundle(const json & trace) {
             {"source_kind", json_value(block.value("source", json::object()), "kind", std::string("runtime_event"))},
             {"hold_keyframe_count", 1},
             {"trace_block_span", json::array({source_block_index, source_block_index})},
+            {"start_offset_ms", block_offset_ms},
+            {"end_offset_ms", block_offset_ms},
+            {"hold_duration_ms", int64_t(0)},
             {"moment", moment},
             {"dominant_dimensions", dominant_dimensions},
         });
@@ -249,21 +425,45 @@ static json build_telegram_emotive_animation_bundle(const json & trace) {
         return nullptr;
     }
 
-    const double seconds_per_keyframe = 0.5;
+    for (size_t index = 0; index + 1 < keyframes.size(); ++index) {
+        const json & current = keyframes.at(index);
+        const json & next = keyframes.at(index + 1);
+        const int64_t transition_start_ms = json_value(
+                current,
+                "end_offset_ms",
+                json_value(current, "start_offset_ms", int64_t(0)));
+        const int64_t transition_end_ms = std::max<int64_t>(
+                transition_start_ms,
+                json_value(next, "start_offset_ms", transition_start_ms));
+        segments.push_back({
+            {"segment_index", static_cast<int32_t>(segments.size())},
+            {"from_keyframe_ordinal", json_value(current, "ordinal", static_cast<int32_t>(index))},
+            {"to_keyframe_ordinal", json_value(next, "ordinal", static_cast<int32_t>(index + 1))},
+            {"start_offset_ms", transition_start_ms},
+            {"duration_ms", std::max<int64_t>(0, transition_end_ms - transition_start_ms)},
+        });
+    }
+
+    const json & final_keyframe = keyframes.back();
+    const int64_t total_duration_ms = std::max<int64_t>(
+            0,
+            json_value(final_keyframe, "end_offset_ms", json_value(final_keyframe, "start_offset_ms", int64_t(0))));
     return {
-        {"bundle_version", 2},
+        {"bundle_version", 3},
         {"trace_id", json_value(trace, "trace_id", std::string())},
-        {"generation_start_block_index", live_start},
+        {"generation_start_block_index", animation_start},
+        {"turn_start_block_index", turn_start},
+        {"live_generation_start_block_index", live_start},
         {"raw_keyframe_count", raw_keyframe_count},
         {"distinct_keyframe_count", static_cast<int32_t>(keyframes.size())},
-        {"seconds_per_keyframe", seconds_per_keyframe},
         {"fps", 30},
         {"viewport_width", 720},
         {"viewport_height", 720},
         {"rotation_period_seconds", 12.0},
-        {"duration_seconds", seconds_per_keyframe * static_cast<double>(raw_keyframe_count)},
+        {"duration_seconds", static_cast<double>(total_duration_ms) / 1000.0},
         {"dimensions", std::move(dimensions)},
         {"keyframes", std::move(keyframes)},
+        {"segments", std::move(segments)},
     };
 }
 
@@ -460,8 +660,12 @@ struct server_policy_rollout_window {
 struct server_policy_runtime_state {
     mutable std::mutex mutex;
     std::deque<server_policy_transition> transitions;
+    std::deque<server_decode_control_trace> decode_traces;
     size_t max_transitions = 256;
+    size_t max_decode_traces = 128;
     uint64_t total_transitions = 0;
+    uint64_t total_decode_traces = 0;
+    uint64_t total_decode_steps = 0;
     uint64_t shadow_request_count = 0;
     uint64_t shadow_disagreement_count = 0;
     uint64_t candidate_failure_count = 0;
@@ -483,6 +687,41 @@ struct server_policy_runtime_state {
     server_policy_rollout_window current_window;
 };
 
+struct server_runtime_artifact_rollout_window {
+    uint64_t sampled_request_count = 0;
+    uint64_t live_candidate_execution_count = 0;
+    uint64_t candidate_failure_count = 0;
+    uint64_t comparison_count = 0;
+    uint64_t disagreement_count = 0;
+    double cosine_similarity_sum = 0.0;
+    double norm_delta_sum = 0.0;
+};
+
+struct server_runtime_artifact_rollout_state {
+    mutable std::mutex mutex;
+    std::string artifact_kind;
+    std::string mode = "capture";
+    std::vector<int32_t> canary_steps = {10, 50, 100};
+    int32_t current_rollout_step_index = 0;
+    int32_t min_requests_per_step = 10;
+    std::string active_alias;
+    std::string active_version;
+    std::string candidate_alias;
+    std::string candidate_version;
+    std::string last_error;
+    std::string last_reload_reason;
+    std::string last_rollback_reason;
+    uint64_t total_sampled_request_count = 0;
+    uint64_t total_live_candidate_execution_count = 0;
+    uint64_t total_candidate_failure_count = 0;
+    uint64_t total_comparison_count = 0;
+    uint64_t total_disagreement_count = 0;
+    double total_cosine_similarity_sum = 0.0;
+    double total_norm_delta_sum = 0.0;
+    uint64_t reset_count = 0;
+    server_runtime_artifact_rollout_window current_window = {};
+};
+
 static server_policy_runtime_config & policy_runtime_config_instance() {
     static server_policy_runtime_config config;
     return config;
@@ -490,6 +729,22 @@ static server_policy_runtime_config & policy_runtime_config_instance() {
 
 static server_policy_runtime_state & policy_runtime_state_instance() {
     static server_policy_runtime_state state;
+    return state;
+}
+
+static server_runtime_artifact_rollout_state & decode_artifact_rollout_state_instance() {
+    static server_runtime_artifact_rollout_state state;
+    if (state.artifact_kind.empty()) {
+        state.artifact_kind = "decode_controller";
+    }
+    return state;
+}
+
+static server_runtime_artifact_rollout_state & cvec_artifact_rollout_state_instance() {
+    static server_runtime_artifact_rollout_state state;
+    if (state.artifact_kind.empty()) {
+        state.artifact_kind = "cvec_generator";
+    }
     return state;
 }
 
@@ -540,6 +795,87 @@ static bool policy_runtime_requests_candidate(const std::string & mode) {
 
 static bool policy_runtime_is_canary_live(const std::string & mode) {
     return mode == "canary_live";
+}
+
+static int32_t runtime_artifact_current_canary_share_percent_locked(
+        const server_runtime_artifact_rollout_state & state) {
+    if (state.canary_steps.empty()) {
+        return 0;
+    }
+    const int32_t bounded_index = std::max<int32_t>(
+            0,
+            std::min<int32_t>(state.current_rollout_step_index, static_cast<int32_t>(state.canary_steps.size()) - 1));
+    return state.canary_steps.at(static_cast<size_t>(bounded_index));
+}
+
+static bool runtime_artifact_requests_candidate(const std::string & mode) {
+    return mode == "shadow" || mode == "eval_only" || mode == "canary_live";
+}
+
+static bool runtime_artifact_is_canary_live(const std::string & mode) {
+    return mode == "canary_live";
+}
+
+static bool runtime_artifact_should_execute_candidate_live(
+        const server_runtime_artifact_rollout_state & state,
+        const std::string & request_id) {
+    if (!runtime_artifact_is_canary_live(state.mode) || state.candidate_version.empty()) {
+        return false;
+    }
+    const int32_t share = runtime_artifact_current_canary_share_percent_locked(state);
+    if (share <= 0) {
+        return false;
+    }
+    const size_t bucket = std::hash<std::string>{}(request_id) % 100;
+    return static_cast<int32_t>(bucket) < share;
+}
+
+static void runtime_artifact_reset_window_locked(
+        server_runtime_artifact_rollout_state & state) {
+    state.current_window = {};
+    ++state.reset_count;
+}
+
+static json runtime_artifact_rollout_state_to_json(
+        const server_runtime_artifact_rollout_state & state) {
+    const double total_comparisons = static_cast<double>(state.total_comparison_count);
+    const double window_comparisons = static_cast<double>(state.current_window.comparison_count);
+    return {
+        {"artifact_kind", state.artifact_kind},
+        {"mode", state.mode},
+        {"active_alias", state.active_alias.empty() ? json(nullptr) : json(state.active_alias)},
+        {"active_version", state.active_version.empty() ? json(nullptr) : json(state.active_version)},
+        {"candidate_alias", state.candidate_alias.empty() ? json(nullptr) : json(state.candidate_alias)},
+        {"candidate_version", state.candidate_version.empty() ? json(nullptr) : json(state.candidate_version)},
+        {"canary_steps", state.canary_steps},
+        {"current_rollout_step_index", state.current_rollout_step_index},
+        {"current_canary_share_percent", runtime_artifact_current_canary_share_percent_locked(state)},
+        {"min_requests_per_step", state.min_requests_per_step},
+        {"last_error", state.last_error.empty() ? json(nullptr) : json(state.last_error)},
+        {"last_reload_reason", state.last_reload_reason.empty() ? json(nullptr) : json(state.last_reload_reason)},
+        {"last_rollback_reason", state.last_rollback_reason.empty() ? json(nullptr) : json(state.last_rollback_reason)},
+        {"reset_count", static_cast<int64_t>(state.reset_count)},
+        {"totals", {
+            {"sampled_request_count", static_cast<int64_t>(state.total_sampled_request_count)},
+            {"live_candidate_execution_count", static_cast<int64_t>(state.total_live_candidate_execution_count)},
+            {"candidate_failure_count", static_cast<int64_t>(state.total_candidate_failure_count)},
+            {"comparison_count", static_cast<int64_t>(state.total_comparison_count)},
+            {"disagreement_count", static_cast<int64_t>(state.total_disagreement_count)},
+            {"disagreement_rate", total_comparisons > 0.0 ? state.total_disagreement_count / total_comparisons : 0.0},
+            {"mean_cosine_similarity", total_comparisons > 0.0 ? state.total_cosine_similarity_sum / total_comparisons : 0.0},
+            {"mean_norm_delta", total_comparisons > 0.0 ? state.total_norm_delta_sum / total_comparisons : 0.0},
+        }},
+        {"current_window", {
+            {"sampled_request_count", static_cast<int64_t>(state.current_window.sampled_request_count)},
+            {"live_candidate_execution_count", static_cast<int64_t>(state.current_window.live_candidate_execution_count)},
+            {"candidate_failure_count", static_cast<int64_t>(state.current_window.candidate_failure_count)},
+            {"comparison_count", static_cast<int64_t>(state.current_window.comparison_count)},
+            {"disagreement_count", static_cast<int64_t>(state.current_window.disagreement_count)},
+            {"disagreement_rate", window_comparisons > 0.0 ? state.current_window.disagreement_count / window_comparisons : 0.0},
+            {"mean_cosine_similarity", window_comparisons > 0.0 ? state.current_window.cosine_similarity_sum / window_comparisons : 0.0},
+            {"mean_norm_delta", window_comparisons > 0.0 ? state.current_window.norm_delta_sum / window_comparisons : 0.0},
+        }},
+    };
 }
 
 static int32_t policy_runtime_current_canary_share_percent_locked(
@@ -671,7 +1007,7 @@ static server_policy_reward_model default_policy_reward_model() {
     model.latency_ms_scale = 4000.0f;
     model.token_cost_cap = 0.25f;
     model.token_scale = 4096.0f;
-    model.tool_success_bonus = 0.05f;
+    model.tool_correctness_scale = 0.10f;
     model.candidate_failure_penalty = 0.05f;
     return model;
 }
@@ -763,7 +1099,7 @@ static void apply_reward_model_override(server_policy_reward_model & model, cons
         {"latency_ms_scale", &server_policy_reward_model::latency_ms_scale},
         {"token_cost_cap", &server_policy_reward_model::token_cost_cap},
         {"token_scale", &server_policy_reward_model::token_scale},
-        {"tool_success_bonus", &server_policy_reward_model::tool_success_bonus},
+        {"tool_correctness_scale", &server_policy_reward_model::tool_correctness_scale},
         {"candidate_failure_penalty", &server_policy_reward_model::candidate_failure_penalty},
     };
     for (const auto & field : scalar_fields) {
@@ -829,8 +1165,8 @@ static bool validate_reward_model(const server_policy_reward_model & model, std:
     if (model.candidate_failure_penalty < 0.0f) {
         return fail("candidate_failure_penalty must be >= 0");
     }
-    if (model.tool_success_bonus < 0.0f) {
-        return fail("tool_success_bonus must be >= 0");
+    if (model.tool_correctness_scale < 0.0f) {
+        return fail("tool_correctness_scale must be >= 0");
     }
     return true;
 }
@@ -860,6 +1196,111 @@ static float compute_desired_state_score(
     return clamp_unit_interval(1.0f - (weighted_distance / total_weight));
 }
 
+struct runtime_tool_invocation_record {
+    std::string tool_name;
+    json observation = nullptr;
+    server_tool_correctness_signal correctness;
+};
+
+static bool clamp_signal_score(server_tool_correctness_signal * signal) {
+    if (!signal) {
+        return false;
+    }
+    signal->score = std::max(0.0f, std::min(1.0f, signal->score));
+    signal->confidence = std::max(0.0f, std::min(1.0f, signal->confidence));
+    return signal->available;
+}
+
+static server_tool_correctness_signal parse_tool_correctness_signal_json(const json & payload) {
+    server_tool_correctness_signal signal = {};
+    signal.available = payload.is_object();
+    if (!payload.is_object()) {
+        return signal;
+    }
+    signal.status = json_value(payload, "status", std::string("unknown"));
+    signal.score = json_value(payload, "score", 0.0f);
+    signal.confidence = json_value(payload, "confidence", 0.0f);
+    signal.source = json_value(payload, "source", std::string("unknown"));
+    signal.evaluator_id = json_value(payload, "evaluator_id", std::string());
+    signal.summary = json_value(payload, "summary", std::string());
+    if (payload.contains("evidence") && payload.at("evidence").is_array()) {
+        for (const auto & item : payload.at("evidence")) {
+            if (!item.is_object()) {
+                continue;
+            }
+            server_tool_correctness_evidence evidence = {};
+            evidence.kind = json_value(item, "kind", std::string());
+            evidence.label = json_value(item, "label", std::string());
+            evidence.value = item.contains("value_json") ? item.at("value_json") : json(nullptr);
+            evidence.weight = json_value(item, "weight", 1.0f);
+            signal.evidence.push_back(std::move(evidence));
+        }
+    }
+    clamp_signal_score(&signal);
+    return signal;
+}
+
+static server_tool_correctness_signal evaluate_tool_correctness_fallback(
+        const std::string & tool_name,
+        const json & observation) {
+    server_tool_correctness_signal signal = {};
+    signal.available = false;
+    signal.source = "server_evaluator";
+    signal.evaluator_id = tool_name + ".fallback";
+
+    if (observation.is_object() && observation.contains("ok") && observation.at("ok").is_boolean()) {
+        const bool ok = json_value(observation, "ok", false);
+        signal.available = true;
+        signal.status = ok ? "verified" : "failed";
+        signal.score = ok ? 0.75f : 0.10f;
+        signal.confidence = 0.60f;
+        signal.summary = ok ? "Tool observation reported success." : "Tool observation reported failure.";
+        signal.evidence.push_back({"assertion", "ok", ok, 1.0f});
+        return signal;
+    }
+
+    return signal;
+}
+
+static server_tool_correctness_signal aggregate_tool_correctness(
+        const std::vector<runtime_tool_invocation_record> & records) {
+    server_tool_correctness_signal aggregate = {};
+    if (records.empty()) {
+        return aggregate;
+    }
+
+    double weighted_score = 0.0;
+    double weight_sum = 0.0;
+    double confidence_sum = 0.0;
+    size_t available_count = 0;
+    for (const auto & record : records) {
+        if (!record.correctness.available) {
+            continue;
+        }
+        available_count += 1;
+        const double weight = std::max(0.1, static_cast<double>(record.correctness.confidence));
+        weighted_score += static_cast<double>(record.correctness.score) * weight;
+        confidence_sum += record.correctness.confidence;
+        weight_sum += weight;
+    }
+
+    if (available_count == 0 || weight_sum <= 0.0) {
+        return aggregate;
+    }
+
+    aggregate.available = true;
+    aggregate.status = "verified";
+    aggregate.source = "server_evaluator";
+    aggregate.evaluator_id = "runtime_tool_aggregate";
+    aggregate.score = static_cast<float>(weighted_score / weight_sum);
+    aggregate.confidence = static_cast<float>(confidence_sum / static_cast<double>(available_count));
+    aggregate.summary = server_string_format(
+            "Aggregated correctness across %zu runtime tool invocation(s).",
+            available_count);
+    aggregate.evidence.push_back({"count", "available_tool_correctness_records", static_cast<int64_t>(available_count), 1.0f});
+    return aggregate;
+}
+
 static server_policy_reward_breakdown compute_policy_reward_breakdown(
         const server_policy_reward_model & model,
         const server_policy_observation & before,
@@ -883,7 +1324,10 @@ static server_policy_reward_breakdown compute_policy_reward_breakdown(
     breakdown.token_cost = -std::min(
             model.token_cost_cap,
             static_cast<float>(result.prompt_tokens + result.completion_tokens) / std::max(1.0f, model.token_scale));
-    breakdown.tool_success_reward = result.tool_calls.empty() ? 0.0f : model.tool_success_bonus;
+    breakdown.tool_correctness_reward =
+            after.tool_correctness.available
+            ? model.tool_correctness_scale * ((2.0f * after.tool_correctness.score) - 1.0f) * std::max(0.25f, after.tool_correctness.confidence)
+            : 0.0f;
     breakdown.candidate_failure_penalty = candidate_policy_failure ? -model.candidate_failure_penalty : 0.0f;
     breakdown.total =
             breakdown.progress_reward +
@@ -891,7 +1335,7 @@ static server_policy_reward_breakdown compute_policy_reward_breakdown(
             breakdown.completion_quality_reward +
             breakdown.latency_cost +
             breakdown.token_cost +
-            breakdown.tool_success_reward +
+            breakdown.tool_correctness_reward +
             breakdown.candidate_failure_penalty;
     return breakdown;
 }
@@ -1013,7 +1457,19 @@ static bool vector_contains_value(const std::vector<std::string> & values, const
     return std::find(values.begin(), values.end(), value) != values.end();
 }
 
-static int64_t policy_token_budget_bucket_for_depth(const std::string & reasoning_depth) {
+static bool vector_contains_int64(const std::vector<int64_t> & values, int64_t value) {
+    return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+static std::vector<int64_t> default_allowed_response_budget_buckets() {
+    return {256, 512, 1024, 2048};
+}
+
+static std::vector<int64_t> default_allowed_reasoning_budget_buckets() {
+    return {0, 64, 128, 256, 512, 1024};
+}
+
+static int64_t policy_response_budget_bucket_for_depth(const std::string & reasoning_depth) {
     if (reasoning_depth == "none") {
         return 256;
     }
@@ -1026,13 +1482,22 @@ static int64_t policy_token_budget_bucket_for_depth(const std::string & reasonin
     return 2048;
 }
 
+static int64_t policy_reasoning_budget_bucket_for_depth(const std::string & reasoning_depth) {
+    (void) reasoning_depth;
+    return 1024;
+}
+
 static server_policy_action build_policy_action_from_native(
         const server_metacognitive_policy_decision & policy_decision) {
     server_policy_action action = {};
     action.policy_version = policy_decision.policy_version;
     action.selected_mode = policy_decision.selected_mode;
     action.reasoning_depth = policy_decision.reasoning_depth;
-    action.token_budget_bucket = policy_token_budget_bucket_for_depth(policy_decision.reasoning_depth);
+    action.response_budget_bucket = policy_decision.response_budget_bucket > 0 ?
+            policy_decision.response_budget_bucket :
+            policy_response_budget_bucket_for_depth(policy_decision.reasoning_depth);
+    action.reasoning_budget_bucket = std::max<int64_t>(0, policy_decision.reasoning_budget_bucket);
+    action.token_budget_bucket = action.response_budget_bucket;
     action.tool_parallelism_cap = policy_decision.tool_parallelism_cap;
     action.interrupt_allowed = policy_decision.interrupt_allowed;
     action.replan_required = policy_decision.replan_required;
@@ -1055,6 +1520,10 @@ static server_metacognitive_policy_decision apply_policy_action_to_decision(
     decision.policy_version = action.policy_version;
     decision.selected_mode = action.selected_mode;
     decision.reasoning_depth = action.reasoning_depth;
+    decision.response_budget_bucket = action.response_budget_bucket > 0 ?
+            action.response_budget_bucket :
+            action.token_budget_bucket;
+    decision.reasoning_budget_bucket = std::max<int64_t>(0, action.reasoning_budget_bucket);
     decision.tool_parallelism_cap = action.tool_parallelism_cap;
     decision.interrupt_allowed = action.interrupt_allowed;
     decision.replan_required = action.replan_required;
@@ -1079,6 +1548,8 @@ static server_policy_action_mask default_policy_action_mask() {
     mask.allowed_sampling_profiles = default_allowed_sampling_profiles();
     mask.allowed_repetition_profiles = default_allowed_repetition_profiles();
     mask.allowed_tool_choice_profiles = default_allowed_tool_choice_profiles();
+    mask.allowed_response_budget_buckets = default_allowed_response_budget_buckets();
+    mask.allowed_reasoning_budget_buckets = default_allowed_reasoning_budget_buckets();
     mask.max_tool_parallelism_cap = 2;
     return mask;
 }
@@ -1138,6 +1609,71 @@ static std::vector<std::string> stop_sequences_for_profile(const std::string & s
     return {};
 }
 
+static server_request_policy_config build_request_policy_config_from_provider_body(
+        const json & provider_body,
+        const server_policy_action & action,
+        const server_policy_applied_provider_controls & applied_controls) {
+    server_request_policy_config config = {};
+    config.response_budget_bucket = action.response_budget_bucket;
+    config.reasoning_budget_bucket = action.reasoning_budget_bucket;
+    config.token_budget_bucket = action.token_budget_bucket;
+    config.thinking_enabled = applied_controls.thinking_enabled;
+    config.thinking_mode = action.thinking_mode;
+    config.prefix_profile = action.prefix_profile;
+    config.stop_profile = action.stop_profile;
+    config.sampling_profile = action.sampling_profile;
+    config.repetition_profile = action.repetition_profile;
+    config.tool_choice_profile = action.tool_choice_profile;
+    config.tool_parallelism_cap = action.tool_parallelism_cap;
+    config.parallel_tool_calls = json_value(
+            provider_body,
+            "parallel_tool_calls",
+            action.tool_parallelism_cap > 1);
+    config.temperature_present = applied_controls.temperature_present;
+    config.temperature = applied_controls.temperature;
+    config.top_k_present = applied_controls.top_k_present;
+    config.top_k = applied_controls.top_k;
+    config.top_p_present = applied_controls.top_p_present;
+    config.top_p = applied_controls.top_p;
+    config.min_p_present = applied_controls.min_p_present;
+    config.min_p = applied_controls.min_p;
+    config.frequency_penalty_present = applied_controls.frequency_penalty_present;
+    config.frequency_penalty = applied_controls.frequency_penalty;
+    config.presence_penalty_present = applied_controls.presence_penalty_present;
+    config.presence_penalty = applied_controls.presence_penalty;
+
+    if (!config.temperature_present && provider_body.contains("temperature") && !provider_body.at("temperature").is_null()) {
+        config.temperature_present = true;
+        config.temperature = provider_body.at("temperature").get<double>();
+    }
+    if (!config.top_k_present && provider_body.contains("top_k") && !provider_body.at("top_k").is_null()) {
+        config.top_k_present = true;
+        config.top_k = provider_body.at("top_k").get<int32_t>();
+    }
+    if (!config.top_p_present && provider_body.contains("top_p") && !provider_body.at("top_p").is_null()) {
+        config.top_p_present = true;
+        config.top_p = provider_body.at("top_p").get<double>();
+    }
+    if (!config.min_p_present && provider_body.contains("min_p") && !provider_body.at("min_p").is_null()) {
+        config.min_p_present = true;
+        config.min_p = provider_body.at("min_p").get<double>();
+    }
+    if (!config.frequency_penalty_present &&
+            provider_body.contains("frequency_penalty") &&
+            !provider_body.at("frequency_penalty").is_null()) {
+        config.frequency_penalty_present = true;
+        config.frequency_penalty = provider_body.at("frequency_penalty").get<double>();
+    }
+    if (!config.presence_penalty_present &&
+            provider_body.contains("presence_penalty") &&
+            !provider_body.at("presence_penalty").is_null()) {
+        config.presence_penalty_present = true;
+        config.presence_penalty = provider_body.at("presence_penalty").get<double>();
+    }
+
+    return config;
+}
+
 static json apply_policy_provider_controls(
         const json & body,
         const server_policy_action & action,
@@ -1164,28 +1700,54 @@ static json apply_policy_provider_controls(
         if (action.repetition_profile != "none") {
             append_string_once(&controls.suppressed_fields, "repetition_profile");
         }
-        for (const char * key : {"temperature", "top_p", "frequency_penalty", "presence_penalty", "logprobs", "top_logprobs"}) {
+        for (const char * key : {"temperature", "top_k", "top_p", "min_p", "frequency_penalty", "presence_penalty", "logprobs", "top_logprobs"}) {
             if (shaped.contains(key)) {
                 shaped.erase(key);
                 controls.suppressed_fields.push_back(key);
             }
         }
+        if (shaped.contains("tool_choice")) {
+            shaped.erase("tool_choice");
+            append_string_once(&controls.suppressed_fields, "tool_choice");
+        }
     } else {
         if (action.sampling_profile == "deterministic") {
             shaped["temperature"] = 0.0;
             shaped.erase("top_p");
+            shaped.erase("top_k");
+            shaped.erase("min_p");
             controls.temperature_present = true;
             controls.temperature = 0.0;
             controls.field_sources["temperature"] = "policy_profile";
         } else if (action.sampling_profile == "balanced") {
             shaped["temperature"] = 0.2;
             shaped.erase("top_p");
+            if (shaped.contains("top_k") && shaped.at("top_k").is_number_integer()) {
+                controls.top_k_present = true;
+                controls.top_k = shaped.at("top_k").get<int32_t>();
+                controls.field_sources["top_k"] = "caller";
+            }
+            if (shaped.contains("min_p") && shaped.at("min_p").is_number()) {
+                controls.min_p_present = true;
+                controls.min_p = shaped.at("min_p").get<double>();
+                controls.field_sources["min_p"] = "caller";
+            }
             controls.temperature_present = true;
             controls.temperature = 0.2;
             controls.field_sources["temperature"] = "policy_profile";
         } else if (action.sampling_profile == "creative") {
             shaped.erase("temperature");
             shaped["top_p"] = 0.95;
+            if (shaped.contains("top_k") && shaped.at("top_k").is_number_integer()) {
+                controls.top_k_present = true;
+                controls.top_k = shaped.at("top_k").get<int32_t>();
+                controls.field_sources["top_k"] = "caller";
+            }
+            if (shaped.contains("min_p") && shaped.at("min_p").is_number()) {
+                controls.min_p_present = true;
+                controls.min_p = shaped.at("min_p").get<double>();
+                controls.field_sources["min_p"] = "caller";
+            }
             controls.top_p_present = true;
             controls.top_p = 0.95;
             controls.field_sources["top_p"] = "policy_profile";
@@ -1194,11 +1756,26 @@ static json apply_policy_provider_controls(
                 controls.temperature_present = true;
                 controls.temperature = shaped.at("temperature").get<double>();
                 controls.field_sources["temperature"] = "caller";
-            } else if (shaped.contains("top_p") && shaped.at("top_p").is_number()) {
+            }
+            if (shaped.contains("top_k") && shaped.at("top_k").is_number_integer()) {
+                controls.top_k_present = true;
+                controls.top_k = shaped.at("top_k").get<int32_t>();
+                controls.field_sources["top_k"] = "caller";
+            }
+            if (shaped.contains("top_p") && shaped.at("top_p").is_number()) {
                 controls.top_p_present = true;
                 controls.top_p = shaped.at("top_p").get<double>();
                 controls.field_sources["top_p"] = "caller";
-            } else {
+            }
+            if (shaped.contains("min_p") && shaped.at("min_p").is_number()) {
+                controls.min_p_present = true;
+                controls.min_p = shaped.at("min_p").get<double>();
+                controls.field_sources["min_p"] = "caller";
+            }
+            if (!controls.temperature_present &&
+                    !controls.top_k_present &&
+                    !controls.top_p_present &&
+                    !controls.min_p_present) {
                 controls.defaulted_fields.push_back("sampling_profile");
             }
         }
@@ -1242,7 +1819,9 @@ static json apply_policy_provider_controls(
         }
     }
 
-    if (!tools_available) {
+    if (controls.thinking_enabled) {
+        append_string_once(&controls.suppressed_fields, "tool_choice_profile");
+    } else if (!tools_available) {
         append_string_once(&controls.suppressed_fields, "tool_choice_profile");
     } else if (named_tool_choice_locked) {
         append_string_once(&controls.suppressed_fields, "tool_choice_profile");
@@ -1325,17 +1904,19 @@ static server_policy_observation build_policy_observation(
         const std::string & decision_id,
         const std::string & trace_id,
         const std::string & mode_label,
+        const std::string & inference_substrate,
         const server_metacognitive_control_state & control_state,
         const server_heuristic_retrieval_decision & heuristic_decision,
-        const json & body) {
+        const json & body,
+        const server_tool_correctness_signal & tool_correctness = {}) {
     server_policy_observation observation = {};
     observation.request_id = request_id;
     observation.trace_id = trace_id;
     observation.decision_id = decision_id;
     observation.mode_label = mode_label;
+    observation.inference_substrate = inference_substrate;
     observation.bridge_scoped = control_state.bridge_scoped;
     observation.cognitive_replay = control_state.cognitive_replay;
-    observation.ongoing_task_due = control_state.ongoing_task_due;
     observation.moment = control_state.moment;
     observation.vad = control_state.vad;
     observation.heuristic_matched = heuristic_decision.matched;
@@ -1345,7 +1926,247 @@ static server_policy_observation build_policy_observation(
     if (body.contains("messages") && body.at("messages").is_array()) {
         observation.input_message_count = static_cast<int32_t>(body.at("messages").size());
     }
+    observation.tool_correctness = tool_correctness;
     return observation;
+}
+
+static void populate_runtime_control_state_from_rollouts(
+        server_llama_runtime_control_state * runtime_control_state,
+        const server_emotive_vector & moment,
+        const server_emotive_vad & vad,
+        const std::string & policy_request_id) {
+    if (!runtime_control_state) {
+        return;
+    }
+    *runtime_control_state = {};
+    runtime_control_state->moment = moment;
+    runtime_control_state->vad = vad;
+    {
+        std::lock_guard<std::mutex> artifact_lock(g_runtime_artifact_mutex);
+        runtime_control_state->cvec_generator = g_active_local_cvec_generator;
+        runtime_control_state->candidate_cvec_generator = g_candidate_local_cvec_generator;
+        runtime_control_state->decode_controller = g_active_local_decode_controller;
+        runtime_control_state->candidate_decode_controller = g_candidate_local_decode_controller;
+    }
+    {
+        auto & decode_rollout = decode_artifact_rollout_state_instance();
+        std::lock_guard<std::mutex> lock(decode_rollout.mutex);
+        runtime_control_state->decode_controller_mode = decode_rollout.mode;
+        runtime_control_state->decode_candidate_execute_live = runtime_artifact_should_execute_candidate_live(
+                decode_rollout,
+                policy_request_id);
+        runtime_control_state->decode_controller_alias = decode_rollout.active_alias;
+        runtime_control_state->decode_controller_version = decode_rollout.active_version;
+        runtime_control_state->candidate_decode_controller_alias = decode_rollout.candidate_alias;
+        runtime_control_state->candidate_decode_controller_version = decode_rollout.candidate_version;
+    }
+    {
+        auto & cvec_rollout = cvec_artifact_rollout_state_instance();
+        std::lock_guard<std::mutex> lock(cvec_rollout.mutex);
+        runtime_control_state->cvec_generator_mode = cvec_rollout.mode;
+        runtime_control_state->cvec_candidate_execute_live = runtime_artifact_should_execute_candidate_live(
+                cvec_rollout,
+                policy_request_id);
+        runtime_control_state->cvec_generator_alias = cvec_rollout.active_alias;
+        runtime_control_state->cvec_generator_version = cvec_rollout.active_version;
+        runtime_control_state->candidate_cvec_generator_alias = cvec_rollout.candidate_alias;
+        runtime_control_state->candidate_cvec_generator_version = cvec_rollout.candidate_version;
+    }
+    if (!runtime_control_state->candidate_decode_controller && runtime_control_state->decode_controller) {
+        runtime_control_state->decode_controller_callback = server_decode_controller_infer_callback;
+        runtime_control_state->decode_controller_user_data = runtime_control_state;
+    }
+    server_llama_runtime_control_begin_request(
+            runtime_control_state,
+            policy_request_id,
+            g_active_provider_runtime_config ?
+                    g_active_provider_runtime_config->resolved_model :
+                    std::string());
+}
+
+static bool ingest_experimental_trace_into_host(
+        server_emotive_runtime & emotive_runtime,
+        const deepseek_chat_result & result,
+        const server_metacognitive_policy_decision & native_policy_decision,
+        const server_metacognitive_policy_decision & effective_policy_decision,
+        const server_policy_action & executed_policy_action,
+        const server_policy_rollout_decision & rollout_decision,
+        const server_policy_applied_provider_controls & applied_provider_controls,
+        const server_heuristic_retrieval_decision & heuristic_decision,
+        server_emotive_trace * out_trace,
+        server_decode_control_trace * out_decode_trace,
+        json * out_emotive_trace_json,
+        std::string * out_error) {
+    server_emotive_trace parsed_trace = {};
+    if (!result.emotive_trace.is_object() ||
+            !server_emotive_trace_from_json(result.emotive_trace, &parsed_trace)) {
+        if (out_error) {
+            *out_error = "experimental inference response did not include a valid emotive trace";
+        }
+        return false;
+    }
+
+    server_decode_control_trace parsed_decode_trace = {};
+    if (result.emotive_trace.contains("decode_controller_trace") &&
+            result.emotive_trace.at("decode_controller_trace").is_object()) {
+        server_decode_control_trace_from_json(
+                result.emotive_trace.at("decode_controller_trace"),
+                &parsed_decode_trace,
+                nullptr);
+    }
+
+    if (!parsed_trace.final_policy.is_object()) {
+        parsed_trace.final_policy = build_final_policy_json_local(
+                native_policy_decision,
+                effective_policy_decision,
+                executed_policy_action,
+                build_request_policy_config_from_provider_body(json::object(), executed_policy_action, applied_provider_controls),
+                rollout_decision,
+                applied_provider_controls,
+                heuristic_decision,
+                parsed_decode_trace);
+    }
+    if (!parsed_trace.heuristic_retrieval.is_object()) {
+        parsed_trace.heuristic_retrieval = build_heuristic_retrieval_json_local(heuristic_decision);
+    }
+    emotive_runtime.remember_trace(parsed_trace);
+
+    if (!parsed_decode_trace.steps.empty()) {
+        policy_runtime_record_decode_trace(parsed_decode_trace);
+        experimental_capture_append_decode_trace(parsed_decode_trace);
+        runtime_artifact_record_decode_trace_metrics(
+                decode_artifact_rollout_state_instance(),
+                parsed_decode_trace);
+        runtime_artifact_record_cvec_metrics(
+                cvec_artifact_rollout_state_instance(),
+                parsed_decode_trace);
+    }
+
+    if (out_trace) {
+        *out_trace = parsed_trace;
+    }
+    if (out_decode_trace) {
+        *out_decode_trace = parsed_decode_trace;
+    }
+    if (out_emotive_trace_json) {
+        *out_emotive_trace_json = server_emotive_trace_to_json(parsed_trace);
+        if (!parsed_decode_trace.steps.empty()) {
+            (*out_emotive_trace_json)["decode_controller_trace"] =
+                    server_decode_control_trace_to_json(parsed_decode_trace);
+        }
+    }
+    return true;
+}
+
+static bool execute_prepared_runpod_node_inference(
+        server_emotive_runtime & emotive_runtime,
+        const json & relay_body,
+        deepseek_chat_result * out_result,
+        json * out_error,
+        const runtime_request_trace_context * trace_context) {
+    if (!out_result) {
+        if (out_error) {
+            *out_error = format_error_response("prepared RunPod inference requires a non-null result output", ERROR_TYPE_SERVER);
+        }
+        return false;
+    }
+    if (!local_llama_provider_selected()) {
+        if (out_error) {
+            *out_error = format_error_response("prepared RunPod inference is no longer supported by the host repository", ERROR_TYPE_NOT_SUPPORTED);
+        }
+        return false;
+    }
+    if (!relay_body.contains("body") || !relay_body.at("body").is_object()) {
+        if (out_error) {
+            *out_error = format_error_response("prepared RunPod inference request missing body", ERROR_TYPE_INVALID_REQUEST);
+        }
+        return false;
+    }
+
+    const json & provider_body = relay_body.at("body");
+    const std::string mode_label = json_value(relay_body, "mode_label", std::string("runpod_node"));
+    std::unique_ptr<server_emotive_turn_builder> turn_builder;
+    if (emotive_runtime.config().enabled) {
+        turn_builder = std::make_unique<server_emotive_turn_builder>(
+                emotive_runtime,
+                g_active_provider_runtime_config ? g_active_provider_runtime_config->resolved_model : std::string(),
+                json_value(relay_body, "cognitive_replay", false),
+                json_value(relay_body, "cognitive_replay_entry_id", std::string()),
+                json_value(relay_body, "suppress_replay_admission", false),
+                mode_label);
+        seed_emotive_turn_from_request(provider_body, turn_builder.get());
+        turn_builder->mark_live_generation_start();
+    }
+
+    deepseek_stream_observer observer;
+    if (turn_builder) {
+        observer.on_reasoning_delta = [&turn_builder](const std::string & text) {
+            turn_builder->observe_reasoning_delta(text);
+        };
+        observer.on_content_delta = [&turn_builder](const std::string & text) {
+            turn_builder->observe_content_delta(text);
+        };
+        observer.on_runtime_event = [&turn_builder](const std::string & text) {
+            turn_builder->observe_runtime_event(text);
+        };
+    }
+
+    server_emotive_vector host_moment = {};
+    server_emotive_vad host_vad = {};
+    if (relay_body.contains("host_self_model") && relay_body.at("host_self_model").is_object()) {
+        const json & host_self_model = relay_body.at("host_self_model");
+        server_emotive_vector_from_json(json_value(host_self_model, "moment", json::object()), &host_moment, nullptr);
+        server_emotive_vad_from_json(json_value(host_self_model, "vad", json::object()), &host_vad, nullptr);
+    }
+
+    server_llama_runtime_control_state runtime_control_state = {};
+    populate_runtime_control_state_from_rollouts(
+            &runtime_control_state,
+            host_moment,
+            host_vad,
+            json_value(relay_body, "request_id", std::string()));
+
+    deepseek_request_trace provider_trace;
+    if (trace_context) {
+        provider_trace.request_id = trace_context->request_id;
+        provider_trace.mode_label = mode_label;
+        provider_trace.emit = [trace_context](const std::string & event, const json & data) {
+            runtime_request_trace_log(*trace_context, "provider", event, data);
+        };
+    }
+
+    *out_result = deepseek_chat_result();
+    if (!g_active_local_llama_provider->complete_chat(
+                provider_body,
+                out_result,
+                turn_builder ? &observer : nullptr,
+                out_error,
+                trace_context ? &provider_trace : nullptr,
+                &runtime_control_state,
+                turn_builder.get())) {
+        return false;
+    }
+
+    if (turn_builder) {
+        turn_builder->observe_runtime_event(
+                "provider_finish:" + (out_result->finish_reason.empty() ? std::string("stop") : out_result->finish_reason));
+        server_emotive_trace final_trace = turn_builder->finalize();
+        server_decode_control_trace final_decode_trace =
+                server_llama_runtime_control_finalize_trace(&runtime_control_state, final_trace.trace_id);
+        final_trace.final_policy = relay_body.contains("host_final_policy") ?
+                relay_body.at("host_final_policy") :
+                json(nullptr);
+        final_trace.heuristic_retrieval = relay_body.contains("host_heuristic_retrieval") ?
+                relay_body.at("host_heuristic_retrieval") :
+                json(nullptr);
+        out_result->emotive_trace = server_emotive_trace_to_json(final_trace);
+        if (!final_decode_trace.steps.empty()) {
+            out_result->emotive_trace["decode_controller_trace"] =
+                    server_decode_control_trace_to_json(final_decode_trace);
+        }
+    }
+
+    return true;
 }
 
 static bool parse_candidate_policy_action(
@@ -1355,6 +2176,7 @@ static bool parse_candidate_policy_action(
         std::string * out_policy_alias,
         bool * out_confidence_present,
         float * out_confidence,
+        server_policy_rollout_metadata * out_rollout,
         std::string * out_error) {
     if (!out_action) {
         if (out_error) {
@@ -1374,16 +2196,46 @@ static bool parse_candidate_policy_action(
     action.policy_version = json_value(payload, "policy_version", std::string("shadow_candidate_v1"));
     action.selected_mode = json_value(action_json, "selected_mode", std::string());
     action.reasoning_depth = json_value(action_json, "reasoning_depth", std::string());
-    if (action_json.contains("token_budget_bucket")) {
-        if (action_json.at("token_budget_bucket").is_number_integer()) {
-            action.token_budget_bucket = action_json.at("token_budget_bucket").get<int64_t>();
-        } else if (action_json.at("token_budget_bucket").is_string()) {
-            action.token_budget_bucket = std::strtoll(
-                    action_json.at("token_budget_bucket").get_ref<const std::string &>().c_str(),
+    if (action_json.contains("response_budget_bucket")) {
+        if (action_json.at("response_budget_bucket").is_number_integer()) {
+            action.response_budget_bucket = action_json.at("response_budget_bucket").get<int64_t>();
+        } else if (action_json.at("response_budget_bucket").is_string()) {
+            action.response_budget_bucket = std::strtoll(
+                    action_json.at("response_budget_bucket").get_ref<const std::string &>().c_str(),
                     nullptr,
                     10);
         }
     }
+    if (action_json.contains("reasoning_budget_bucket")) {
+        if (action_json.at("reasoning_budget_bucket").is_number_integer()) {
+            action.reasoning_budget_bucket = action_json.at("reasoning_budget_bucket").get<int64_t>();
+        } else if (action_json.at("reasoning_budget_bucket").is_string()) {
+            action.reasoning_budget_bucket = std::strtoll(
+                    action_json.at("reasoning_budget_bucket").get_ref<const std::string &>().c_str(),
+                    nullptr,
+                    10);
+        }
+    }
+    if (action.response_budget_bucket <= 0 && action_json.contains("token_budget_bucket")) {
+        if (action_json.at("token_budget_bucket").is_number_integer()) {
+            action.response_budget_bucket = action_json.at("token_budget_bucket").get<int64_t>();
+        } else if (action_json.at("token_budget_bucket").is_string()) {
+            action.response_budget_bucket = std::strtoll(
+            action_json.at("token_budget_bucket").get_ref<const std::string &>().c_str(),
+                    nullptr,
+                    10);
+        }
+    }
+    if (action.response_budget_bucket <= 0) {
+        action.response_budget_bucket = policy_response_budget_bucket_for_depth(action.reasoning_depth);
+    }
+    if (action.reasoning_budget_bucket < 0) {
+        action.reasoning_budget_bucket = 0;
+    }
+    if (!action_json.contains("reasoning_budget_bucket")) {
+        action.reasoning_budget_bucket = policy_reasoning_budget_bucket_for_depth(action.reasoning_depth);
+    }
+    action.token_budget_bucket = action.response_budget_bucket;
     action.tool_parallelism_cap = json_value(action_json, "tool_parallelism_cap", int32_t(0));
     action.interrupt_allowed = json_value(action_json, "interrupt_allowed", false);
     action.replan_required = json_value(action_json, "replan_required", false);
@@ -1400,7 +2252,8 @@ static bool parse_candidate_policy_action(
     action.tool_choice_profile = json_value(action_json, "tool_choice_profile", std::string("caller_default"));
     action.proposal_source = "candidate";
 
-    if (action.selected_mode.empty() || action.reasoning_depth.empty() || action.token_budget_bucket <= 0) {
+    if (action.selected_mode.empty() || action.reasoning_depth.empty() ||
+            action.response_budget_bucket <= 0 || action.reasoning_budget_bucket < 0) {
         if (out_error) {
             *out_error = "candidate policy response missing required bounded action fields";
         }
@@ -1442,6 +2295,18 @@ static bool parse_candidate_policy_action(
             }
         }
     }
+    if (out_rollout) {
+        *out_rollout = {};
+        if (payload.contains("rollout") && payload.at("rollout").is_object()) {
+            const json & rollout_json = payload.at("rollout");
+            out_rollout->available = json_value(rollout_json, "available", false);
+            out_rollout->artifact_kind = json_value(rollout_json, "artifact_kind", std::string());
+            out_rollout->policy_version = json_value(rollout_json, "policy_version", std::string());
+            out_rollout->selected_log_prob = json_value(rollout_json, "selected_log_prob", 0.0f);
+            out_rollout->value_estimate = json_value(rollout_json, "value_estimate", 0.0f);
+            out_rollout->entropy = json_value(rollout_json, "entropy", 0.0f);
+        }
+    }
     return true;
 }
 
@@ -1470,6 +2335,17 @@ static server_policy_safety_guard_result shield_candidate_policy_action(
         result.blocked_fields.push_back("thinking_mode");
         result.allowed = false;
     }
+    if (!vector_contains_int64(mask.allowed_response_budget_buckets, shielded.response_budget_bucket)) {
+        shielded.response_budget_bucket = native_action.response_budget_bucket;
+        result.blocked_fields.push_back("response_budget_bucket");
+        result.allowed = false;
+    }
+    if (!vector_contains_int64(mask.allowed_reasoning_budget_buckets, shielded.reasoning_budget_bucket)) {
+        shielded.reasoning_budget_bucket = native_action.reasoning_budget_bucket;
+        result.blocked_fields.push_back("reasoning_budget_bucket");
+        result.allowed = false;
+    }
+    shielded.token_budget_bucket = shielded.response_budget_bucket;
     if (!vector_contains_value(mask.allowed_prefix_profiles, shielded.prefix_profile)) {
         shielded.prefix_profile = native_action.prefix_profile;
         result.blocked_fields.push_back("prefix_profile");
@@ -1541,6 +2417,8 @@ static bool policy_actions_differ(
         const server_policy_action & rhs) {
     return lhs.selected_mode != rhs.selected_mode ||
             lhs.reasoning_depth != rhs.reasoning_depth ||
+            lhs.response_budget_bucket != rhs.response_budget_bucket ||
+            lhs.reasoning_budget_bucket != rhs.reasoning_budget_bucket ||
             lhs.token_budget_bucket != rhs.token_budget_bucket ||
             lhs.tool_parallelism_cap != rhs.tool_parallelism_cap ||
             lhs.interrupt_allowed != rhs.interrupt_allowed ||
@@ -1553,6 +2431,13 @@ static bool policy_actions_differ(
             lhs.sampling_profile != rhs.sampling_profile ||
             lhs.repetition_profile != rhs.repetition_profile ||
             lhs.tool_choice_profile != rhs.tool_choice_profile;
+}
+
+static bool llama_runtime_control_actions_differ(
+        const llama_runtime_control_action & lhs,
+        const llama_runtime_control_action & rhs) {
+    return server_llama_runtime_control_action_to_json(lhs) !=
+            server_llama_runtime_control_action_to_json(rhs);
 }
 
 struct server_policy_rollout_decision {
@@ -1731,10 +2616,95 @@ static void policy_runtime_record_transition(const server_policy_transition & tr
     }
 }
 
+static void policy_runtime_record_decode_trace(const server_decode_control_trace & trace) {
+    if (trace.steps.empty()) {
+        return;
+    }
+    auto & state = policy_runtime_state_instance();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.decode_traces.push_back(trace);
+    ++state.total_decode_traces;
+    state.total_decode_steps += static_cast<uint64_t>(trace.steps.size());
+    while (state.decode_traces.size() > state.max_decode_traces) {
+        state.decode_traces.pop_front();
+    }
+}
+
+static void runtime_artifact_record_decode_trace_metrics(
+        server_runtime_artifact_rollout_state & state,
+        const server_decode_control_trace & trace) {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    bool sampled_live = false;
+    bool counted_live_execution = false;
+    for (const auto & step : trace.steps) {
+        if (!step.candidate_metadata.controller_version.empty() && !step.candidate_metadata.available) {
+            ++state.total_candidate_failure_count;
+            ++state.current_window.candidate_failure_count;
+        }
+        if (step.candidate_metadata.available) {
+            ++state.total_comparison_count;
+            ++state.current_window.comparison_count;
+            if (llama_runtime_control_actions_differ(step.candidate_action, step.executed_action) &&
+                    !step.candidate_metadata.executed_live) {
+                ++state.total_disagreement_count;
+                ++state.current_window.disagreement_count;
+            }
+            if (step.candidate_metadata.executed_live && !counted_live_execution) {
+                sampled_live = true;
+                ++state.total_live_candidate_execution_count;
+                ++state.current_window.live_candidate_execution_count;
+                counted_live_execution = true;
+            }
+        }
+    }
+    if (sampled_live) {
+        ++state.total_sampled_request_count;
+        ++state.current_window.sampled_request_count;
+    }
+}
+
+static void runtime_artifact_record_cvec_metrics(
+        server_runtime_artifact_rollout_state & state,
+        const server_decode_control_trace & trace) {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    bool sampled_live = false;
+    bool counted_live_execution = false;
+    for (const auto & step : trace.steps) {
+        if (!step.cvec_rollout.candidate_generator_version.empty() && !step.cvec_rollout.candidate_available) {
+            ++state.total_candidate_failure_count;
+            ++state.current_window.candidate_failure_count;
+        }
+        if (step.cvec_rollout.candidate_executed_live) {
+            sampled_live = true;
+            if (!counted_live_execution) {
+                ++state.total_live_candidate_execution_count;
+                ++state.current_window.live_candidate_execution_count;
+                counted_live_execution = true;
+            }
+        }
+        if (step.cvec_rollout.candidate_compared) {
+            ++state.total_comparison_count;
+            ++state.current_window.comparison_count;
+            state.total_cosine_similarity_sum += step.cvec_rollout.candidate_cosine_similarity;
+            state.current_window.cosine_similarity_sum += step.cvec_rollout.candidate_cosine_similarity;
+            state.total_norm_delta_sum += step.cvec_rollout.candidate_norm_delta;
+            state.current_window.norm_delta_sum += step.cvec_rollout.candidate_norm_delta;
+        }
+    }
+    if (sampled_live) {
+        ++state.total_sampled_request_count;
+        ++state.current_window.sampled_request_count;
+    }
+}
+
 static json policy_runtime_status_json() {
     const auto & config = policy_runtime_config_instance();
     auto & state = policy_runtime_state_instance();
+    auto & decode_state = decode_artifact_rollout_state_instance();
+    auto & cvec_state = cvec_artifact_rollout_state_instance();
     std::lock_guard<std::mutex> lock(state.mutex);
+    std::lock_guard<std::mutex> decode_lock(decode_state.mutex);
+    std::lock_guard<std::mutex> cvec_lock(cvec_state.mutex);
     const int32_t current_canary_share = policy_runtime_current_canary_share_percent_locked(config, state);
     return {
         {"object", "vicuna.policy.status"},
@@ -1746,8 +2716,12 @@ static json policy_runtime_status_json() {
         {"candidate_policy_version", state.candidate_policy_version.empty() ? json(nullptr) : json(state.candidate_policy_version)},
         {"candidate_policy_alias", state.candidate_policy_alias.empty() ? json(nullptr) : json(state.candidate_policy_alias)},
         {"stored_transitions", static_cast<int64_t>(state.transitions.size())},
+        {"stored_decode_traces", static_cast<int64_t>(state.decode_traces.size())},
         {"max_transitions", static_cast<int64_t>(state.max_transitions)},
+        {"max_decode_traces", static_cast<int64_t>(state.max_decode_traces)},
         {"total_transitions", static_cast<int64_t>(state.total_transitions)},
+        {"total_decode_traces", static_cast<int64_t>(state.total_decode_traces)},
+        {"total_decode_steps", static_cast<int64_t>(state.total_decode_steps)},
         {"shadow_request_count", static_cast<int64_t>(state.shadow_request_count)},
         {"shadow_disagreement_count", static_cast<int64_t>(state.shadow_disagreement_count)},
         {"candidate_failure_count", static_cast<int64_t>(state.candidate_failure_count)},
@@ -1783,13 +2757,21 @@ static json policy_runtime_status_json() {
         {"last_candidate_error", state.last_candidate_error.empty() ? json(nullptr) : json(state.last_candidate_error)},
         {"candidate_url", config.candidate_url.empty() ? json(nullptr) : json(config.candidate_url)},
         {"reward_config_path", config.reward_config_path.empty() ? json(nullptr) : json(config.reward_config_path)},
+        {"runtime_artifacts", {
+            {"decode_controller", runtime_artifact_rollout_state_to_json(decode_state)},
+            {"cvec_generator", runtime_artifact_rollout_state_to_json(cvec_state)},
+        }},
     };
 }
 
 static json policy_runtime_health_json() {
     const auto & config = policy_runtime_config_instance();
     auto & state = policy_runtime_state_instance();
+    auto & decode_state = decode_artifact_rollout_state_instance();
+    auto & cvec_state = cvec_artifact_rollout_state_instance();
     std::lock_guard<std::mutex> lock(state.mutex);
+    std::lock_guard<std::mutex> decode_lock(decode_state.mutex);
+    std::lock_guard<std::mutex> cvec_lock(cvec_state.mutex);
     const int32_t current_canary_share = policy_runtime_current_canary_share_percent_locked(config, state);
     return {
         {"enabled", config.enabled},
@@ -1797,8 +2779,12 @@ static json policy_runtime_health_json() {
         {"rollout_mode", config.mode},
         {"rollout_state", policy_runtime_rollout_state_label_locked(config, state)},
         {"stored_transitions", static_cast<int64_t>(state.transitions.size())},
+        {"stored_decode_traces", static_cast<int64_t>(state.decode_traces.size())},
         {"max_transitions", static_cast<int64_t>(state.max_transitions)},
+        {"max_decode_traces", static_cast<int64_t>(state.max_decode_traces)},
         {"total_transitions", static_cast<int64_t>(state.total_transitions)},
+        {"total_decode_traces", static_cast<int64_t>(state.total_decode_traces)},
+        {"total_decode_steps", static_cast<int64_t>(state.total_decode_steps)},
         {"shadow_request_count", static_cast<int64_t>(state.shadow_request_count)},
         {"shadow_disagreement_count", static_cast<int64_t>(state.shadow_disagreement_count)},
         {"candidate_failure_count", static_cast<int64_t>(state.candidate_failure_count)},
@@ -1818,6 +2804,10 @@ static json policy_runtime_health_json() {
         {"latest_applied_provider_controls", state.transitions.empty() ?
                 json(nullptr) :
                 server_policy_applied_provider_controls_to_json(state.transitions.back().applied_provider_controls)},
+        {"runtime_artifacts", {
+            {"decode_controller", runtime_artifact_rollout_state_to_json(decode_state)},
+            {"cvec_generator", runtime_artifact_rollout_state_to_json(cvec_state)},
+        }},
     };
 }
 
@@ -1848,6 +2838,219 @@ static json policy_runtime_transitions_json(const server_http_req & req) {
         {"max_transitions", static_cast<int64_t>(state.max_transitions)},
         {"items", std::move(items)},
     };
+}
+
+static json policy_runtime_decode_traces_json(const server_http_req & req) {
+    const std::string request_id = trim_copy(req.get_param("request_id", ""));
+    const int64_t limit = std::max<int64_t>(1, std::min<int64_t>(
+            128,
+            std::strtoll(req.get_param("limit", "64").c_str(), nullptr, 10)));
+
+    auto & state = policy_runtime_state_instance();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    json items = json::array();
+    for (auto it = state.decode_traces.rbegin(); it != state.decode_traces.rend(); ++it) {
+        if (!request_id.empty() && it->request_id != request_id) {
+            continue;
+        }
+        items.push_back(server_decode_control_trace_to_json(*it));
+        if (static_cast<int64_t>(items.size()) >= limit) {
+            break;
+        }
+    }
+
+    return {
+        {"object", "vicuna.policy.decode_traces"},
+        {"count", static_cast<int64_t>(items.size())},
+        {"limit", limit},
+        {"request_id", request_id.empty() ? json(nullptr) : json(request_id)},
+        {"items", std::move(items)},
+    };
+}
+
+static server_runtime_artifact_rollout_state * runtime_artifact_rollout_state_for_kind(
+        const std::string & artifact_kind) {
+    if (artifact_kind == "decode_controller") {
+        return &decode_artifact_rollout_state_instance();
+    }
+    if (artifact_kind == "cvec_generator") {
+        return &cvec_artifact_rollout_state_instance();
+    }
+    return nullptr;
+}
+
+static json policy_runtime_artifacts_status_json() {
+    auto & decode_state = decode_artifact_rollout_state_instance();
+    auto & cvec_state = cvec_artifact_rollout_state_instance();
+    std::lock_guard<std::mutex> decode_lock(decode_state.mutex);
+    std::lock_guard<std::mutex> cvec_lock(cvec_state.mutex);
+    return {
+        {"object", "vicuna.policy.runtime_artifacts"},
+        {"items", {
+            {"decode_controller", runtime_artifact_rollout_state_to_json(decode_state)},
+            {"cvec_generator", runtime_artifact_rollout_state_to_json(cvec_state)},
+        }},
+    };
+}
+
+static bool apply_runtime_artifact_payload(
+        const json & body,
+        json * out_result,
+        json * out_error) {
+    const std::string artifact_kind = trim_copy(json_value(body, "artifact_kind", std::string()));
+    const std::string slot = trim_copy(json_value(body, "slot", std::string("active")));
+    const bool clear = json_value(body, "clear", false);
+    if (slot != "active" && slot != "candidate") {
+        if (out_error) {
+            *out_error = format_error_response("runtime artifact slot must be active or candidate", ERROR_TYPE_INVALID_REQUEST);
+        }
+        return false;
+    }
+    auto * rollout_state = runtime_artifact_rollout_state_for_kind(artifact_kind);
+    if (rollout_state == nullptr) {
+        if (out_error) {
+            *out_error = format_error_response("unsupported runtime artifact kind", ERROR_TYPE_INVALID_REQUEST);
+        }
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(rollout_state->mutex);
+        if (body.contains("mode")) {
+            rollout_state->mode = normalize_policy_runtime_mode(json_value(body, "mode", std::string("disabled")));
+        }
+        if (body.contains("canary_steps") && body.at("canary_steps").is_array()) {
+            std::vector<int32_t> steps;
+            for (const auto & item : body.at("canary_steps")) {
+                if (item.is_number_integer()) {
+                    const int32_t value = item.get<int32_t>();
+                    if (value > 0 && value <= 100) {
+                        steps.push_back(value);
+                    }
+                }
+            }
+            if (!steps.empty()) {
+                rollout_state->canary_steps = steps;
+            }
+        }
+        if (body.contains("current_rollout_step_index")) {
+            rollout_state->current_rollout_step_index = std::max<int32_t>(0, json_value(body, "current_rollout_step_index", 0));
+        }
+        if (body.contains("min_requests_per_step")) {
+            rollout_state->min_requests_per_step = std::max<int32_t>(1, json_value(body, "min_requests_per_step", rollout_state->min_requests_per_step));
+        }
+        if (json_value(body, "reset_metrics", false)) {
+            runtime_artifact_reset_window_locked(*rollout_state);
+        }
+    }
+
+    std::lock_guard<std::mutex> artifact_lock(g_runtime_artifact_mutex);
+    const std::string alias = trim_copy(json_value(body, "artifact_alias", std::string()));
+    const std::string version = trim_copy(json_value(body, "artifact_version", std::string()));
+    if (artifact_kind == "cvec_generator") {
+        if (clear) {
+            if (slot == "active") {
+                g_active_local_cvec_generator.reset();
+            } else {
+                g_candidate_local_cvec_generator.reset();
+            }
+            auto & state = cvec_artifact_rollout_state_instance();
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (slot == "active") {
+                state.active_alias.clear();
+                state.active_version.clear();
+            } else {
+                state.candidate_alias.clear();
+                state.candidate_version.clear();
+            }
+            state.last_reload_reason = "cleared";
+        } else {
+            if (!body.contains("artifact") || !body.at("artifact").is_object()) {
+                if (out_error) {
+                    *out_error = format_error_response("runtime artifact payload missing artifact object", ERROR_TYPE_INVALID_REQUEST);
+                }
+                return false;
+            }
+            auto artifact = std::make_shared<server_cvec_generator_artifact>();
+            std::string load_error;
+            if (!server_cvec_generator_load_artifact_payload(body.at("artifact"), artifact.get(), &load_error)) {
+                if (out_error) {
+                    *out_error = format_error_response(load_error, ERROR_TYPE_INVALID_REQUEST);
+                }
+                return false;
+            }
+            auto & state = cvec_artifact_rollout_state_instance();
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (slot == "active") {
+                g_active_local_cvec_generator = artifact;
+                state.active_alias = alias;
+                state.active_version = version.empty() ? artifact->generator_version : version;
+            } else {
+                state.candidate_alias = alias;
+                state.candidate_version = version.empty() ? artifact->generator_version : version;
+            }
+            if (slot == "candidate") {
+                g_candidate_local_cvec_generator = artifact;
+            } else {
+                g_active_local_cvec_generator = artifact;
+            }
+            state.last_error.clear();
+            state.last_reload_reason = "loaded";
+        }
+    }
+    if (artifact_kind == "decode_controller") {
+        if (clear) {
+            if (slot == "active") {
+                g_active_local_decode_controller.reset();
+            } else {
+                g_candidate_local_decode_controller.reset();
+            }
+            auto & state = decode_artifact_rollout_state_instance();
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (slot == "active") {
+                state.active_alias.clear();
+                state.active_version.clear();
+            } else {
+                state.candidate_alias.clear();
+                state.candidate_version.clear();
+            }
+            state.last_reload_reason = "cleared";
+        } else {
+            if (!body.contains("artifact") || !body.at("artifact").is_object()) {
+                if (out_error) {
+                    *out_error = format_error_response("runtime artifact payload missing artifact object", ERROR_TYPE_INVALID_REQUEST);
+                }
+                return false;
+            }
+            auto artifact = std::make_shared<server_decode_controller_artifact>();
+            std::string load_error;
+            if (!server_decode_controller_load_artifact_payload(body.at("artifact"), artifact.get(), &load_error)) {
+                if (out_error) {
+                    *out_error = format_error_response(load_error, ERROR_TYPE_INVALID_REQUEST);
+                }
+                return false;
+            }
+            auto & state = decode_artifact_rollout_state_instance();
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (slot == "active") {
+                g_active_local_decode_controller = artifact;
+                state.active_alias = alias;
+                state.active_version = version.empty() ? artifact->controller_version : version;
+            } else {
+                g_candidate_local_decode_controller = artifact;
+                state.candidate_alias = alias;
+                state.candidate_version = version.empty() ? artifact->controller_version : version;
+            }
+            state.last_error.clear();
+            state.last_reload_reason = "loaded";
+        }
+    }
+
+    if (out_result) {
+        *out_result = policy_runtime_artifacts_status_json();
+    }
+    return true;
 }
 
 struct telegram_outbox_item {
@@ -1929,6 +3132,7 @@ struct telegram_delivery_result {
 struct telegram_runtime_tool_adapter_config {
     std::string node_bin = "node";
     std::string entry_path;
+    std::string snapshot_path;
     int32_t max_rounds = 8;
 };
 
@@ -2209,6 +3413,30 @@ static telegram_runtime_tool_adapter_config telegram_runtime_tool_adapter_config
         }
     }
 
+    if (const char * value = std::getenv("VICUNA_TELEGRAM_RUNTIME_TOOLS_SNAPSHOT_PATH")) {
+        config.snapshot_path = trim_copy(value);
+    }
+    if (config.snapshot_path.empty()) {
+        try {
+            const std::filesystem::path cwd = std::filesystem::current_path();
+            const std::vector<std::filesystem::path> candidates = {
+                cwd / ".cache" / "vicuna" / "telegram-runtime-tools.json",
+                cwd / ".." / ".cache" / "vicuna" / "telegram-runtime-tools.json",
+                std::filesystem::path("/var/lib/vicuna/telegram-runtime-tools.json"),
+            };
+            for (const auto & candidate : candidates) {
+                if (std::filesystem::exists(candidate)) {
+                    config.snapshot_path = candidate.lexically_normal().string();
+                    break;
+                }
+            }
+        } catch (const std::exception &) {
+        }
+        if (config.snapshot_path.empty()) {
+            config.snapshot_path = "/var/lib/vicuna/telegram-runtime-tools.json";
+        }
+    }
+
     if (const char * value = std::getenv("VICUNA_TELEGRAM_RUNTIME_MAX_ROUNDS")) {
         const int parsed = std::atoi(value);
         if (parsed > 0) {
@@ -2322,6 +3550,9 @@ struct telegram_runtime_tool_cache_state {
     std::string cache_key;
     json tools = json::array();
     bool loaded_from_override = false;
+    std::string last_source = "uninitialized";
+    std::string snapshot_path;
+    uint64_t fallbacks = 0;
     uint64_t hits = 0;
     uint64_t misses = 0;
 };
@@ -2338,9 +3569,21 @@ static staged_tool_prompt_cache_state & staged_tool_prompt_cache_state_instance(
 static std::string build_telegram_runtime_tool_cache_key(
         const telegram_runtime_tool_adapter_config & config,
         bool used_override,
-        const json & payload) {
+        const json & payload,
+        const std::string & selected_source = std::string()) {
     if (used_override) {
         return "override:" + safe_json_to_str(payload);
+    }
+
+    try {
+        if (selected_source == "published_snapshot" &&
+                !config.snapshot_path.empty() &&
+                std::filesystem::exists(config.snapshot_path)) {
+            const auto mtime = std::filesystem::last_write_time(config.snapshot_path).time_since_epoch().count();
+            return "snapshot:" + config.snapshot_path + "|" +
+                    std::to_string(static_cast<long long>(mtime));
+        }
+    } catch (...) {
     }
 
     std::string mtime_token = "missing";
@@ -2352,10 +3595,45 @@ static std::string build_telegram_runtime_tool_cache_key(
     return "entry:" + config.node_bin + "|" + config.entry_path + "|" + mtime_token;
 }
 
+static bool load_json_file(const std::string & path, json * out_json, std::string * out_error) {
+    if (!out_json) {
+        if (out_error) {
+            *out_error = "json file output must not be null";
+        }
+        return false;
+    }
+    std::ifstream input(path);
+    if (!input.good()) {
+        if (out_error) {
+            *out_error = "unable to open " + path;
+        }
+        return false;
+    }
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    const std::string trimmed = trim_copy(buffer.str());
+    if (trimmed.empty()) {
+        if (out_error) {
+            *out_error = path + " did not contain JSON";
+        }
+        return false;
+    }
+    try {
+        *out_json = json::parse(trimmed);
+        return true;
+    } catch (const std::exception & e) {
+        if (out_error) {
+            *out_error = server_string_format("%s contained invalid JSON: %s", path.c_str(), e.what());
+        }
+        return false;
+    }
+}
+
 static bool load_server_owned_telegram_runtime_tools(
         const telegram_runtime_tool_adapter_config & config,
         json * out_tools,
-        std::string * out_error) {
+        std::string * out_error,
+        std::string * out_source = nullptr) {
     if (!out_tools) {
         if (out_error) {
             *out_error = "runtime tool output must not be null";
@@ -2373,27 +3651,52 @@ static bool load_server_owned_telegram_runtime_tools(
         return false;
     }
 
-    const std::string cache_key = build_telegram_runtime_tool_cache_key(config, used_override, payload);
+    std::string selected_source = used_override ? "override" : "live_cli";
+    if (!used_override) {
+        json snapshot_payload;
+        std::string snapshot_error;
+        if (!config.snapshot_path.empty() && load_json_file(config.snapshot_path, &snapshot_payload, &snapshot_error)) {
+            payload = std::move(snapshot_payload);
+            selected_source = "published_snapshot";
+        }
+    }
+
+    const std::string cache_key = build_telegram_runtime_tool_cache_key(config, used_override, payload, selected_source);
     auto & cache_state = telegram_runtime_tool_cache_state_instance();
     {
         std::lock_guard<std::mutex> lock(cache_state.mutex);
         if (!cache_state.cache_key.empty() && cache_state.cache_key == cache_key) {
             ++cache_state.hits;
             *out_tools = cache_state.tools;
+            if (out_source) {
+                *out_source = cache_state.last_source;
+            }
             return true;
         }
     }
 
-    if (!used_override) {
+    if (!used_override && selected_source != "published_snapshot") {
         const std::string command_line =
                 shell_escape_single_quoted(config.node_bin) + " " +
                 shell_escape_single_quoted(config.entry_path) + " runtime-tools 2>&1";
         if (!run_shell_json_command(command_line, &payload, &command_error)) {
+            std::lock_guard<std::mutex> lock(cache_state.mutex);
+            if (!cache_state.cache_key.empty() && cache_state.tools.is_array() && !cache_state.tools.empty()) {
+                ++cache_state.hits;
+                ++cache_state.fallbacks;
+                cache_state.last_source = "cached_fallback_after_live_cli_failure";
+                *out_tools = cache_state.tools;
+                if (out_source) {
+                    *out_source = cache_state.last_source;
+                }
+                return true;
+            }
             if (out_error) {
                 *out_error = "unable to load Telegram runtime tool catalog: " + command_error;
             }
             return false;
         }
+        selected_source = "live_cli";
     }
 
     json tools = payload;
@@ -2425,10 +3728,15 @@ static bool load_server_owned_telegram_runtime_tools(
         cache_state.cache_key = cache_key;
         cache_state.tools = final_tools;
         cache_state.loaded_from_override = used_override;
+        cache_state.last_source = selected_source;
+        cache_state.snapshot_path = config.snapshot_path;
         ++cache_state.misses;
     }
 
     *out_tools = std::move(final_tools);
+    if (out_source) {
+        *out_source = selected_source;
+    }
     return true;
 }
 
@@ -2439,7 +3747,10 @@ static json telegram_runtime_tool_cache_health_json() {
         {"cached", !cache_state.cache_key.empty()},
         {"hits", cache_state.hits},
         {"misses", cache_state.misses},
+        {"fallbacks", cache_state.fallbacks},
         {"loaded_from_override", cache_state.loaded_from_override},
+        {"source", cache_state.last_source},
+        {"snapshot_path", cache_state.snapshot_path},
         {"tool_count", cache_state.tools.is_array() ? static_cast<int64_t>(cache_state.tools.size()) : 0},
     };
 }
@@ -2486,6 +3797,7 @@ static bool invoke_server_owned_telegram_runtime_tool(
         const telegram_runtime_tool_adapter_config & config,
         const deepseek_tool_call & tool_call,
         json * out_observation,
+        server_tool_correctness_signal * out_correctness,
         std::string * out_error) {
     if (!out_observation) {
         if (out_error) {
@@ -2502,12 +3814,15 @@ static bool invoke_server_owned_telegram_runtime_tool(
             }
             return false;
         }
+        if (out_correctness) {
+            *out_correctness = evaluate_tool_correctness_fallback(tool_call.name, *out_observation);
+        }
         return true;
     }
 
     json payload;
     std::string command_error;
-    const std::string arguments_base64 = base64::encode(tool_call.arguments_json);
+    const std::string arguments_base64 = vicuna_base64::encode(tool_call.arguments_json);
     const std::string command_line =
             shell_escape_single_quoted(config.node_bin) + " " +
             shell_escape_single_quoted(config.entry_path) + " invoke-runtime " +
@@ -2522,6 +3837,13 @@ static bool invoke_server_owned_telegram_runtime_tool(
     }
 
     *out_observation = payload.contains("observation") ? payload.at("observation") : json::object();
+    if (out_correctness) {
+        if (payload.contains("correctness") && payload.at("correctness").is_object()) {
+            *out_correctness = parse_tool_correctness_signal_json(payload.at("correctness"));
+        } else {
+            *out_correctness = evaluate_tool_correctness_fallback(tool_call.name, *out_observation);
+        }
+    }
     return true;
 }
 
@@ -2570,9 +3892,11 @@ static json build_server_owned_bridge_request_body(
                 "Bridge-scoped delivery contract: when you are ready to respond to the user, do not call a Telegram tool. "
                 "Return normal assistant content instead. You may optionally start with YAML front matter delimited by --- lines. "
                 "Supported fields are format (plain_text|markdown|html), title, disable_web_page_preview, delivery_hint (reply|replace_prompt|silent), "
-                "and reply_markup. HTML is the canonical Telegram rich-text format for user-facing delivery. Prefer format: html whenever you intend any formatting. "
+                "and reply_markup. HTML is the canonical Telegram rich-text format for inline Telegram formatting only. Prefer format: html whenever you intend supported inline formatting. "
                 "Markdown front matter and markdown-like decorators are accepted for compatibility and will be normalized into Telegram-supported HTML. "
-                "For tabular or chart-like output, prefer HTML or a preformatted grid; do not rely on raw markdown pipe tables. "
+                "If you emit Telegram HTML, keep it within Telegram's supported tag subset and ensure every tag is balanced. "
+                "For tabular or chart-like output, never emit raw markdown pipe tables, HTML table tags, or preformatted chart or grid layouts. "
+                "Rewrite comparisons and chart-like content into supported rich text such as bullets, labeled sections, or short paragraphs. "
                 "After the closing --- line, include the user-facing rich text body."},
     });
     for (const auto & item : body.at("messages")) {
@@ -2617,73 +3941,6 @@ struct cognitive_replay_worker_state {
     std::string last_error;
     int64_t last_started_at_ms = 0;
     int64_t last_finished_at_ms = 0;
-};
-
-struct server_ongoing_task_config {
-    bool enabled = false;
-    std::string base_url = "https://api.supermemory.ai";
-    std::string auth_token;
-    std::string container_tag = "vicuna";
-    std::string runtime_identity = "vicuna";
-    std::string registry_key = "ongoing-tasks-registry";
-    std::string registry_title = "Ongoing task registry";
-    float query_threshold = 0.0f;
-    int32_t poll_interval_ms = 60000;
-    int32_t timeout_ms = 5000;
-};
-
-struct server_ongoing_task_frequency {
-    int32_t interval = 1;
-    std::string unit = "days";
-};
-
-struct server_ongoing_task_record {
-    std::string task_id;
-    std::string task_text;
-    server_ongoing_task_frequency frequency;
-    std::string created_at;
-    std::string updated_at;
-    std::string last_done_at;
-    bool active = true;
-};
-
-struct server_ongoing_task_summary {
-    std::string task_id;
-    std::string task_text;
-    server_ongoing_task_frequency frequency;
-    std::string last_done_at;
-    std::string next_due_at;
-    bool due_now = false;
-    bool active = true;
-};
-
-struct server_ongoing_task_registry {
-    int32_t schema_version = 1;
-    std::string updated_at;
-    std::vector<server_ongoing_task_record> tasks;
-};
-
-struct server_ongoing_task_decision {
-    bool valid = false;
-    bool should_run = false;
-    std::string selected_task_id;
-    std::string rationale;
-    int64_t decided_at_ms = 0;
-    std::string current_time_iso;
-    int32_t task_count = 0;
-};
-
-struct ongoing_task_worker_state {
-    mutable std::mutex mutex;
-    bool running = false;
-    std::string mode = "idle";
-    std::string active_task_id;
-    std::string last_error;
-    int64_t last_poll_at_ms = 0;
-    int64_t last_finished_at_ms = 0;
-    std::string last_completed_task_id;
-    std::string last_completed_at_iso;
-    server_ongoing_task_decision last_decision;
 };
 
 enum staged_tool_stage_kind {
@@ -2782,14 +4039,10 @@ static std::string staged_tool_titleize(const std::string & raw) {
 
 static std::vector<std::string> staged_tool_known_family_prefixes() {
     return {
-        "ongoing_tasks",
         "hard_memory",
-        "parsed_documents",
-        "web_search",
+        "skills",
         "telegram",
-        "radarr",
-        "sonarr",
-        "chaptarr",
+        "host_shell",
         "runtime",
     };
 }
@@ -3087,15 +4340,34 @@ static json build_staged_payload_provider_schema(const json & schema) {
         if (schema.contains("properties") && schema.at("properties").is_object()) {
             for (const auto & item : schema.at("properties").items()) {
                 const bool is_required = staged_schema_property_is_required(schema, item.key());
-                if (is_required) {
-                    properties[item.key()] = build_staged_payload_provider_schema(item.value());
-                    required.push_back(item.key());
+                json child_schema = build_staged_payload_provider_schema(item.value());
+                if (!child_schema.is_object()) {
+                    continue;
                 }
+                if (!is_required) {
+                    json nullable_schema = {
+                        {"anyOf", json::array({
+                            child_schema,
+                            json{
+                                {"type", "null"},
+                                {"description", "Use null when this optional field is not needed."},
+                            },
+                        })},
+                    };
+                    const std::string child_description = trim_copy(json_value(item.value(), "description", std::string()));
+                    if (!child_description.empty()) {
+                        nullable_schema["description"] = child_description;
+                    }
+                    properties[item.key()] = std::move(nullable_schema);
+                } else {
+                    properties[item.key()] = std::move(child_schema);
+                }
+                required.push_back(item.key());
             }
         }
         // DeepSeek strict mode requires every exposed object property to also
-        // appear in `required`, so the provider-facing payload contract is a
-        // projection to the original required subset only.
+        // appear in `required`, so optional properties are exposed as
+        // nullable-required and later stripped if the model returns null.
         json result = {
             {"type", "object"},
             {"properties", std::move(properties)},
@@ -3936,8 +5208,8 @@ static bool execute_staged_selection_turn(
             std::string(),
             true,
             suppress_replay_admission,
-            0.0f,
             mode_label,
+            nullptr,
             trace_context);
 }
 
@@ -3981,8 +5253,8 @@ static bool execute_final_completion_after_staged_loop(
             std::string(),
             true,
             suppress_replay_admission,
-            0.0f,
             mode_label,
+            nullptr,
             trace_context);
 }
 
@@ -4309,6 +5581,98 @@ static int64_t current_epoch_ms() {
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
+static experimental_capture_runtime_config experimental_capture_runtime_config_from_env() {
+    experimental_capture_runtime_config config;
+    config.enabled = env_to_bool_local("VICUNA_EXPERIMENTAL_CAPTURE_ENABLED", true);
+    const char * root_value = std::getenv("VICUNA_EXPERIMENTAL_CAPTURE_DIR");
+    const std::string root = trim_copy(root_value ? root_value : "/var/lib/vicuna/experimental-capture/live");
+    if (root.empty()) {
+        config.enabled = false;
+        return config;
+    }
+    config.root_dir = root;
+    config.transitions_path = config.root_dir / "transitions.jsonl";
+    config.decode_traces_path = config.root_dir / "decode_traces.jsonl";
+    config.emotive_traces_path = config.root_dir / "emotive_traces.jsonl";
+    return config;
+}
+
+static const experimental_capture_runtime_config & experimental_capture_runtime_config_instance() {
+    static const experimental_capture_runtime_config config = experimental_capture_runtime_config_from_env();
+    return config;
+}
+
+static void experimental_capture_append_jsonl(
+        const std::filesystem::path & path,
+        const json & row) {
+    if (path.empty()) {
+        return;
+    }
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    if (error) {
+        return;
+    }
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    if (!out.is_open()) {
+        return;
+    }
+    out << row.dump() << '\n';
+}
+
+static void experimental_capture_append_transition(const server_policy_transition & transition) {
+    const auto & config = experimental_capture_runtime_config_instance();
+    if (!config.enabled) {
+        return;
+    }
+    const json row = {
+        {"schema_version", "vicuna.experimental_transition_capture.v1"},
+        {"captured_at_ms", current_epoch_ms()},
+        {"transition", server_policy_transition_to_json(transition)},
+    };
+    std::lock_guard<std::mutex> lock(g_experimental_capture_mutex);
+    experimental_capture_append_jsonl(config.transitions_path, row);
+}
+
+static void experimental_capture_append_decode_trace(const server_decode_control_trace & trace) {
+    if (trace.steps.empty()) {
+        return;
+    }
+    const auto & config = experimental_capture_runtime_config_instance();
+    if (!config.enabled) {
+        return;
+    }
+    const json row = {
+        {"schema_version", "vicuna.experimental_decode_trace_capture.v1"},
+        {"captured_at_ms", current_epoch_ms()},
+        {"decode_trace", server_decode_control_trace_to_json(trace)},
+    };
+    std::lock_guard<std::mutex> lock(g_experimental_capture_mutex);
+    experimental_capture_append_jsonl(config.decode_traces_path, row);
+}
+
+static void experimental_capture_append_emotive_trace(
+        const std::string & request_id,
+        const json & emotive_trace,
+        const json & emotive_animation) {
+    const auto & config = experimental_capture_runtime_config_instance();
+    if (!config.enabled || !emotive_trace.is_object()) {
+        return;
+    }
+    json row = {
+        {"schema_version", "vicuna.experimental_emotive_trace_capture.v1"},
+        {"captured_at_ms", current_epoch_ms()},
+        {"request_id", request_id.empty() ? json(nullptr) : json(request_id)},
+        {"trace_id", json_value(emotive_trace, "trace_id", std::string())},
+        {"emotive_trace", emotive_trace},
+    };
+    if (!emotive_animation.is_null()) {
+        row["emotive_animation"] = emotive_animation;
+    }
+    std::lock_guard<std::mutex> lock(g_experimental_capture_mutex);
+    experimental_capture_append_jsonl(config.emotive_traces_path, row);
+}
+
 static bool env_to_bool_local(const char * name, bool default_value) {
     if (const char * value = std::getenv(name)) {
         const std::string parsed = value;
@@ -4340,37 +5704,6 @@ static float env_to_float_local(const char * name, float default_value) {
         }
     }
     return default_value;
-}
-
-static server_ongoing_task_config server_ongoing_task_config_from_env() {
-    server_ongoing_task_config config;
-    config.enabled = false;
-    if (const char * value = std::getenv("VICUNA_ONGOING_TASKS_BASE_URL")) {
-        config.base_url = trim_copy(value);
-    }
-    if (const char * value = std::getenv("VICUNA_ONGOING_TASKS_AUTH_TOKEN")) {
-        config.auth_token = trim_copy(value);
-    }
-    if (const char * value = std::getenv("VICUNA_ONGOING_TASKS_CONTAINER_TAG")) {
-        config.container_tag = trim_copy(value);
-    } else if (const char * value = std::getenv("VICUNA_HARD_MEMORY_RUNTIME_IDENTITY")) {
-        config.container_tag = trim_copy(value);
-    }
-    if (const char * value = std::getenv("VICUNA_ONGOING_TASKS_RUNTIME_IDENTITY")) {
-        config.runtime_identity = trim_copy(value);
-    } else if (const char * value = std::getenv("VICUNA_HARD_MEMORY_RUNTIME_IDENTITY")) {
-        config.runtime_identity = trim_copy(value);
-    }
-    if (const char * value = std::getenv("VICUNA_ONGOING_TASKS_REGISTRY_KEY")) {
-        config.registry_key = trim_copy(value);
-    }
-    if (const char * value = std::getenv("VICUNA_ONGOING_TASKS_REGISTRY_TITLE")) {
-        config.registry_title = trim_copy(value);
-    }
-    config.query_threshold = env_to_float_local("VICUNA_ONGOING_TASKS_QUERY_THRESHOLD", config.query_threshold);
-    config.poll_interval_ms = env_to_int_local("VICUNA_ONGOING_TASKS_POLL_MS", config.poll_interval_ms);
-    config.timeout_ms = env_to_int_local("VICUNA_ONGOING_TASKS_TIMEOUT_MS", config.timeout_ms);
-    return config;
 }
 
 static int64_t current_time_ms_utc() {
@@ -4434,35 +5767,6 @@ static bool parse_iso8601_utc_ms(const std::string & value, int64_t * out_ms) {
     return true;
 }
 
-static json ongoing_task_decision_to_json(const server_ongoing_task_decision & decision) {
-    return {
-        {"valid", decision.valid},
-        {"should_run", decision.should_run},
-        {"selected_task_id", decision.selected_task_id},
-        {"rationale", decision.rationale},
-        {"decided_at_ms", decision.decided_at_ms},
-        {"current_time_iso", decision.current_time_iso},
-        {"task_count", decision.task_count},
-    };
-}
-
-static int64_t ongoing_task_frequency_window_ms(const server_ongoing_task_frequency & frequency) {
-    const int64_t interval = std::max<int32_t>(1, frequency.interval);
-    if (frequency.unit == "minutes") {
-        return interval * 60LL * 1000LL;
-    }
-    if (frequency.unit == "hours") {
-        return interval * 60LL * 60LL * 1000LL;
-    }
-    if (frequency.unit == "days") {
-        return interval * 24LL * 60LL * 60LL * 1000LL;
-    }
-    if (frequency.unit == "weeks") {
-        return interval * 7LL * 24LL * 60LL * 60LL * 1000LL;
-    }
-    return 24LL * 60LL * 60LL * 1000LL;
-}
-
 static std::string join_url_path(const server_http_url & parts, const std::string & suffix) {
     std::string path = parts.path;
     if (path.empty() || path == "/") {
@@ -4483,6 +5787,217 @@ static std::string join_url_path(const server_http_url & parts, const std::strin
     return path + suffix;
 }
 
+static bool request_body_has_explicit_generation_cap(const json & body) {
+    return body.contains("max_tokens") ||
+            body.contains("max_output_tokens") ||
+            body.contains("max_completion_tokens");
+}
+
+static json apply_runpod_default_generation_cap(
+        const runpod_inference_runtime_config & config,
+        json body) {
+    if (!body.is_object()) {
+        return body;
+    }
+    if (config.default_max_tokens <= 0 || request_body_has_explicit_generation_cap(body)) {
+        return body;
+    }
+    body["max_tokens"] = config.default_max_tokens;
+    return body;
+}
+
+static json sanitize_runpod_relay_body(json body) {
+    if (!body.is_object()) {
+        return body;
+    }
+    body.erase("x-vicuna-provider-max-tokens-override");
+    body.erase("x-vicuna-provider-reasoning-budget-override");
+    body.erase("reasoning_budget_tokens");
+    body.erase("thinking");
+    return body;
+}
+
+static bool runpod_request_has_thinking_disabled(const json & relay_request) {
+    if (!relay_request.is_object()) {
+        return false;
+    }
+    if (!relay_request.contains("chat_template_kwargs") || !relay_request.at("chat_template_kwargs").is_object()) {
+        return false;
+    }
+    return json_value(relay_request.at("chat_template_kwargs"), "enable_thinking", true) == false;
+}
+
+static json build_runpod_reasoning_fallback_request(const json & relay_request) {
+    json retry_request = relay_request;
+    retry_request["relay_retry_reason"] = "reasoning_only_no_content";
+    json chat_template_kwargs = retry_request.value("chat_template_kwargs", json::object());
+    if (!chat_template_kwargs.is_object()) {
+        chat_template_kwargs = json::object();
+    }
+    chat_template_kwargs["enable_thinking"] = false;
+    retry_request["chat_template_kwargs"] = chat_template_kwargs;
+    return retry_request;
+}
+
+static bool runpod_result_needs_no_thinking_retry(const deepseek_chat_result & result) {
+    return trim_copy(result.content).empty() &&
+            !trim_copy(result.reasoning_content).empty() &&
+            result.tool_calls.empty();
+}
+
+static json build_final_policy_json_local(
+        const server_metacognitive_policy_decision & native_policy_decision,
+        const server_metacognitive_policy_decision & effective_policy_decision,
+        const server_policy_action & executed_policy_action,
+        const server_request_policy_config & request_policy_config,
+        const server_policy_rollout_decision & rollout_decision,
+        const server_policy_applied_provider_controls & applied_provider_controls,
+        const server_heuristic_retrieval_decision & heuristic_decision,
+        const server_decode_control_trace & final_decode_trace) {
+    return {
+        {"policy_version", effective_policy_decision.policy_version},
+        {"selected_mode", effective_policy_decision.selected_mode},
+        {"reasoning_depth", effective_policy_decision.reasoning_depth},
+        {"thinking_mode", effective_policy_decision.thinking_mode},
+        {"response_budget_bucket", effective_policy_decision.response_budget_bucket},
+        {"reasoning_budget_bucket", effective_policy_decision.reasoning_budget_bucket},
+        {"behavior_policy_version", native_policy_decision.policy_version},
+        {"proposal_source", executed_policy_action.proposal_source},
+        {"rollout_mode", rollout_decision.rollout_mode},
+        {"rollout_decision_reason", rollout_decision.reason},
+        {"candidate_executed_live", rollout_decision.execute_candidate_live},
+        {"score_breakdown", {
+            {"direct", native_policy_decision.direct_score},
+            {"reflective", native_policy_decision.reflective_score},
+            {"tool_light", native_policy_decision.tool_light_score},
+            {"tool_heavy", native_policy_decision.tool_heavy_score},
+            {"background_defer", native_policy_decision.background_defer_score},
+        }},
+        {"reasoning_score", native_policy_decision.reasoning_score},
+        {"tool_aggression", native_policy_decision.tool_aggression},
+        {"interrupt_score", native_policy_decision.interrupt_score},
+        {"tool_parallelism_cap", effective_policy_decision.tool_parallelism_cap},
+        {"interrupt_allowed", effective_policy_decision.interrupt_allowed},
+        {"replan_required", effective_policy_decision.replan_required},
+        {"early_stop_ok", effective_policy_decision.early_stop_ok},
+        {"force_synthesis", effective_policy_decision.force_synthesis},
+        {"prefix_profile", effective_policy_decision.prefix_profile},
+        {"stop_profile", effective_policy_decision.stop_profile},
+        {"sampling_profile", effective_policy_decision.sampling_profile},
+        {"repetition_profile", effective_policy_decision.repetition_profile},
+        {"tool_choice_profile", effective_policy_decision.tool_choice_profile},
+        {"request_policy_config", server_request_policy_config_to_json(request_policy_config)},
+        {"applied_provider_controls", server_policy_applied_provider_controls_to_json(applied_provider_controls)},
+        {"heuristic_biases", native_policy_decision.heuristic_biases},
+        {"prompt_hints", native_policy_decision.prompt_hints},
+        {"heuristic_matched", heuristic_decision.matched},
+        {"decode_controller", {
+            {"mode", final_decode_trace.controller_mode},
+            {"step_count", static_cast<int64_t>(final_decode_trace.steps.size())},
+            {"candidate_policy_version", final_decode_trace.candidate_policy_version.empty() ? json(nullptr) : json(final_decode_trace.candidate_policy_version)},
+            {"candidate_policy_alias", final_decode_trace.candidate_policy_alias.empty() ? json(nullptr) : json(final_decode_trace.candidate_policy_alias)},
+        }},
+    };
+}
+
+static server_metacognitive_policy_decision build_policy_decision_from_final_policy_json(
+        const json & final_policy) {
+    server_metacognitive_policy_decision decision = {};
+    if (!final_policy.is_object()) {
+        return decision;
+    }
+    decision.valid = true;
+    decision.policy_version = json_value(final_policy, "policy_version", decision.policy_version);
+    decision.selected_mode = json_value(final_policy, "selected_mode", decision.selected_mode);
+    decision.reasoning_depth = json_value(final_policy, "reasoning_depth", decision.reasoning_depth);
+    decision.thinking_mode = json_value(final_policy, "thinking_mode", decision.thinking_mode);
+    decision.response_budget_bucket = json_value(
+            final_policy,
+            "response_budget_bucket",
+            decision.response_budget_bucket);
+    decision.reasoning_budget_bucket = json_value(
+            final_policy,
+            "reasoning_budget_bucket",
+            decision.reasoning_budget_bucket);
+    decision.prefix_profile = json_value(final_policy, "prefix_profile", decision.prefix_profile);
+    decision.stop_profile = json_value(final_policy, "stop_profile", decision.stop_profile);
+    decision.sampling_profile = json_value(final_policy, "sampling_profile", decision.sampling_profile);
+    decision.repetition_profile = json_value(final_policy, "repetition_profile", decision.repetition_profile);
+    decision.tool_choice_profile = json_value(final_policy, "tool_choice_profile", decision.tool_choice_profile);
+    decision.tool_parallelism_cap = json_value(final_policy, "tool_parallelism_cap", decision.tool_parallelism_cap);
+    decision.interrupt_allowed = json_value(final_policy, "interrupt_allowed", decision.interrupt_allowed);
+    decision.replan_required = json_value(final_policy, "replan_required", decision.replan_required);
+    decision.early_stop_ok = json_value(final_policy, "early_stop_ok", decision.early_stop_ok);
+    decision.force_synthesis = json_value(final_policy, "force_synthesis", decision.force_synthesis);
+    const json score_breakdown = json_value(final_policy, "score_breakdown", json::object());
+    decision.direct_score = json_value(score_breakdown, "direct", decision.direct_score);
+    decision.reflective_score = json_value(score_breakdown, "reflective", decision.reflective_score);
+    decision.tool_light_score = json_value(score_breakdown, "tool_light", decision.tool_light_score);
+    decision.tool_heavy_score = json_value(score_breakdown, "tool_heavy", decision.tool_heavy_score);
+    decision.background_defer_score = json_value(score_breakdown, "background_defer", decision.background_defer_score);
+    decision.reasoning_score = json_value(final_policy, "reasoning_score", decision.reasoning_score);
+    decision.tool_aggression = json_value(final_policy, "tool_aggression", decision.tool_aggression);
+    decision.interrupt_score = json_value(final_policy, "interrupt_score", decision.interrupt_score);
+    return decision;
+}
+
+static server_policy_applied_provider_controls build_applied_provider_controls_from_json(
+        const json & payload) {
+    server_policy_applied_provider_controls controls = {};
+    if (!payload.is_object()) {
+        return controls;
+    }
+    controls.thinking_enabled = json_value(payload, "thinking_enabled", controls.thinking_enabled);
+    controls.prefix_profile = json_value(payload, "prefix_profile", controls.prefix_profile);
+    controls.stop_profile = json_value(payload, "stop_profile", controls.stop_profile);
+    controls.sampling_profile = json_value(payload, "sampling_profile", controls.sampling_profile);
+    controls.repetition_profile = json_value(payload, "repetition_profile", controls.repetition_profile);
+    controls.tool_choice_profile = json_value(payload, "tool_choice_profile", controls.tool_choice_profile);
+    controls.prefix_used = json_value(payload, "prefix_used", controls.prefix_used);
+    controls.temperature_present = payload.contains("temperature") && !payload.at("temperature").is_null();
+    if (controls.temperature_present) {
+        controls.temperature = payload.at("temperature").get<double>();
+    }
+    controls.top_k_present = payload.contains("top_k") && !payload.at("top_k").is_null();
+    if (controls.top_k_present) {
+        controls.top_k = payload.at("top_k").get<int32_t>();
+    }
+    controls.top_p_present = payload.contains("top_p") && !payload.at("top_p").is_null();
+    if (controls.top_p_present) {
+        controls.top_p = payload.at("top_p").get<double>();
+    }
+    controls.min_p_present = payload.contains("min_p") && !payload.at("min_p").is_null();
+    if (controls.min_p_present) {
+        controls.min_p = payload.at("min_p").get<double>();
+    }
+    controls.frequency_penalty_present =
+            payload.contains("frequency_penalty") && !payload.at("frequency_penalty").is_null();
+    if (controls.frequency_penalty_present) {
+        controls.frequency_penalty = payload.at("frequency_penalty").get<double>();
+    }
+    controls.presence_penalty_present =
+            payload.contains("presence_penalty") && !payload.at("presence_penalty").is_null();
+    if (controls.presence_penalty_present) {
+        controls.presence_penalty = payload.at("presence_penalty").get<double>();
+    }
+    controls.tool_choice = json_value(payload, "tool_choice", controls.tool_choice);
+    return controls;
+}
+
+static json build_heuristic_retrieval_json_local(const server_heuristic_retrieval_decision & heuristic_decision) {
+    return {
+        {"matched", heuristic_decision.matched},
+        {"record_id", heuristic_decision.record_id},
+        {"heuristic_id", heuristic_decision.heuristic_id},
+        {"semantic_score", heuristic_decision.semantic_score},
+        {"struct_score", heuristic_decision.struct_score},
+        {"emotive_score", heuristic_decision.emotive_score},
+        {"total_score", heuristic_decision.total_score},
+        {"threshold", heuristic_decision.threshold},
+        {"control_biases", heuristic_decision.control_biases},
+    };
+}
+
 static bool parse_and_normalize_iso8601_utc(const json & value, std::string * out_iso) {
     if (!out_iso || !value.is_string()) {
         return false;
@@ -4493,478 +6008,6 @@ static bool parse_and_normalize_iso8601_utc(const json & value, std::string * ou
     }
     *out_iso = iso_from_epoch_ms(parsed_ms);
     return true;
-}
-
-static bool parse_ongoing_task_frequency(
-        const json & value,
-        server_ongoing_task_frequency * out_frequency,
-        std::string * out_error) {
-    if (!out_frequency || !value.is_object()) {
-        if (out_error) {
-            *out_error = "ongoing-task frequency must be an object";
-        }
-        return false;
-    }
-
-    const int32_t interval = json_value(value, "interval", 0);
-    const std::string unit = trim_copy(json_value(value, "unit", std::string()));
-    if (interval < 1) {
-        if (out_error) {
-            *out_error = "ongoing-task frequency interval must be >= 1";
-        }
-        return false;
-    }
-    if (unit != "minutes" && unit != "hours" && unit != "days" && unit != "weeks") {
-        if (out_error) {
-            *out_error = "ongoing-task frequency unit must be one of minutes, hours, days, or weeks";
-        }
-        return false;
-    }
-
-    out_frequency->interval = interval;
-    out_frequency->unit = unit;
-    return true;
-}
-
-static bool parse_ongoing_task_record(
-        const json & value,
-        server_ongoing_task_record * out_record,
-        std::string * out_error) {
-    if (!out_record || !value.is_object()) {
-        if (out_error) {
-            *out_error = "ongoing-task record must be an object";
-        }
-        return false;
-    }
-
-    server_ongoing_task_record record = {};
-    record.task_id = trim_copy(json_value(value, "task_id", std::string()));
-    record.task_text = trim_copy(json_value(value, "task_text", std::string()));
-    if (record.task_id.empty() || record.task_text.empty()) {
-        if (out_error) {
-            *out_error = "ongoing-task record must include non-empty task_id and task_text";
-        }
-        return false;
-    }
-    if (!parse_ongoing_task_frequency(json_value(value, "frequency", json::object()), &record.frequency, out_error)) {
-        return false;
-    }
-    if (!parse_and_normalize_iso8601_utc(value.value("created_at", json()), &record.created_at)) {
-        if (out_error) {
-            *out_error = "ongoing-task record created_at must be a valid ISO-8601 UTC timestamp";
-        }
-        return false;
-    }
-    if (!parse_and_normalize_iso8601_utc(value.value("updated_at", json()), &record.updated_at)) {
-        if (out_error) {
-            *out_error = "ongoing-task record updated_at must be a valid ISO-8601 UTC timestamp";
-        }
-        return false;
-    }
-    if (value.contains("last_done_at") && !value.at("last_done_at").is_null()) {
-        if (!parse_and_normalize_iso8601_utc(value.at("last_done_at"), &record.last_done_at)) {
-            if (out_error) {
-                *out_error = "ongoing-task record last_done_at must be null or a valid ISO-8601 UTC timestamp";
-            }
-            return false;
-        }
-    }
-    record.active = json_value(value, "active", true);
-    *out_record = std::move(record);
-    return true;
-}
-
-static bool parse_ongoing_task_registry_payload(
-        const std::string & raw_content,
-        server_ongoing_task_registry * out_registry,
-        std::string * out_error) {
-    if (!out_registry) {
-        if (out_error) {
-            *out_error = "ongoing-task registry output must not be null";
-        }
-        return false;
-    }
-
-    json payload;
-    try {
-        payload = json::parse(raw_content);
-    } catch (const std::exception & e) {
-        if (out_error) {
-            *out_error = server_string_format("ongoing-task registry was not valid JSON: %s", e.what());
-        }
-        return false;
-    }
-
-    if (!payload.is_object() || !payload.contains("tasks") || !payload.at("tasks").is_array()) {
-        if (out_error) {
-            *out_error = "ongoing-task registry must contain a tasks array";
-        }
-        return false;
-    }
-
-    server_ongoing_task_registry registry = {};
-    registry.schema_version = json_value(payload, "schema_version", 1);
-    if (!parse_and_normalize_iso8601_utc(payload.value("updated_at", json()), &registry.updated_at)) {
-        if (out_error) {
-            *out_error = "ongoing-task registry updated_at must be a valid ISO-8601 UTC timestamp";
-        }
-        return false;
-    }
-
-    for (const auto & item : payload.at("tasks")) {
-        server_ongoing_task_record record = {};
-        if (!parse_ongoing_task_record(item, &record, out_error)) {
-            return false;
-        }
-        registry.tasks.push_back(std::move(record));
-    }
-
-    *out_registry = std::move(registry);
-    return true;
-}
-
-static server_ongoing_task_registry empty_ongoing_task_registry() {
-    server_ongoing_task_registry registry = {};
-    registry.schema_version = 1;
-    registry.updated_at = iso_from_epoch_ms(current_time_ms_utc());
-    return registry;
-}
-
-static server_ongoing_task_summary summarize_ongoing_task(
-        const server_ongoing_task_record & record,
-        int64_t now_ms) {
-    server_ongoing_task_summary summary = {};
-    summary.task_id = record.task_id;
-    summary.task_text = record.task_text;
-    summary.frequency = record.frequency;
-    summary.last_done_at = record.last_done_at;
-    summary.active = record.active;
-
-    int64_t due_anchor_ms = now_ms;
-    if (!record.last_done_at.empty()) {
-        int64_t last_done_ms = 0;
-        if (parse_iso8601_utc_ms(record.last_done_at, &last_done_ms)) {
-            due_anchor_ms = last_done_ms + ongoing_task_frequency_window_ms(record.frequency);
-        }
-    } else {
-        int64_t created_ms = 0;
-        if (parse_iso8601_utc_ms(record.created_at, &created_ms)) {
-            due_anchor_ms = created_ms;
-        }
-    }
-
-    summary.next_due_at = iso_from_epoch_ms(due_anchor_ms);
-    summary.due_now = record.active && due_anchor_ms <= now_ms;
-    return summary;
-}
-
-static std::vector<server_ongoing_task_summary> list_active_ongoing_task_summaries(
-        const server_ongoing_task_registry & registry,
-        int64_t now_ms) {
-    std::vector<server_ongoing_task_summary> tasks;
-    for (const auto & record : registry.tasks) {
-        if (!record.active) {
-            continue;
-        }
-        tasks.push_back(summarize_ongoing_task(record, now_ms));
-    }
-    std::sort(
-            tasks.begin(),
-            tasks.end(),
-            [](const server_ongoing_task_summary & lhs, const server_ongoing_task_summary & rhs) {
-                if (lhs.next_due_at == rhs.next_due_at) {
-                    return lhs.task_id < rhs.task_id;
-                }
-                return lhs.next_due_at < rhs.next_due_at;
-            });
-    return tasks;
-}
-
-static bool ongoing_task_hard_memory_request(
-        const server_ongoing_task_config & config,
-        const std::string & path_suffix,
-        const json & request_body,
-        json * out_response,
-        std::string * out_error) {
-    if (!out_response) {
-        if (out_error) {
-            *out_error = "ongoing-task response output must not be null";
-        }
-        return false;
-    }
-    if (config.auth_token.empty()) {
-        if (out_error) {
-            *out_error = "missing ongoing-task hard-memory auth token";
-        }
-        return false;
-    }
-
-    try {
-        auto [client, parts] = server_http_client(config.base_url);
-        client.set_connection_timeout(std::chrono::milliseconds(config.timeout_ms));
-        client.set_read_timeout(std::chrono::milliseconds(config.timeout_ms));
-        client.set_write_timeout(std::chrono::milliseconds(config.timeout_ms));
-
-        const httplib::Headers headers = {
-            {"Authorization", "Bearer " + config.auth_token},
-            {"x-supermemory-api-key", config.auth_token},
-            {"Accept", "application/json"},
-        };
-
-        const std::string path = join_url_path(parts, path_suffix);
-        auto response = client.Post(path.c_str(), headers, request_body.dump(), "application/json");
-        if (!response) {
-            if (out_error) {
-                *out_error = "ongoing-task hard-memory request failed before a response was received";
-            }
-            return false;
-        }
-        if (response->status < 200 || response->status >= 300) {
-            if (out_error) {
-                *out_error = server_string_format(
-                        "ongoing-task hard-memory request failed with HTTP %d",
-                        response->status);
-            }
-            return false;
-        }
-
-        *out_response = response->body.empty() ? json::object() : json::parse(response->body);
-        return true;
-    } catch (const std::exception & e) {
-        if (out_error) {
-            *out_error = e.what();
-        }
-        return false;
-    }
-}
-
-static bool load_ongoing_task_registry(
-        const server_ongoing_task_config & config,
-        server_ongoing_task_registry * out_registry,
-        std::string * out_error) {
-    if (!out_registry) {
-        if (out_error) {
-            *out_error = "ongoing-task registry output must not be null";
-        }
-        return false;
-    }
-
-    json response;
-    if (!ongoing_task_hard_memory_request(config, "/v4/profile", {
-                {"containerTag", config.container_tag},
-                {"q", config.registry_key},
-                {"threshold", config.query_threshold},
-            }, &response, out_error)) {
-        return false;
-    }
-
-    const json search_results = json_value(response, "searchResults", json::object());
-    const json results = json_value(search_results, "results", json::array());
-    if (!results.is_array()) {
-        *out_registry = empty_ongoing_task_registry();
-        return true;
-    }
-
-    bool found_match = false;
-    server_ongoing_task_registry best_registry = empty_ongoing_task_registry();
-    for (const auto & item : results) {
-        if (!item.is_object()) {
-            continue;
-        }
-
-        const json metadata = json_value(item, "metadata", json::object());
-        const std::string metadata_key = trim_copy(json_value(metadata, "key", std::string()));
-        const std::string title = trim_copy(json_value(item, "title", json_value(metadata, "title", std::string())));
-        if (metadata_key != config.registry_key && title != config.registry_title) {
-            continue;
-        }
-
-        std::string raw_content;
-        if (item.contains("memory") && item.at("memory").is_string()) {
-            raw_content = item.at("memory").get<std::string>();
-        } else if (item.contains("chunk") && item.at("chunk").is_string()) {
-            raw_content = item.at("chunk").get<std::string>();
-        } else if (item.contains("content") && item.at("content").is_string()) {
-            raw_content = item.at("content").get<std::string>();
-        } else {
-            if (out_error) {
-                *out_error = "ongoing-task registry result was missing content";
-            }
-            return false;
-        }
-
-        server_ongoing_task_registry parsed = {};
-        if (!parse_ongoing_task_registry_payload(raw_content, &parsed, out_error)) {
-            return false;
-        }
-        if (!found_match || parsed.updated_at > best_registry.updated_at) {
-            best_registry = std::move(parsed);
-            found_match = true;
-        }
-    }
-
-    *out_registry = found_match ? best_registry : empty_ongoing_task_registry();
-    return true;
-}
-
-static json ongoing_task_registry_to_json(const server_ongoing_task_registry & registry) {
-    json tasks = json::array();
-    for (const auto & task : registry.tasks) {
-        tasks.push_back({
-            {"task_id", task.task_id},
-            {"task_text", task.task_text},
-            {"frequency", {
-                {"interval", task.frequency.interval},
-                {"unit", task.frequency.unit},
-            }},
-            {"created_at", task.created_at},
-            {"updated_at", task.updated_at},
-            {"last_done_at", task.last_done_at.empty() ? json(nullptr) : json(task.last_done_at)},
-            {"active", task.active},
-        });
-    }
-    return {
-        {"schema_version", 1},
-        {"updated_at", registry.updated_at},
-        {"tasks", std::move(tasks)},
-    };
-}
-
-static bool save_ongoing_task_registry(
-        const server_ongoing_task_config & config,
-        server_ongoing_task_registry registry,
-        std::string * out_error) {
-    registry.schema_version = 1;
-    registry.updated_at = iso_from_epoch_ms(current_time_ms_utc());
-
-    json ignored_response;
-    return ongoing_task_hard_memory_request(config, "/v4/memories", {
-                {"containerTag", config.container_tag},
-                {"memories", json::array({
-                    {
-                        {"content", safe_json_to_str(ongoing_task_registry_to_json(registry))},
-                        {"metadata", {
-                            {"source", "vicuna"},
-                            {"runtimeIdentity", config.runtime_identity},
-                            {"kind", "tool_observation"},
-                            {"domain", "strategy"},
-                            {"key", config.registry_key},
-                            {"title", config.registry_title},
-                            {"tags", json::array({"ongoing_tasks", "registry"})},
-                            {"importance", 0.8},
-                            {"confidence", 1.0},
-                            {"gainBias", 0.3},
-                            {"allostaticRelevance", 0.0},
-                        }},
-                    },
-                })},
-            }, &ignored_response, out_error);
-}
-
-static bool mark_ongoing_task_complete(
-        server_ongoing_task_registry * registry,
-        const std::string & task_id,
-        const std::string & completed_at_iso,
-        std::string * out_error) {
-    if (!registry) {
-        if (out_error) {
-            *out_error = "ongoing-task registry must not be null";
-        }
-        return false;
-    }
-    for (auto & task : registry->tasks) {
-        if (task.task_id != task_id) {
-            continue;
-        }
-        task.last_done_at = completed_at_iso;
-        task.updated_at = iso_from_epoch_ms(current_time_ms_utc());
-        return true;
-    }
-    if (out_error) {
-        *out_error = "selected ongoing task was not present in the loaded registry";
-    }
-    return false;
-}
-
-static std::string build_ongoing_task_decision_system_prompt() {
-    return
-            "You are deciding whether one recurring ongoing task should run now before true idle. "
-            "Use both the explicit cadence/timestamp fields and the task wording. "
-            "Select at most one task. Return exactly one JSON object and no markdown. "
-            "The object must contain: should_run (boolean), selected_task_id (string or empty string), "
-            "rationale (short string).";
-}
-
-static std::string build_ongoing_task_decision_user_prompt(
-        const std::vector<server_ongoing_task_summary> & tasks,
-        const std::string & current_time_iso) {
-    std::ostringstream out;
-    out << "Current system time: " << current_time_iso << "\n";
-    out << "Decide whether exactly one ongoing task should run now.\n";
-    out << "Prefer the most overdue or most clearly due task. If none should run, return should_run=false.\n";
-    out << "Tasks:\n";
-    for (const auto & task : tasks) {
-        out << "- task_id: " << task.task_id << "\n";
-        out << "  task_text: " << task.task_text << "\n";
-        out << "  frequency_interval: " << task.frequency.interval << "\n";
-        out << "  frequency_unit: " << task.frequency.unit << "\n";
-        out << "  last_done_at: " << (task.last_done_at.empty() ? "null" : task.last_done_at) << "\n";
-        out << "  next_due_at: " << task.next_due_at << "\n";
-        out << "  due_now: " << (task.due_now ? "true" : "false") << "\n";
-        out << "  active: " << (task.active ? "true" : "false") << "\n";
-    }
-    return out.str();
-}
-
-static bool parse_ongoing_task_decision_response(
-        const std::string & text,
-        server_ongoing_task_decision * out_decision,
-        std::string * out_error) {
-    if (!out_decision) {
-        if (out_error) {
-            *out_error = "ongoing-task decision output must not be null";
-        }
-        return false;
-    }
-
-    json payload;
-    try {
-        payload = json::parse(extract_json_object_payload(text));
-    } catch (const std::exception & e) {
-        if (out_error) {
-            *out_error = server_string_format("ongoing-task decision was not valid JSON: %s", e.what());
-        }
-        return false;
-    }
-
-    server_ongoing_task_decision decision = {};
-    decision.valid = true;
-    decision.should_run = json_value(payload, "should_run", false);
-    decision.selected_task_id = trim_copy(json_value(payload, "selected_task_id", std::string()));
-    decision.rationale = trim_copy(json_value(payload, "rationale", std::string()));
-    if (!decision.should_run) {
-        decision.selected_task_id.clear();
-    }
-    if (decision.should_run && decision.selected_task_id.empty()) {
-        if (out_error) {
-            *out_error = "ongoing-task decision selected work but did not provide selected_task_id";
-        }
-        return false;
-    }
-
-    *out_decision = std::move(decision);
-    return true;
-}
-
-static const server_ongoing_task_summary * find_ongoing_task_summary(
-        const std::vector<server_ongoing_task_summary> & tasks,
-        const std::string & task_id) {
-    for (const auto & task : tasks) {
-        if (task.task_id == task_id) {
-            return &task;
-        }
-    }
-    return nullptr;
 }
 
 static bool telegram_method_is_allowed(const std::string & method) {
@@ -6299,7 +7342,17 @@ static void seed_emotive_turn_from_request(const json & body, server_emotive_tur
     }
 
     if (body.contains("messages") && body.at("messages").is_array()) {
-        for (const auto & item : body.at("messages")) {
+        const json & messages = body.at("messages");
+        int32_t last_user_message_index = -1;
+        for (size_t index = 0; index < messages.size(); ++index) {
+            const auto & item = messages.at(index);
+            if (item.is_object() && json_value(item, "role", std::string()) == "user") {
+                last_user_message_index = static_cast<int32_t>(index);
+            }
+        }
+
+        for (size_t index = 0; index < messages.size(); ++index) {
+            const auto & item = messages.at(index);
             if (!item.is_object()) {
                 continue;
             }
@@ -6320,6 +7373,9 @@ static void seed_emotive_turn_from_request(const json & body, server_emotive_tur
                         request_content_to_text(item.at("content")) :
                         std::string();
                 if (!text.empty()) {
+                    if (static_cast<int32_t>(index) == last_user_message_index) {
+                        builder->mark_turn_start();
+                    }
                     builder->add_user_message(text);
                 }
                 continue;
@@ -6368,6 +7424,7 @@ static void seed_emotive_turn_from_request(const json & body, server_emotive_tur
     if (body.contains("prompt")) {
         const std::string prompt_text = request_content_to_text(body.at("prompt"));
         if (!prompt_text.empty()) {
+            builder->mark_turn_start();
             builder->add_user_message(prompt_text);
         }
     }
@@ -7584,6 +8641,7 @@ static bool request_candidate_policy_action(
         std::string * out_policy_alias,
         bool * out_confidence_present,
         float * out_confidence,
+        server_policy_rollout_metadata * out_rollout,
         std::string * out_error) {
     const auto & config = policy_runtime_config_instance();
     if (!out_action) {
@@ -7647,6 +8705,7 @@ static bool request_candidate_policy_action(
                 out_policy_alias,
                 out_confidence_present,
                 out_confidence,
+                out_rollout,
                 out_error);
     } catch (const std::exception & e) {
         if (out_error) {
@@ -7667,8 +8726,8 @@ static bool execute_deepseek_chat_with_emotive(
         const std::string & cognitive_replay_entry_id,
         bool enable_heuristic_guidance,
         bool suppress_replay_admission,
-        float ongoing_task_due,
         const std::string & mode_label,
+        const server_tool_correctness_signal * tool_correctness_override,
         const runtime_request_trace_context * trace_context) {
     if (!out_result) {
         if (out_error) {
@@ -7676,14 +8735,23 @@ static bool execute_deepseek_chat_with_emotive(
         }
         return false;
     }
-
     *out_result = deepseek_chat_result();
     if (out_trace) {
         *out_trace = server_emotive_trace();
     }
 
+    const auto & runpod_config = runpod_inference_runtime_config_instance();
+    const bool detached_standard_deepseek =
+            host_inference_standard_enabled(runpod_config) &&
+            deepseek_provider_selected() &&
+            !local_llama_provider_selected();
+    const bool experimental_pod_policy_authority = runpod_inference_host_relay_enabled(runpod_config);
+    const std::string inference_substrate = current_inference_substrate_label();
+
     std::unique_ptr<server_emotive_turn_builder> turn_builder;
-    if (emotive_runtime.config().enabled) {
+    if (emotive_runtime.config().enabled &&
+            !detached_standard_deepseek &&
+            !experimental_pod_policy_authority) {
         turn_builder = std::make_unique<server_emotive_turn_builder>(
                 emotive_runtime,
                 config.model,
@@ -7710,7 +8778,12 @@ static bool execute_deepseek_chat_with_emotive(
 
     server_heuristic_retrieval_decision heuristic_decision = {};
     std::string heuristic_guidance;
-    if (enable_heuristic_guidance && !cognitive_replay && body.contains("messages") && body.at("messages").is_array()) {
+    if (!detached_standard_deepseek &&
+            !experimental_pod_policy_authority &&
+            enable_heuristic_guidance &&
+            !cognitive_replay &&
+            body.contains("messages") &&
+            body.at("messages").is_array()) {
         std::vector<std::string> struct_tags;
         const std::string query_text = build_live_heuristic_query_text(body.at("messages"), &struct_tags);
         if (!query_text.empty()) {
@@ -7731,25 +8804,33 @@ static bool execute_deepseek_chat_with_emotive(
         control_state.moment = turn_builder->current_moment();
         control_state.vad = turn_builder->current_vad();
     }
-    control_state.ongoing_task_due = ongoing_task_due;
     control_state.bridge_scoped = json_value(body, "x-vicuna-bridge-scoped", false);
     control_state.cognitive_replay = cognitive_replay;
     control_state.suppress_replay_admission = suppress_replay_admission;
     control_state.heuristic = heuristic_decision;
     const std::string policy_request_id = trace_context ? trace_context->request_id : generate_runtime_trace_request_id();
     const std::string policy_decision_id = generate_policy_decision_id();
-    const server_metacognitive_policy_decision native_policy_decision =
-            emotive_runtime.compute_control_policy(control_state);
-    const server_policy_action native_policy_action = build_policy_action_from_native(native_policy_decision);
+    const bool native_control_surface_enabled =
+            !detached_standard_deepseek &&
+            !experimental_pod_policy_authority &&
+            env_to_bool_local("VICUNA_NATIVE_CONTROL_SURFACE_ENABLED", true);
+    server_metacognitive_policy_decision native_policy_decision = {};
+    server_policy_action native_policy_action = {};
+    if (native_control_surface_enabled) {
+        native_policy_decision = emotive_runtime.compute_control_policy(control_state);
+        native_policy_action = build_policy_action_from_native(native_policy_decision);
+    }
     const server_policy_action_mask policy_action_mask = default_policy_action_mask();
     const server_policy_observation policy_observation = build_policy_observation(
             policy_request_id,
             policy_decision_id,
             std::string(),
             mode_label,
+            inference_substrate,
             control_state,
             heuristic_decision,
-            body);
+            body,
+            tool_correctness_override ? *tool_correctness_override : server_tool_correctness_signal());
     server_policy_safety_guard_result policy_safety_guard = {};
     server_policy_action candidate_policy_action = {};
     server_policy_action shielded_candidate_action = {};
@@ -7759,12 +8840,15 @@ static bool execute_deepseek_chat_with_emotive(
     std::string candidate_policy_alias;
     bool candidate_confidence_present = false;
     float candidate_confidence = 0.0f;
+    server_policy_rollout_metadata candidate_policy_rollout = {};
     std::string candidate_policy_error;
     server_policy_rollout_decision rollout_decision = {};
     server_policy_action executed_policy_action = native_policy_action;
     server_metacognitive_policy_decision effective_policy_decision = native_policy_decision;
     const auto & policy_runtime_config = policy_runtime_config_instance();
-    if (policy_runtime_config.enabled && policy_runtime_config.mode == "canary_live") {
+    if (native_control_surface_enabled &&
+            policy_runtime_config.enabled &&
+            policy_runtime_config.mode == "canary_live") {
         auto & policy_state = policy_runtime_state_instance();
         std::lock_guard<std::mutex> lock(policy_state.mutex);
         rollout_decision.rollout_mode = policy_runtime_config.mode;
@@ -7775,7 +8859,7 @@ static bool execute_deepseek_chat_with_emotive(
             rollout_decision.reason = "rollback_active";
         }
     }
-    if (trace_context) {
+    if (trace_context && native_control_surface_enabled) {
         runtime_request_trace_log(*trace_context, "control_policy", "policy_computed", {
             {"policy_version", native_policy_decision.policy_version},
             {"selected_mode", native_policy_decision.selected_mode},
@@ -7804,9 +8888,11 @@ static bool execute_deepseek_chat_with_emotive(
             {"heuristic_biases", native_policy_decision.heuristic_biases},
             {"heuristic_matched", heuristic_decision.matched},
             {"heuristic_id", heuristic_decision.heuristic_id.empty() ? json(nullptr) : json(heuristic_decision.heuristic_id)},
+            {"controls_enabled", native_control_surface_enabled},
         });
     }
-    if (policy_runtime_config.enabled &&
+    if (native_control_surface_enabled &&
+            policy_runtime_config.enabled &&
             policy_runtime_requests_candidate(policy_runtime_config.mode) &&
             rollout_decision.reason != "rollback_active") {
         if (request_candidate_policy_action(
@@ -7819,6 +8905,7 @@ static bool execute_deepseek_chat_with_emotive(
                     &candidate_policy_alias,
                     &candidate_confidence_present,
                     &candidate_confidence,
+                    &candidate_policy_rollout,
                     &candidate_policy_error)) {
             have_candidate_policy_action = true;
             candidate_policy_action.proposal_source =
@@ -7876,90 +8963,106 @@ static bool execute_deepseek_chat_with_emotive(
         }
     }
 
-    if (policy_runtime_config.enabled && !policy_runtime_requests_candidate(policy_runtime_config.mode)) {
+    if (native_control_surface_enabled &&
+            policy_runtime_config.enabled &&
+            !policy_runtime_requests_candidate(policy_runtime_config.mode)) {
         rollout_decision.rollout_mode = policy_runtime_config.mode;
         rollout_decision.reason = policy_runtime_config.mode == "capture" ? "capture_only" : policy_runtime_config.mode;
     }
 
+    const bool runtime_native_control_surface = local_llama_provider_selected();
+
     json adjusted_body = body;
     adjusted_body = strip_stale_assistant_reasoning_from_request(adjusted_body);
-    adjusted_body = inject_skill_and_memory_prompt_indexes(adjusted_body, trace_context);
-    if (!adjusted_body.contains("parallel_tool_calls")) {
+    if (!runtime_native_control_surface) {
+        adjusted_body = inject_skill_and_memory_prompt_indexes(adjusted_body, trace_context);
+    } else if (trace_context) {
+        runtime_request_trace_log(*trace_context, "prompt_context", "skill_memory_indexes_skipped", {
+            {"reason", "runtime_native_control_surface"},
+        });
+    }
+    if (native_control_surface_enabled && !adjusted_body.contains("parallel_tool_calls")) {
         adjusted_body["parallel_tool_calls"] = executed_policy_action.tool_parallelism_cap > 1;
     }
-    if (!adjusted_body.contains("x-vicuna-provider-max-tokens-override") &&
+    if (native_control_surface_enabled &&
+            !experimental_pod_policy_authority &&
+            !adjusted_body.contains("x-vicuna-provider-max-tokens-override") &&
             !adjusted_body.contains("max_tokens") &&
             !adjusted_body.contains("max_output_tokens") &&
             !adjusted_body.contains("max_completion_tokens")) {
-        adjusted_body["x-vicuna-provider-max-tokens-override"] = executed_policy_action.token_budget_bucket;
+        adjusted_body["x-vicuna-provider-max-tokens-override"] = executed_policy_action.response_budget_bucket;
+    }
+    if (native_control_surface_enabled &&
+            !experimental_pod_policy_authority &&
+            !adjusted_body.contains("x-vicuna-provider-reasoning-budget-override") &&
+            !adjusted_body.contains("reasoning_budget_tokens")) {
+        adjusted_body["x-vicuna-provider-reasoning-budget-override"] =
+                executed_policy_action.reasoning_budget_bucket;
     }
 
-    const json provider_guidance_body = inject_additive_runtime_guidance(
-            adjusted_body,
-            turn_builder.get(),
-            &emotive_runtime,
-            &effective_policy_decision,
-            &heuristic_decision,
-            heuristic_guidance.empty() ? nullptr : &heuristic_guidance,
-            enable_heuristic_guidance && !cognitive_replay,
-            trace_context);
-    server_policy_applied_provider_controls applied_provider_controls = {};
-    const json provider_body = apply_policy_provider_controls(
-            provider_guidance_body,
-            executed_policy_action,
-            &applied_provider_controls);
-    if (trace_context) {
-        runtime_request_trace_log(*trace_context, "policy_runtime", "provider_controls_applied", {
-            {"executed_action", server_policy_action_to_json(executed_policy_action)},
-            {"applied_provider_controls", server_policy_applied_provider_controls_to_json(applied_provider_controls)},
+    const json provider_guidance_body = (runtime_native_control_surface || experimental_pod_policy_authority) ?
+            adjusted_body :
+            inject_additive_runtime_guidance(
+                    adjusted_body,
+                    turn_builder.get(),
+                    &emotive_runtime,
+                    &effective_policy_decision,
+                    &heuristic_decision,
+                    heuristic_guidance.empty() ? nullptr : &heuristic_guidance,
+                    enable_heuristic_guidance && !cognitive_replay,
+                    trace_context);
+    if (runtime_native_control_surface && trace_context) {
+        runtime_request_trace_log(*trace_context, "runtime_guidance", "guidance_skipped", {
+            {"reason", "runtime_native_control_surface"},
+        });
+    } else if (experimental_pod_policy_authority && trace_context) {
+        runtime_request_trace_log(*trace_context, "runtime_guidance", "guidance_skipped", {
+            {"reason", "experimental_pod_policy_authority"},
         });
     }
+    server_policy_applied_provider_controls applied_provider_controls = {};
+    server_request_policy_config request_policy_config = {};
+    json provider_body = provider_guidance_body;
+    if (native_control_surface_enabled) {
+        provider_body = apply_policy_provider_controls(
+                provider_guidance_body,
+                executed_policy_action,
+                &applied_provider_controls);
+        request_policy_config = build_request_policy_config_from_provider_body(
+                provider_body,
+                executed_policy_action,
+                applied_provider_controls);
+        if (trace_context) {
+            runtime_request_trace_log(*trace_context, "policy_runtime", "provider_controls_applied", {
+                {"executed_action", server_policy_action_to_json(executed_policy_action)},
+                {"request_policy_config", server_request_policy_config_to_json(request_policy_config)},
+                {"applied_provider_controls", server_policy_applied_provider_controls_to_json(applied_provider_controls)},
+            });
+        }
+    } else if (trace_context) {
+        runtime_request_trace_log(*trace_context, "policy_runtime", "provider_controls_skipped", {
+            {"reason", experimental_pod_policy_authority ? "experimental_pod_policy_authority" : "native_control_surface_disabled"},
+        });
+    }
+    if (!native_control_surface_enabled) {
+        request_policy_config.parallel_tool_calls = json_value(provider_body, "parallel_tool_calls", false);
+    }
+    server_decode_control_trace empty_decode_trace = {};
+    const json host_final_policy_json = experimental_pod_policy_authority ? json(nullptr) : build_final_policy_json_local(
+            native_policy_decision,
+            effective_policy_decision,
+            executed_policy_action,
+            request_policy_config,
+            rollout_decision,
+            applied_provider_controls,
+            heuristic_decision,
+            empty_decode_trace);
+    const json host_heuristic_retrieval_json = experimental_pod_policy_authority ?
+            json(nullptr) :
+            build_heuristic_retrieval_json_local(heuristic_decision);
     if (turn_builder) {
-        turn_builder->set_final_policy({
-            {"policy_version", effective_policy_decision.policy_version},
-            {"selected_mode", effective_policy_decision.selected_mode},
-            {"reasoning_depth", effective_policy_decision.reasoning_depth},
-            {"thinking_mode", effective_policy_decision.thinking_mode},
-            {"behavior_policy_version", native_policy_decision.policy_version},
-            {"proposal_source", executed_policy_action.proposal_source},
-            {"rollout_mode", rollout_decision.rollout_mode},
-            {"rollout_decision_reason", rollout_decision.reason},
-            {"candidate_executed_live", rollout_decision.execute_candidate_live},
-            {"score_breakdown", {
-                {"direct", native_policy_decision.direct_score},
-                {"reflective", native_policy_decision.reflective_score},
-                {"tool_light", native_policy_decision.tool_light_score},
-                {"tool_heavy", native_policy_decision.tool_heavy_score},
-                {"background_defer", native_policy_decision.background_defer_score},
-            }},
-            {"reasoning_score", native_policy_decision.reasoning_score},
-            {"tool_aggression", native_policy_decision.tool_aggression},
-            {"interrupt_score", native_policy_decision.interrupt_score},
-            {"tool_parallelism_cap", effective_policy_decision.tool_parallelism_cap},
-            {"interrupt_allowed", effective_policy_decision.interrupt_allowed},
-            {"replan_required", effective_policy_decision.replan_required},
-            {"early_stop_ok", effective_policy_decision.early_stop_ok},
-            {"force_synthesis", effective_policy_decision.force_synthesis},
-            {"prefix_profile", effective_policy_decision.prefix_profile},
-            {"stop_profile", effective_policy_decision.stop_profile},
-            {"sampling_profile", effective_policy_decision.sampling_profile},
-            {"repetition_profile", effective_policy_decision.repetition_profile},
-            {"tool_choice_profile", effective_policy_decision.tool_choice_profile},
-            {"applied_provider_controls", server_policy_applied_provider_controls_to_json(applied_provider_controls)},
-            {"heuristic_biases", native_policy_decision.heuristic_biases},
-            {"prompt_hints", native_policy_decision.prompt_hints},
-        });
-        turn_builder->set_heuristic_retrieval({
-            {"matched", heuristic_decision.matched},
-            {"record_id", heuristic_decision.record_id},
-            {"heuristic_id", heuristic_decision.heuristic_id},
-            {"semantic_score", heuristic_decision.semantic_score},
-            {"struct_score", heuristic_decision.struct_score},
-            {"emotive_score", heuristic_decision.emotive_score},
-            {"total_score", heuristic_decision.total_score},
-            {"threshold", heuristic_decision.threshold},
-            {"control_biases", heuristic_decision.control_biases},
-        });
+        turn_builder->set_final_policy(host_final_policy_json);
+        turn_builder->set_heuristic_retrieval(host_heuristic_retrieval_json);
     }
     deepseek_request_trace provider_trace;
     if (trace_context) {
@@ -7969,70 +9072,189 @@ static bool execute_deepseek_chat_with_emotive(
             runtime_request_trace_log(*trace_context, "provider", event, data);
         };
     }
-    if (!deepseek_complete_chat(
+    server_llama_runtime_control_state runtime_control_state = {};
+    populate_runtime_control_state_from_rollouts(
+            &runtime_control_state,
+            control_state.moment,
+            control_state.vad,
+            policy_request_id);
+
+    bool provider_ok = false;
+    if (runpod_inference_host_relay_enabled(runpod_config)) {
+        if (trace_context) {
+            runtime_request_trace_log(*trace_context, "runpod_inference", "relay_started", {
+                {"mode_label", mode_label},
+                {"relay_url", runpod_build_health_json(runpod_config).value("relay_url", json(nullptr))},
+                {"resolved_model", runpod_config.resolved_model},
+                {"prepared_request", true},
+            });
+        }
+        json relay_error;
+        json relay_meta;
+        json relay_request = experimental_pod_policy_authority ? adjusted_body : provider_body;
+        relay_request = sanitize_runpod_relay_body(std::move(relay_request));
+        relay_request = apply_runpod_default_generation_cap(runpod_config, std::move(relay_request));
+        provider_ok = runpod_relay_inference_request(runpod_config, relay_request, out_result, &relay_error, &relay_meta);
+        if (!provider_ok) {
+            if (trace_context) {
+                runtime_request_trace_log(*trace_context, "runpod_inference", "relay_failed", {
+                    {"mode_label", mode_label},
+                    {"meta", relay_meta},
+                    {"message", json_value(relay_error, "message", std::string("RunPod relay failed"))},
+                });
+            }
+            if (out_error) {
+                *out_error = relay_error;
+            }
+            return false;
+        }
+        if (runpod_result_needs_no_thinking_retry(*out_result) &&
+                !runpod_request_has_thinking_disabled(relay_request)) {
+            json retry_meta;
+            json retry_error;
+            const json retry_request = build_runpod_reasoning_fallback_request(relay_request);
+            if (trace_context) {
+                runtime_request_trace_log(*trace_context, "runpod_inference", "relay_retry_started", {
+                    {"reason", "reasoning_only_no_content"},
+                    {"initial_finish_reason", out_result->finish_reason},
+                    {"initial_reasoning_chars", static_cast<int64_t>(out_result->reasoning_content.size())},
+                    {"retry_enable_thinking", false},
+                });
+            }
+            provider_ok = runpod_relay_inference_request(runpod_config, retry_request, out_result, &retry_error, &retry_meta);
+            if (!provider_ok) {
+                if (trace_context) {
+                    runtime_request_trace_log(*trace_context, "runpod_inference", "relay_retry_failed", {
+                        {"reason", "reasoning_only_no_content"},
+                        {"meta", retry_meta},
+                        {"message", json_value(retry_error, "message", std::string("RunPod retry failed"))},
+                    });
+                }
+                if (out_error) {
+                    *out_error = retry_error;
+                }
+                return false;
+            }
+            relay_meta = {
+                {"initial", relay_meta},
+                {"retry", retry_meta},
+                {"reasoning_fallback_retry_used", true},
+            };
+            if (trace_context) {
+                runtime_request_trace_log(*trace_context, "runpod_inference", "relay_retry_completed", {
+                    {"reason", "reasoning_only_no_content"},
+                    {"meta", retry_meta},
+                    {"finish_reason", out_result->finish_reason},
+                    {"content_chars", static_cast<int64_t>(out_result->content.size())},
+                });
+            }
+        }
+        if (trace_context) {
+            runtime_request_trace_log(*trace_context, "runpod_inference", "relay_completed", {
+                {"mode_label", mode_label},
+                {"meta", relay_meta},
+                {"finish_reason", out_result->finish_reason},
+                {"tool_call_count", static_cast<int64_t>(out_result->tool_calls.size())},
+                {"content_chars", static_cast<int64_t>(out_result->content.size())},
+            });
+        }
+    } else if (local_llama_provider_selected()) {
+        provider_ok = g_active_local_llama_provider->complete_chat(
+                provider_body,
+                out_result,
+                turn_builder ? &observer : nullptr,
+                out_error,
+                trace_context ? &provider_trace : nullptr,
+                &runtime_control_state,
+                turn_builder.get());
+    } else {
+        provider_ok = deepseek_complete_chat(
                 config,
                 provider_body,
                 out_result,
                 turn_builder ? &observer : nullptr,
                 out_error,
-                trace_context ? &provider_trace : nullptr)) {
+                trace_context ? &provider_trace : nullptr);
+    }
+    if (!provider_ok) {
         return false;
     }
 
     server_emotive_trace final_trace = {};
-    if (turn_builder) {
-        turn_builder->observe_runtime_event(
-                "provider_finish:" + (out_result->finish_reason.empty() ? std::string("stop") : out_result->finish_reason));
-        final_trace = turn_builder->finalize();
-        final_trace.final_policy = {
-            {"policy_version", effective_policy_decision.policy_version},
-            {"selected_mode", effective_policy_decision.selected_mode},
-            {"reasoning_depth", effective_policy_decision.reasoning_depth},
-            {"thinking_mode", effective_policy_decision.thinking_mode},
-            {"behavior_policy_version", native_policy_decision.policy_version},
-            {"proposal_source", executed_policy_action.proposal_source},
-            {"rollout_mode", rollout_decision.rollout_mode},
-            {"rollout_decision_reason", rollout_decision.reason},
-            {"candidate_executed_live", rollout_decision.execute_candidate_live},
-            {"score_breakdown", {
-                {"direct", native_policy_decision.direct_score},
-                {"reflective", native_policy_decision.reflective_score},
-                {"tool_light", native_policy_decision.tool_light_score},
-                {"tool_heavy", native_policy_decision.tool_heavy_score},
-                {"background_defer", native_policy_decision.background_defer_score},
-            }},
-            {"reasoning_score", native_policy_decision.reasoning_score},
-            {"tool_aggression", native_policy_decision.tool_aggression},
-            {"interrupt_score", native_policy_decision.interrupt_score},
-            {"tool_parallelism_cap", effective_policy_decision.tool_parallelism_cap},
-            {"interrupt_allowed", effective_policy_decision.interrupt_allowed},
-            {"replan_required", effective_policy_decision.replan_required},
-            {"early_stop_ok", effective_policy_decision.early_stop_ok},
-            {"force_synthesis", effective_policy_decision.force_synthesis},
-            {"prefix_profile", effective_policy_decision.prefix_profile},
-            {"stop_profile", effective_policy_decision.stop_profile},
-            {"sampling_profile", effective_policy_decision.sampling_profile},
-            {"repetition_profile", effective_policy_decision.repetition_profile},
-            {"tool_choice_profile", effective_policy_decision.tool_choice_profile},
-            {"applied_provider_controls", server_policy_applied_provider_controls_to_json(applied_provider_controls)},
-            {"heuristic_biases", native_policy_decision.heuristic_biases},
-            {"prompt_hints", native_policy_decision.prompt_hints},
-        };
-        final_trace.heuristic_retrieval = {
-            {"matched", heuristic_decision.matched},
-            {"record_id", heuristic_decision.record_id},
-            {"heuristic_id", heuristic_decision.heuristic_id},
-            {"semantic_score", heuristic_decision.semantic_score},
-            {"struct_score", heuristic_decision.struct_score},
-            {"emotive_score", heuristic_decision.emotive_score},
-            {"total_score", heuristic_decision.total_score},
-            {"threshold", heuristic_decision.threshold},
-            {"control_biases", heuristic_decision.control_biases},
-        };
-        out_result->emotive_trace = server_emotive_trace_to_json(final_trace);
+    server_decode_control_trace final_decode_trace = {};
+    if (runpod_inference_host_relay_enabled(runpod_config)) {
+        json ingested_trace_json = nullptr;
+        std::string ingest_error;
+        if (!ingest_experimental_trace_into_host(
+                    emotive_runtime,
+                    *out_result,
+                    native_policy_decision,
+                    effective_policy_decision,
+                    executed_policy_action,
+                    rollout_decision,
+                    applied_provider_controls,
+                    heuristic_decision,
+                    &final_trace,
+                    &final_decode_trace,
+                    &ingested_trace_json,
+                    &ingest_error)) {
+            if (out_error) {
+                *out_error = format_error_response(ingest_error, ERROR_TYPE_SERVER);
+            }
+            return false;
+        }
+        out_result->emotive_trace = std::move(ingested_trace_json);
         if (out_trace) {
             *out_trace = final_trace;
         }
+        experimental_capture_append_emotive_trace(
+                policy_request_id,
+                out_result->emotive_trace,
+                build_telegram_emotive_animation_bundle(out_result->emotive_trace));
+    } else if (turn_builder) {
+        turn_builder->observe_runtime_event(
+                "provider_finish:" + (out_result->finish_reason.empty() ? std::string("stop") : out_result->finish_reason));
+        final_trace = turn_builder->finalize();
+        final_decode_trace = server_llama_runtime_control_finalize_trace(
+                &runtime_control_state,
+                final_trace.trace_id);
+        if (!final_decode_trace.steps.empty()) {
+            policy_runtime_record_decode_trace(final_decode_trace);
+            runtime_artifact_record_decode_trace_metrics(
+                    decode_artifact_rollout_state_instance(),
+                    final_decode_trace);
+            runtime_artifact_record_cvec_metrics(
+                    cvec_artifact_rollout_state_instance(),
+                    final_decode_trace);
+        }
+        final_trace.final_policy = build_final_policy_json_local(
+                native_policy_decision,
+                effective_policy_decision,
+                executed_policy_action,
+                request_policy_config,
+                rollout_decision,
+                applied_provider_controls,
+                heuristic_decision,
+                final_decode_trace);
+        final_trace.heuristic_retrieval = host_heuristic_retrieval_json;
+        out_result->emotive_trace = server_emotive_trace_to_json(final_trace);
+        if (!final_decode_trace.steps.empty()) {
+            out_result->emotive_trace["decode_controller_trace"] = server_decode_control_trace_to_json(final_decode_trace);
+        }
+        if (out_trace) {
+            *out_trace = final_trace;
+        }
+    }
+
+    if (experimental_pod_policy_authority && final_trace.final_policy.is_object()) {
+        native_policy_decision = build_policy_decision_from_final_policy_json(final_trace.final_policy);
+        effective_policy_decision = native_policy_decision;
+        executed_policy_action = build_policy_action_from_native(native_policy_decision);
+        executed_policy_action.proposal_source = "pod_native";
+        applied_provider_controls = build_applied_provider_controls_from_json(
+                json_value(final_trace.final_policy, "applied_provider_controls", json::object()));
+        rollout_decision.rollout_mode = policy_runtime_config.enabled ? policy_runtime_config.mode : "capture";
+        rollout_decision.reason = "pod_native_behavior";
     }
 
     maybe_capture_post_response_session_memory(
@@ -8043,15 +9265,17 @@ static bool execute_deepseek_chat_with_emotive(
             mode_label,
             trace_context);
 
-    if (policy_runtime_config.enabled) {
+    if (policy_runtime_config.enabled && !detached_standard_deepseek) {
         server_policy_observation next_observation = build_policy_observation(
                 policy_request_id,
                 policy_decision_id,
                 final_trace.valid ? final_trace.trace_id : std::string(),
                 mode_label,
+                inference_substrate,
                 control_state,
                 heuristic_decision,
-                body);
+                body,
+                tool_correctness_override ? *tool_correctness_override : server_tool_correctness_signal());
         if (final_trace.valid) {
             next_observation.trace_id = final_trace.trace_id;
             next_observation.moment = final_trace.final_moment;
@@ -8075,8 +9299,8 @@ static bool execute_deepseek_chat_with_emotive(
             {"latency_cost", reward_breakdown.latency_cost, 1.0f, "request_latency_ms"},
             {"token_cost", reward_breakdown.token_cost, 1.0f, "provider_usage_tokens"},
         };
-        if (reward_breakdown.tool_success_reward != 0.0f) {
-            reward_events.push_back({"tool_success", reward_breakdown.tool_success_reward, 1.0f, "provider_tool_call"});
+        if (reward_breakdown.tool_correctness_reward != 0.0f) {
+            reward_events.push_back({"tool_correctness", reward_breakdown.tool_correctness_reward, 1.0f, "tool_posthoc_correctness"});
         }
         if (reward_breakdown.candidate_failure_penalty != 0.0f) {
             reward_events.push_back({
@@ -8092,7 +9316,7 @@ static bool execute_deepseek_chat_with_emotive(
         transition.decision_id = policy_decision_id;
         transition.policy_mode = policy_runtime_config.mode;
         transition.rollout_mode = rollout_decision.rollout_mode.empty() ? policy_runtime_config.mode : rollout_decision.rollout_mode;
-        transition.behavior_policy_version = native_policy_action.policy_version;
+        transition.behavior_policy_version = executed_policy_action.policy_version;
         transition.candidate_policy_version = candidate_policy_version;
         transition.candidate_policy_alias = candidate_policy_alias;
         transition.observation = policy_observation;
@@ -8105,6 +9329,7 @@ static bool execute_deepseek_chat_with_emotive(
         transition.candidate_confidence_present = candidate_confidence_present;
         transition.candidate_confidence = candidate_confidence;
         transition.candidate_confidence_passed = rollout_decision.candidate_confidence_passed;
+        transition.policy_rollout = candidate_policy_rollout;
         transition.rollout_decision_reason = rollout_decision.reason;
         transition.canary_share_percent = rollout_decision.canary_share_percent;
         transition.rollout_step_index = rollout_decision.rollout_step_index;
@@ -8121,10 +9346,13 @@ static bool execute_deepseek_chat_with_emotive(
         transition.provider_finish_reason = out_result->finish_reason.empty() ? "stop" : out_result->finish_reason;
         transition.created_at_ms = runtime_now_epoch_ms();
         policy_runtime_record_transition(transition);
+        if (runpod_inference_host_relay_enabled(runpod_config)) {
+            experimental_capture_append_transition(transition);
+        }
 
         auto & policy_state = policy_runtime_state_instance();
         std::lock_guard<std::mutex> lock(policy_state.mutex);
-        policy_state.behavior_policy_version = native_policy_action.policy_version;
+        policy_state.behavior_policy_version = executed_policy_action.policy_version;
         if (policy_runtime_config.mode == "shadow") {
             ++policy_state.shadow_request_count;
         }
@@ -8174,8 +9402,14 @@ static json convert_responses_input_to_chat(const json & body) {
     if (body.contains("temperature")) {
         converted["temperature"] = body.at("temperature");
     }
+    if (body.contains("top_k")) {
+        converted["top_k"] = body.at("top_k");
+    }
     if (body.contains("top_p")) {
         converted["top_p"] = body.at("top_p");
+    }
+    if (body.contains("min_p")) {
+        converted["min_p"] = body.at("min_p");
     }
     if (body.contains("presence_penalty")) {
         converted["presence_penalty"] = body.at("presence_penalty");
@@ -8316,31 +9550,6 @@ static json cognitive_replay_worker_json(
     };
 }
 
-static json ongoing_task_worker_json(
-        const ongoing_task_worker_state & worker_state,
-        const request_activity_state & activity_state,
-        const server_ongoing_task_config & config) {
-    std::lock_guard<std::mutex> lock(worker_state.mutex);
-    return {
-        {"enabled", config.enabled},
-        {"mode", worker_state.mode},
-        {"running", worker_state.running},
-        {"active_task_id", worker_state.active_task_id},
-        {"last_error", worker_state.last_error},
-        {"last_poll_at_ms", worker_state.last_poll_at_ms},
-        {"last_finished_at_ms", worker_state.last_finished_at_ms},
-        {"last_completed_task_id", worker_state.last_completed_task_id},
-        {"last_completed_at_iso", worker_state.last_completed_at_iso},
-        {"last_decision", ongoing_task_decision_to_json(worker_state.last_decision)},
-        {"poll_interval_ms", config.poll_interval_ms},
-        {"timeout_ms", config.timeout_ms},
-        {"registry_key", config.registry_key},
-        {"container_tag", config.container_tag},
-        {"idle_ms", activity_state.idle_ms()},
-        {"active_request_count", activity_state.active_requests.load()},
-    };
-}
-
 static bool execute_bridge_scoped_telegram_request(
         const deepseek_runtime_config & config,
         server_emotive_runtime & emotive_runtime,
@@ -8348,6 +9557,7 @@ static bool execute_bridge_scoped_telegram_request(
         const json & body,
         deepseek_chat_result * out_result,
         json * out_error,
+        server_tool_correctness_signal * out_tool_correctness,
         const runtime_request_trace_context * trace_context = nullptr) {
     if (!out_result) {
         if (out_error) {
@@ -8373,7 +9583,8 @@ static bool execute_bridge_scoped_telegram_request(
     const telegram_runtime_tool_adapter_config adapter_config = telegram_runtime_tool_adapter_config_from_env();
     json runtime_tools;
     std::string tool_error;
-    if (!load_server_owned_telegram_runtime_tools(adapter_config, &runtime_tools, &tool_error)) {
+    std::string tool_source;
+    if (!load_server_owned_telegram_runtime_tools(adapter_config, &runtime_tools, &tool_error, &tool_source)) {
         if (trace_context) {
             runtime_request_trace_log(*trace_context, "runtime", "telegram_runtime_tools_load_failed", {
                 {"message", tool_error},
@@ -8387,10 +9598,12 @@ static bool execute_bridge_scoped_telegram_request(
     if (trace_context) {
         runtime_request_trace_log(*trace_context, "runtime", "telegram_runtime_tools_loaded", {
             {"tool_count", runtime_tools.is_array() ? static_cast<int64_t>(runtime_tools.size()) : 0},
+            {"source", tool_source},
         });
     }
 
     json current_body = build_server_owned_bridge_request_body(body, context, runtime_tools);
+    std::vector<runtime_tool_invocation_record> tool_invocations;
     for (int32_t round = 0; round < std::max<int32_t>(1, adapter_config.max_rounds); ++round) {
         if (trace_context) {
             runtime_request_trace_log(*trace_context, "runtime", "bridge_round_started", {
@@ -8399,6 +9612,9 @@ static bool execute_bridge_scoped_telegram_request(
         }
         deepseek_chat_result round_result;
         const bool use_staged_tools = should_use_staged_tool_loop_for_request(current_body);
+        const server_tool_correctness_signal aggregate_correctness = aggregate_tool_correctness(tool_invocations);
+        const server_tool_correctness_signal * aggregate_correctness_ptr =
+                aggregate_correctness.available ? &aggregate_correctness : nullptr;
         const bool executed = use_staged_tools ?
                 execute_deepseek_chat_with_staged_tools(
                         config,
@@ -8420,8 +9636,8 @@ static bool execute_bridge_scoped_telegram_request(
                         std::string(),
                         true,
                         false,
-                        0.0f,
                         "telegram_bridge",
+                        aggregate_correctness_ptr,
                         trace_context);
         if (!executed) {
             return false;
@@ -8476,8 +9692,14 @@ static bool execute_bridge_scoped_telegram_request(
                 });
             }
             json observation;
+            server_tool_correctness_signal correctness;
             std::string observation_error;
-            if (!invoke_server_owned_telegram_runtime_tool(adapter_config, tool_call, &observation, &observation_error)) {
+            if (!invoke_server_owned_telegram_runtime_tool(
+                    adapter_config,
+                    tool_call,
+                    &observation,
+                    &correctness,
+                    &observation_error)) {
                 if (trace_context) {
                     runtime_request_trace_log(*trace_context, "runtime_tool", "tool_invocation_failed", {
                         {"round", round + 1},
@@ -8497,8 +9719,10 @@ static bool execute_bridge_scoped_telegram_request(
                     {"tool_name", tool_call.name},
                     {"tool_call_id", tool_call.id},
                     {"observation", observation},
+                    {"correctness", server_tool_correctness_signal_to_json(correctness)},
                 });
             }
+            tool_invocations.push_back({tool_call.name, observation, correctness});
             messages.push_back(build_bridge_tool_result_message(tool_call, observation));
         }
         current_body["messages"] = std::move(messages);
@@ -8513,6 +9737,9 @@ static bool execute_bridge_scoped_telegram_request(
             build_bridge_round_budget_synthesis_body(current_body, std::max<int32_t>(1, adapter_config.max_rounds));
     deepseek_chat_result synthesis_result;
     json synthesis_error;
+    const server_tool_correctness_signal synthesis_correctness = aggregate_tool_correctness(tool_invocations);
+    const server_tool_correctness_signal * synthesis_correctness_ptr =
+            synthesis_correctness.available ? &synthesis_correctness : nullptr;
     const bool synthesized = execute_deepseek_chat_with_emotive(
             config,
             emotive_runtime,
@@ -8524,8 +9751,8 @@ static bool execute_bridge_scoped_telegram_request(
             std::string(),
             true,
             false,
-            0.0f,
             "telegram_bridge_budget_synthesis",
+            synthesis_correctness_ptr,
             trace_context);
     if (synthesized && synthesis_result.tool_calls.empty()) {
         if (trace_context) {
@@ -8533,6 +9760,9 @@ static bool execute_bridge_scoped_telegram_request(
                 {"content_chars", static_cast<int64_t>(synthesis_result.content.size())},
                 {"finish_reason", synthesis_result.finish_reason},
             });
+        }
+        if (out_tool_correctness) {
+            *out_tool_correctness = aggregate_tool_correctness(tool_invocations);
         }
         *out_result = std::move(synthesis_result);
         return true;
@@ -8547,6 +9777,9 @@ static bool execute_bridge_scoped_telegram_request(
             {"tool_call_count", synthesized ? static_cast<int64_t>(synthesis_result.tool_calls.size()) : 0},
         });
     }
+    if (out_tool_correctness) {
+        *out_tool_correctness = aggregate_tool_correctness(tool_invocations);
+    }
     *out_result = build_bridge_round_budget_local_fallback_result();
     return true;
 }
@@ -8559,8 +9792,11 @@ static server_http_res_ptr handle_deepseek_chat(
         const json & body,
         bool responses_api,
         bool text_completion_api) {
+    const auto & runpod_config = runpod_inference_runtime_config_instance();
     json error;
-    if (!deepseek_validate_runtime_config(config, &error)) {
+    if (deepseek_provider_selected() &&
+            !runpod_inference_host_relay_enabled(runpod_config) &&
+            !deepseek_validate_runtime_config(config, &error)) {
         return make_error_response(error);
     }
 
@@ -8579,10 +9815,10 @@ static server_http_res_ptr handle_deepseek_chat(
                 static_cast<int64_t>(body.at("tools").size()) : 0},
     });
     const bool executed = telegram_context.active ?
-            execute_bridge_scoped_telegram_request(config, emotive_runtime, req, body, &result, &error, &trace_context) :
+            execute_bridge_scoped_telegram_request(config, emotive_runtime, req, body, &result, &error, nullptr, &trace_context) :
             (should_use_staged_tool_loop_for_request(body) ?
                     execute_deepseek_chat_with_staged_tools(config, emotive_runtime, body, &result, &error, false, "foreground", &trace_context) :
-                    execute_deepseek_chat_with_emotive(config, emotive_runtime, body, &result, &error, nullptr, false, std::string(), true, false, 0.0f, "foreground", &trace_context));
+                    execute_deepseek_chat_with_emotive(config, emotive_runtime, body, &result, &error, nullptr, false, std::string(), true, false, "foreground", nullptr, &trace_context));
     if (!executed) {
         runtime_request_trace_log(trace_context, "runtime", "request_failed", {
             {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
@@ -8602,7 +9838,7 @@ static server_http_res_ptr handle_deepseek_chat(
 
     const std::string completion_id = gen_chatcmplid();
     if (responses_api) {
-        json response = deepseek_format_responses_response(config, result);
+        json response = deepseek_format_responses_response(response_format_runtime_config(config), result);
         if (!result.rich_response.is_null()) {
             response["vicuna_rich_response"] = result.rich_response;
         }
@@ -8613,7 +9849,7 @@ static server_http_res_ptr handle_deepseek_chat(
         return make_json_response(response);
     }
     if (text_completion_api) {
-        json response = deepseek_format_text_completion_response(config, result, completion_id);
+        json response = deepseek_format_text_completion_response(response_format_runtime_config(config), result, completion_id);
         if (!result.rich_response.is_null()) {
             response["vicuna_rich_response"] = result.rich_response;
         }
@@ -8633,7 +9869,7 @@ static server_http_res_ptr handle_deepseek_chat(
         res->status = 200;
         res->content_type = "text/event-stream";
         res->data = format_oai_sse(
-                deepseek_format_chat_completion_stream(config, result, completion_id, include_usage));
+                deepseek_format_chat_completion_stream(response_format_runtime_config(config), result, completion_id, include_usage));
         runtime_request_trace_log(trace_context, "runtime", "request_completed", {
             {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
             {"stream", true},
@@ -8644,7 +9880,7 @@ static server_http_res_ptr handle_deepseek_chat(
         return res;
     }
 
-    json response = deepseek_format_chat_completion_response(config, result, completion_id);
+    json response = deepseek_format_chat_completion_response(response_format_runtime_config(config), result, completion_id);
     if (!result.rich_response.is_null()) {
         response["vicuna_rich_response"] = result.rich_response;
     }
@@ -8663,73 +9899,99 @@ static server_http_res_ptr handle_deepseek_chat(
     return make_json_response(response);
 }
 
-static void ongoing_task_worker_set_mode(
-        ongoing_task_worker_state * worker_state,
-        const std::string & mode,
-        bool running,
-        const std::string & active_task_id = std::string()) {
-    if (!worker_state) {
-        return;
+static server_http_res_ptr handle_runpod_inference_request(
+        const deepseek_runtime_config & config,
+        server_emotive_runtime & emotive_runtime,
+        const server_http_req & req,
+        const json & body) {
+    const auto & runpod_config = runpod_inference_runtime_config_instance();
+    if (!runpod_inference_node_execution_enabled(runpod_config)) {
+        return make_error_response(format_error_response(
+                "RunPod node execution mode is not enabled on this server.",
+                ERROR_TYPE_NOT_SUPPORTED));
     }
-    std::lock_guard<std::mutex> lock(worker_state->mutex);
-    worker_state->mode = mode;
-    worker_state->running = running;
-    worker_state->active_task_id = active_task_id;
-}
 
-static void ongoing_task_worker_set_error(ongoing_task_worker_state * worker_state, const std::string & error) {
-    if (!worker_state) {
-        return;
+    std::string auth_error;
+    if (!runpod_validate_bearer_auth(runpod_config, request_header_value(req, "Authorization"), &auth_error)) {
+        return make_error_response(format_error_response(auth_error, ERROR_TYPE_AUTHENTICATION));
     }
-    std::lock_guard<std::mutex> lock(worker_state->mutex);
-    worker_state->last_error = error;
-}
 
-static void ongoing_task_worker_set_decision(
-        ongoing_task_worker_state * worker_state,
-        const server_ongoing_task_decision & decision,
-        const std::string & error = std::string()) {
-    if (!worker_state) {
-        return;
+    json config_error;
+    if (deepseek_provider_selected() && !deepseek_validate_runtime_config(config, &config_error)) {
+        return make_error_response(config_error);
     }
-    std::lock_guard<std::mutex> lock(worker_state->mutex);
-    worker_state->last_decision = decision;
-    worker_state->last_error = error;
-}
+    if (!body.is_object()) {
+        return make_error_response(format_error_response(
+                "RunPod inference request payload must be an object.",
+                ERROR_TYPE_INVALID_REQUEST));
+    }
+    if (!body.contains("body") || !body.at("body").is_object()) {
+        return make_error_response(format_error_response(
+                "RunPod inference request must include an object field named body.",
+                ERROR_TYPE_INVALID_REQUEST));
+    }
 
-static void ongoing_task_worker_mark_poll(ongoing_task_worker_state * worker_state, int64_t poll_ms) {
-    if (!worker_state) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(worker_state->mutex);
-    worker_state->last_poll_at_ms = poll_ms;
-}
+    const std::string relay_request_kind = json_value(body, "relay_request_kind", std::string());
+    const std::string mode_label = json_value(body, "mode_label", std::string("runpod_node"));
+    const runtime_request_trace_context trace_context =
+            make_runtime_request_trace_context(req, "/v1/inference/run", parse_telegram_bridge_request_context(req), mode_label);
+    runtime_request_trace_log(trace_context, "runpod_inference", "request_received", {
+        {"forwarded_request_id", json_value(body, "request_id", std::string())},
+        {"mode_label", mode_label},
+        {"relay_request_kind", relay_request_kind.empty() ? json(nullptr) : json(relay_request_kind)},
+    });
 
-static void ongoing_task_worker_mark_completion(
-        ongoing_task_worker_state * worker_state,
-        const std::string & task_id,
-        const std::string & completed_at_iso) {
-    if (!worker_state) {
-        return;
+    deepseek_chat_result result;
+    json error;
+    const bool executed = relay_request_kind == "prepared_provider_request" ?
+            execute_prepared_runpod_node_inference(
+                    emotive_runtime,
+                    body,
+                    &result,
+                    &error,
+                    &trace_context) :
+            execute_deepseek_chat_with_emotive(
+                    config,
+                    emotive_runtime,
+                    body.at("body"),
+                    &result,
+                    &error,
+                    nullptr,
+                    json_value(body, "cognitive_replay", false),
+                    json_value(body, "cognitive_replay_entry_id", std::string()),
+                    json_value(body, "enable_heuristic_guidance", true),
+                    json_value(body, "suppress_replay_admission", false),
+                    mode_label,
+                    nullptr,
+                    &trace_context);
+    if (!executed) {
+        runtime_request_trace_log(trace_context, "runpod_inference", "request_failed", {
+            {"relay_request_kind", relay_request_kind.empty() ? json(nullptr) : json(relay_request_kind)},
+            {"message", json_value(error, "message", std::string("RunPod node inference failed"))},
+        });
+        return make_error_response(error);
     }
-    std::lock_guard<std::mutex> lock(worker_state->mutex);
-    worker_state->last_completed_task_id = task_id;
-    worker_state->last_completed_at_iso = completed_at_iso;
-    worker_state->last_finished_at_ms = current_epoch_ms();
-    worker_state->last_error.clear();
-}
 
-static void ongoing_task_worker_mark_finished(ongoing_task_worker_state * worker_state) {
-    if (!worker_state) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(worker_state->mutex);
-    worker_state->last_finished_at_ms = current_epoch_ms();
-    if (worker_state->mode != "error") {
-        worker_state->mode = "idle";
-    }
-    worker_state->running = false;
-    worker_state->active_task_id.clear();
+    runtime_request_trace_log(trace_context, "runpod_inference", "request_completed", {
+        {"relay_request_kind", relay_request_kind.empty() ? json(nullptr) : json(relay_request_kind)},
+        {"finish_reason", result.finish_reason},
+        {"tool_call_count", static_cast<int64_t>(result.tool_calls.size())},
+        {"content_chars", static_cast<int64_t>(result.content.size())},
+    });
+    return make_json_response({
+        {"ok", true},
+        {"request_id", json_value(body, "request_id", std::string())},
+        {"mode_label", mode_label},
+        {"relay_request_kind", relay_request_kind.empty() ? json(nullptr) : json(relay_request_kind)},
+        {"result", deepseek_chat_result_to_json(result)},
+        {"runpod", {
+            {"node_id", runpod_config.node_id},
+            {"resolved_model", runpod_config.resolved_model},
+            {"serving_dtype", runpod_config.serving_dtype},
+            {"kv_profile", runpod_config.kv_profile},
+            {"context_limit", runpod_config.context_limit},
+        }},
+    });
 }
 
 static bool request_activity_is_idle_for_background(
@@ -8739,244 +10001,6 @@ static bool request_activity_is_idle_for_background(
         return true;
     }
     return activity_state->active_requests.load() <= 0 && activity_state->idle_ms() >= idle_after_ms;
-}
-
-static bool decide_due_ongoing_task(
-        const deepseek_runtime_config & config,
-        server_emotive_runtime & emotive_runtime,
-        const server_ongoing_task_config & ongoing_config,
-        ongoing_task_worker_state * worker_state,
-        server_ongoing_task_registry * out_registry,
-        server_ongoing_task_summary * out_selected_task) {
-    const runtime_request_trace_context trace_context =
-            make_background_trace_context("/background/ongoing-task", "ongoing_task_decision");
-    if (!out_registry) {
-        ongoing_task_worker_set_error(worker_state, "ongoing-task registry output must not be null");
-        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
-            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
-            {"message", "ongoing-task registry output must not be null"},
-        });
-        return false;
-    }
-    if (out_selected_task) {
-        *out_selected_task = server_ongoing_task_summary();
-    }
-
-    const int64_t poll_ms = current_time_ms_utc();
-    runtime_request_trace_log(trace_context, "runtime", "request_received", {
-        {"current_time_ms", poll_ms},
-        {"ongoing_tasks_enabled", ongoing_config.enabled},
-    });
-    ongoing_task_worker_mark_poll(worker_state, poll_ms);
-    ongoing_task_worker_set_mode(worker_state, "ongoing_task_poll", true);
-
-    server_ongoing_task_registry registry = {};
-    std::string registry_error;
-    if (!load_ongoing_task_registry(ongoing_config, &registry, &registry_error)) {
-        ongoing_task_worker_set_error(worker_state, registry_error);
-        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
-            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
-            {"message", registry_error},
-        });
-        ongoing_task_worker_mark_finished(worker_state);
-        return false;
-    }
-
-    const std::string current_time_iso = iso_from_epoch_ms(poll_ms);
-    const std::vector<server_ongoing_task_summary> tasks = list_active_ongoing_task_summaries(registry, poll_ms);
-    server_ongoing_task_decision decision = {};
-    decision.valid = true;
-    decision.decided_at_ms = poll_ms;
-    decision.current_time_iso = current_time_iso;
-    decision.task_count = (int32_t) tasks.size();
-
-    if (tasks.empty()) {
-        decision.should_run = false;
-        decision.rationale = "No active ongoing tasks are registered.";
-        ongoing_task_worker_set_decision(worker_state, decision);
-        *out_registry = std::move(registry);
-        runtime_request_trace_log(trace_context, "runtime", "request_completed", {
-            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
-            {"task_count", 0},
-            {"should_run", false},
-            {"rationale", decision.rationale},
-        });
-        ongoing_task_worker_mark_finished(worker_state);
-        return false;
-    }
-
-    ongoing_task_worker_set_mode(worker_state, "ongoing_task_decision", true);
-    json body = {
-        {"model", config.model},
-        {"messages", json::array({
-            {
-                {"role", "system"},
-                {"content", build_ongoing_task_decision_system_prompt()},
-            },
-            {
-                {"role", "user"},
-                {"content", build_ongoing_task_decision_user_prompt(tasks, current_time_iso)},
-            },
-        })},
-        {"stream", false},
-    };
-
-    deepseek_chat_result result;
-    json error;
-    if (!execute_deepseek_chat_with_emotive(
-                config,
-                emotive_runtime,
-                body,
-                &result,
-                &error,
-                nullptr,
-                false,
-                std::string(),
-                true,
-                true,
-                tasks.empty() ? 0.0f : 1.0f,
-                "ongoing_task_decision",
-                &trace_context)) {
-        ongoing_task_worker_set_error(
-                worker_state,
-                json_value(error, "message", std::string("ongoing-task decision request failed")));
-        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
-            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
-            {"message", json_value(error, "message", std::string("ongoing-task decision request failed"))},
-        });
-        ongoing_task_worker_mark_finished(worker_state);
-        return false;
-    }
-
-    std::string parse_error;
-    if (!parse_ongoing_task_decision_response(result.content, &decision, &parse_error)) {
-        ongoing_task_worker_set_error(worker_state, parse_error);
-        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
-            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
-            {"message", parse_error},
-        });
-        ongoing_task_worker_mark_finished(worker_state);
-        return false;
-    }
-    decision.decided_at_ms = poll_ms;
-    decision.current_time_iso = current_time_iso;
-    decision.task_count = (int32_t) tasks.size();
-
-    if (decision.should_run && !find_ongoing_task_summary(tasks, decision.selected_task_id)) {
-        ongoing_task_worker_set_error(worker_state, "ongoing-task decision selected an unknown task_id");
-        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
-            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
-            {"message", "ongoing-task decision selected an unknown task_id"},
-        });
-        ongoing_task_worker_mark_finished(worker_state);
-        return false;
-    }
-
-    ongoing_task_worker_set_decision(worker_state, decision);
-    *out_registry = std::move(registry);
-    runtime_request_trace_log(trace_context, "runtime", "request_completed", {
-        {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
-        {"task_count", static_cast<int64_t>(tasks.size())},
-        {"should_run", decision.should_run},
-        {"selected_task_id", decision.should_run ? json(decision.selected_task_id) : json(nullptr)},
-        {"rationale", decision.rationale},
-    });
-    if (!decision.should_run) {
-        ongoing_task_worker_mark_finished(worker_state);
-        return false;
-    }
-
-    if (out_selected_task) {
-        *out_selected_task = *find_ongoing_task_summary(tasks, decision.selected_task_id);
-    }
-    return true;
-}
-
-static bool execute_selected_ongoing_task(
-        const deepseek_runtime_config & config,
-        server_emotive_runtime & emotive_runtime,
-        const server_ongoing_task_config & ongoing_config,
-        const server_ongoing_task_summary & task,
-        server_ongoing_task_registry registry,
-        ongoing_task_worker_state * worker_state) {
-    const runtime_request_trace_context trace_context =
-            make_background_trace_context("/background/ongoing-task", "ongoing_task_execution");
-    runtime_request_trace_log(trace_context, "runtime", "request_received", {
-        {"task_id", task.task_id},
-        {"task_text", task.task_text},
-    });
-    ongoing_task_worker_set_mode(worker_state, "ongoing_task_execution", true, task.task_id);
-
-    json body = {
-        {"model", config.model},
-        {"messages", json::array({
-            {
-                {"role", "user"},
-                {"content", task.task_text},
-            },
-        })},
-        {"stream", false},
-    };
-
-    deepseek_chat_result result;
-    json error;
-    if (!execute_deepseek_chat_with_emotive(
-                config,
-                emotive_runtime,
-                body,
-                &result,
-                &error,
-                nullptr,
-                false,
-                std::string(),
-                true,
-                true,
-                0.8f,
-                "ongoing_task_execution",
-                &trace_context)) {
-        ongoing_task_worker_set_error(
-                worker_state,
-                json_value(error, "message", std::string("ongoing-task execution request failed")));
-        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
-            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
-            {"message", json_value(error, "message", std::string("ongoing-task execution request failed"))},
-            {"task_id", task.task_id},
-        });
-        ongoing_task_worker_mark_finished(worker_state);
-        return false;
-    }
-
-    const std::string completed_at_iso = iso_from_epoch_ms(current_time_ms_utc());
-    std::string completion_error;
-    if (!mark_ongoing_task_complete(&registry, task.task_id, completed_at_iso, &completion_error)) {
-        ongoing_task_worker_set_error(worker_state, completion_error);
-        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
-            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
-            {"message", completion_error},
-            {"task_id", task.task_id},
-        });
-        ongoing_task_worker_mark_finished(worker_state);
-        return false;
-    }
-    if (!save_ongoing_task_registry(ongoing_config, std::move(registry), &completion_error)) {
-        ongoing_task_worker_set_error(worker_state, completion_error);
-        runtime_request_trace_log(trace_context, "runtime", "request_failed", {
-            {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
-            {"message", completion_error},
-            {"task_id", task.task_id},
-        });
-        ongoing_task_worker_mark_finished(worker_state);
-        return false;
-    }
-
-    ongoing_task_worker_mark_completion(worker_state, task.task_id, completed_at_iso);
-    runtime_request_trace_log(trace_context, "runtime", "request_completed", {
-        {"elapsed_ms", runtime_now_epoch_ms() - trace_context.started_at_ms},
-        {"task_id", task.task_id},
-        {"completed_at", completed_at_iso},
-    });
-    ongoing_task_worker_mark_finished(worker_state);
-    return true;
 }
 
 static std::string build_cognitive_replay_system_prompt() {
@@ -9122,8 +10146,8 @@ static void compress_resolved_replay_into_heuristic(
                 entry.entry_id,
                 false,
                 false,
-                0.0f,
                 "heuristic_compression",
+                nullptr,
                 &trace_context)) {
         if (worker_state) {
             std::lock_guard<std::mutex> lock(worker_state->mutex);
@@ -9215,8 +10239,8 @@ static void run_cognitive_replay_once(
                 entry.entry_id,
                 true,
                 false,
-                0.0f,
                 "cognitive_replay",
+                nullptr,
                 &trace_context)) {
         emotive_runtime.fail_cognitive_replay_entry(
                 entry.entry_id,
@@ -9266,30 +10290,19 @@ static void cognitive_replay_worker_loop(
         const deepseek_runtime_config & config,
         server_emotive_runtime & emotive_runtime,
         request_activity_state * activity_state,
-        cognitive_replay_worker_state * worker_state,
-        const server_ongoing_task_config & ongoing_config,
-        ongoing_task_worker_state * ongoing_worker_state) {
+        cognitive_replay_worker_state * worker_state) {
     const auto & replay_config = emotive_runtime.config().cognitive_replay;
-    const int32_t worker_poll_ms = [&]() {
-        int32_t poll_ms = replay_config.enabled ? replay_config.poll_interval_ms : 250;
-        if (ongoing_config.enabled) {
-            poll_ms = replay_config.enabled ?
-                    std::min(poll_ms, ongoing_config.poll_interval_ms) :
-                    ongoing_config.poll_interval_ms;
-        }
-        return std::max<int32_t>(50, poll_ms);
-    }();
+    const int32_t worker_poll_ms = std::max<int32_t>(50, replay_config.enabled ? replay_config.poll_interval_ms : 250);
     const auto sleep_for_poll = [worker_poll_ms]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(worker_poll_ms));
     };
 
     while (stop_flag && !stop_flag->load()) {
-        if (!replay_config.enabled && !ongoing_config.enabled) {
+        if (!replay_config.enabled) {
             sleep_for_poll();
             continue;
         }
         if (!request_activity_is_idle_for_background(activity_state, replay_config.idle_after_ms)) {
-            ongoing_task_worker_set_mode(ongoing_worker_state, "idle", false);
             sleep_for_poll();
             continue;
         }
@@ -9317,52 +10330,6 @@ static void cognitive_replay_worker_loop(
                 continue;
             }
         }
-
-        if (!ongoing_config.enabled) {
-            sleep_for_poll();
-            continue;
-        }
-
-        int64_t last_poll_at_ms = 0;
-        if (ongoing_worker_state) {
-            std::lock_guard<std::mutex> lock(ongoing_worker_state->mutex);
-            last_poll_at_ms = ongoing_worker_state->last_poll_at_ms;
-        }
-        const int64_t now_ms = current_epoch_ms();
-        if (last_poll_at_ms > 0 && now_ms - last_poll_at_ms < ongoing_config.poll_interval_ms) {
-            sleep_for_poll();
-            continue;
-        }
-
-        server_ongoing_task_registry registry = {};
-        server_ongoing_task_summary selected_task = {};
-        const bool should_run_task = decide_due_ongoing_task(
-                config,
-                emotive_runtime,
-                ongoing_config,
-                ongoing_worker_state,
-                &registry,
-                &selected_task);
-        if (!should_run_task) {
-            sleep_for_poll();
-            continue;
-        }
-
-        if (!request_activity_is_idle_for_background(activity_state, replay_config.idle_after_ms)) {
-            ongoing_task_worker_set_mode(ongoing_worker_state, "idle", false);
-            ongoing_task_worker_set_error(ongoing_worker_state, std::string());
-            ongoing_task_worker_mark_finished(ongoing_worker_state);
-            sleep_for_poll();
-            continue;
-        }
-
-        execute_selected_ongoing_task(
-                config,
-                emotive_runtime,
-                ongoing_config,
-                selected_task,
-                std::move(registry),
-                ongoing_worker_state);
         sleep_for_poll();
     }
 }
@@ -9406,25 +10373,77 @@ int main(int argc, char ** argv) {
     LOG_INF("\n");
 
     const deepseek_runtime_config deepseek_config = deepseek_runtime_config_from_env();
+    const runpod_inference_runtime_config runpod_config = runpod_inference_runtime_config_from_env();
+    const server_provider_runtime_config provider_runtime_config =
+            server_provider_runtime_config_from_env(params, runpod_config);
+    const server_local_llama_provider_config local_llama_provider_config =
+            server_local_llama_provider_config_from_env(params, provider_runtime_config);
     const server_emotive_runtime_config emotive_config = server_emotive_runtime_config_from_env();
-    const server_ongoing_task_config ongoing_task_config = server_ongoing_task_config_from_env();
     const server_policy_runtime_config policy_runtime_config = server_policy_runtime_config_from_env();
     if (!policy_runtime_config.config_error.empty()) {
         LOG_ERR("%s: %s\n", __func__, policy_runtime_config.config_error.c_str());
         return 1;
     }
+    if (!runpod_config.config_error.empty()) {
+        LOG_ERR("%s: %s\n", __func__, runpod_config.config_error.c_str());
+        return 1;
+    }
+    configure_runpod_inference_runtime(runpod_config);
     configure_policy_runtime(policy_runtime_config);
     server_emotive_runtime emotive_runtime(emotive_config);
+    server_local_llama_provider local_llama_provider;
     json config_error;
-    if (!deepseek_validate_runtime_config(deepseek_config, &config_error)) {
+    if (local_llama_provider_config.enabled) {
+        std::string local_provider_error;
+        if (!local_llama_provider.configure(local_llama_provider_config, &local_provider_error)) {
+            LOG_ERR("%s: %s\n", __func__, local_provider_error.c_str());
+            return 1;
+        }
+    } else if (!runpod_inference_host_relay_enabled(runpod_config) &&
+            !deepseek_validate_runtime_config(deepseek_config, &config_error)) {
         LOG_ERR("%s: %s\n", __func__, json_value(config_error, "message", std::string("invalid provider config")).c_str());
         return 1;
+    }
+    g_active_provider_runtime_config = &provider_runtime_config;
+    g_active_local_llama_provider = &local_llama_provider;
+    g_active_local_cvec_generator.reset();
+    g_candidate_local_cvec_generator.reset();
+    g_active_local_decode_controller.reset();
+    g_candidate_local_decode_controller.reset();
+    if (const char * cvec_artifact_path = std::getenv("VICUNA_LOCAL_CVEC_GENERATOR_ARTIFACT")) {
+        if (*cvec_artifact_path != '\0') {
+            auto artifact = std::make_shared<server_cvec_generator_artifact>();
+            std::string cvec_error;
+            if (!server_cvec_generator_load_artifact(cvec_artifact_path, artifact.get(), &cvec_error)) {
+                LOG_ERR("%s: failed to load VICUNA_LOCAL_CVEC_GENERATOR_ARTIFACT: %s\n", __func__, cvec_error.c_str());
+                return 1;
+            }
+            g_active_local_cvec_generator = std::move(artifact);
+            auto & rollout = cvec_artifact_rollout_state_instance();
+            std::lock_guard<std::mutex> lock(rollout.mutex);
+            rollout.active_alias = "startup";
+            rollout.active_version = g_active_local_cvec_generator->generator_version;
+        }
+    }
+    if (const char * decode_controller_path = std::getenv("VICUNA_LOCAL_DECODE_CONTROLLER_ARTIFACT")) {
+        if (*decode_controller_path != '\0') {
+            auto artifact = std::make_shared<server_decode_controller_artifact>();
+            std::string decode_error;
+            if (!server_decode_controller_load_artifact(decode_controller_path, artifact.get(), &decode_error)) {
+                LOG_ERR("%s: failed to load VICUNA_LOCAL_DECODE_CONTROLLER_ARTIFACT: %s\n", __func__, decode_error.c_str());
+                return 1;
+            }
+            g_active_local_decode_controller = std::move(artifact);
+            auto & rollout = decode_artifact_rollout_state_instance();
+            std::lock_guard<std::mutex> lock(rollout.mutex);
+            rollout.active_alias = "startup";
+            rollout.active_version = g_active_local_decode_controller->controller_version;
+        }
     }
 
     bridge_compat_state bridge_state;
     request_activity_state request_activity;
     cognitive_replay_worker_state replay_worker_state;
-    ongoing_task_worker_state ongoing_worker_state;
     std::atomic<bool> replay_worker_stop(false);
     telegram_outbox_state telegram_outbox;
     server_http_context ctx_http;
@@ -9436,13 +10455,25 @@ int main(int argc, char ** argv) {
     const auto get_health =
             [&bridge_state,
              &deepseek_config,
+             &runpod_config,
+             &local_llama_provider,
+             &local_llama_provider_config,
              &emotive_runtime,
-             &ongoing_task_config,
              &telegram_outbox,
              &request_activity,
-             &replay_worker_state,
-             &ongoing_worker_state](const server_http_req &) {
+             &replay_worker_state](const server_http_req &) {
         json payload = deepseek_build_health_json(deepseek_config);
+        payload["runpod_inference"] = runpod_build_health_json(runpod_config);
+        payload["provider"]["name"] = provider_health_name();
+        payload["provider"]["mode"] = g_active_provider_runtime_config ?
+                g_active_provider_runtime_config->provider_label :
+                std::string("deepseek");
+        payload["provider"]["model"] = runpod_inference_host_relay_enabled(runpod_config) ?
+                runpod_config.resolved_model :
+                (local_llama_provider_selected() ? local_llama_provider.resolved_model() : deepseek_config.model);
+        if (local_llama_provider_config.enabled) {
+            payload["provider"]["local_llama"] = local_llama_provider.health_json();
+        }
         payload["proactive_mailbox"] = {
             {"stored_responses", 0},
             {"publish_total", 0},
@@ -9463,8 +10494,13 @@ int main(int argc, char ** argv) {
         return make_json_response(payload);
     };
 
-    const auto get_models = [&deepseek_config](const server_http_req &) {
-        return make_json_response(deepseek_build_models_json(deepseek_config));
+    const auto get_models = [&deepseek_config, &runpod_config, &local_llama_provider](const server_http_req &) {
+        return make_json_response(
+                runpod_inference_host_relay_enabled(runpod_config) ?
+                        runpod_build_models_json(runpod_config) :
+                        (local_llama_provider_selected() ?
+                                local_llama_provider.models_json() :
+                                deepseek_build_models_json(deepseek_config)));
     };
 
     const auto get_latest_emotive_trace = [&emotive_runtime](const server_http_req &) {
@@ -9493,6 +10529,22 @@ int main(int argc, char ** argv) {
         return make_json_response(policy_runtime_transitions_json(req));
     };
 
+    const auto get_policy_decode_traces = [](const server_http_req & req) {
+        return make_json_response(policy_runtime_decode_traces_json(req));
+    };
+    const auto get_policy_runtime_artifacts = [](const server_http_req &) {
+        return make_json_response(policy_runtime_artifacts_status_json());
+    };
+    const auto post_policy_runtime_artifact = [](const server_http_req & req) {
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        json result;
+        json error;
+        if (!apply_runtime_artifact_payload(body, &result, &error)) {
+            return make_json_response(error, 400);
+        }
+        return make_json_response(result);
+    };
+
     const auto post_chat_completions = [&deepseek_config, &emotive_runtime, &telegram_outbox](const server_http_req & req) {
         const json body = json::parse(req.body);
         return handle_deepseek_chat(deepseek_config, emotive_runtime, req, &telegram_outbox, body, false, false);
@@ -9506,6 +10558,11 @@ int main(int argc, char ** argv) {
     const auto post_responses = [&deepseek_config, &emotive_runtime, &telegram_outbox](const server_http_req & req) {
         const json body = convert_responses_input_to_chat(json::parse(req.body));
         return handle_deepseek_chat(deepseek_config, emotive_runtime, req, &telegram_outbox, body, true, false);
+    };
+
+    const auto post_runpod_inference = [&deepseek_config, &emotive_runtime](const server_http_req & req) {
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        return handle_runpod_inference_request(deepseek_config, emotive_runtime, req, body);
     };
 
     const auto get_responses_stream = [&bridge_state](const server_http_req & req) {
@@ -9571,10 +10628,14 @@ int main(int argc, char ** argv) {
     ctx_http.get("/v1/emotive/heuristics", ex_wrapper(get_heuristic_memory));
     ctx_http.get("/v1/policy/status", ex_wrapper(get_policy_status));
     ctx_http.get("/v1/policy/transitions", ex_wrapper(get_policy_transitions));
+    ctx_http.get("/v1/policy/decode-traces", ex_wrapper(get_policy_decode_traces));
+    ctx_http.get("/v1/policy/runtime-artifacts", ex_wrapper(get_policy_runtime_artifacts));
+    ctx_http.post("/v1/policy/runtime-artifacts", ex_wrapper(post_policy_runtime_artifact));
     ctx_http.get("/v1/debug/request-traces", ex_wrapper(get_request_traces));
     ctx_http.post("/v1/chat/completions", ex_wrapper(post_chat_completions, &request_activity));
     ctx_http.post("/v1/completions", ex_wrapper(post_completions, &request_activity));
     ctx_http.post("/v1/responses", ex_wrapper(post_responses, &request_activity));
+    ctx_http.post("/v1/inference/run", ex_wrapper(post_runpod_inference, &request_activity));
     ctx_http.get("/v1/responses/stream", ex_wrapper(get_responses_stream));
     ctx_http.get("/v1/telegram/outbox", ex_wrapper(get_telegram_outbox));
     ctx_http.post("/v1/telegram/outbox", ex_wrapper(post_telegram_outbox));
@@ -9585,6 +10646,7 @@ int main(int argc, char ** argv) {
         ctx_http.post("/chat/completions", ex_wrapper(post_chat_completions, &request_activity));
         ctx_http.post("/completions", ex_wrapper(post_completions, &request_activity));
         ctx_http.post("/responses", ex_wrapper(post_responses, &request_activity));
+        ctx_http.post("/inference/run", ex_wrapper(post_runpod_inference, &request_activity));
         ctx_http.get("/models", ex_wrapper(get_models));
     }
 
@@ -9602,9 +10664,7 @@ int main(int argc, char ** argv) {
                 std::cref(deepseek_config),
                 std::ref(emotive_runtime),
                 &request_activity,
-                &replay_worker_state,
-                std::cref(ongoing_task_config),
-                &ongoing_worker_state);
+                &replay_worker_state);
     }
 
     shutdown_handler = [&](int) {

@@ -1,0 +1,10 @@
+[Unit]
+Description=Vicuña Policy Live Rollout Controller Timer
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=vicuna-policy-rollout.service
+
+[Install]
+WantedBy=timers.target

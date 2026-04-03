@@ -1,0 +1,210 @@
+{
+  "chatId": "7502424413",
+  "conversationId": "agentic-training-batch-50",
+  "hostBaseUrl": "http://127.0.0.1:8080",
+  "model": "vicuna-experimental",
+  "deferredDelivery": true,
+  "verifyCapture": true,
+  "requests": [
+    {
+      "id": "turn_01",
+      "text": "Use whatever runtime tools are appropriate to find the current official guidance for serving Mistral Small 3.2 on llama.cpp, then summarize the two most important deployment recommendations."
+    },
+    {
+      "id": "turn_02",
+      "text": "Inspect local docs or runtime knowledge and explain how the Telegram bridge sequences text delivery and follow-up emotive video delivery for one completed turn."
+    },
+    {
+      "id": "turn_03",
+      "text": "Check the local docs, hard memory, or runtime knowledge and summarize how request-level PPO capture differs from decode-level GRU capture in this system."
+    },
+    {
+      "id": "turn_04",
+      "text": "Use research or docs tools to compare flash attention guidance for llama.cpp versus any older non-flash baseline, and explain when flash attention matters most."
+    },
+    {
+      "id": "turn_05",
+      "text": "Review the current experimental capture surfaces and explain what transitions.jsonl, decode_traces.jsonl, and emotive_traces.jsonl are each meant to train."
+    },
+    {
+      "id": "turn_06",
+      "text": "Use available tools to identify one likely source of latency in a single-A100 inference stack and give one concrete measurement strategy for it."
+    },
+    {
+      "id": "turn_07",
+      "text": "Find and summarize the current upstream guidance for Mistral Jinja templates in llama.cpp, then explain why the template should be applied on the pod instead of the host."
+    },
+    {
+      "id": "turn_08",
+      "text": "Use local docs or runtime memory to explain how EM and VAD are projected from richer runtime signals during decode-boundary operation."
+    },
+    {
+      "id": "turn_09",
+      "text": "Research or inspect local docs to explain what the memory rail is supposed to do when context usage rises toward the configured budget threshold."
+    },
+    {
+      "id": "turn_10",
+      "text": "Use the tool surface if helpful to compare two ways to benchmark tokens per second on a local model server, and recommend which metric is more useful for interactive agents."
+    },
+    {
+      "id": "turn_11",
+      "text": "Inspect local docs or runtime notes and explain what information the host still owns in experimental mode versus what authority belongs to the pod."
+    },
+    {
+      "id": "turn_12",
+      "text": "Use available research tools to find one source on GRU-based sequence control and one source on PPO-based request control, then compare the levels of control they operate at."
+    },
+    {
+      "id": "turn_13",
+      "text": "Check the runtime docs and summarize how bridge state is used to track pending emotive video deliveries and delivery receipts."
+    },
+    {
+      "id": "turn_14",
+      "text": "Use tools if useful to identify the best practices for keeping an SSH or TCP relay stable between a host and a remote inference node, then summarize the most relevant ones."
+    },
+    {
+      "id": "turn_15",
+      "text": "Explain how a request can complete through the host while still having its training data written from the pod back into the host-side experimental capture directory."
+    },
+    {
+      "id": "turn_16",
+      "text": "Use available docs or local knowledge to explain why we want hardware/runtime knobs like n_ctx and n_batch outside the learned policy surfaces."
+    },
+    {
+      "id": "turn_17",
+      "text": "Research or inspect local references and summarize the tradeoff between BF16 fidelity and serving speed for controller-training collection."
+    },
+    {
+      "id": "turn_18",
+      "text": "Check local docs and explain what is meant by additive reasoning and response budgets in the local runtime path."
+    },
+    {
+      "id": "turn_19",
+      "text": "Use any relevant tool surface to identify one likely cause of bad throughput in llama.cpp that is not simply lack of GPU memory."
+    },
+    {
+      "id": "turn_20",
+      "text": "Inspect the current architecture docs and summarize how candidate policy artifacts are expected to move from capture to shadow to live control."
+    },
+    {
+      "id": "turn_21",
+      "text": "Use local docs or hard memory to explain what the cvec generator is supposed to learn from EM and VAD, and how that differs from request-level PPO."
+    },
+    {
+      "id": "turn_22",
+      "text": "Research one official source about Mistral Small 3.2 function-calling behavior or instruction tuning, then summarize what matters for agentic work."
+    },
+    {
+      "id": "turn_23",
+      "text": "Explain how a Telegram-scoped request is recognized on the host without the bridge directly owning prompt construction."
+    },
+    {
+      "id": "turn_24",
+      "text": "Use tools or docs to compare direct exposed TCP relay versus SSH port forwarding for a stable pod connector, and recommend one."
+    },
+    {
+      "id": "turn_25",
+      "text": "Inspect current docs and explain why bridge-owned prompt construction is intentionally avoided in the current architecture."
+    },
+    {
+      "id": "turn_26",
+      "text": "Use research tools to find one practical reference on attention sinks or KV eviction in transformer serving, then explain how it relates to the memory rail."
+    },
+    {
+      "id": "turn_27",
+      "text": "Summarize the different failure modes between text delivery failure, video-render failure, and host capture-sync failure in this runtime."
+    },
+    {
+      "id": "turn_28",
+      "text": "Inspect local docs and explain how the Telegram bridge recovers from malformed HTML or invalid reply targets during delivery."
+    },
+    {
+      "id": "turn_29",
+      "text": "Use available tools to gather two strong reasons to keep request-level control and decode-level control as separate training problems."
+    },
+    {
+      "id": "turn_30",
+      "text": "Explain how the host can remain the owner of tool execution and dialogue transport even while the pod is the owner of request-level policy and decode control."
+    },
+    {
+      "id": "turn_31",
+      "text": "Research or inspect local references to explain why Mistral or dense models may be preferable to MoE models on llama.cpp for certain interactive workloads."
+    },
+    {
+      "id": "turn_32",
+      "text": "Use local docs and any available tools to explain how outbox sequence numbers and delivery receipts help the bridge avoid duplicate user-facing replies."
+    },
+    {
+      "id": "turn_33",
+      "text": "Summarize how request-level control parameters like temperature, top_k, top_p, and min_p should remain explicit and inspectable instead of hidden."
+    },
+    {
+      "id": "turn_34",
+      "text": "Use research or docs tools to identify one good benchmark prompt for evaluating agentic tool-use quality and explain why it is better than a trivial hello-world prompt."
+    },
+    {
+      "id": "turn_35",
+      "text": "Explain how a host-side automation can keep collecting controller training data without requiring me to manually type every turn into Telegram."
+    },
+    {
+      "id": "turn_36",
+      "text": "Use local docs or runtime memory to explain how emotional keyframes become follow-up Telegram videos after a response is delivered."
+    },
+    {
+      "id": "turn_37",
+      "text": "Research or inspect current references and explain the main tradeoff between rich decode-time telemetry and high-throughput serving engines."
+    },
+    {
+      "id": "turn_38",
+      "text": "Explain what makes a turn good training data for the request-level controller versus merely a correct final answer."
+    },
+    {
+      "id": "turn_39",
+      "text": "Use available tools to gather current advice on keeping long-running model requests reliable over HTTP, then summarize the most relevant timeout practices."
+    },
+    {
+      "id": "turn_40",
+      "text": "Inspect local docs and explain the intended meaning of observation mode for PPO, GRU, and the cvec generator."
+    },
+    {
+      "id": "turn_41",
+      "text": "Use research tools to identify one relevant source on structured tool-calling prompts or agent loops, then explain how it applies to this runtime."
+    },
+    {
+      "id": "turn_42",
+      "text": "Explain how the bridge can show me both the text reply and the emotional animation without blocking the user-visible response on video rendering."
+    },
+    {
+      "id": "turn_43",
+      "text": "Use local docs or current runtime knowledge to explain why the pod should own model-specific prompt templating for Mistral."
+    },
+    {
+      "id": "turn_44",
+      "text": "Research one official or upstream reference on Mistral Small 3.2 context length expectations in llama.cpp and summarize the practical implication for serving."
+    },
+    {
+      "id": "turn_45",
+      "text": "Explain how a safe training harness can encourage tool use and planning behavior without touching personal media libraries or collections."
+    },
+    {
+      "id": "turn_46",
+      "text": "Use tools if needed to identify one likely observability gap between request-level and decode-level telemetry, then explain how you would compensate for it."
+    },
+    {
+      "id": "turn_47",
+      "text": "Inspect local docs and explain how bridge state, outbox state, and experimental capture state differ from one another."
+    },
+    {
+      "id": "turn_48",
+      "text": "Use research or local docs to explain what qualities make a response useful for later cvec training, beyond just being factually correct."
+    },
+    {
+      "id": "turn_49",
+      "text": "Explain how a future live rollout of trained controller artifacts can remain bounded and reversible based on the current architecture."
+    },
+    {
+      "id": "turn_50",
+      "text": "Use available tools or docs to give a concise end-of-batch summary of what kinds of training signals this 50-turn run is intended to generate."
+    }
+  ]
+}

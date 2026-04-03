@@ -17,9 +17,8 @@ SYSTEM_HOST_SHELL_ROOT="${VICUNA_SYSTEM_HOST_SHELL_ROOT:-$HOST_SHELL_ROOT}"
 TELEGRAM_STATE_PATH="${VICUNA_SYSTEM_TELEGRAM_STATE_PATH:-$STATE_ROOT/telegram-bridge-state.json}"
 OPENCLAW_SECRETS_PATH="${VICUNA_SYSTEM_OPENCLAW_TOOL_FABRIC_SECRETS_PATH:-$STATE_ROOT/openclaw-tool-secrets.json}"
 OPENCLAW_CATALOG_PATH="${VICUNA_SYSTEM_OPENCLAW_TOOL_FABRIC_CATALOG_PATH:-$STATE_ROOT/openclaw-catalog.json}"
+TELEGRAM_RUNTIME_TOOLS_SNAPSHOT_PATH="${VICUNA_TELEGRAM_RUNTIME_TOOLS_SNAPSHOT_PATH:-$STATE_ROOT/telegram-runtime-tools.json}"
 HARD_MEMORY_DIR="${VICUNA_HARD_MEMORY_DIR:-$SYSTEM_HOST_SHELL_ROOT/memories}"
-ONGOING_TASKS_DIR="${VICUNA_ONGOING_TASKS_DIR:-$STATE_ROOT/ongoing-tasks}"
-ONGOING_TASKS_TMPDIR="${VICUNA_ONGOING_TASKS_TMPDIR:-$ONGOING_TASKS_DIR/tmp}"
 SKILLS_DIR="${VICUNA_SKILLS_DIR:-$SYSTEM_HOST_SHELL_ROOT/skills}"
 DOCS_DIR="${VICUNA_DOCS_DIR:-$SYSTEM_HOST_SHELL_ROOT/docs}"
 HEURISTICS_DIR="${VICUNA_HEURISTICS_DIR:-$SYSTEM_HOST_SHELL_ROOT/heuristics}"
@@ -27,9 +26,21 @@ HEURISTIC_MEMORY_PATH="${VICUNA_HEURISTIC_MEMORY_PATH:-$HEURISTICS_DIR/vicuna-he
 POLICY_DATASET_DIR="${VICUNA_POLICY_DATASET_DIR:-$STATE_ROOT/policy-datasets/nightly}"
 POLICY_REGISTRY_DIR="${VICUNA_POLICY_REGISTRY_DIR:-$STATE_ROOT/policy-registry}"
 POLICY_RUN_ROOT="${VICUNA_POLICY_RUN_ROOT:-$STATE_ROOT/policy-runs}"
+POLICY_ROLLOUT_ROOT="${VICUNA_POLICY_ROLLOUT_ROOT:-$STATE_ROOT/policy-rollout}"
+LOG_RETENTION_DAYS="${VICUNA_LOG_RETENTION_DAYS:-7}"
+LEGACY_OBSERVABILITY_ARCHIVE_ROOT="${VICUNA_LEGACY_OBSERVABILITY_ARCHIVE_ROOT:-$STATE_ROOT/backup/legacy-observability}"
 RUNTIME_SERVICE="${VICUNA_RUNTIME_SERVICE_NAME:-vicuna-runtime.service}"
 BRIDGE_SERVICE="${VICUNA_TELEGRAM_BRIDGE_SERVICE_NAME:-vicuna-telegram-bridge.service}"
 WEBGL_RENDERER_SERVICE="${VICUNA_WEBGL_RENDERER_SERVICE_NAME:-vicuna-webgl-renderer.service}"
+POLICY_REGISTRY_SERVICE="${VICUNA_POLICY_REGISTRY_SERVICE_NAME:-vicuna-policy-registry.service}"
+POLICY_ROLLOUT_SERVICE="${VICUNA_POLICY_ROLLOUT_SERVICE_NAME:-vicuna-policy-rollout.service}"
+POLICY_ROLLOUT_TIMER="${VICUNA_POLICY_ROLLOUT_TIMER_NAME:-vicuna-policy-rollout.timer}"
+POLICY_NIGHTLY_SERVICE="${VICUNA_POLICY_NIGHTLY_SERVICE_NAME:-vicuna-policy-nightly.service}"
+POLICY_NIGHTLY_TIMER="${VICUNA_POLICY_NIGHTLY_TIMER_NAME:-vicuna-policy-nightly.timer}"
+RUNPOD_CAPTURE_SYNC_SERVICE="${VICUNA_RUNPOD_CAPTURE_SYNC_SERVICE_NAME:-vicuna-runpod-capture-sync.service}"
+RUNPOD_CAPTURE_SYNC_TIMER="${VICUNA_RUNPOD_CAPTURE_SYNC_TIMER_NAME:-vicuna-runpod-capture-sync.timer}"
+HOST_CAPTURE_RENDER_SERVICE="${VICUNA_HOST_CAPTURE_RENDER_SERVICE_NAME:-vicuna-host-capture-render.service}"
+HOST_CAPTURE_RENDER_TIMER="${VICUNA_HOST_CAPTURE_RENDER_TIMER_NAME:-vicuna-host-capture-render.timer}"
 RUNTIME_PORT="${VICUNA_RUNTIME_PORT:-8080}"
 DRY_RUN=0
 
@@ -393,6 +404,32 @@ ensure_service_writable_file() {
     install -m "$mode" -o "$SERVICE_USER" -g "$SERVICE_GROUP" /dev/null "$target_path"
 }
 
+ensure_service_writable_dir() {
+    local target_path="$1"
+    run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$target_path"
+}
+
+archive_legacy_observability() {
+    local archive_root="$LEGACY_OBSERVABILITY_ARCHIVE_ROOT"
+    run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$archive_root"
+
+    local provenance_path
+    for provenance_path in "$STATE_ROOT"/runtime-state.json.provenance.*.jsonl; do
+        [[ -e "$provenance_path" ]] || continue
+        run_cmd mv "$provenance_path" "$archive_root/"
+    done
+
+    if [[ -d "$POLICY_ROLLOUT_ROOT/journal" ]] && [[ -n "$(find "$POLICY_ROLLOUT_ROOT/journal" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]]; then
+        run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$archive_root/policy-rollout-journal"
+        run_cmd bash -lc "shopt -s nullglob && mv '$POLICY_ROLLOUT_ROOT/journal'/* '$archive_root/policy-rollout-journal/'"
+    fi
+
+    if [[ -d "$STATE_ROOT/.npm/_logs" ]] && [[ -n "$(find "$STATE_ROOT/.npm/_logs" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]]; then
+        run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$archive_root/npm-logs"
+        run_cmd bash -lc "shopt -s nullglob && mv '$STATE_ROOT/.npm/_logs'/* '$archive_root/npm-logs/'"
+    fi
+}
+
 grant_parent_access() {
     local target="$1"
     while [[ "$target" != "/" ]]; do
@@ -416,13 +453,15 @@ write_env_file() {
     local telegram_bridge_video_encoder telegram_bridge_render_backend webgl_renderer_url webgl_renderer_host
     local webgl_renderer_port webgl_renderer_ffmpeg_bin webgl_renderer_video_encoder
     local webgl_renderer_max_concurrent_renders webgl_renderer_gpu_memory_budget_mb webgl_renderer_mandatory_gpu
-    local ongoing_tasks_runner_script ongoing_tasks_runtime_url ongoing_tasks_runtime_model
-    local openclaw_node_bin tavily_api_key radarr_api_key radarr_base_url sonarr_api_key sonarr_base_url
-    local chaptarr_api_key chaptarr_base_url vicuna_api_key
+    local openclaw_node_bin vicuna_api_key
     local policy_mode policy_candidate_url policy_timeout_ms policy_dataset_dir policy_registry_dir
     local policy_run_root policy_model_name policy_server_url policy_registry_host policy_registry_port
     local policy_default_alias policy_fallback_alias policy_limit policy_min_record_count
     local policy_min_exact_match_rate policy_max_invalid_action_rate policy_min_reward_delta
+    local policy_live_rollout_runtime_env_file policy_live_rollout_runtime_service
+    local policy_live_rollout_state_path policy_live_rollout_journal_dir
+    local policy_shadow_min_requests policy_shadow_max_disagreement_rate
+    local policy_shadow_max_candidate_failure_rate
 
     runtime_build_dir="$(resolved_env_value "VICUNA_RUNTIME_BUILD_DIR" "build-host-cuda-128")"
     runtime_port="$(resolved_env_value "VICUNA_RUNTIME_PORT" "8080")"
@@ -443,17 +482,7 @@ write_env_file() {
     webgl_renderer_max_concurrent_renders="$(resolved_env_value "VICUNA_WEBGL_RENDERER_MAX_CONCURRENT_RENDERS" "1")"
     webgl_renderer_gpu_memory_budget_mb="$(resolved_env_value "VICUNA_WEBGL_RENDERER_GPU_MEMORY_BUDGET_MB" "1024")"
     webgl_renderer_mandatory_gpu="$(resolved_env_value "VICUNA_WEBGL_RENDERER_MANDATORY_GPU" "1")"
-    ongoing_tasks_runner_script="$(resolved_env_value "VICUNA_ONGOING_TASKS_RUNNER_SCRIPT" "$REPO_ROOT/tools/ops/run-ongoing-task-cron.sh")"
-    ongoing_tasks_runtime_url="$(resolved_env_value "VICUNA_ONGOING_TASKS_RUNTIME_URL" "http://127.0.0.1:${runtime_port}/v1/chat/completions")"
-    ongoing_tasks_runtime_model="$(resolved_env_value "VICUNA_ONGOING_TASKS_RUNTIME_MODEL" "$deepseek_model")"
     openclaw_node_bin="$(resolved_env_value "VICUNA_OPENCLAW_NODE_BIN" "$telegram_bridge_node_bin")"
-    tavily_api_key="$(resolved_env_value "TAVILY_API_KEY")"
-    radarr_api_key="$(resolved_env_value "RADARR_API_KEY")"
-    radarr_base_url="$(resolved_env_value "RADARR_BASE_URL" "http://10.0.0.218:7878")"
-    sonarr_api_key="$(resolved_env_value "SONARR_API_KEY")"
-    sonarr_base_url="$(resolved_env_value "SONARR_BASE_URL" "http://10.0.0.218:8989")"
-    chaptarr_api_key="$(resolved_env_value "CHAPTARR_API_KEY")"
-    chaptarr_base_url="$(resolved_env_value "CHAPTARR_BASE_URL" "http://10.0.0.218:8789")"
     vicuna_api_key="$(resolved_env_value "VICUNA_API_KEY")"
     policy_mode="$(resolved_env_value "VICUNA_POLICY_MODE")"
     policy_candidate_url="$(resolved_env_value "VICUNA_POLICY_CANDIDATE_URL")"
@@ -472,6 +501,16 @@ write_env_file() {
     policy_min_exact_match_rate="$(resolved_env_value "VICUNA_POLICY_MIN_EXACT_MATCH_RATE" "0.55")"
     policy_max_invalid_action_rate="$(resolved_env_value "VICUNA_POLICY_MAX_INVALID_ACTION_RATE" "0.0")"
     policy_min_reward_delta="$(resolved_env_value "VICUNA_POLICY_MIN_REWARD_DELTA" "0.0")"
+    policy_live_rollout_runtime_env_file="$(resolved_env_value "VICUNA_POLICY_LIVE_ROLLOUT_RUNTIME_ENV_FILE" "$ENV_FILE")"
+    policy_live_rollout_runtime_service="$(resolved_env_value "VICUNA_POLICY_LIVE_ROLLOUT_RUNTIME_SERVICE" "$RUNTIME_SERVICE")"
+    policy_live_rollout_state_path="$(resolved_env_value "VICUNA_POLICY_LIVE_ROLLOUT_STATE_PATH" "$POLICY_ROLLOUT_ROOT/state.json")"
+    policy_live_rollout_journal_dir="$(resolved_env_value "VICUNA_POLICY_LIVE_ROLLOUT_JOURNAL_DIR" "$LOG_ROOT/policy-rollout/legacy-journal")"
+    if [[ "$policy_live_rollout_journal_dir" == "$POLICY_ROLLOUT_ROOT/journal" ]]; then
+        policy_live_rollout_journal_dir="$LOG_ROOT/policy-rollout/legacy-journal"
+    fi
+    policy_shadow_min_requests="$(resolved_env_value "VICUNA_POLICY_SHADOW_MIN_REQUESTS" "25")"
+    policy_shadow_max_disagreement_rate="$(resolved_env_value "VICUNA_POLICY_SHADOW_MAX_DISAGREEMENT_RATE" "0.25")"
+    policy_shadow_max_candidate_failure_rate="$(resolved_env_value "VICUNA_POLICY_SHADOW_MAX_CANDIDATE_FAILURE_RATE" "0.10")"
 
     run_cmd install -d -m 0755 "$ETC_DIR"
     if (( DRY_RUN )); then
@@ -485,6 +524,9 @@ VICUNA_TELEGRAM_BRIDGE_SERVICE_NAME=$BRIDGE_SERVICE
 VICUNA_WEBGL_RENDERER_SERVICE_NAME=$WEBGL_RENDERER_SERVICE
 VICUNA_REPO_ROOT=$REPO_ROOT
 REPO_ROOT=$REPO_ROOT
+VICUNA_LOG_ROOT=$LOG_ROOT
+VICUNA_LOG_RETENTION_DAYS=$LOG_RETENTION_DAYS
+VICUNA_LEGACY_OBSERVABILITY_ARCHIVE_ROOT=$LEGACY_OBSERVABILITY_ARCHIVE_ROOT
 VICUNA_RUNTIME_BUILD_DIR=$runtime_build_dir
 VICUNA_RUNTIME_PORT=$runtime_port
 VICUNA_DEEPSEEK_BASE_URL=$deepseek_base_url
@@ -508,17 +550,12 @@ VICUNA_WEBGL_RENDERER_GPU_MEMORY_BUDGET_MB=$webgl_renderer_gpu_memory_budget_mb
 VICUNA_WEBGL_RENDERER_MANDATORY_GPU=$webgl_renderer_mandatory_gpu
 VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH=$OPENCLAW_SECRETS_PATH
 VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH=$OPENCLAW_CATALOG_PATH
+VICUNA_TELEGRAM_RUNTIME_TOOLS_SNAPSHOT_PATH=$TELEGRAM_RUNTIME_TOOLS_SNAPSHOT_PATH
 VICUNA_STATE_ROOT=$STATE_ROOT
 VICUNA_HARD_MEMORY_DIR=$HARD_MEMORY_DIR
 VICUNA_SKILLS_DIR=$SKILLS_DIR
-VICUNA_ONGOING_TASKS_DIR=$ONGOING_TASKS_DIR
-VICUNA_ONGOING_TASKS_TMPDIR=$ONGOING_TASKS_TMPDIR
-VICUNA_ONGOING_TASKS_RUNNER_SCRIPT=$ongoing_tasks_runner_script
-VICUNA_ONGOING_TASKS_RUNTIME_URL=$ongoing_tasks_runtime_url
-VICUNA_ONGOING_TASKS_RUNTIME_MODEL=$ongoing_tasks_runtime_model
 VICUNA_OPENCLAW_NODE_BIN=$openclaw_node_bin
 VICUNA_HOST_SHELL_ROOT=$SYSTEM_HOST_SHELL_ROOT
-VICUNA_SKILLS_DIR=$SKILLS_DIR
 VICUNA_DOCS_DIR=$DOCS_DIR
 VICUNA_HEURISTIC_MEMORY_PATH=$HEURISTIC_MEMORY_PATH
 VICUNA_POLICY_MODE=$policy_mode
@@ -538,13 +575,13 @@ VICUNA_POLICY_MIN_RECORD_COUNT=$policy_min_record_count
 VICUNA_POLICY_MIN_EXACT_MATCH_RATE=$policy_min_exact_match_rate
 VICUNA_POLICY_MAX_INVALID_ACTION_RATE=$policy_max_invalid_action_rate
 VICUNA_POLICY_MIN_REWARD_DELTA=$policy_min_reward_delta
-TAVILY_API_KEY=$tavily_api_key
-RADARR_API_KEY=$radarr_api_key
-RADARR_BASE_URL=$radarr_base_url
-SONARR_API_KEY=$sonarr_api_key
-SONARR_BASE_URL=$sonarr_base_url
-CHAPTARR_API_KEY=$chaptarr_api_key
-CHAPTARR_BASE_URL=$chaptarr_base_url
+VICUNA_POLICY_LIVE_ROLLOUT_RUNTIME_ENV_FILE=$policy_live_rollout_runtime_env_file
+VICUNA_POLICY_LIVE_ROLLOUT_RUNTIME_SERVICE=$policy_live_rollout_runtime_service
+VICUNA_POLICY_LIVE_ROLLOUT_STATE_PATH=$policy_live_rollout_state_path
+VICUNA_POLICY_LIVE_ROLLOUT_JOURNAL_DIR=$policy_live_rollout_journal_dir
+VICUNA_POLICY_SHADOW_MIN_REQUESTS=$policy_shadow_min_requests
+VICUNA_POLICY_SHADOW_MAX_DISAGREEMENT_RATE=$policy_shadow_max_disagreement_rate
+VICUNA_POLICY_SHADOW_MAX_CANDIDATE_FAILURE_RATE=$policy_shadow_max_candidate_failure_rate
 VICUNA_API_KEY=$vicuna_api_key
 EOF
         return 0
@@ -560,6 +597,9 @@ VICUNA_TELEGRAM_BRIDGE_SERVICE_NAME=$BRIDGE_SERVICE
 VICUNA_WEBGL_RENDERER_SERVICE_NAME=$WEBGL_RENDERER_SERVICE
 VICUNA_REPO_ROOT=$REPO_ROOT
 REPO_ROOT=$REPO_ROOT
+VICUNA_LOG_ROOT=$LOG_ROOT
+VICUNA_LOG_RETENTION_DAYS=$LOG_RETENTION_DAYS
+VICUNA_LEGACY_OBSERVABILITY_ARCHIVE_ROOT=$LEGACY_OBSERVABILITY_ARCHIVE_ROOT
 VICUNA_RUNTIME_BUILD_DIR=$runtime_build_dir
 VICUNA_RUNTIME_PORT=$runtime_port
 VICUNA_DEEPSEEK_BASE_URL=$deepseek_base_url
@@ -583,17 +623,12 @@ VICUNA_WEBGL_RENDERER_GPU_MEMORY_BUDGET_MB=$webgl_renderer_gpu_memory_budget_mb
 VICUNA_WEBGL_RENDERER_MANDATORY_GPU=$webgl_renderer_mandatory_gpu
 VICUNA_OPENCLAW_TOOL_FABRIC_SECRETS_PATH=$OPENCLAW_SECRETS_PATH
 VICUNA_OPENCLAW_TOOL_FABRIC_CATALOG_PATH=$OPENCLAW_CATALOG_PATH
+VICUNA_TELEGRAM_RUNTIME_TOOLS_SNAPSHOT_PATH=$TELEGRAM_RUNTIME_TOOLS_SNAPSHOT_PATH
 VICUNA_STATE_ROOT=$STATE_ROOT
 VICUNA_HARD_MEMORY_DIR=$HARD_MEMORY_DIR
 VICUNA_SKILLS_DIR=$SKILLS_DIR
-VICUNA_ONGOING_TASKS_DIR=$ONGOING_TASKS_DIR
-VICUNA_ONGOING_TASKS_TMPDIR=$ONGOING_TASKS_TMPDIR
-VICUNA_ONGOING_TASKS_RUNNER_SCRIPT=$ongoing_tasks_runner_script
-VICUNA_ONGOING_TASKS_RUNTIME_URL=$ongoing_tasks_runtime_url
-VICUNA_ONGOING_TASKS_RUNTIME_MODEL=$ongoing_tasks_runtime_model
 VICUNA_OPENCLAW_NODE_BIN=$openclaw_node_bin
 VICUNA_HOST_SHELL_ROOT=$SYSTEM_HOST_SHELL_ROOT
-VICUNA_SKILLS_DIR=$SKILLS_DIR
 VICUNA_DOCS_DIR=$DOCS_DIR
 VICUNA_HEURISTIC_MEMORY_PATH=$HEURISTIC_MEMORY_PATH
 VICUNA_POLICY_MODE=$policy_mode
@@ -613,13 +648,13 @@ VICUNA_POLICY_MIN_RECORD_COUNT=$policy_min_record_count
 VICUNA_POLICY_MIN_EXACT_MATCH_RATE=$policy_min_exact_match_rate
 VICUNA_POLICY_MAX_INVALID_ACTION_RATE=$policy_max_invalid_action_rate
 VICUNA_POLICY_MIN_REWARD_DELTA=$policy_min_reward_delta
-TAVILY_API_KEY=$tavily_api_key
-RADARR_API_KEY=$radarr_api_key
-RADARR_BASE_URL=$radarr_base_url
-SONARR_API_KEY=$sonarr_api_key
-SONARR_BASE_URL=$sonarr_base_url
-CHAPTARR_API_KEY=$chaptarr_api_key
-CHAPTARR_BASE_URL=$chaptarr_base_url
+VICUNA_POLICY_LIVE_ROLLOUT_RUNTIME_ENV_FILE=$policy_live_rollout_runtime_env_file
+VICUNA_POLICY_LIVE_ROLLOUT_RUNTIME_SERVICE=$policy_live_rollout_runtime_service
+VICUNA_POLICY_LIVE_ROLLOUT_STATE_PATH=$policy_live_rollout_state_path
+VICUNA_POLICY_LIVE_ROLLOUT_JOURNAL_DIR=$policy_live_rollout_journal_dir
+VICUNA_POLICY_SHADOW_MIN_REQUESTS=$policy_shadow_min_requests
+VICUNA_POLICY_SHADOW_MAX_DISAGREEMENT_RATE=$policy_shadow_max_disagreement_rate
+VICUNA_POLICY_SHADOW_MAX_CANDIDATE_FAILURE_RATE=$policy_shadow_max_candidate_failure_rate
 VICUNA_API_KEY=$vicuna_api_key
 EOF
     chmod 0644 "$ENV_FILE"
@@ -774,21 +809,36 @@ log "repo=$REPO_ROOT service_user=$SERVICE_USER interactive_owner=$INTERACTIVE_O
 ensure_group
 ensure_user
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_ROOT" "$LOG_ROOT"
+ensure_service_writable_dir "$LOG_ROOT/runtime"
+ensure_service_writable_dir "$LOG_ROOT/telegram-bridge"
+ensure_service_writable_dir "$LOG_ROOT/webgl-renderer"
+ensure_service_writable_dir "$LOG_ROOT/policy-registry"
+ensure_service_writable_dir "$LOG_ROOT/policy-rollout"
+ensure_service_writable_dir "$LOG_ROOT/policy-nightly"
+ensure_service_writable_dir "$LOG_ROOT/host-capture-render"
+ensure_service_writable_dir "$LOG_ROOT/ops"
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$HARD_MEMORY_DIR"
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
-    "$ONGOING_TASKS_DIR" "$ONGOING_TASKS_TMPDIR" "$SKILLS_DIR" "$DOCS_DIR" "$HEURISTICS_DIR" \
-    "$POLICY_DATASET_DIR" "$POLICY_REGISTRY_DIR" "$POLICY_RUN_ROOT"
+    "$SKILLS_DIR" "$DOCS_DIR" "$HEURISTICS_DIR" \
+    "$POLICY_DATASET_DIR" "$POLICY_REGISTRY_DIR" \
+    "$POLICY_RUN_ROOT" "$POLICY_ROLLOUT_ROOT"
+run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
+    "$(dirname "${VICUNA_HOST_CAPTURE_RENDER_STATE_PATH:-$STATE_ROOT/experimental-capture/render-state.json}")" \
+    "${VICUNA_HOST_CAPTURE_RENDER_VIDEO_DIR:-$STATE_ROOT/experimental-capture/live/videos}"
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$(dirname "$TELEGRAM_STATE_PATH")"
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$(dirname "$SYSTEM_HOST_SHELL_ROOT")"
 run_cmd install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$SYSTEM_HOST_SHELL_ROOT"
 ensure_service_writable_file "$TELEGRAM_STATE_PATH" 0640
 ensure_service_writable_file "$OPENCLAW_SECRETS_PATH" 0600
 ensure_service_writable_file "$OPENCLAW_CATALOG_PATH" 0640
+ensure_service_writable_file "$TELEGRAM_RUNTIME_TOOLS_SNAPSHOT_PATH" 0640
+archive_legacy_observability
 grant_repo_access
 
 stop_system_service_if_present "$BRIDGE_SERVICE"
 stop_system_service_if_present "$WEBGL_RENDERER_SERVICE"
 stop_system_service_if_present "$RUNTIME_SERVICE"
+stop_system_service_if_present "$POLICY_REGISTRY_SERVICE"
 
 for idx in "${!USER_SERVICE_HOMES[@]}"; do
     owner_name="${USER_SERVICE_OWNERS[$idx]}"
@@ -803,20 +853,46 @@ done
 clear_system_override "$BRIDGE_SERVICE"
 clear_system_override "$WEBGL_RENDERER_SERVICE"
 clear_system_override "$RUNTIME_SERVICE"
+clear_system_override "$POLICY_REGISTRY_SERVICE"
+clear_system_override "$POLICY_ROLLOUT_SERVICE"
+clear_system_override "$POLICY_NIGHTLY_SERVICE"
+clear_system_override "$RUNPOD_CAPTURE_SYNC_SERVICE"
+clear_system_override "$HOST_CAPTURE_RENDER_SERVICE"
 assert_runtime_port_clear
 
 write_env_file "$NODE_BIN" "$FFMPEG_BIN" "$CHROMIUM_BIN"
 install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-runtime.system.service" "$(system_unit_path "$RUNTIME_SERVICE")"
 install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-telegram-bridge.system.service" "$(system_unit_path "$BRIDGE_SERVICE")"
 install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-webgl-renderer.system.service" "$(system_unit_path "$WEBGL_RENDERER_SERVICE")"
+install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-policy-registry.system.service" "$(system_unit_path "$POLICY_REGISTRY_SERVICE")"
+install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-policy-rollout.system.service" "$(system_unit_path "$POLICY_ROLLOUT_SERVICE")"
+install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-policy-nightly.system.service" "$(system_unit_path "$POLICY_NIGHTLY_SERVICE")"
+install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-runpod-capture-sync.system.service" "$(system_unit_path "$RUNPOD_CAPTURE_SYNC_SERVICE")"
+install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-host-capture-render.system.service" "$(system_unit_path "$HOST_CAPTURE_RENDER_SERVICE")"
+install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-policy-rollout.timer" "$(system_unit_path "$POLICY_ROLLOUT_TIMER")"
+install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-policy-nightly.timer" "$(system_unit_path "$POLICY_NIGHTLY_TIMER")"
+install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-runpod-capture-sync.timer" "$(system_unit_path "$RUNPOD_CAPTURE_SYNC_TIMER")"
+install_unit "$REPO_ROOT/tools/ops/systemd/vicuna-host-capture-render.timer" "$(system_unit_path "$HOST_CAPTURE_RENDER_TIMER")"
 run_cmd systemctl daemon-reload
 reset_failed_service_if_present "$RUNTIME_SERVICE"
 reset_failed_service_if_present "$WEBGL_RENDERER_SERVICE"
 reset_failed_service_if_present "$BRIDGE_SERVICE"
-run_cmd systemctl enable "$RUNTIME_SERVICE" "$WEBGL_RENDERER_SERVICE" "$BRIDGE_SERVICE"
+reset_failed_service_if_present "$POLICY_REGISTRY_SERVICE"
+reset_failed_service_if_present "$POLICY_ROLLOUT_SERVICE"
+reset_failed_service_if_present "$POLICY_NIGHTLY_SERVICE"
+reset_failed_service_if_present "$RUNPOD_CAPTURE_SYNC_SERVICE"
+reset_failed_service_if_present "$HOST_CAPTURE_RENDER_SERVICE"
+run_cmd systemctl enable \
+    "$RUNTIME_SERVICE" "$WEBGL_RENDERER_SERVICE" "$BRIDGE_SERVICE" "$POLICY_REGISTRY_SERVICE" \
+    "$POLICY_ROLLOUT_TIMER" "$POLICY_NIGHTLY_TIMER" "$RUNPOD_CAPTURE_SYNC_TIMER" "$HOST_CAPTURE_RENDER_TIMER"
 run_cmd systemctl restart "$RUNTIME_SERVICE"
 run_cmd systemctl restart "$WEBGL_RENDERER_SERVICE"
 run_cmd systemctl restart "$BRIDGE_SERVICE"
+run_cmd systemctl restart "$POLICY_REGISTRY_SERVICE"
+run_cmd systemctl restart "$POLICY_ROLLOUT_TIMER"
+run_cmd systemctl restart "$POLICY_NIGHTLY_TIMER"
+run_cmd systemctl restart "$RUNPOD_CAPTURE_SYNC_TIMER"
+run_cmd systemctl restart "$HOST_CAPTURE_RENDER_TIMER"
 
 if (( DRY_RUN )); then
     log "system-service install complete"
@@ -829,4 +905,8 @@ log "system-service install complete"
 log "runtime unit: $(system_unit_path "$RUNTIME_SERVICE")"
 log "webgl renderer unit: $(system_unit_path "$WEBGL_RENDERER_SERVICE")"
 log "bridge unit: $(system_unit_path "$BRIDGE_SERVICE")"
+log "policy registry unit: $(system_unit_path "$POLICY_REGISTRY_SERVICE")"
+log "policy rollout timer: $(system_unit_path "$POLICY_ROLLOUT_TIMER")"
+log "policy nightly timer: $(system_unit_path "$POLICY_NIGHTLY_TIMER")"
+log "host capture render timer: $(system_unit_path "$HOST_CAPTURE_RENDER_TIMER")"
 log "env file: $ENV_FILE"

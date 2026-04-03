@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -11,6 +12,53 @@ from typing import Any
 
 from policy_registry import resolve_version_entry
 from policy_trainer import load_policy_artifact, predict_action_with_confidence
+
+
+def _load_artifact_for_serving(path: Path) -> tuple[str, dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    schema_version = str(payload.get("schema_version", ""))
+    if schema_version == "vicuna.policy_artifact.v1":
+        return "policy", load_policy_artifact(path)
+    if schema_version == "vicuna.ppo_policy_artifact.v1":
+        from ppo_policy import load_ppo_policy_artifact
+
+        return "ppo_policy", load_ppo_policy_artifact(path)
+    raise ValueError(f"unsupported artifact schema_version {schema_version}")
+
+
+def _predict_from_artifact(
+    artifact_kind: str,
+    artifact: dict[str, Any],
+    *,
+    observation: dict[str, Any],
+    action_mask: dict[str, Any],
+) -> dict[str, Any]:
+    if artifact_kind == "policy":
+        return predict_action_with_confidence(
+            artifact=artifact,
+            observation=observation,
+            action_mask=action_mask,
+        )
+    if artifact_kind == "ppo_policy":
+        from ppo_policy import predict_ppo_action_with_confidence
+
+        return predict_ppo_action_with_confidence(
+            artifact=artifact,
+            observation=observation,
+            action_mask=action_mask,
+        )
+    raise ValueError(f"unsupported artifact kind {artifact_kind}")
+
+
+def emit_log(event: str, **fields: Any) -> None:
+    payload = {
+        "schema_version": "vicuna.service_event.v1",
+        "timestamp_ms": int(time.time() * 1000),
+        "service": "policy-registry",
+        "event": event,
+        **fields,
+    }
+    print(json.dumps(payload, sort_keys=True), flush=True)
 
 
 def _read_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
@@ -76,9 +124,10 @@ class PolicyRegistryService:
         }
         try:
             entry, resolved_alias = self._resolve_entry(alias=self.default_alias)
-            artifact = load_policy_artifact(Path(entry["artifact_path"]))
+            artifact_kind, artifact = _load_artifact_for_serving(Path(entry["artifact_path"]))
             payload.update(
                 {
+                    "artifact_kind": artifact_kind,
                     "resolved_default_alias": resolved_alias,
                     "resolved_default_version": entry["resolved_version"],
                     "resolved_default_policy_version": artifact["policy_version"],
@@ -94,9 +143,10 @@ class PolicyRegistryService:
         version_value = request_payload.get("artifact_version")
         version = int(version_value) if version_value is not None else None
         entry, resolved_alias = self._resolve_entry(alias=requested_alias, version=version)
-        artifact = load_policy_artifact(Path(entry["artifact_path"]))
-        prediction = predict_action_with_confidence(
-            artifact=artifact,
+        artifact_kind, artifact = _load_artifact_for_serving(Path(entry["artifact_path"]))
+        prediction = _predict_from_artifact(
+            artifact_kind,
+            artifact,
             observation=request_payload.get("observation", {}),
             action_mask=request_payload.get("action_mask", {}),
         )
@@ -104,9 +154,33 @@ class PolicyRegistryService:
             "policy_version": artifact["policy_version"],
             "policy_alias": resolved_alias or requested_alias or self.default_alias,
             "artifact_version": entry["resolved_version"],
+            "artifact_kind": artifact_kind,
             "model_name": self.model_name,
             "action": prediction["action"],
             "confidence": prediction["confidence"],
+            "rollout": prediction.get("rollout"),
+        }
+
+    def resolve_artifact(self, request_payload: dict[str, Any]) -> dict[str, Any]:
+        requested_alias = request_payload.get("artifact_alias") or request_payload.get("policy_alias")
+        version_value = request_payload.get("artifact_version")
+        version = int(version_value) if version_value is not None else None
+        artifact_kind = request_payload.get("artifact_kind")
+        entry, resolved_alias = self._resolve_entry(alias=requested_alias, version=version)
+        if artifact_kind and entry.get("artifact_kind") != artifact_kind:
+            raise ValueError(
+                f"resolved artifact kind {entry.get('artifact_kind')} does not match requested {artifact_kind}"
+            )
+        artifact_path = Path(entry["artifact_path"])
+        artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        return {
+            "model_name": self.model_name,
+            "artifact_kind": entry.get("artifact_kind"),
+            "artifact_alias": resolved_alias or requested_alias,
+            "artifact_version": entry.get("artifact_version"),
+            "registry_version": entry.get("resolved_version"),
+            "artifact_path": str(artifact_path),
+            "artifact": artifact_payload,
         }
 
 
@@ -139,24 +213,49 @@ def create_server(
             if self.path == "/health":
                 payload = service.health()
                 status = HTTPStatus.OK if payload.get("ok", False) else HTTPStatus.SERVICE_UNAVAILABLE
+                emit_log("health_checked", path=self.path, status=int(status), ok=payload.get("ok", False))
                 self._write_json(int(status), payload)
                 return
+            emit_log("not_found", path=self.path, method="GET")
             self._write_json(int(HTTPStatus.NOT_FOUND), {"error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802
-            if self.path != "/v1/policy/propose":
+            if self.path not in {"/v1/policy/propose", "/v1/artifacts/resolve"}:
+                emit_log("not_found", path=self.path, method="POST")
                 self._write_json(int(HTTPStatus.NOT_FOUND), {"error": "not found"})
                 return
             try:
                 payload = _read_json_body(self)
-                response = service.propose(payload)
+                if self.path == "/v1/policy/propose":
+                    response = service.propose(payload)
+                    emit_log(
+                        "proposal_served",
+                        path=self.path,
+                        request_id=payload.get("observation", {}).get("request_id"),
+                        policy_alias=response.get("policy_alias"),
+                        artifact_version=response.get("artifact_version"),
+                        policy_version=response.get("policy_version"),
+                    )
+                else:
+                    response = service.resolve_artifact(payload)
+                    emit_log(
+                        "artifact_resolved",
+                        path=self.path,
+                        artifact_kind=response.get("artifact_kind"),
+                        artifact_alias=response.get("artifact_alias"),
+                        artifact_version=response.get("artifact_version"),
+                        registry_version=response.get("registry_version"),
+                    )
             except ValueError as exc:
+                emit_log("proposal_not_found", path=self.path, error=str(exc))
                 self._write_json(int(HTTPStatus.NOT_FOUND), {"error": str(exc)})
                 return
             except json.JSONDecodeError as exc:
+                emit_log("proposal_bad_request", path=self.path, error=str(exc))
                 self._write_json(int(HTTPStatus.BAD_REQUEST), {"error": str(exc)})
                 return
             except Exception as exc:
+                emit_log("proposal_failed", path=self.path, error=str(exc))
                 self._write_json(int(HTTPStatus.INTERNAL_SERVER_ERROR), {"error": str(exc)})
                 return
             self._write_json(int(HTTPStatus.OK), response)
@@ -176,6 +275,14 @@ def run_server(
     default_alias: str,
     fallback_alias: str | None = None,
 ) -> None:
+    emit_log(
+        "service_starting",
+        host=host,
+        port=port,
+        model_name=model_name,
+        default_alias=default_alias,
+        fallback_alias=fallback_alias,
+    )
     server = create_server(
         host=host,
         port=port,
@@ -185,8 +292,10 @@ def run_server(
         fallback_alias=fallback_alias,
     )
     try:
+        emit_log("service_ready", host=host, port=port)
         server.serve_forever()
     finally:
+        emit_log("service_stopped", host=host, port=port)
         server.server_close()
 
 

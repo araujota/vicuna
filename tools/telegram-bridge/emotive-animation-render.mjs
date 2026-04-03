@@ -1,6 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { createCanvas } from '@napi-rs/canvas';
@@ -99,6 +100,73 @@ async function resolveNvencEncoderArgs(ffmpegBin, videoEncoder) {
 
   NVENC_OPTION_CACHE.set(cacheKey, args);
   return args;
+}
+
+async function writeChunk(stream, chunk) {
+  if (stream.destroyed || !stream.writable) {
+    throw new Error('encoder stdin is not writable');
+  }
+  if (stream.write(chunk)) {
+    return;
+  }
+  await once(stream, 'drain');
+}
+
+async function startStreamingEncoder(ffmpegBin, videoEncoder, bundle, outputPath) {
+  const ffmpegArgs = [
+    '-y',
+    '-f',
+    'image2pipe',
+    '-vcodec',
+    'png',
+    '-framerate',
+    String(bundle.fps),
+    '-i',
+    '-',
+    '-c:v',
+    videoEncoder,
+  ];
+  if (videoEncoder === 'h264_nvenc') {
+    ffmpegArgs.push(...await resolveNvencEncoderArgs(ffmpegBin, videoEncoder));
+  }
+  ffmpegArgs.push(
+    '-pix_fmt',
+    'yuv420p',
+    '-movflags',
+    '+faststart',
+    outputPath,
+  );
+  const child = spawn(ffmpegBin, ffmpegArgs, {
+    stdio: ['pipe', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr?.on('data', (chunk) => {
+    stderr += String(chunk);
+    if (stderr.length > 16384) {
+      stderr = stderr.slice(-16384);
+    }
+  });
+  const completion = new Promise((resolve, reject) => {
+    child.once('error', (error) => {
+      error.stage = error.stage || 'encode';
+      reject(error);
+    });
+    child.once('close', (code, signal) => {
+      if (code === 0) {
+        resolve({ stderr });
+        return;
+      }
+      const error = new Error(
+        `ffmpeg exited with code ${code ?? 'null'}${signal ? ` signal ${signal}` : ''}: ${stderr.trim() || 'no stderr'}`,
+      );
+      error.stage = 'finalize';
+      reject(error);
+    });
+  });
+  return {
+    child,
+    completion,
+  };
 }
 
 function renderFrame(canvas, surfaceCanvas, bundle, topology, frameIndex) {
@@ -278,49 +346,47 @@ export async function renderEmotiveAnimationMp4(rawBundle, options = {}) {
   const ffmpegBin = String(options.ffmpegBin ?? 'ffmpeg').trim() || 'ffmpeg';
   const videoEncoder = String(options.videoEncoder ?? 'h264_nvenc').trim() || 'h264_nvenc';
   const tempDir = await mkdtemp(path.join(os.tmpdir(), 'vicuna-emotive-animation-'));
-  const frameDir = path.join(tempDir, 'frames');
   const outputPath = options.outputPath
     ? path.resolve(String(options.outputPath))
     : path.join(tempDir, 'emotive-animation.mp4');
 
   try {
-    let renderResult;
+    const topology = buildOuterHullTopology(bundle);
+    const canvas = createCanvas(bundle.viewportWidth, bundle.viewportHeight);
+    const surfaceCanvas = createCanvas(bundle.viewportWidth, bundle.viewportHeight);
+    let lastFrameState = null;
+    let encoder = null;
     try {
-      renderResult = await renderEmotiveAnimationFrames(bundle, frameDir);
-    } catch (error) {
-      error.stage = 'render';
-      throw error;
-    }
-    try {
-      const ffmpegArgs = [
-        '-y',
-        '-framerate',
-        String(bundle.fps),
-        '-i',
-        path.join(frameDir, 'frame-%04d.png'),
-        '-c:v',
-        videoEncoder,
-      ];
-      if (videoEncoder === 'h264_nvenc') {
-        ffmpegArgs.push(...await resolveNvencEncoderArgs(ffmpegBin, videoEncoder));
+      encoder = await startStreamingEncoder(ffmpegBin, videoEncoder, bundle, outputPath);
+      for (let frameIndex = 0; frameIndex < bundle.totalFrames; frameIndex += 1) {
+        lastFrameState = renderFrame(canvas, surfaceCanvas, bundle, topology, frameIndex);
+        await writeChunk(encoder.child.stdin, canvas.toBuffer('image/png'));
       }
-      ffmpegArgs.push(
-        '-pix_fmt',
-        'yuv420p',
-        '-movflags',
-        '+faststart',
-        outputPath,
-      );
-      await execFileAsync(ffmpegBin, ffmpegArgs, {
-        maxBuffer: 32 * 1024 * 1024,
-      });
+      encoder.child.stdin.end();
+      await encoder.completion;
     } catch (error) {
-      error.stage = 'encode';
+      error.stage = error.stage || 'render';
+      encoder?.child?.stdin?.destroy?.();
+      encoder?.child?.kill?.('SIGKILL');
       throw error;
     }
 
     return {
-      ...renderResult,
+      ...buildEmotiveAnimationRenderPlan(bundle),
+      bundle,
+      topology: {
+        anchorCount: topology.anchorCount,
+        vertexCount: topology.vertexCount,
+        triangleCount: topology.triangleCount,
+        subdivisions: topology.subdivisions,
+      },
+      scene: lastFrameState?.scene ?? {
+        background: BACKGROUND_COLOR,
+        anchorCount: topology.anchorCount,
+        vertexCount: topology.vertexCount,
+        triangleCount: topology.triangleCount,
+      },
+      pipeline: 'streamed_image2pipe_png',
       outputPath,
     };
   } finally {

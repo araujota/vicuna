@@ -33,7 +33,6 @@ def test_registry_policy_adapter_replays_artifact(tmp_path: Path):
             "available_tool_count": 1,
             "parallel_tool_calls_requested": True,
             "input_message_count": 1,
-            "ongoing_task_due": 0.0,
             "vad": {"valence": 0.0, "arousal": 0.2, "dominance": 0.4},
         },
         "action_mask": {

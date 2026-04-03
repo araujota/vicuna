@@ -1,0 +1,10 @@
+[Unit]
+Description=Vicuña RunPod Experimental Capture Sync Timer
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=15s
+Unit=vicuna-runpod-capture-sync.service
+
+[Install]
+WantedBy=timers.target

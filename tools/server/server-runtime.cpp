@@ -5,8 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <limits>
-#include <map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -18,30 +18,13 @@ static bool parse_int32(const std::string & value, int32_t * out_value) {
     if (!out_value || value.empty()) {
         return false;
     }
-
     char * end = nullptr;
     const long parsed = std::strtol(value.c_str(), &end, 10);
     if (!end || *end != '\0' || parsed < std::numeric_limits<int32_t>::min() || parsed > std::numeric_limits<int32_t>::max()) {
         return false;
     }
-
-    *out_value = (int32_t) parsed;
+    *out_value = static_cast<int32_t>(parsed);
     return true;
-}
-
-static bool parse_bool_string(const std::string & value, bool * out_value) {
-    if (!out_value) {
-        return false;
-    }
-    if (value == "1" || value == "true" || value == "TRUE" || value == "on") {
-        *out_value = true;
-        return true;
-    }
-    if (value == "0" || value == "false" || value == "FALSE" || value == "off") {
-        *out_value = false;
-        return true;
-    }
-    return false;
 }
 
 static bool parse_api_surface_string(const std::string & value, server_api_surface * out_surface) {
@@ -75,39 +58,6 @@ static bool option_requires_value(const std::string & arg) {
         "--parallel",
         "--threads",
         "--threads-batch",
-        "--temp",
-        "--seed",
-        "--model",
-        "--model-url",
-        "--model-draft",
-        "--hf-repo",
-        "--hf-file",
-        "--models-dir",
-        "--models-max",
-        "--batch-size",
-        "--ubatch-size",
-        "--n-gpu-layers",
-        "--draft",
-        "--pooling",
-        "--alias",
-        "--tags",
-        "--ctx-size",
-        "-ctk",
-        "-ctv",
-        "-fa",
-        "--n-predict",
-        "--slot-save-path",
-        "--grp-attn-n",
-        "--grp-attn-w",
-        "--draft-max",
-        "--draft-min",
-        "--reasoning-format",
-        "--reasoning-budget",
-        "--chat-template",
-        "--chat-template-file",
-        "--mmproj-url",
-        "--media-path",
-        "--sleep-idle-seconds",
     };
     return valued.find(arg) != valued.end();
 }
@@ -159,7 +109,6 @@ bool server_runtime_params_parse(
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-
         if (arg == "--help" || arg == "-h") {
             if (out_show_help) {
                 *out_show_help = true;
@@ -185,7 +134,6 @@ bool server_runtime_params_parse(
         if (option_is_ignored_flag(arg)) {
             continue;
         }
-
         if (!option_requires_value(arg)) {
             return fail("unsupported argument: " + arg);
         }
@@ -194,94 +142,51 @@ bool server_runtime_params_parse(
         }
 
         const std::string value = argv[++i];
-
         if (arg == "--host") {
             params.hostname = value;
-            continue;
-        }
-        if (arg == "--port") {
+        } else if (arg == "--port") {
             if (!parse_int32(value, &params.port) || params.port < 0) {
                 return fail("invalid port: " + value);
             }
-            continue;
-        }
-        if (arg == "--api-prefix") {
+        } else if (arg == "--api-prefix") {
             params.api_prefix = value;
-            continue;
-        }
-        if (arg == "--api-key") {
+        } else if (arg == "--api-key") {
             params.api_keys.push_back(value);
-            continue;
-        }
-        if (arg == "--api-surface") {
+        } else if (arg == "--api-surface") {
             if (!parse_api_surface_string(value, &params.api_surface)) {
                 return fail("invalid api surface: " + value);
             }
-            continue;
-        }
-        if (arg == "--public-path") {
+        } else if (arg == "--public-path") {
             params.public_path = value;
-            continue;
-        }
-        if (arg == "--ssl-file-key") {
+        } else if (arg == "--ssl-file-key") {
             params.ssl_file_key = value;
-            continue;
-        }
-        if (arg == "--ssl-file-cert") {
+        } else if (arg == "--ssl-file-cert") {
             params.ssl_file_cert = value;
-            continue;
-        }
-        if (arg == "--timeout-read") {
+        } else if (arg == "--timeout-read") {
             if (!parse_int32(value, &params.timeout_read) || params.timeout_read <= 0) {
                 return fail("invalid read timeout: " + value);
             }
-            continue;
-        }
-        if (arg == "--timeout-write") {
+        } else if (arg == "--timeout-write") {
             if (!parse_int32(value, &params.timeout_write) || params.timeout_write <= 0) {
                 return fail("invalid write timeout: " + value);
             }
-            continue;
-        }
-        if (arg == "--threads-http") {
+        } else if (arg == "--threads-http") {
             if (!parse_int32(value, &params.n_threads_http)) {
                 return fail("invalid HTTP thread count: " + value);
             }
-            continue;
-        }
-        if (arg == "--parallel") {
+        } else if (arg == "--parallel") {
             if (!parse_int32(value, &params.n_parallel)) {
                 return fail("invalid parallel count: " + value);
             }
-            continue;
-        }
-        if (arg == "--threads") {
+        } else if (arg == "--threads") {
             if (!parse_int32(value, &params.n_threads)) {
                 return fail("invalid thread count: " + value);
             }
-            continue;
-        }
-        if (arg == "--threads-batch") {
+        } else if (arg == "--threads-batch") {
             if (!parse_int32(value, &params.n_threads_batch)) {
                 return fail("invalid batch thread count: " + value);
             }
-            continue;
         }
-
-        // Provider-first compatibility: accept and ignore legacy local-runtime flags.
-        if (option_requires_value(arg)) {
-            continue;
-        }
-    }
-
-    if (params.n_parallel < 1) {
-        params.n_parallel = 4;
-    }
-    if (params.timeout_read <= 0) {
-        params.timeout_read = 600;
-    }
-    if (params.timeout_write <= 0) {
-        params.timeout_write = 600;
     }
 
     return true;
@@ -304,13 +209,13 @@ void server_runtime_print_usage(const char * prog_name) {
             "  --threads-http <n>        HTTP worker thread count\n"
             "  --parallel <n>            Parallel request budget for thread sizing\n"
             "  --threads <n>             Reported CPU thread count\n"
+            "  --threads-batch <n>       Reported batch thread count\n"
             "  --verbose                 Enable verbose logging\n",
             prog_name ? prog_name : "llama-server");
 }
 
 void server_runtime_init(bool verbose) {
-    common_log_set_verbosity_thold(verbose ? LOG_LEVEL_DEBUG : LOG_LEVEL_INFO);
-    llama_log_set(common_log_default_callback, nullptr);
+    vicuna_log_set_verbosity(verbose ? VICUNA_LOG_LEVEL_DEBUG : VICUNA_LOG_LEVEL_INFO);
     LOG_INF("build: %s\n", server_runtime_build_info().c_str());
 }
 
@@ -320,7 +225,7 @@ std::string server_runtime_system_info(const server_runtime_params & params) {
     if (params.n_threads_batch >= 0) {
         os << " (n_threads_batch = " << params.n_threads_batch << ")";
     }
-    os << " / " << std::thread::hardware_concurrency() << " | " << llama_print_system_info();
+    os << " / " << std::thread::hardware_concurrency();
     os << " | api_surface = " << server_api_surface_to_string(params.api_surface);
     return os.str();
 }
@@ -330,7 +235,7 @@ const std::string & server_runtime_build_info() {
 #ifdef VICUNA_SERVER_BUILD_INFO
             VICUNA_SERVER_BUILD_INFO;
 #else
-            "provider-runtime";
+            "host-runtime";
 #endif
     return build;
 }
@@ -416,12 +321,12 @@ std::string server_string_format(const char * fmt, ...) {
     va_copy(ap_copy, ap);
     const int size = std::vsnprintf(nullptr, 0, fmt, ap);
     va_end(ap);
-    GGML_ASSERT(size >= 0);
-    std::vector<char> buffer((size_t) size + 1);
+    assert(size >= 0);
+    std::vector<char> buffer(static_cast<size_t>(size) + 1);
     const int written = std::vsnprintf(buffer.data(), buffer.size(), fmt, ap_copy);
     va_end(ap_copy);
-    GGML_ASSERT(written == size);
-    return std::string(buffer.data(), (size_t) size);
+    assert(written == size);
+    return std::string(buffer.data(), static_cast<size_t>(size));
 }
 
 std::vector<std::string> server_string_split(const std::string & str, char delim) {
@@ -441,95 +346,24 @@ bool server_string_ends_with(std::string_view str, std::string_view suffix) {
     return str.size() >= suffix.size() && str.substr(str.size() - suffix.size()) == suffix;
 }
 
-void server_batch_add(
-        llama_batch & batch,
-        llama_token id,
-        llama_pos pos,
-        const std::vector<llama_seq_id> & seq_ids,
-        bool logits) {
-    GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded");
-
-    batch.token[batch.n_tokens] = id;
-    batch.pos[batch.n_tokens] = pos;
-    batch.n_seq_id[batch.n_tokens] = seq_ids.size();
-    for (size_t i = 0; i < seq_ids.size(); ++i) {
-        batch.seq_id[batch.n_tokens][i] = seq_ids[i];
-    }
-    batch.logits[batch.n_tokens] = logits;
-    batch.n_tokens++;
-}
-
-std::vector<llama_token> server_tokenize(
-        const llama_context * ctx,
-        const std::string & text,
-        bool add_special,
-        bool parse_special) {
-    const llama_model * model = llama_get_model(ctx);
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-
-    int32_t n_tokens = (int32_t) text.size() + (add_special ? 2 : 0);
-    std::vector<llama_token> result((size_t) std::max(1, n_tokens));
-    n_tokens = llama_tokenize(vocab, text.data(), (int32_t) text.size(), result.data(), (int32_t) result.size(), add_special, parse_special);
-    if (n_tokens == std::numeric_limits<int32_t>::min()) {
-        throw std::runtime_error("tokenization failed: text too large");
-    }
-    if (n_tokens < 0) {
-        result.resize((size_t) -n_tokens);
-        const int32_t check = llama_tokenize(vocab, text.data(), (int32_t) text.size(), result.data(), (int32_t) result.size(), add_special, parse_special);
-        GGML_ASSERT(check == -n_tokens);
-    } else {
-        result.resize((size_t) n_tokens);
-    }
-    return result;
-}
-
-void server_embd_normalize(const float * inp, float * out, int n, int embd_norm) {
-    double sum = 0.0;
-
-    switch (embd_norm) {
-        case -1:
-            sum = 1.0;
-            break;
-        case 0:
-            for (int i = 0; i < n; ++i) {
-                sum = std::max(sum, (double) std::abs(inp[i]));
-            }
-            sum /= 32760.0;
-            break;
-        case 2:
-            for (int i = 0; i < n; ++i) {
-                sum += inp[i] * inp[i];
-            }
-            sum = std::sqrt(sum);
-            break;
-        default:
-            for (int i = 0; i < n; ++i) {
-                sum += std::pow(std::abs(inp[i]), embd_norm);
-            }
-            sum = std::pow(sum, 1.0 / embd_norm);
-            break;
+float server_embd_similarity_cos(const float * a, const float * b, int n) {
+    if (!a || !b || n <= 0) {
+        return 0.0f;
     }
 
-    const float norm = sum > 0.0 ? (float) (1.0 / sum) : 0.0f;
+    double dot = 0.0;
+    double norm_a = 0.0;
+    double norm_b = 0.0;
     for (int i = 0; i < n; ++i) {
-        out[i] = inp[i] * norm;
-    }
-}
-
-float server_embd_similarity_cos(const float * embd1, const float * embd2, int n) {
-    double sum = 0.0;
-    double sum1 = 0.0;
-    double sum2 = 0.0;
-
-    for (int i = 0; i < n; ++i) {
-        sum += embd1[i] * embd2[i];
-        sum1 += embd1[i] * embd1[i];
-        sum2 += embd2[i] * embd2[i];
+        const double av = a[i];
+        const double bv = b[i];
+        dot += av * bv;
+        norm_a += av * av;
+        norm_b += bv * bv;
     }
 
-    if (sum1 == 0.0 || sum2 == 0.0) {
-        return (sum1 == 0.0 && sum2 == 0.0) ? 1.0f : 0.0f;
+    if (norm_a <= 0.0 || norm_b <= 0.0) {
+        return 0.0f;
     }
-
-    return (float) (sum / (std::sqrt(sum1) * std::sqrt(sum2)));
+    return static_cast<float>(dot / (std::sqrt(norm_a) * std::sqrt(norm_b)));
 }

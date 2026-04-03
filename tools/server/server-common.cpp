@@ -1,7 +1,43 @@
 #include "server-common.h"
 
+#include <chrono>
 #include <random>
 #include <sstream>
+
+namespace {
+
+std::mutex & vicuna_log_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+int & vicuna_log_level_storage() {
+    static int level = VICUNA_LOG_LEVEL_INFO;
+    return level;
+}
+
+FILE * vicuna_log_stream_for_level(int level) {
+    return level <= VICUNA_LOG_LEVEL_WARN ? stderr : stdout;
+}
+
+} // namespace
+
+void vicuna_log_set_verbosity(int level) {
+    vicuna_log_level_storage() = level;
+}
+
+void vicuna_log_printf(int level, const char * fmt, ...) {
+    if (level > vicuna_log_level_storage()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(vicuna_log_mutex());
+    FILE * stream = vicuna_log_stream_for_level(level);
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(stream, fmt, ap);
+    va_end(ap);
+    std::fflush(stream);
+}
 
 json format_error_response(const std::string & message, enum error_type type) {
     std::string type_str;

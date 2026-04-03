@@ -12,7 +12,13 @@ if str(TOOLS_ROOT) not in sys.path:
     sys.path.insert(0, str(TOOLS_ROOT))
 
 from policy_dataset import append_transitions
-from policy_registry import promote_alias, register_artifact, registry_status, resolve_artifact_path
+from policy_registry import (
+    get_alias_version,
+    promote_alias,
+    register_artifact,
+    registry_status,
+    resolve_artifact_path,
+)
 from policy_trainer import train_policy
 from policy_training_contract import build_training_corpus
 
@@ -42,7 +48,6 @@ def bootstrap_artifact(tmp_path: Path) -> tuple[Path, dict]:
                     "available_tool_count": 0,
                     "parallel_tool_calls_requested": False,
                     "input_message_count": 1,
-                    "ongoing_task_due": 0.0,
                     "vad": {"valence": 0.0, "arousal": 0.2, "dominance": 0.4},
                 },
                 "action_mask": {
@@ -129,5 +134,57 @@ def test_registry_versions_and_aliases(tmp_path: Path):
         registry_dir=registry_dir,
         model_name="vicuna-governance",
         alias="candidate",
+    )
+    assert resolved.exists()
+
+
+def test_registry_supports_decode_controller_aliases_by_kind(tmp_path: Path):
+    registry_dir = tmp_path / "registry"
+    version_dir = tmp_path / "decode-run"
+    version_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = version_dir / "artifact.json"
+    artifact_path.write_text(
+        '{"schema_version":"vicuna.decode_controller_artifact.v1","controller_version":"decode-gru-1","training_metrics":{"record_count":2,"total":0.1}}\n',
+        encoding="utf-8",
+    )
+    training_run_manifest_path = version_dir / "training_run_manifest.json"
+    training_run_manifest_path.write_text(
+        '{"dataset_id":"vicuna-local-v1"}\n',
+        encoding="utf-8",
+    )
+    evaluation_report_path = version_dir / "offline_eval.json"
+    evaluation_report_path.write_text(
+        '{"valid_action_rate":1.0,"teacher_bool_match_rate":1.0}\n',
+        encoding="utf-8",
+    )
+
+    registered = register_artifact(
+        registry_dir=registry_dir,
+        model_name="vicuna-governance",
+        artifact_path=artifact_path,
+        training_run_manifest_path=training_run_manifest_path,
+        evaluation_report_path=evaluation_report_path,
+    )
+    assert registered["artifact_kind"] == "decode_controller"
+
+    promote_alias(
+        registry_dir=registry_dir,
+        model_name="vicuna-governance",
+        alias="candidate",
+        version=registered["version"],
+        reason="decode ready",
+        artifact_kind="decode_controller",
+    )
+    assert get_alias_version(
+        registry_dir=registry_dir,
+        model_name="vicuna-governance",
+        alias="candidate",
+        artifact_kind="decode_controller",
+    ) == registered["version"]
+    resolved = resolve_artifact_path(
+        registry_dir=registry_dir,
+        model_name="vicuna-governance",
+        alias="candidate",
+        artifact_kind="decode_controller",
     )
     assert resolved.exists()

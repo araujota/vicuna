@@ -9,7 +9,7 @@ from typing import Any
 
 TRAINING_RECORD_SCHEMA_VERSION = "vicuna.policy_training_record.v1"
 TRAINING_MANIFEST_SCHEMA_VERSION = "vicuna.policy_training_manifest.v1"
-TRAINING_CONTRACT_VERSION = "vicuna.governance_masked_heads.v2"
+TRAINING_CONTRACT_VERSION = "vicuna.governance_masked_heads.v3"
 
 SELECTED_MODE_VOCAB = [
     "direct",
@@ -20,6 +20,7 @@ SELECTED_MODE_VOCAB = [
 ]
 REASONING_DEPTH_VOCAB = ["none", "short", "medium", "deep"]
 TOKEN_BUDGET_BUCKET_VOCAB = [256, 512, 1024, 2048]
+REASONING_BUDGET_BUCKET_VOCAB = [0, 64, 128, 256, 512, 1024]
 THINKING_MODE_VOCAB = ["enabled", "disabled"]
 PREFIX_PROFILE_VOCAB = ["none", "bounded_answer", "replan_outline", "json_object_open"]
 STOP_PROFILE_VOCAB = ["none", "concise_answer", "markdown_code_fence"]
@@ -41,6 +42,7 @@ def _build_index(vocab: list[Any]) -> dict[Any, int]:
 SELECTED_MODE_INDEX = _build_index(SELECTED_MODE_VOCAB)
 REASONING_DEPTH_INDEX = _build_index(REASONING_DEPTH_VOCAB)
 TOKEN_BUDGET_BUCKET_INDEX = _build_index(TOKEN_BUDGET_BUCKET_VOCAB)
+REASONING_BUDGET_BUCKET_INDEX = _build_index(REASONING_BUDGET_BUCKET_VOCAB)
 THINKING_MODE_INDEX = _build_index(THINKING_MODE_VOCAB)
 PREFIX_PROFILE_INDEX = _build_index(PREFIX_PROFILE_VOCAB)
 STOP_PROFILE_INDEX = _build_index(STOP_PROFILE_VOCAB)
@@ -58,6 +60,14 @@ def normalize_action_mask(action_mask: dict[str, Any]) -> dict[str, Any]:
     allowed_sampling_profiles = action_mask.get("allowed_sampling_profiles", SAMPLING_PROFILE_VOCAB)
     allowed_repetition_profiles = action_mask.get("allowed_repetition_profiles", REPETITION_PROFILE_VOCAB)
     allowed_tool_choice_profiles = action_mask.get("allowed_tool_choice_profiles", TOOL_CHOICE_PROFILE_VOCAB)
+    allowed_response_budget_buckets = action_mask.get(
+        "allowed_response_budget_buckets",
+        TOKEN_BUDGET_BUCKET_VOCAB,
+    )
+    allowed_reasoning_budget_buckets = action_mask.get(
+        "allowed_reasoning_budget_buckets",
+        REASONING_BUDGET_BUCKET_VOCAB,
+    )
     max_tool_parallelism_cap = int(action_mask.get("max_tool_parallelism_cap", 0))
 
     for mode in allowed_modes:
@@ -84,6 +94,12 @@ def normalize_action_mask(action_mask: dict[str, Any]) -> dict[str, Any]:
     for value in allowed_tool_choice_profiles:
         if value not in TOOL_CHOICE_PROFILE_INDEX:
             raise ValueError(f"unsupported tool_choice_profile in action mask: {value}")
+    for value in allowed_response_budget_buckets:
+        if int(value) not in TOKEN_BUDGET_BUCKET_INDEX:
+            raise ValueError(f"unsupported response_budget_bucket in action mask: {value}")
+    for value in allowed_reasoning_budget_buckets:
+        if int(value) not in REASONING_BUDGET_BUCKET_INDEX:
+            raise ValueError(f"unsupported reasoning_budget_bucket in action mask: {value}")
     if max_tool_parallelism_cap < 0:
         raise ValueError("max_tool_parallelism_cap must be non-negative")
 
@@ -110,6 +126,14 @@ def normalize_action_mask(action_mask: dict[str, Any]) -> dict[str, Any]:
         "allowed_tool_choice_profile_indices": [
             TOOL_CHOICE_PROFILE_INDEX[value] for value in allowed_tool_choice_profiles
         ],
+        "allowed_response_budget_buckets": [int(value) for value in allowed_response_budget_buckets],
+        "allowed_response_budget_bucket_indices": [
+            TOKEN_BUDGET_BUCKET_INDEX[int(value)] for value in allowed_response_budget_buckets
+        ],
+        "allowed_reasoning_budget_buckets": [int(value) for value in allowed_reasoning_budget_buckets],
+        "allowed_reasoning_budget_bucket_indices": [
+            REASONING_BUDGET_BUCKET_INDEX[int(value)] for value in allowed_reasoning_budget_buckets
+        ],
         "max_tool_parallelism_cap": max_tool_parallelism_cap,
         "allowed_tool_parallelism_caps": list(range(max_tool_parallelism_cap + 1)),
         "allow_interrupt": bool(action_mask.get("allow_interrupt", True)),
@@ -122,7 +146,10 @@ def normalize_action_mask(action_mask: dict[str, Any]) -> dict[str, Any]:
 def normalize_action_targets(action: dict[str, Any], normalized_mask: dict[str, Any]) -> dict[str, Any]:
     selected_mode = action.get("selected_mode")
     reasoning_depth = action.get("reasoning_depth")
-    token_budget_bucket = int(action.get("token_budget_bucket", 0))
+    response_budget_bucket = int(
+        action.get("response_budget_bucket", action.get("token_budget_bucket", 0))
+    )
+    reasoning_budget_bucket = int(action.get("reasoning_budget_bucket", 0))
     tool_parallelism_cap = int(action.get("tool_parallelism_cap", 0))
     thinking_mode = action.get(
         "thinking_mode",
@@ -138,8 +165,10 @@ def normalize_action_targets(action: dict[str, Any], normalized_mask: dict[str, 
         raise ValueError(f"unsupported selected_mode target: {selected_mode}")
     if reasoning_depth not in REASONING_DEPTH_INDEX:
         raise ValueError(f"unsupported reasoning_depth target: {reasoning_depth}")
-    if token_budget_bucket not in TOKEN_BUDGET_BUCKET_INDEX:
-        raise ValueError(f"unsupported token_budget_bucket target: {token_budget_bucket}")
+    if response_budget_bucket not in TOKEN_BUDGET_BUCKET_INDEX:
+        raise ValueError(f"unsupported response_budget_bucket target: {response_budget_bucket}")
+    if reasoning_budget_bucket not in REASONING_BUDGET_BUCKET_INDEX:
+        raise ValueError(f"unsupported reasoning_budget_bucket target: {reasoning_budget_bucket}")
     if thinking_mode not in THINKING_MODE_INDEX:
         raise ValueError(f"unsupported thinking_mode target: {thinking_mode}")
     if prefix_profile not in PREFIX_PROFILE_INDEX:
@@ -189,6 +218,16 @@ def normalize_action_targets(action: dict[str, Any], normalized_mask: dict[str, 
             "tool_choice_profile target "
             f"{tool_choice_profile} violates action mask {normalized_mask['allowed_tool_choice_profiles']}"
         )
+    if response_budget_bucket not in normalized_mask["allowed_response_budget_buckets"]:
+        raise ValueError(
+            "response_budget_bucket target "
+            f"{response_budget_bucket} violates action mask {normalized_mask['allowed_response_budget_buckets']}"
+        )
+    if reasoning_budget_bucket not in normalized_mask["allowed_reasoning_budget_buckets"]:
+        raise ValueError(
+            "reasoning_budget_bucket target "
+            f"{reasoning_budget_bucket} violates action mask {normalized_mask['allowed_reasoning_budget_buckets']}"
+        )
     if tool_parallelism_cap not in normalized_mask["allowed_tool_parallelism_caps"]:
         raise ValueError(
             "tool_parallelism_cap target "
@@ -225,8 +264,12 @@ def normalize_action_targets(action: dict[str, Any], normalized_mask: dict[str, 
         "repetition_profile_index": REPETITION_PROFILE_INDEX[repetition_profile],
         "tool_choice_profile": tool_choice_profile,
         "tool_choice_profile_index": TOOL_CHOICE_PROFILE_INDEX[tool_choice_profile],
-        "token_budget_bucket": token_budget_bucket,
-        "token_budget_bucket_index": TOKEN_BUDGET_BUCKET_INDEX[token_budget_bucket],
+        "response_budget_bucket": response_budget_bucket,
+        "response_budget_bucket_index": TOKEN_BUDGET_BUCKET_INDEX[response_budget_bucket],
+        "token_budget_bucket": response_budget_bucket,
+        "token_budget_bucket_index": TOKEN_BUDGET_BUCKET_INDEX[response_budget_bucket],
+        "reasoning_budget_bucket": reasoning_budget_bucket,
+        "reasoning_budget_bucket_index": REASONING_BUDGET_BUCKET_INDEX[reasoning_budget_bucket],
         "tool_parallelism_cap": tool_parallelism_cap,
         **bool_targets,
     }
@@ -306,7 +349,9 @@ def build_training_corpus(dataset_dir: Path) -> dict[str, Any]:
         "sampling_profile_vocab": SAMPLING_PROFILE_VOCAB,
         "repetition_profile_vocab": REPETITION_PROFILE_VOCAB,
         "tool_choice_profile_vocab": TOOL_CHOICE_PROFILE_VOCAB,
+        "response_budget_bucket_vocab": TOKEN_BUDGET_BUCKET_VOCAB,
         "token_budget_bucket_vocab": TOKEN_BUDGET_BUCKET_VOCAB,
+        "reasoning_budget_bucket_vocab": REASONING_BUDGET_BUCKET_VOCAB,
         "boolean_heads": BOOLEAN_HEADS,
         "records_path": str(training_records_path.relative_to(dataset_dir)),
     }

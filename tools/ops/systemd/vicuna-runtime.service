@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/home/tyler-araujo/Projects/vicuna
-ExecStart=/home/tyler-araujo/Projects/vicuna/tools/ops/run-vicuna-runtime.sh
+ExecStart=/home/tyler-araujo/Projects/vicuna/tools/ops/run-with-service-logs.sh runtime /home/tyler-araujo/Projects/vicuna/tools/ops/run-vicuna-runtime.sh
 LimitNOFILE=65536
 Restart=always
 RestartSec=2

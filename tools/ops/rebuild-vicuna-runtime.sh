@@ -34,8 +34,32 @@ log() {
     printf '[vicuna-rebuild] %s\n' "$*"
 }
 
+OPS_OPERATION_ID="rebuild_$(date +%s%3N)_$$"
+
+log_event() {
+    local event="$1"
+    local message="$2"
+    shift 2
+    local fields=(
+        --field "operation_id=\"$OPS_OPERATION_ID\""
+        --field "target_surface=\"runtime\""
+    )
+    local field
+    for field in "$@"; do
+        fields+=(--field "$field")
+    done
+    python3 "$CONFIGURED_REPO_ROOT/tools/ops/service_log_router.py" event \
+        --service ops \
+        --event "$event" \
+        --message "$message" \
+        --log-root "${VICUNA_LOG_ROOT:-/var/log/vicuna}" \
+        --retention-days "${VICUNA_LOG_RETENTION_DAYS:-7}" \
+        "${fields[@]}" >/dev/null 2>&1 || true
+}
+
 die() {
     printf '[vicuna-rebuild] error: %s\n' "$*" >&2
+    log_event "runtime_rebuild_failed" "$*" 'result="failed"'
     exit 1
 }
 
@@ -119,6 +143,8 @@ systemctl_cmd() {
     if [[ "$SYSTEMD_SCOPE" == "system" ]]; then
         if (( EUID == 0 )); then
             systemctl "$@"
+        elif [[ ! -t 0 ]]; then
+            sudo -S systemctl "$@"
         else
             sudo systemctl "$@"
         fi
@@ -181,28 +207,6 @@ ensure_port_released() {
     die "runtime port $PORT is still owned after stopping $RUNTIME_SERVICE: $listeners"
 }
 
-restart_bridge_if_present() {
-    if (( DRY_RUN )); then
-        run_cmd systemctl_cmd try-restart "$BRIDGE_SERVICE"
-        return 0
-    fi
-
-    if systemctl_cmd status "$BRIDGE_SERVICE" >/dev/null 2>&1; then
-        systemctl_cmd try-restart "$BRIDGE_SERVICE" || true
-    fi
-}
-
-restart_webgl_renderer_if_present() {
-    if (( DRY_RUN )); then
-        run_cmd systemctl_cmd try-restart "$WEBGL_RENDERER_SERVICE"
-        return 0
-    fi
-
-    if systemctl_cmd status "$WEBGL_RENDERER_SERVICE" >/dev/null 2>&1; then
-        systemctl_cmd try-restart "$WEBGL_RENDERER_SERVICE" || true
-    fi
-}
-
 wait_for_health() {
     local attempts=60
     for ((i = 0; i < attempts; ++i)); do
@@ -235,15 +239,16 @@ assert_scope_convergence
 assert_repo_root_alignment
 
 log "repo=$CONFIGURED_REPO_ROOT scope=$SYSTEMD_SCOPE service=$RUNTIME_SERVICE build_dir=$BUILD_DIR"
+log_event "runtime_rebuild_started" "runtime rebuild started" \
+    "scope=\"$SYSTEMD_SCOPE\"" \
+    "repo_root=\"$CONFIGURED_REPO_ROOT\"" \
+    "build_dir=\"$BUILD_DIR\""
 run_cmd systemctl_cmd stop "$RUNTIME_SERVICE"
 ensure_port_released
 run_cmd cmake -S "$CONFIGURED_REPO_ROOT" -B "$CONFIGURED_REPO_ROOT/$BUILD_DIR" -G Ninja -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a
 run_cmd cmake --build "$CONFIGURED_REPO_ROOT/$BUILD_DIR" --target llama-server -j 12
-run_cmd "$CONFIGURED_REPO_ROOT/tools/ops/sync-openclaw-runtime-state.sh"
 run_cmd systemctl_cmd reset-failed "$RUNTIME_SERVICE"
 run_cmd systemctl_cmd start "$RUNTIME_SERVICE"
-restart_webgl_renderer_if_present
-restart_bridge_if_present
 
 if (( DRY_RUN )); then
     exit 0
@@ -252,3 +257,4 @@ fi
 wait_for_health || die "runtime health endpoint did not recover after restart"
 
 log "rebuild complete"
+log_event "runtime_rebuild_finished" "runtime rebuild finished" 'result="succeeded"'

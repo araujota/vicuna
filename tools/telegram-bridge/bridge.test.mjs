@@ -11,6 +11,9 @@ import {
   renderEmotiveAnimationFrames,
 } from './emotive-animation-render.mjs';
 import {
+  buildTelegramEmotiveAnimationBundle,
+} from './emotive-animation-bundle.mjs';
+import {
   ANCHOR_MAX_RADIUS,
   ANCHOR_MIN_RADIUS,
   buildFrameGeometry,
@@ -18,15 +21,20 @@ import {
   computeBundleRadiusNormalizationRange,
 } from './emotive-animation-scene.mjs';
 import {
+  buildWebglRenderTimeoutMs,
   getWebglRendererHealth,
   renderEmotiveAnimationViaWebglService,
 } from './emotive-webgl-renderer-client.mjs';
+import { handleBridgeControlCommand } from './control-commands.mjs';
 
 import {
   appendProactiveId,
   appendChatTranscriptMessage,
   buildTelegramAnimationDeliveryPlan,
+  buildTelegramBridgeRequestTimeoutMs,
+  buildTelegramPlainTextFallbackPayload,
   buildTelegramChatCompletionRequest,
+  buildTelegramMessageChunkPlan,
   bootstrapTelegramOutboxOffset,
   buildTelegramDocumentDescriptor,
   buildTelegramDocumentLinkage,
@@ -35,13 +43,16 @@ import {
   buildChatCompletionToolResultMessage,
   buildTelegramFileUrl,
   createTelegramConversation,
+  deleteTelegramPendingVideoDelivery,
   detectTelegramDocumentLogicalType,
+  enqueueTelegramPendingVideoDelivery,
   extractAssistantToolReplayMessage,
   extractChatCompletionText,
   extractChatCompletionToolCalls,
   extractResponseText,
   getConversationForTelegramMessage,
   getTelegramEmotiveAnimationState,
+  getTelegramPendingVideoDelivery,
   getChatTranscript,
   getLatestConversationId,
   getTelegramRequestDeltaMessages,
@@ -66,29 +77,50 @@ import {
   setTelegramEmotiveAnimationState,
   sanitizeAssistantRelayText,
   setTelegramOutboxCheckpoint,
+  shouldSuppressDeferredTelegramFailureMessage,
   shouldBootstrapTelegramOutboxOffset,
   splitSseBuffer,
   summarizeChatCompletion,
   TELEGRAM_BRIDGE_ASK_OUTBOX_POLL_IDLE_MS,
   TELEGRAM_BRIDGE_SELF_EMIT_ACTIVE_DELAY_MS,
   TELEGRAM_BRIDGE_SELF_EMIT_ERROR_DELAY_MS,
+  TELEGRAM_MESSAGE_SAFE_RENDERED_LIMIT,
+  TELEGRAM_MESSAGE_TEXT_LIMIT,
   TELEGRAM_VIDEO_CAPTION_LIMIT,
   TELEGRAM_BRIDGE_WATCHDOG_DELAY_MS,
+  updateTelegramPendingVideoDelivery,
   updateTelegramOffset,
 } from './lib.mjs';
 
+function assertBalancedTelegramSupportedTags(text) {
+  const tokenPattern = /<(\/)?(b|i|u|s|code|pre|blockquote|tg-spoiler|a)(?:\s+[^>]*)?>/gi;
+  const stack = [];
+  let match;
+  while ((match = tokenPattern.exec(String(text ?? ''))) !== null) {
+    const isClosingTag = Boolean(match[1]);
+    const tagName = String(match[2] ?? '').toLowerCase();
+    if (!isClosingTag) {
+      stack.push(tagName);
+      continue;
+    }
+    assert.equal(stack.length > 0, true, `unexpected closing tag </${tagName}> in ${text}`);
+    assert.equal(stack.pop(), tagName, `mismatched closing tag </${tagName}> in ${text}`);
+  }
+  assert.deepEqual(stack, [], `unclosed Telegram HTML tags remained in ${text}`);
+}
+
 function sampleEmotiveAnimationBundle() {
   return {
-    bundle_version: 2,
+    bundle_version: 3,
     trace_id: 'emo_test',
     generation_start_block_index: 3,
     raw_keyframe_count: 4,
     distinct_keyframe_count: 2,
-    seconds_per_keyframe: 0.5,
     fps: 30,
     viewport_width: 720,
     viewport_height: 720,
     rotation_period_seconds: 12,
+    duration_seconds: 1.8,
     dimensions: [
       { id: 'confidence', label: 'Confidence', direction_index: 0, direction_xyz: [0.577, 0.577, 0.577] },
       { id: 'caution', label: 'Caution', direction_index: 1, direction_xyz: [-0.577, -0.577, 0.577] },
@@ -102,6 +134,9 @@ function sampleEmotiveAnimationBundle() {
         source_kind: 'assistant_reasoning',
         hold_keyframe_count: 2,
         trace_block_span: [3, 4],
+        start_offset_ms: 0,
+        end_offset_ms: 350,
+        hold_duration_ms: 350,
         moment: { confidence: 0.2, caution: 0.7, curiosity: 0.35, satisfaction: 0.4 },
         dominant_dimensions: ['caution'],
       },
@@ -111,8 +146,81 @@ function sampleEmotiveAnimationBundle() {
         source_kind: 'assistant_content',
         hold_keyframe_count: 2,
         trace_block_span: [5, 6],
+        start_offset_ms: 1200,
+        end_offset_ms: 1800,
+        hold_duration_ms: 600,
         moment: { confidence: 0.85, caution: 0.25, curiosity: 0.65, satisfaction: 0.75 },
         dominant_dimensions: ['confidence'],
+      },
+    ],
+    segments: [
+      {
+        segment_index: 0,
+        from_keyframe_ordinal: 0,
+        to_keyframe_ordinal: 1,
+        start_offset_ms: 350,
+        duration_ms: 850,
+      },
+    ],
+  };
+}
+
+function sampleRawEmotiveTrace() {
+  return {
+    trace_id: 'emo_trace_raw',
+    turn_start_block_index: 1,
+    live_generation_start_block_index: 2,
+    blocks: [
+      {
+        block_index: 0,
+        source: { kind: 'system_message' },
+        timestamp_ms: 1000,
+        moment: {
+          epistemic_pressure: 0.1,
+          confidence: 0.2,
+        },
+        vad: {
+          dominant_dimensions: ['confidence'],
+        },
+      },
+      {
+        block_index: 1,
+        source: { kind: 'user_message' },
+        timestamp_ms: 1500,
+        moment: {
+          epistemic_pressure: 0.3,
+          confidence: 0.7,
+          caution: 0.2,
+        },
+        vad: {
+          dominant_dimensions: ['confidence'],
+        },
+      },
+      {
+        block_index: 2,
+        source: { kind: 'assistant_response' },
+        timestamp_ms: 1700,
+        moment: {
+          epistemic_pressure: 0.3,
+          confidence: 0.7,
+          caution: 0.2,
+        },
+        vad: {
+          dominant_dimensions: ['confidence', 'caution'],
+        },
+      },
+      {
+        block_index: 3,
+        source: { kind: 'assistant_response' },
+        timestamp_ms: 2300,
+        moment: {
+          epistemic_pressure: 0.6,
+          confidence: 0.4,
+          caution: 0.5,
+        },
+        vad: {
+          dominant_dimensions: ['caution'],
+        },
       },
     ],
   };
@@ -234,6 +342,44 @@ test('extractChatCompletionText returns empty string for tool-call-only completi
   assert.equal(text, '');
 });
 
+test('handleBridgeControlCommand executes host mode helper and replies with summary', async () => {
+  const sent = [];
+  let execArgs = null;
+  const handled = await handleBridgeControlCommand({
+    repoRoot: '/tmp/vicuna',
+    text: '/togglemode',
+    message: {
+      chat: { id: 42 },
+      message_id: 9,
+    },
+    sendTelegramMessage: async (...args) => {
+      sent.push(args);
+    },
+    execFileAsyncImpl: async (file, args) => {
+      execArgs = { file, args };
+      return {
+        stdout: JSON.stringify({
+          previous_mode: 'standard',
+          current_mode: 'experimental',
+          pod_action: 'started',
+          pod_id: 'pod-123',
+          tunnel_local_port: 18080,
+          runtime_service: 'vicuna-runtime.service',
+        }),
+      };
+    },
+  });
+
+  assert.equal(handled, true);
+  assert.deepEqual(execArgs, {
+    file: 'sudo',
+    args: ['-n', '/tmp/vicuna/tools/ops/host-inference-mode.sh', 'toggle', '--json'],
+  });
+  assert.equal(sent.length, 1);
+  assert.match(sent[0][1], /Inference mode switched: standard -> experimental\./);
+  assert.match(sent[0][1], /Relay tunnel listening on 127\.0\.0\.1:18080\./);
+});
+
 test('tool-call extraction and assistant replay preserve reasoning_content exactly', () => {
   const body = {
     choices: [
@@ -242,14 +388,14 @@ test('tool-call extraction and assistant replay preserve reasoning_content exact
         message: {
           role: 'assistant',
           content: '',
-          reasoning_content: 'Think first.\nThen call Radarr.',
+          reasoning_content: 'Think first.\nThen call the runtime tool.',
           tool_calls: [
             {
               id: 'call_1',
               type: 'function',
               function: {
-                name: 'radarr_download_movie',
-                arguments: '{"term":"Arrival"}',
+                name: 'runtime_health_check',
+                arguments: '{"target":"runpod"}',
               },
             },
           ],
@@ -260,20 +406,20 @@ test('tool-call extraction and assistant replay preserve reasoning_content exact
 
   const toolCalls = extractChatCompletionToolCalls(body);
   assert.equal(toolCalls.length, 1);
-  assert.equal(toolCalls[0].function.name, 'radarr_download_movie');
+  assert.equal(toolCalls[0].function.name, 'runtime_health_check');
 
   const replay = extractAssistantToolReplayMessage(body);
   assert.deepEqual(replay, {
     role: 'assistant',
     content: '',
-    reasoning_content: 'Think first.\nThen call Radarr.',
+    reasoning_content: 'Think first.\nThen call the runtime tool.',
     tool_calls: [
       {
         id: 'call_1',
         type: 'function',
         function: {
-          name: 'radarr_download_movie',
-          arguments: '{"term":"Arrival"}',
+          name: 'runtime_health_check',
+          arguments: '{"target":"runpod"}',
         },
       },
     ],
@@ -285,19 +431,19 @@ test('buildChatCompletionToolResultMessage serializes tool observations as tool 
     id: 'call_1',
     type: 'function',
     function: {
-      name: 'radarr_download_movie',
-      arguments: '{"term":"Arrival","monitored":true}',
+      name: 'runtime_health_check',
+      arguments: '{"target":"runpod","detailed":true}',
     },
   };
 
   assert.deepEqual(buildChatCompletionToolResultMessage(toolCall, {
     ok: true,
-    movie: 'Arrival',
+    status: 'healthy',
   }), {
     role: 'tool',
     tool_call_id: 'call_1',
-    name: 'radarr_download_movie',
-    content: '{"ok":true,"movie":"Arrival"}',
+    name: 'runtime_health_check',
+    content: '{"ok":true,"status":"healthy"}',
   });
 });
 
@@ -305,7 +451,7 @@ test('buildTelegramChatCompletionRequest forwards only the carried transcript an
   const transcript = [
     { role: 'user', content: 'Earlier user turn.' },
     { role: 'assistant', content: 'Earlier assistant turn.' },
-    { role: 'user', content: 'Check Radarr please.' },
+    { role: 'user', content: 'Check the runtime please.' },
   ];
 
   const payload = buildTelegramChatCompletionRequest({
@@ -318,9 +464,34 @@ test('buildTelegramChatCompletionRequest forwards only the carried transcript an
     model: 'deepseek-reasoner',
     temperature: 0.2,
     messages: transcript,
-    max_tokens: 256,
+    max_tokens: 4096,
   });
   assert.equal('tools' in payload, false);
+});
+
+test('buildTelegramBridgeRequestTimeoutMs defaults to a substantially longer request lifetime', () => {
+  assert.equal(buildTelegramBridgeRequestTimeoutMs(undefined), 1800000);
+  assert.equal(buildTelegramBridgeRequestTimeoutMs('3600000'), 3600000);
+  assert.equal(buildTelegramBridgeRequestTimeoutMs('25'), 1000);
+});
+
+test('shouldSuppressDeferredTelegramFailureMessage suppresses misleading deferred transport failures once runtime accepted the request', () => {
+  assert.equal(shouldSuppressDeferredTelegramFailureMessage({
+    classification: 'transport',
+    latestTraceEvent: 'relay_started',
+  }), true);
+  assert.equal(shouldSuppressDeferredTelegramFailureMessage({
+    classification: 'timeout',
+    latestTraceEvent: 'request_completed',
+  }), true);
+  assert.equal(shouldSuppressDeferredTelegramFailureMessage({
+    classification: 'runtime',
+    latestTraceEvent: 'relay_started',
+  }), false);
+  assert.equal(shouldSuppressDeferredTelegramFailureMessage({
+    classification: 'transport',
+    latestTraceEvent: 'request_failed',
+  }), false);
 });
 
 test('bridge polling constants are tightened for lower tail latency', () => {
@@ -1038,6 +1209,83 @@ test('saveState persists chatSessions transcript history', async () => {
   ]);
 });
 
+test('recordTelegramOutboxDeliveryReceipt preserves chunked delivery metadata', () => {
+  const state = recordTelegramOutboxDeliveryReceipt(normalizeState({}), {
+    sequenceNumber: 22,
+    chatId: '7502424413',
+    replyToMessageId: 592,
+    deliveryMode: 'chunked_reply',
+    telegramMessageId: 105,
+    telegramMessageIds: [103, 104, 105],
+    chunkCount: 3,
+    deliveredAtMs: 123999,
+  });
+
+  assert.deepEqual(state.telegramOutboxDeliveryReceipt, {
+    sequenceNumber: 22,
+    chatId: '7502424413',
+    replyToMessageId: 592,
+    deliveryMode: 'chunked_reply',
+    telegramMessageId: 105,
+    telegramMessageIds: [103, 104, 105],
+    chunkCount: 3,
+    deliveredAtMs: 123999,
+  });
+});
+
+test('pending video deliveries persist bounded retry metadata', () => {
+  let state = normalizeState({});
+  state = enqueueTelegramPendingVideoDelivery(state, {
+    jobId: 'tv_1',
+    sequenceNumber: 22,
+    chatId: '7502424413',
+    conversationId: 'tc1',
+    replyToMessageId: 608,
+    textTelegramMessageId: 610,
+    deliveryMode: 'chunked_reply',
+    telegramMessageIds: [608, 609, 610],
+    chunkCount: 3,
+    videoPayload: { has_spoiler: true, supports_streaming: true },
+    bundle: sampleEmotiveAnimationBundle(),
+    attemptCount: 1,
+    stage: 'queued',
+    nextAttemptAtMs: 123000,
+    createdAtMs: 122000,
+    updatedAtMs: 122500,
+  });
+
+  assert.deepEqual(getTelegramPendingVideoDelivery(state, 'tv_1'), {
+    jobId: 'tv_1',
+    sequenceNumber: 22,
+    chatId: '7502424413',
+    conversationId: 'tc1',
+    replyToMessageId: 608,
+    textTelegramMessageId: 610,
+    deliveryMode: 'chunked_reply',
+    telegramMessageIds: [608, 609, 610],
+    chunkCount: 3,
+    videoPayload: { has_spoiler: true, supports_streaming: true },
+    bundle: sampleEmotiveAnimationBundle(),
+    attemptCount: 1,
+    stage: 'queued',
+    nextAttemptAtMs: 123000,
+    createdAtMs: 122000,
+    updatedAtMs: 122500,
+  });
+
+  state = updateTelegramPendingVideoDelivery(state, 'tv_1', {
+    attemptCount: 2,
+    nextAttemptAtMs: 124000,
+    lastError: 'fetch failed',
+    updatedAtMs: 123500,
+  });
+  assert.equal(getTelegramPendingVideoDelivery(state, 'tv_1').attemptCount, 2);
+  assert.equal(getTelegramPendingVideoDelivery(state, 'tv_1').lastError, 'fetch failed');
+
+  state = deleteTelegramPendingVideoDelivery(state, 'tv_1');
+  assert.equal(getTelegramPendingVideoDelivery(state, 'tv_1'), null);
+});
+
 test('updateTelegramOffset remains monotonic alongside transcript updates', () => {
   let state = normalizeState({});
   state = updateTelegramOffset(state, 40);
@@ -1236,6 +1484,42 @@ test('buildTelegramSpoilerVideoPayload derives a spoilered sendVideo caption pay
   });
 });
 
+test('buildTelegramEmotiveAnimationBundle preserves full-turn timing from raw trace blocks', () => {
+  const bundle = buildTelegramEmotiveAnimationBundle(sampleRawEmotiveTrace());
+
+  assert.equal(bundle.trace_id, 'emo_trace_raw');
+  assert.equal(bundle.generation_start_block_index, 1);
+  assert.equal(bundle.turn_start_block_index, 1);
+  assert.equal(bundle.live_generation_start_block_index, 2);
+  assert.equal(bundle.raw_keyframe_count, 3);
+  assert.equal(bundle.distinct_keyframe_count, 2);
+  assert.equal(bundle.keyframes.length, 2);
+  assert.equal(bundle.keyframes[0].hold_keyframe_count, 2);
+  assert.equal(bundle.keyframes[0].start_offset_ms, 0);
+  assert.equal(bundle.keyframes[0].end_offset_ms, 200);
+  assert.deepEqual(bundle.keyframes[0].trace_block_span, [1, 2]);
+  assert.deepEqual(bundle.keyframes[0].dominant_dimensions, ['confidence', 'caution']);
+  assert.equal(bundle.keyframes[1].start_offset_ms, 800);
+  assert.equal(bundle.segments.length, 1);
+  assert.equal(bundle.segments[0].start_offset_ms, 200);
+  assert.equal(bundle.segments[0].duration_ms, 600);
+  assert.equal(bundle.duration_seconds, 0.8);
+});
+
+test('buildTelegramEmotiveAnimationBundle clamps mixed timestamp epochs to monotonic offsets', () => {
+  const trace = sampleRawEmotiveTrace();
+  trace.blocks[1].timestamp_ms = 1775157640000;
+  trace.blocks[2].timestamp_ms = 3169201721;
+  trace.blocks[3].timestamp_ms = 1775157640762;
+
+  const bundle = buildTelegramEmotiveAnimationBundle(trace);
+
+  assert.equal(bundle.keyframes[0].start_offset_ms, 0);
+  assert.equal(bundle.keyframes[0].end_offset_ms, 0);
+  assert.equal(bundle.keyframes[1].start_offset_ms, 500);
+  assert.equal(bundle.duration_seconds, 0.5);
+});
+
 test('normalizeTelegramRichTextPayload converts markdownish sendMessage text into Telegram HTML', () => {
   const normalized = normalizeTelegramRichTextPayload({
     telegramMethod: 'sendMessage',
@@ -1309,7 +1593,7 @@ test('normalizeTelegramRichTextPayload canonicalizes captions for media methods'
   assert.equal(normalized.textLength, 'Ready & steady'.length);
 });
 
-test('normalizeTelegramRichTextPayload converts markdown pipe tables into preformatted grids', () => {
+test('normalizeTelegramRichTextPayload rewrites markdown pipe tables into rich text sections', () => {
   const normalized = normalizeTelegramRichTextPayload({
     telegramMethod: 'sendMessage',
     telegramPayload: {
@@ -1318,10 +1602,73 @@ test('normalizeTelegramRichTextPayload converts markdown pipe tables into prefor
   });
 
   assert.equal(normalized.payload.parse_mode, 'HTML');
-  assert.equal(
-    normalized.payload.text,
-    '<pre>+-------+-------+\n| Name  | Score |\n+-------+-------+\n| Calm  | 0.42  |\n| Trust | 0.80  |\n+-------+-------+</pre>',
-  );
+  assert.match(normalized.payload.text, /<b>Name:<\/b> Calm/);
+  assert.match(normalized.payload.text, /<b>Score:<\/b> 0\.42/);
+  assert.ok(!normalized.payload.text.includes('| --- | --- |'));
+});
+
+test('normalizeTelegramRichTextPayload flattens HTML tables into rich text sections', () => {
+  const normalized = normalizeTelegramRichTextPayload({
+    telegramMethod: 'sendMessage',
+    telegramPayload: {
+      text: [
+        '<table>',
+        '<thead><tr><th>Name</th><th>Score</th><th>Notes</th></tr></thead>',
+        '<tbody><tr><td>Calm</td><td>0.42</td><td><b>Readable</b> narrative output</td></tr></tbody>',
+        '</table>',
+      ].join(''),
+    },
+  });
+
+  assert.equal(normalized.payload.parse_mode, 'HTML');
+  assert.match(normalized.payload.text, /<b>Name:<\/b> Calm/);
+  assert.match(normalized.payload.text, /<b>Score:<\/b> 0\.42/);
+  assert.match(normalized.payload.text, /<b>Notes:<\/b> Readable narrative output/);
+  assert.ok(!normalized.payload.text.includes('<table>'));
+  assert.ok(!normalized.payload.text.includes('<tr>'));
+});
+
+test('normalizeTelegramRichTextPayload balances dangling provider-authored html tags', () => {
+  const normalized = normalizeTelegramRichTextPayload({
+    telegramMethod: 'sendMessage',
+    telegramPayload: {
+      parse_mode: 'HTML',
+      text: '<b>Status update\n\nStill working',
+    },
+  });
+
+  assert.equal(normalized.payload.parse_mode, 'HTML');
+  assert.equal(normalized.payload.text, '<b>Status update\n\nStill working</b>');
+  assertBalancedTelegramSupportedTags(normalized.payload.text);
+});
+
+test('normalizeTelegramRichTextPayload repairs mismatched nested html tags', () => {
+  const normalized = normalizeTelegramRichTextPayload({
+    telegramMethod: 'sendMessage',
+    telegramPayload: {
+      parse_mode: 'HTML',
+      text: '<b>Bold <i>italic</b> tail',
+    },
+  });
+
+  assert.equal(normalized.payload.parse_mode, 'HTML');
+  assert.equal(normalized.payload.text, '<b>Bold <i>italic</i></b> tail');
+  assertBalancedTelegramSupportedTags(normalized.payload.text);
+});
+
+test('buildTelegramPlainTextFallbackPayload strips telegram html and parse mode', () => {
+  const fallback = buildTelegramPlainTextFallbackPayload({
+    telegramMethod: 'sendMessage',
+    telegramPayload: {
+      text: '<b>Bold</b> and <i>italic',
+      parse_mode: 'HTML',
+      reply_parameters: { message_id: 42 },
+    },
+  });
+
+  assert.equal(fallback.payload.text, 'Bold and italic');
+  assert.equal(Object.hasOwn(fallback.payload, 'parse_mode'), false);
+  assert.deepEqual(fallback.payload.reply_parameters, { message_id: 42 });
 });
 
 test('normalizeTelegramRichTextPayload strips DSML markup before canonicalizing HTML', () => {
@@ -1394,8 +1741,8 @@ test('buildTelegramSpoilerVideoPayload preserves provider-authored HTML captions
   assert.equal(payload.payload.parse_mode, 'HTML');
 });
 
-test('buildTelegramAnimationDeliveryPlan switches to split text and video when caption is too long', () => {
-  const sourceText = `### Status\n\n${'x'.repeat(TELEGRAM_VIDEO_CAPTION_LIMIT + 5)}`;
+test('buildTelegramAnimationDeliveryPlan always uses split text and standalone video', () => {
+  const sourceText = '### Status\n\nShort reply';
   const plan = buildTelegramAnimationDeliveryPlan({
     telegramMethod: 'sendMessage',
     text: sourceText,
@@ -1420,8 +1767,86 @@ test('buildTelegramAnimationDeliveryPlan switches to split text and video when c
     supports_streaming: true,
     disable_notification: true,
   });
-  assert.equal(plan.captionLength, TELEGRAM_VIDEO_CAPTION_LIMIT + 5 + 'Status'.length + 2);
+  assert.equal(plan.captionLength, 0);
   assert.equal(plan.captionLimit, TELEGRAM_VIDEO_CAPTION_LIMIT);
+});
+
+test('buildTelegramMessageChunkPlan splits long rich text into Telegram-safe chunks', () => {
+  const paragraph = Array.from(
+    { length: 40 },
+    (_, index) => `### Finding ${index + 1}\n\nThis supporting explanation stays detailed enough to force chunking while preserving readable markdown structure, explicit source bullets, careful operator-facing delivery verification, and a long enough paragraph body to exceed Telegram single-message limits once repeated across many findings in a single answer.`,
+  ).join('\n\n');
+  const sourceText = `${paragraph}\n\nFinal operator note.`;
+  const plan = buildTelegramMessageChunkPlan({
+    telegramPayload: {
+      text: sourceText,
+    },
+    text: sourceText,
+  });
+
+  assert.ok(plan.chunkCount > 1);
+  for (const chunk of plan.chunks) {
+    assert.ok(chunk.textLength <= TELEGRAM_MESSAGE_TEXT_LIMIT);
+    assert.ok(chunk.renderedLength <= TELEGRAM_MESSAGE_SAFE_RENDERED_LIMIT);
+    assert.equal(chunk.payload.parse_mode, 'HTML');
+    assert.ok(String(chunk.payload.text ?? '').trim().length > 0);
+  }
+});
+
+test('buildTelegramMessageChunkPlan strips raw markdown table separators from chunked delivery', () => {
+  const row = '| Calm | 0.42 | This explanation is intentionally long so the overall answer forces Telegram chunking when the table is rewritten into supported rich text. |';
+  const sourceText = `| Name | Score | Notes |\n| --- | --- | --- |\n${Array.from({ length: 24 }, () => row).join('\n')}`;
+  const plan = buildTelegramMessageChunkPlan({
+    telegramPayload: {
+      text: sourceText,
+    },
+    text: sourceText,
+  });
+
+  assert.ok(plan.chunkCount > 1);
+  for (const chunk of plan.chunks) {
+    const rendered = String(chunk.payload.text ?? '');
+    assert.ok(!rendered.includes('| --- | --- | --- |'));
+    assert.ok(!rendered.includes('| Calm | 0.42 |'));
+  }
+});
+
+test('buildTelegramMessageChunkPlan strips HTML table markup from chunked delivery', () => {
+  const row = '<tr><td>Calm</td><td>0.42</td><td>This explanation is intentionally long so the overall answer forces Telegram chunking when the HTML table is flattened into supported rich text.</td></tr>';
+  const sourceText = `<table><thead><tr><th>Name</th><th>Score</th><th>Notes</th></tr></thead><tbody>${Array.from({ length: 24 }, () => row).join('')}</tbody></table>`;
+  const plan = buildTelegramMessageChunkPlan({
+    telegramPayload: {
+      text: sourceText,
+      parse_mode: 'HTML',
+    },
+    text: sourceText,
+  });
+
+  assert.ok(plan.chunkCount > 1);
+  for (const chunk of plan.chunks) {
+    const rendered = String(chunk.payload.text ?? '');
+    assert.ok(!rendered.includes('<table>'));
+    assert.ok(!rendered.includes('<tr>'));
+    assert.ok(!rendered.includes('<td>'));
+    assert.match(rendered, /<b>Name:<\/b> Calm/);
+  }
+});
+
+test('buildTelegramMessageChunkPlan balances malformed html across chunks', () => {
+  const sourceText = `<b>${'Detailed literature note. '.repeat(300)}`;
+  const plan = buildTelegramMessageChunkPlan({
+    telegramPayload: {
+      text: sourceText,
+      parse_mode: 'HTML',
+    },
+    text: sourceText,
+  });
+
+  assert.ok(plan.chunkCount > 1);
+  for (const chunk of plan.chunks) {
+    assertBalancedTelegramSupportedTags(chunk.payload.text);
+    assert.equal(chunk.payload.parse_mode, 'HTML');
+  }
 });
 
 test('webgl renderer page keeps the saturated heatmap shader controls', async () => {
@@ -1444,14 +1869,16 @@ test('normalizeEmotiveAnimationBundle and render plan keep timing explicit', () 
   assert.equal(bundle.dimensions.length, 4);
   assert.equal(bundle.keyframes.length, 2);
   assert.equal(bundle.keyframes[0].holdKeyframeCount, 2);
+  assert.equal(bundle.keyframes[0].startOffsetMs, 0);
+  assert.equal(bundle.keyframes[0].endOffsetMs, 350);
   assert.equal(bundle.rawKeyframeCount, 4);
   assert.equal(bundle.distinctKeyframeCount, 2);
-  assert.equal(bundle.durationSeconds, 2);
-  assert.equal(bundle.timelineSlots.length, 4);
+  assert.equal(bundle.segments.length, 1);
+  assert.equal(bundle.durationSeconds, 1.8);
   assert.equal(plan.keyframeCount, 2);
   assert.equal(plan.rawKeyframeCount, 4);
-  assert.equal(plan.totalFrames, 60);
-  assert.equal(plan.durationSeconds, 2);
+  assert.equal(plan.totalFrames, 54);
+  assert.equal(plan.durationSeconds, 1.8);
 });
 
 test('computeBundleRadiusNormalizationRange anchors the heatmap to the explicit support range', () => {
@@ -1528,10 +1955,12 @@ test('prependEmotiveAnimationStartMoment seeds the next clip from the prior term
   assert.equal(bundle.rawKeyframeCount, 5);
   assert.equal(bundle.keyframes[0].sourceKind, 'prior_delivery_terminal');
   assert.equal(bundle.keyframes[0].holdKeyframeCount, 1);
+  assert.equal(bundle.keyframes[0].startOffsetMs, 0);
+  assert.equal(bundle.keyframes[0].endOffsetMs, 0);
   assert.deepEqual(bundle.keyframes[0].moment, priorMoment);
-  assert.equal(bundle.durationSeconds, 2.5);
-  assert.equal(bundle.totalFrames, 75);
-  assert.equal(bundle.timelineSlots.length, 5);
+  assert.equal(bundle.durationSeconds, 1.8);
+  assert.equal(bundle.totalFrames, 54);
+  assert.equal(bundle.segments.length, 2);
   assert.equal(bundle.keyframes[1].ordinal, 1);
 });
 
@@ -1577,10 +2006,10 @@ test('renderEmotiveAnimationFrames writes one PNG per planned frame', async () =
     const result = await renderEmotiveAnimationFrames(sampleEmotiveAnimationBundle(), dir);
     const files = await readdir(dir);
 
-    assert.equal(result.totalFrames, 60);
-    assert.equal(files.length, 60);
+    assert.equal(result.totalFrames, 54);
+    assert.equal(files.length, 54);
     assert.equal(files[0], 'frame-0000.png');
-    assert.equal(files.at(-1), 'frame-0059.png');
+    assert.equal(files.at(-1), 'frame-0053.png');
     assert.equal(result.topology.anchorCount, 4);
     assert.ok(result.topology.vertexCount > 700);
     assert.ok(result.topology.triangleCount > 1500);
@@ -1688,7 +2117,7 @@ test('renderEmotiveAnimationViaWebglService posts a render job and returns the s
       assert.equal(init?.method, 'POST');
       const parsed = JSON.parse(String(init?.body));
       assert.equal(parsed.outputPath, '/tmp/out.mp4');
-      assert.equal(parsed.bundle.bundle_version, 2);
+      assert.equal(parsed.bundle.bundle_version, 3);
       return {
         ok: true,
         async json() {
@@ -1710,6 +2139,107 @@ test('renderEmotiveAnimationViaWebglService posts a render job and returns the s
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('renderEmotiveAnimationViaWebglService retries one transient transport failure', async () => {
+  const originalFetch = globalThis.fetch;
+  let attempts = 0;
+  try {
+    globalThis.fetch = async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error('fetch failed');
+      }
+      return {
+        ok: true,
+        async json() {
+          return {
+            outputPath: '/tmp/out.mp4',
+            backend: 'chromium_webgl',
+            keyframeCount: 2,
+          };
+        },
+      };
+    };
+
+    const result = await renderEmotiveAnimationViaWebglService(sampleEmotiveAnimationBundle(), {
+      serviceUrl: 'http://127.0.0.1:8091',
+      outputPath: '/tmp/out.mp4',
+      timeoutMs: 2000,
+      maxAttempts: 2,
+    });
+    assert.equal(attempts, 2);
+    assert.equal(result.outputPath, '/tmp/out.mp4');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('renderEmotiveAnimationViaWebglService surfaces renderer_not_ready without burning local retries', async () => {
+  const originalFetch = globalThis.fetch;
+  let attempts = 0;
+  try {
+    globalThis.fetch = async () => {
+      attempts += 1;
+      return {
+        ok: false,
+        status: 503,
+        async json() {
+          return {
+            error: 'renderer_not_ready',
+          };
+        },
+      };
+    };
+
+    await assert.rejects(
+      renderEmotiveAnimationViaWebglService(sampleEmotiveAnimationBundle(), {
+        serviceUrl: 'http://127.0.0.1:8091',
+        outputPath: '/tmp/out.mp4',
+        maxAttempts: 3,
+      }),
+      (error) => {
+        assert.equal(error.code, 'renderer_not_ready');
+        assert.equal(error.stage, 'render');
+        return true;
+      },
+    );
+    assert.equal(attempts, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('buildWebglRenderTimeoutMs scales with bundle size within explicit bounds', () => {
+  const shortTimeout = buildWebglRenderTimeoutMs(sampleEmotiveAnimationBundle(), {
+    minTimeoutMs: 45000,
+    maxTimeoutMs: 180000,
+  });
+  const largerBundle = {
+    ...sampleEmotiveAnimationBundle(),
+    duration_seconds: 22,
+    distinct_keyframe_count: 37,
+    keyframes: Array.from({ length: 37 }, (_, index) => ({
+      ordinal: index,
+      trace_block_index: index + 1,
+      source_kind: 'assistant_content',
+      hold_keyframe_count: 1,
+      trace_block_span: [index + 1, index + 1],
+      moment: {
+        confidence: 0.5,
+        runtime_trust: 0.8,
+      },
+      dominant_dimensions: ['confidence'],
+    })),
+  };
+  const largeTimeout = buildWebglRenderTimeoutMs(largerBundle, {
+    minTimeoutMs: 45000,
+    maxTimeoutMs: 180000,
+  });
+
+  assert.ok(shortTimeout >= 45000);
+  assert.ok(largeTimeout > shortTimeout);
+  assert.ok(largeTimeout <= 180000);
 });
 
 test('getWebglRendererHealth reads the local service health payload', async () => {
@@ -1738,4 +2268,52 @@ test('getWebglRendererHealth reads the local service health payload', async () =
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('pending video deliveries preserve stage and persisted artifact metadata', () => {
+  const state = enqueueTelegramPendingVideoDelivery({}, {
+    jobId: 'job-1',
+    chatId: '7502424413',
+    conversationId: 'tc1',
+    sequenceNumber: 2,
+    replyToMessageId: 609,
+    textTelegramMessageId: 611,
+    deliveryMode: 'reply',
+    videoPayload: {
+      has_spoiler: true,
+      supports_streaming: true,
+    },
+    bundle: sampleEmotiveAnimationBundle(),
+    attemptCount: 3,
+    stage: 'upload',
+    artifactPath: '/var/lib/vicuna/telegram-video-spool/job-1.mp4',
+    artifactReadyAtMs: 1234,
+    nextAttemptAtMs: 5678,
+    createdAtMs: 1000,
+    updatedAtMs: 2000,
+    lastError: 'telegram sendVideo transport failed: fetch failed',
+  });
+
+  assert.deepEqual(getTelegramPendingVideoDelivery(state, 'job-1'), {
+    jobId: 'job-1',
+    chatId: '7502424413',
+    conversationId: 'tc1',
+    sequenceNumber: 2,
+    replyToMessageId: 609,
+    textTelegramMessageId: 611,
+    deliveryMode: 'reply',
+    videoPayload: {
+      has_spoiler: true,
+      supports_streaming: true,
+    },
+    bundle: sampleEmotiveAnimationBundle(),
+    attemptCount: 3,
+    stage: 'upload',
+    artifactPath: '/var/lib/vicuna/telegram-video-spool/job-1.mp4',
+    artifactReadyAtMs: 1234,
+    nextAttemptAtMs: 5678,
+    createdAtMs: 1000,
+    updatedAtMs: 2000,
+    lastError: 'telegram sendVideo transport failed: fetch failed',
+  });
 });

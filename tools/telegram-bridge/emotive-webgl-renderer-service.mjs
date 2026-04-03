@@ -1,7 +1,8 @@
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -44,12 +45,21 @@ const env = {
 };
 
 function log(message, extra = undefined) {
-  const prefix = '[vicuna-webgl-renderer]';
-  if (extra === undefined) {
-    console.log(`${prefix} ${message}`);
-    return;
+  const payload = {
+    schema_version: 'vicuna.service_event.v1',
+    timestamp_ms: Date.now(),
+    service: 'webgl-renderer',
+    event: 'log',
+    message,
+  };
+  if (extra !== undefined) {
+    if (extra && typeof extra === 'object' && !Array.isArray(extra)) {
+      Object.assign(payload, extra);
+    } else {
+      payload.payload = extra;
+    }
   }
-  console.log(`${prefix} ${message}`, extra);
+  console.log(JSON.stringify(payload));
 }
 
 function fail(message) {
@@ -206,6 +216,77 @@ function writeJson(res, statusCode, payload) {
   res.end(JSON.stringify(payload));
 }
 
+async function writeChunk(stream, chunk) {
+  if (stream.destroyed || !stream.writable) {
+    throw new Error('encoder stdin is not writable');
+  }
+  if (stream.write(chunk)) {
+    return;
+  }
+  await once(stream, 'drain');
+}
+
+async function startStreamingEncoder(bundle, outputPath) {
+  const ffmpegArgs = [
+    '-y',
+    '-f',
+    'image2pipe',
+    '-vcodec',
+    'png',
+    '-framerate',
+    String(bundle.fps),
+    '-i',
+    '-',
+    '-c:v',
+    env.videoEncoder,
+  ];
+  if (env.videoEncoder === 'h264_nvenc') {
+    ffmpegArgs.push(...await resolveNvencEncoderArgs(env.ffmpegBin, env.videoEncoder));
+  }
+  ffmpegArgs.push(
+    '-pix_fmt',
+    'yuv420p',
+    '-movflags',
+    '+faststart',
+    outputPath,
+  );
+
+  const child = spawn(env.ffmpegBin, ffmpegArgs, {
+    stdio: ['pipe', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr?.on('data', (chunk) => {
+    stderr += String(chunk);
+    if (stderr.length > 16384) {
+      stderr = stderr.slice(-16384);
+    }
+  });
+
+  const completion = new Promise((resolve, reject) => {
+    child.once('error', (error) => {
+      error.stage = error.stage || 'encode';
+      reject(error);
+    });
+    child.once('close', (code, signal) => {
+      if (code === 0) {
+        resolve({ stderr });
+        return;
+      }
+      const error = new Error(
+        `ffmpeg exited with code ${code ?? 'null'}${signal ? ` signal ${signal}` : ''}: ${stderr.trim() || 'no stderr'}`,
+      );
+      error.stage = 'finalize';
+      reject(error);
+    });
+  });
+
+  return {
+    child,
+    completion,
+    ffmpegArgs,
+  };
+}
+
 let browser = null;
 let page = null;
 let pagePath = '';
@@ -220,6 +301,13 @@ let gpuInfo = {
   vendor: '',
   renderer: '',
   software: true,
+};
+let rendererCacheInfo = {
+  activeKey: '',
+  entryCount: 0,
+  maxEntries: 0,
+  hits: 0,
+  misses: 0,
 };
 let activeRenders = 0;
 let renderQueue = Promise.resolve();
@@ -266,6 +354,7 @@ async function startBrowser() {
   await page.waitForFunction(() => Boolean(window.vicunaWebglRenderer), { timeout: env.startupTimeoutMs });
   const health = await page.evaluate(() => window.vicunaWebglRenderer.ping());
   gpuInfo = health?.gpu ?? gpuInfo;
+  rendererCacheInfo = health?.cache ?? rendererCacheInfo;
   rendererReady = Boolean(health?.ready);
   if (env.mandatoryGpu && (!rendererReady || gpuInfo.software)) {
     fail(`Chromium WebGL renderer is not using GPU hardware: ${JSON.stringify(gpuInfo)}`);
@@ -357,50 +446,37 @@ async function renderBundle(rawBundle, outputPath = '') {
   }
 
   const tempDir = await mkdtemp(path.join(env.tempRoot, 'vicuna-webgl-render-'));
-  const frameDir = path.join(tempDir, 'frames');
   const finalOutputPath = outputPath
     ? path.resolve(String(outputPath))
     : path.join(tempDir, 'emotive-animation.mp4');
+  let encoder = null;
+  let stage = 'prepare';
 
   try {
+    await mkdir(path.dirname(finalOutputPath), { recursive: true });
     await page.setViewport({
       width: bundle.viewportWidth,
       height: bundle.viewportHeight,
       deviceScaleFactor: 1,
     });
-    await mkdir(frameDir, { recursive: true });
     const renderPlan = await page.evaluate((nextBundle) => window.vicunaWebglRenderer.prepare(nextBundle), bundle);
     const root = await page.$('#capture-root');
     if (!root) {
       fail('renderer page capture root was missing');
     }
+    stage = 'encode';
+    encoder = await startStreamingEncoder(bundle, finalOutputPath);
+    stage = 'render';
     for (let frameIndex = 0; frameIndex < bundle.totalFrames; frameIndex += 1) {
       await page.evaluate((index) => window.vicunaWebglRenderer.renderFrame(index), frameIndex);
-      await root.screenshot({ path: path.join(frameDir, `frame-${String(frameIndex).padStart(4, '0')}.png`) });
+      const pngBuffer = await root.screenshot({ type: 'png' });
+      stage = 'encode';
+      await writeChunk(encoder.child.stdin, pngBuffer);
+      stage = 'render';
     }
-
-    const ffmpegArgs = [
-      '-y',
-      '-framerate',
-      String(bundle.fps),
-      '-i',
-      path.join(frameDir, 'frame-%04d.png'),
-      '-c:v',
-      env.videoEncoder,
-    ];
-    if (env.videoEncoder === 'h264_nvenc') {
-      ffmpegArgs.push(...await resolveNvencEncoderArgs(env.ffmpegBin, env.videoEncoder));
-    }
-    ffmpegArgs.push(
-      '-pix_fmt',
-      'yuv420p',
-      '-movflags',
-      '+faststart',
-      finalOutputPath,
-    );
-    await execFileAsync(env.ffmpegBin, ffmpegArgs, {
-      maxBuffer: 32 * 1024 * 1024,
-    });
+    stage = 'finalize';
+    encoder.child.stdin.end();
+    await encoder.completion;
 
     return {
       ...renderPlan,
@@ -410,13 +486,22 @@ async function renderBundle(rawBundle, outputPath = '') {
       chromiumBin: env.chromiumBin,
       ffmpegBin: env.ffmpegBin,
       videoEncoder: env.videoEncoder,
+      pipeline: 'streamed_image2pipe_png',
       gpu: gpuInfo,
       launchFlags: buildChromiumArgs(),
     };
   } catch (error) {
+    error.stage = error.stage || stage;
+    encoder?.child?.stdin?.destroy?.();
+    encoder?.child?.kill?.('SIGKILL');
+    await rm(finalOutputPath, { force: true }).catch(() => {});
     await rm(tempDir, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
+}
+
+function createRenderRequestId() {
+  return `render_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function enqueueRender(task) {
@@ -441,6 +526,9 @@ async function refreshGpuInfoIfIdle() {
     const health = await page.evaluate(() => window.vicunaWebglRenderer.ping());
     if (health?.gpu) {
       gpuInfo = health.gpu;
+    }
+    if (health?.cache) {
+      rendererCacheInfo = health.cache;
     }
     rendererReady = Boolean(health?.ready);
   } catch (error) {
@@ -469,6 +557,7 @@ const server = http.createServer(async (req, res) => {
           startupTimeoutMs: env.startupTimeoutMs,
         },
         gpu: gpuInfo,
+        cache: rendererCacheInfo,
         limits: {
           maxConcurrentRenders: env.maxConcurrentRenders,
           gpuMemoryBudgetMb: env.gpuMemoryBudgetMb,
@@ -488,8 +577,36 @@ const server = http.createServer(async (req, res) => {
       }
       const body = await readJsonBody(req);
       const bundle = body?.bundle ?? body;
-      const result = await enqueueRender(() => renderBundle(bundle, body?.outputPath ?? ''));
-      writeJson(res, 200, result);
+      const requestId = String(body?.requestId ?? '').trim() || createRenderRequestId();
+      const startedAtMs = Date.now();
+      log('render request queued', {
+        requestId,
+        outputPath: String(body?.outputPath ?? '').trim(),
+      });
+      try {
+        const result = await enqueueRender(() => renderBundle(bundle, body?.outputPath ?? ''));
+        log('render request completed', {
+          requestId,
+          elapsedMs: Date.now() - startedAtMs,
+          outputPath: String(result?.outputPath ?? body?.outputPath ?? '').trim(),
+          keyframeCount: Number(result?.keyframeCount ?? 0) || 0,
+          durationSeconds: Number(result?.durationSeconds ?? 0) || 0,
+          totalFrames: Number(result?.totalFrames ?? 0) || 0,
+          cache: result?.cache ?? undefined,
+        });
+        writeJson(res, 200, {
+          ...result,
+          requestId,
+        });
+      } catch (error) {
+        log('render request failed', {
+          requestId,
+          elapsedMs: Date.now() - startedAtMs,
+          error: String(error?.message ?? error),
+          stage: String(error?.stage ?? '').trim() || undefined,
+        });
+        throw error;
+      }
       return;
     }
 
@@ -497,6 +614,7 @@ const server = http.createServer(async (req, res) => {
   } catch (error) {
     writeJson(res, 500, {
       error: String(error?.message ?? error),
+      error_stage: String(error?.stage ?? '').trim() || undefined,
     });
   }
 });

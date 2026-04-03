@@ -38,19 +38,37 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     artifact_path = resolve_input_artifact(args)
-    artifact = load_policy_artifact(artifact_path)
+    raw_artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    schema_version = str(raw_artifact.get("schema_version", ""))
     payload = json.loads(sys.stdin.read() or "{}")
-    prediction = predict_action_with_confidence(
-        artifact=artifact,
-        observation=payload.get("observation", {}),
-        action_mask=payload.get("action_mask", {}),
-    )
+    if schema_version == "vicuna.policy_artifact.v1":
+        artifact = load_policy_artifact(artifact_path)
+        prediction = predict_action_with_confidence(
+            artifact=artifact,
+            observation=payload.get("observation", {}),
+            action_mask=payload.get("action_mask", {}),
+        )
+        artifact_kind = "policy"
+    elif schema_version == "vicuna.ppo_policy_artifact.v1":
+        from ppo_policy import load_ppo_policy_artifact, predict_ppo_action_with_confidence
+
+        artifact = load_ppo_policy_artifact(artifact_path)
+        prediction = predict_ppo_action_with_confidence(
+            artifact=artifact,
+            observation=payload.get("observation", {}),
+            action_mask=payload.get("action_mask", {}),
+        )
+        artifact_kind = "ppo_policy"
+    else:
+        raise ValueError(f"unsupported artifact schema_version {schema_version}")
     print(
         json.dumps(
             {
+                "artifact_kind": artifact_kind,
                 "policy_version": artifact["policy_version"],
                 "action": prediction["action"],
                 "confidence": prediction["confidence"],
+                "rollout": prediction.get("rollout"),
             },
             sort_keys=True,
         )

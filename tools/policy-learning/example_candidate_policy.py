@@ -22,6 +22,8 @@ def main() -> int:
     allowed_sampling_profiles = action_mask.get("allowed_sampling_profiles", ["provider_default"])
     allowed_repetition_profiles = action_mask.get("allowed_repetition_profiles", ["none"])
     allowed_tool_choice_profiles = action_mask.get("allowed_tool_choice_profiles", ["caller_default"])
+    allowed_response_budget_buckets = action_mask.get("allowed_response_budget_buckets", [256, 512, 1024, 2048])
+    allowed_reasoning_budget_buckets = action_mask.get("allowed_reasoning_budget_buckets", [0, 64, 128, 256, 512, 1024])
     max_parallelism = int(action_mask.get("max_tool_parallelism_cap", 0))
 
     preferred_mode = "tool_light" if int(observation.get("available_tool_count", 0)) > 0 else "direct"
@@ -32,12 +34,23 @@ def main() -> int:
     if preferred_reasoning not in allowed_reasoning_depths:
         preferred_reasoning = _choose_first(allowed_reasoning_depths, "short")
 
-    token_budget_bucket = {
+    response_budget_bucket = {
         "none": 256,
         "short": 512,
         "medium": 1024,
         "deep": 2048,
     }.get(preferred_reasoning, 512)
+    if response_budget_bucket not in allowed_response_budget_buckets:
+        response_budget_bucket = int(_choose_first([str(v) for v in allowed_response_budget_buckets], "512"))
+
+    reasoning_budget_bucket = {
+        "none": 0,
+        "short": 64,
+        "medium": 128,
+        "deep": 256,
+    }.get(preferred_reasoning, 64)
+    if reasoning_budget_bucket not in allowed_reasoning_budget_buckets:
+        reasoning_budget_bucket = int(_choose_first([str(v) for v in allowed_reasoning_budget_buckets], "64"))
 
     preferred_thinking = "disabled" if preferred_reasoning in {"none", "short"} else "enabled"
     if preferred_thinking not in allowed_thinking_modes:
@@ -74,7 +87,9 @@ def main() -> int:
             "sampling_profile": preferred_sampling,
             "repetition_profile": preferred_repetition,
             "tool_choice_profile": preferred_tool_choice,
-            "token_budget_bucket": token_budget_bucket,
+            "response_budget_bucket": response_budget_bucket,
+            "token_budget_bucket": response_budget_bucket,
+            "reasoning_budget_bucket": reasoning_budget_bucket,
             "tool_parallelism_cap": 1 if max_parallelism >= 1 else 0,
             "interrupt_allowed": bool(action_mask.get("allow_interrupt", True)),
             "replan_required": False,

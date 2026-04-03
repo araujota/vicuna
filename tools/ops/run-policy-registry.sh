@@ -7,7 +7,9 @@ cd "$REPO_ROOT"
 # shellcheck disable=SC1091
 source "$REPO_ROOT/tools/ops/runtime-env.sh"
 
-exec python3 "$REPO_ROOT/tools/policy-learning/cli.py" serve-registry \
+POLICY_PYTHON_BIN="${VICUNA_POLICY_PYTHON_BIN:-python3}"
+
+exec "$POLICY_PYTHON_BIN" "$REPO_ROOT/tools/policy-learning/cli.py" serve-registry \
   --host "${VICUNA_POLICY_REGISTRY_HOST:-127.0.0.1}" \
   --port "${VICUNA_POLICY_REGISTRY_PORT:-18081}" \
   --registry-dir "${VICUNA_POLICY_REGISTRY_DIR:-${VICUNA_STATE_ROOT:-/var/lib/vicuna}/policy-registry}" \

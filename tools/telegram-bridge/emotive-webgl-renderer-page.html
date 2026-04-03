@@ -86,6 +86,7 @@
         ANCHOR_MIN_RADIUS,
         ANCHOR_MAX_RADIUS,
         BACKGROUND_COLOR,
+        buildEmotiveAnimationCacheKey,
         buildFrameGeometry,
         buildOuterHullTopology,
         clamp01,
@@ -131,6 +132,13 @@
       let bundle = null;
       let bundleRadiusRange = { minRadius: ANCHOR_MIN_RADIUS, maxRadius: ANCHOR_MAX_RADIUS };
       let labelNodes = [];
+      let activeCacheKey = '';
+      const topologyCache = new Map();
+      const MAX_TOPOLOGY_CACHE_ENTRIES = 4;
+      const rendererStats = {
+        cacheHits: 0,
+        cacheMisses: 0,
+      };
 
       const membraneMaterial = new THREE.ShaderMaterial({
         side: THREE.FrontSide,
@@ -230,6 +238,12 @@
       }
 
       function createLabels(nextBundle) {
+        if (
+          labelNodes.length === nextBundle.dimensions.length
+          && labelNodes.every((node, index) => node.dimension?.id === nextBundle.dimensions[index]?.id)
+        ) {
+          return;
+        }
         clearLabels();
         labelNodes = nextBundle.dimensions.map((dimension, anchorIndex) => {
           const label = document.createElement('div');
@@ -243,14 +257,49 @@
       }
 
       function ensureMesh(nextBundle) {
-        if (mesh) {
+        const cacheKey = buildEmotiveAnimationCacheKey(nextBundle);
+        const cached = topologyCache.get(cacheKey);
+        if (cached) {
+          if (mesh && mesh !== cached.mesh && scene.children.includes(mesh)) {
+            scene.remove(mesh);
+          }
+          topology = cached.topology;
+          mesh = cached.mesh;
+          cached.lastUsedAt = Date.now();
+          if (!scene.children.includes(mesh)) {
+            scene.add(mesh);
+          }
+          activeCacheKey = cacheKey;
+          rendererStats.cacheHits += 1;
+          return { cacheKey, cacheHit: true };
+        }
+
+        if (mesh && scene.children.includes(mesh)) {
           scene.remove(mesh);
-          mesh.geometry.dispose();
         }
         topology = buildOuterHullTopology(nextBundle);
         mesh = new THREE.Mesh(topology.geometry, membraneMaterial);
         mesh.frustumCulled = false;
         scene.add(mesh);
+        activeCacheKey = cacheKey;
+        topologyCache.set(cacheKey, {
+          topology,
+          mesh,
+          lastUsedAt: Date.now(),
+        });
+        if (topologyCache.size > MAX_TOPOLOGY_CACHE_ENTRIES) {
+          const oldestKey = topologyCache.keys().next().value;
+          if (oldestKey && oldestKey !== cacheKey) {
+            const oldest = topologyCache.get(oldestKey);
+            if (oldest?.mesh && scene.children.includes(oldest.mesh)) {
+              scene.remove(oldest.mesh);
+            }
+            oldest?.mesh?.geometry?.dispose?.();
+            topologyCache.delete(oldestKey);
+          }
+        }
+        rendererStats.cacheMisses += 1;
+        return { cacheKey, cacheHit: false };
       }
 
       function readGpuInfoFromContext(gl) {
@@ -353,7 +402,7 @@
         }
         bundle = nextBundle;
         setViewport(bundle.viewportWidth, bundle.viewportHeight);
-        ensureMesh(bundle);
+        const cacheState = ensureMesh(bundle);
         bundleRadiusRange = computeBundleRadiusNormalizationRange(bundle, topology) ?? bundleRadiusRange;
         membraneMaterial.uniforms.uRadiusRange.value.set(bundleRadiusRange.minRadius, bundleRadiusRange.maxRadius);
         createLabels(bundle);
@@ -364,6 +413,12 @@
           totalFrames: bundle.totalFrames,
           durationSeconds: bundle.durationSeconds,
           fps: bundle.fps,
+          cache: {
+            key: cacheState?.cacheKey ?? '',
+            hit: Boolean(cacheState?.cacheHit),
+            entryCount: topologyCache.size,
+            maxEntries: MAX_TOPOLOGY_CACHE_ENTRIES,
+          },
         };
       }
 
@@ -432,6 +487,13 @@
           return {
             ready: true,
             gpu: getGpuInfo(),
+            cache: {
+              activeKey: activeCacheKey,
+              entryCount: topologyCache.size,
+              maxEntries: MAX_TOPOLOGY_CACHE_ENTRIES,
+              hits: rendererStats.cacheHits,
+              misses: rendererStats.cacheMisses,
+            },
           };
         },
         prepare,

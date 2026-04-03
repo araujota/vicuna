@@ -132,6 +132,9 @@ export function normalizeEmotiveAnimationBundle(raw) {
         traceBlockIndex: Math.max(0, Number(keyframe?.trace_block_index ?? keyframe?.traceBlockIndex ?? index) || index),
         sourceKind: String(keyframe?.source_kind ?? keyframe?.sourceKind ?? '').trim() || 'runtime_event',
         holdKeyframeCount: Math.max(1, Math.round(Number(keyframe?.hold_keyframe_count ?? keyframe?.holdKeyframeCount ?? 1) || 1)),
+        startOffsetMsRaw: keyframe?.start_offset_ms ?? keyframe?.startOffsetMs,
+        endOffsetMsRaw: keyframe?.end_offset_ms ?? keyframe?.endOffsetMs,
+        holdDurationMsRaw: keyframe?.hold_duration_ms ?? keyframe?.holdDurationMs,
         traceBlockSpan: Array.isArray(keyframe?.trace_block_span) && keyframe.trace_block_span.length === 2
           ? [
             Math.max(0, Number(keyframe.trace_block_span[0] ?? keyframe?.trace_block_index ?? index) || index),
@@ -156,21 +159,85 @@ export function normalizeEmotiveAnimationBundle(raw) {
     return null;
   }
 
-  const secondsPerKeyframe = Math.max(0.1, Number(raw.seconds_per_keyframe ?? raw.secondsPerKeyframe ?? 0.5) || 0.5);
+  const legacySecondsPerKeyframe = Math.max(0.1, Number(raw.seconds_per_keyframe ?? raw.secondsPerKeyframe ?? 0.5) || 0.5);
+  const legacyStepMs = Math.max(1, Math.round(legacySecondsPerKeyframe * 1000));
+  let legacyCursorMs = 0;
+  const timedKeyframes = keyframes.map((keyframe, index) => {
+    const hasExplicitTiming = Number.isFinite(Number(keyframe?.startOffsetMsRaw))
+      || Number.isFinite(Number(keyframe?.endOffsetMsRaw));
+    if (hasExplicitTiming) {
+      const startOffsetMs = Math.max(0, Math.round(Number(keyframe?.startOffsetMsRaw ?? 0) || 0));
+      const endOffsetMs = Math.max(
+        startOffsetMs,
+        Math.round(Number(keyframe?.endOffsetMsRaw ?? startOffsetMs) || startOffsetMs),
+      );
+      return {
+        ...keyframe,
+        startOffsetMs,
+        endOffsetMs,
+        holdDurationMs: Math.max(
+          0,
+          Math.round(Number(keyframe?.holdDurationMsRaw ?? (endOffsetMs - startOffsetMs)) || (endOffsetMs - startOffsetMs)),
+        ),
+      };
+    }
+    const isLast = index === keyframes.length - 1;
+    const startOffsetMs = legacyCursorMs;
+    const endOffsetMs = isLast
+      ? legacyCursorMs + (keyframe.holdKeyframeCount * legacyStepMs)
+      : legacyCursorMs + (Math.max(0, keyframe.holdKeyframeCount - 1) * legacyStepMs);
+    legacyCursorMs += keyframe.holdKeyframeCount * legacyStepMs;
+    return {
+      ...keyframe,
+      startOffsetMs,
+      endOffsetMs,
+      holdDurationMs: Math.max(0, endOffsetMs - startOffsetMs),
+    };
+  });
   const fps = Math.max(1, Math.round(Number(raw.fps ?? 24) || 24));
   const viewportWidth = Math.max(256, Math.round(Number(raw.viewport_width ?? raw.viewportWidth ?? 720) || 720));
   const viewportHeight = Math.max(256, Math.round(Number(raw.viewport_height ?? raw.viewportHeight ?? 720) || 720));
   const rotationPeriodSeconds = Math.max(1, Number(raw.rotation_period_seconds ?? raw.rotationPeriodSeconds ?? 12) || 12);
-  const timelineSlots = [];
-  for (const keyframe of keyframes) {
-    for (let slot = 0; slot < keyframe.holdKeyframeCount; slot += 1) {
-      timelineSlots.push(keyframe.moment);
-    }
-  }
-  const rawKeyframeCount = Math.max(1, timelineSlots.length);
-  const distinctKeyframeCount = Math.max(1, keyframes.length);
-  const durationSeconds = secondsPerKeyframe * rawKeyframeCount;
-  const totalFrames = Math.max(1, Math.round(durationSeconds * fps));
+  const segments = Array.isArray(raw.segments)
+    ? raw.segments.map((segment, index) => {
+      const startOffsetMs = Math.max(0, Math.round(Number(segment?.start_offset_ms ?? segment?.startOffsetMs ?? 0) || 0));
+      const durationMs = Math.max(0, Math.round(Number(segment?.duration_ms ?? segment?.durationMs ?? 0) || 0));
+      return {
+        segmentIndex: Math.max(0, Number(segment?.segment_index ?? segment?.segmentIndex ?? index) || index),
+        fromKeyframeOrdinal: Math.max(0, Number(segment?.from_keyframe_ordinal ?? segment?.fromKeyframeOrdinal ?? index) || index),
+        toKeyframeOrdinal: Math.max(0, Number(segment?.to_keyframe_ordinal ?? segment?.toKeyframeOrdinal ?? (index + 1)) || (index + 1)),
+        startOffsetMs,
+        durationMs,
+        endOffsetMs: startOffsetMs + durationMs,
+      };
+    }).filter(Boolean)
+    : timedKeyframes.slice(0, -1).map((keyframe, index) => {
+      const next = timedKeyframes[index + 1];
+      const startOffsetMs = Math.max(0, keyframe.endOffsetMs);
+      const endOffsetMs = Math.max(startOffsetMs, next?.startOffsetMs ?? startOffsetMs);
+      return {
+        segmentIndex: index,
+        fromKeyframeOrdinal: keyframe.ordinal,
+        toKeyframeOrdinal: next?.ordinal ?? keyframe.ordinal,
+        startOffsetMs,
+        durationMs: endOffsetMs - startOffsetMs,
+        endOffsetMs,
+      };
+    });
+  const rawKeyframeCount = Math.max(
+    1,
+    Math.round(Number(raw.raw_keyframe_count ?? raw.rawKeyframeCount ?? timedKeyframes.reduce(
+      (sum, keyframe) => sum + Math.max(1, keyframe.holdKeyframeCount),
+      0,
+    )) || 1),
+  );
+  const distinctKeyframeCount = Math.max(1, timedKeyframes.length);
+  const totalDurationMs = Math.max(
+    0,
+    Math.round(Number(raw.duration_ms ?? raw.durationMs ?? raw.duration_seconds * 1000 ?? raw.durationSeconds * 1000 ?? timedKeyframes[timedKeyframes.length - 1]?.endOffsetMs ?? 0) || (timedKeyframes[timedKeyframes.length - 1]?.endOffsetMs ?? 0)),
+  );
+  const durationSeconds = totalDurationMs / 1000;
+  const totalFrames = Math.max(1, Math.ceil(durationSeconds * fps));
 
   return {
     bundleVersion: Math.max(1, Number(raw.bundle_version ?? raw.bundleVersion ?? 1) || 1),
@@ -178,16 +245,17 @@ export function normalizeEmotiveAnimationBundle(raw) {
     generationStartBlockIndex: Math.max(0, Number(raw.generation_start_block_index ?? raw.generationStartBlockIndex ?? 0) || 0),
     rawKeyframeCount,
     distinctKeyframeCount,
-    secondsPerKeyframe,
+    legacySecondsPerKeyframe,
     fps,
     viewportWidth,
     viewportHeight,
     rotationPeriodSeconds,
+    totalDurationMs,
     durationSeconds,
     totalFrames,
-    timelineSlots,
+    segments,
     dimensions,
-    keyframes,
+    keyframes: timedKeyframes,
   };
 }
 
@@ -198,10 +266,9 @@ export function coerceNormalizedBundle(rawBundle) {
     && !Array.isArray(rawBundle)
     && Array.isArray(rawBundle.dimensions)
     && Array.isArray(rawBundle.keyframes)
-    && Array.isArray(rawBundle.timelineSlots)
+    && Array.isArray(rawBundle.segments)
     && Number(rawBundle.totalFrames ?? 0) > 0
-    && Number(rawBundle.durationSeconds ?? 0) > 0
-    && Number(rawBundle.secondsPerKeyframe ?? 0) > 0
+    && Number(rawBundle.durationSeconds ?? 0) >= 0
     && rawBundle.dimensions.every((dimension) => dimension?.direction && typeof dimension.direction.clone === 'function')
   ) {
     return rawBundle;
@@ -224,6 +291,25 @@ export function buildEmotiveAnimationRenderPlan(rawBundle) {
     viewportWidth: bundle.viewportWidth,
     viewportHeight: bundle.viewportHeight,
   };
+}
+
+export function buildEmotiveAnimationCacheKey(rawBundle) {
+  const bundle = coerceNormalizedBundle(rawBundle);
+  if (!bundle) {
+    return '';
+  }
+  const dimensionSignature = bundle.dimensions.map((dimension) => [
+    dimension.id,
+    dimension.direction.x.toFixed(6),
+    dimension.direction.y.toFixed(6),
+    dimension.direction.z.toFixed(6),
+  ].join(':')).join('|');
+  return [
+    bundle.viewportWidth,
+    bundle.viewportHeight,
+    bundle.dimensions.length,
+    dimensionSignature,
+  ].join('::');
 }
 
 export function supportedAnchorRadiusForMagnitude(magnitude) {
@@ -289,6 +375,9 @@ export function prependEmotiveAnimationStartMoment(rawBundle, startMoment) {
         Math.max(0, bundle.generationStartBlockIndex - 1),
         Math.max(0, bundle.generationStartBlockIndex - 1),
       ],
+      startOffsetMs: 0,
+      endOffsetMs: 0,
+      holdDurationMs: 0,
       moment,
       dominantDimensions: [],
     },
@@ -297,16 +386,25 @@ export function prependEmotiveAnimationStartMoment(rawBundle, startMoment) {
       ordinal: index + 1,
     })),
   ];
-  const timelineSlots = [{ ...moment }, ...bundle.timelineSlots];
-  const rawKeyframeCount = bundle.rawKeyframeCount + 1;
-  const durationSeconds = bundle.secondsPerKeyframe * rawKeyframeCount;
+  const segments = keyframes.slice(0, -1).map((keyframe, index) => {
+    const next = keyframes[index + 1];
+    const startOffsetMs = Math.max(0, keyframe.endOffsetMs ?? 0);
+    const endOffsetMs = Math.max(startOffsetMs, next?.startOffsetMs ?? startOffsetMs);
+    return {
+      segmentIndex: index,
+      fromKeyframeOrdinal: keyframe.ordinal,
+      toKeyframeOrdinal: next?.ordinal ?? keyframe.ordinal,
+      startOffsetMs,
+      durationMs: endOffsetMs - startOffsetMs,
+      endOffsetMs,
+    };
+  });
   return {
     ...bundle,
-    rawKeyframeCount,
+    rawKeyframeCount: bundle.rawKeyframeCount + 1,
     distinctKeyframeCount: keyframes.length,
-    durationSeconds,
-    totalFrames: Math.max(1, Math.round(durationSeconds * bundle.fps)),
-    timelineSlots,
+    totalFrames: Math.max(1, Math.ceil(bundle.durationSeconds * bundle.fps)),
+    segments,
     keyframes,
   };
 }
@@ -316,21 +414,51 @@ export function computeFrameState(bundle, frameIndex) {
   const t = bundle.totalFrames <= 1
     ? 0
     : (frameIndex / Math.max(1, bundle.totalFrames - 1)) * duration;
-  const segmentIndex = Math.min(
-    bundle.timelineSlots.length - 1,
-    Math.max(0, Math.floor(t / bundle.secondsPerKeyframe)),
-  );
-  const nextSegmentIndex = Math.min(bundle.timelineSlots.length - 1, segmentIndex + 1);
-  const segmentStart = segmentIndex * bundle.secondsPerKeyframe;
-  const localAlpha = nextSegmentIndex === segmentIndex
-    ? 0
-    : easeInOutSine((t - segmentStart) / bundle.secondsPerKeyframe);
+  const tMs = t * 1000;
 
   const magnitudes = {};
+  const firstKeyframe = bundle.keyframes[0] ?? null;
+  const lastKeyframe = bundle.keyframes[bundle.keyframes.length - 1] ?? null;
+  let currentMoment = firstKeyframe?.moment ?? {};
+  let nextMoment = currentMoment;
+  let alpha = 0;
+
+  if (bundle.keyframes.length > 1) {
+    let resolved = false;
+    for (let index = 0; index < bundle.keyframes.length; index += 1) {
+      const currentKeyframe = bundle.keyframes[index];
+      const followingKeyframe = bundle.keyframes[index + 1] ?? null;
+      if (!followingKeyframe || tMs <= currentKeyframe.endOffsetMs) {
+        currentMoment = currentKeyframe.moment;
+        nextMoment = currentMoment;
+        alpha = 0;
+        resolved = true;
+        break;
+      }
+
+      const transitionStartMs = Math.max(0, currentKeyframe.endOffsetMs);
+      const transitionEndMs = Math.max(transitionStartMs, followingKeyframe.startOffsetMs);
+      if (tMs <= transitionEndMs) {
+        currentMoment = currentKeyframe.moment;
+        nextMoment = followingKeyframe.moment;
+        alpha = transitionEndMs <= transitionStartMs
+          ? 1
+          : easeInOutSine((tMs - transitionStartMs) / Math.max(1, transitionEndMs - transitionStartMs));
+        resolved = true;
+        break;
+      }
+    }
+    if (!resolved) {
+      currentMoment = lastKeyframe?.moment ?? currentMoment;
+      nextMoment = currentMoment;
+      alpha = 0;
+    }
+  }
+
   for (const dimension of bundle.dimensions) {
-    const current = bundle.timelineSlots[segmentIndex]?.[dimension.id] ?? 0;
-    const next = bundle.timelineSlots[nextSegmentIndex]?.[dimension.id] ?? current;
-    magnitudes[dimension.id] = lerp(current, next, localAlpha);
+    const current = currentMoment?.[dimension.id] ?? 0;
+    const next = nextMoment?.[dimension.id] ?? current;
+    magnitudes[dimension.id] = lerp(current, next, alpha);
   }
 
   return {

@@ -16,7 +16,7 @@ from policy_dataset import append_transitions
 from policy_training_contract import build_training_corpus, build_training_record
 
 
-def make_transition(token_budget_bucket: int = 512) -> dict:
+def make_transition(response_budget_bucket: int = 1024, reasoning_budget_bucket: int = 1024) -> dict:
     return {
         "transition_id": "tr-1",
         "request_id": "req-1",
@@ -26,6 +26,8 @@ def make_transition(token_budget_bucket: int = 512) -> dict:
         "action_mask": {
             "allowed_modes": ["direct"],
             "allowed_reasoning_depths": ["short"],
+            "allowed_response_budget_buckets": [256, 512, 1024],
+            "allowed_reasoning_budget_buckets": [0, 64, 1024],
             "max_tool_parallelism_cap": 0,
             "allow_interrupt": False,
             "allow_replan": False,
@@ -35,7 +37,9 @@ def make_transition(token_budget_bucket: int = 512) -> dict:
         "executed_action": {
             "selected_mode": "direct",
             "reasoning_depth": "short",
-            "token_budget_bucket": token_budget_bucket,
+            "response_budget_bucket": response_budget_bucket,
+            "token_budget_bucket": response_budget_bucket,
+            "reasoning_budget_bucket": reasoning_budget_bucket,
             "tool_parallelism_cap": 0,
             "interrupt_allowed": False,
             "replan_required": False,
@@ -70,17 +74,19 @@ def test_build_training_corpus_writes_records(tmp_path: Path):
     assert rows[0]["targets"]["selected_mode_index"] == 0
     assert rows[0]["targets"]["thinking_mode_index"] == 0
     assert rows[0]["targets"]["prefix_profile_index"] == 0
-    assert rows[0]["targets"]["token_budget_bucket_index"] == 1
+    assert rows[0]["targets"]["response_budget_bucket_index"] == 2
+    assert rows[0]["targets"]["reasoning_budget_bucket_index"] == 5
+    assert rows[0]["targets"]["token_budget_bucket_index"] == 2
 
 
 def test_build_training_record_rejects_invalid_bucket():
     dataset_row = {
         "export_key": "tr-1|req-1|dec-1|1700000000000",
-        "transition": make_transition(token_budget_bucket=999),
+        "transition": make_transition(response_budget_bucket=999),
     }
     try:
         build_training_record("vicuna-local-v1", dataset_row)
     except ValueError as exc:
-        assert "unsupported token_budget_bucket" in str(exc)
+        assert "unsupported response_budget_bucket" in str(exc)
     else:
         raise AssertionError("expected invalid token budget bucket to fail")

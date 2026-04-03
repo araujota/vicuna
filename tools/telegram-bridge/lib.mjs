@@ -3,12 +3,13 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 export const DEFAULT_STATE = {
-  schemaVersion: 3,
+  schemaVersion: 5,
   telegramOffset: 0,
   telegramOutboxOffset: 0,
   telegramOutboxCheckpointInitialized: false,
   telegramOutboxDeliveryReceipt: null,
   telegramEmotiveAnimationState: {},
+  pendingVideoDeliveries: {},
   chatIds: [],
   proactiveResponseIds: [],
   nextConversationOrdinal: 1,
@@ -21,13 +22,17 @@ export const DEFAULT_MAX_HISTORY_MESSAGES = 12;
 export const DEFAULT_MAX_DOCUMENT_CHARS = 12000;
 export const DEFAULT_MAX_DOCUMENT_CHUNKS = 128;
 export const DEFAULT_MAX_PENDING_OPTION_PROMPTS = 32;
+export const DEFAULT_MAX_PENDING_VIDEO_DELIVERIES = 32;
 export const DEFAULT_MAX_CONVERSATION_MESSAGE_LINKS = 64;
 export const DEFAULT_PROVIDER_MAX_TOKENS = 256;
-export const TELEGRAM_BRIDGE_STATE_SCHEMA_VERSION = 3;
+export const DEFAULT_TELEGRAM_BRIDGE_REQUEST_TIMEOUT_MS = 1800000;
+export const TELEGRAM_BRIDGE_STATE_SCHEMA_VERSION = 5;
 export const TELEGRAM_BRIDGE_ASK_OUTBOX_POLL_IDLE_MS = 200;
 export const TELEGRAM_BRIDGE_SELF_EMIT_ACTIVE_DELAY_MS = 250;
 export const TELEGRAM_BRIDGE_SELF_EMIT_ERROR_DELAY_MS = 250;
 export const TELEGRAM_BRIDGE_WATCHDOG_DELAY_MS = 1000;
+export const TELEGRAM_MESSAGE_TEXT_LIMIT = 4096;
+export const TELEGRAM_MESSAGE_SAFE_RENDERED_LIMIT = 4000;
 export const TELEGRAM_VIDEO_CAPTION_LIMIT = 1024;
 export const TELEGRAM_RELAY_ALLOWED_METHODS = [
   'sendMessage',
@@ -53,13 +58,42 @@ export function buildTelegramChatCompletionRequest({
   temperature = 0.2,
 }) {
   const messages = Array.isArray(transcript) ? structuredClone(transcript) : [];
+  const tokenCap = Math.max(32, parseInteger(maxTokens, DEFAULT_PROVIDER_MAX_TOKENS));
   const payload = {
     model: String(model ?? '').trim(),
     temperature,
     messages,
   };
-  payload.max_tokens = DEFAULT_PROVIDER_MAX_TOKENS;
+  payload.max_tokens = tokenCap;
   return payload;
+}
+
+export function buildTelegramBridgeRequestTimeoutMs(timeoutMs) {
+  const configured = parseInteger(timeoutMs, DEFAULT_TELEGRAM_BRIDGE_REQUEST_TIMEOUT_MS);
+  return Math.max(1000, configured);
+}
+
+export function shouldSuppressDeferredTelegramFailureMessage({
+  classification = '',
+  latestTraceEvent = '',
+} = {}) {
+  const normalizedClassification = String(classification ?? '').trim().toLowerCase();
+  if (normalizedClassification !== 'transport' && normalizedClassification !== 'timeout') {
+    return false;
+  }
+  const normalizedEvent = String(latestTraceEvent ?? '').trim().toLowerCase();
+  if (!normalizedEvent) {
+    return false;
+  }
+  return [
+    'request_received',
+    'bridge_round_started',
+    'relay_started',
+    'relay_completed',
+    'bridge_round_completed_without_tool_call',
+    'telegram_outbox_enqueued',
+    'request_completed',
+  ].includes(normalizedEvent);
 }
 
 export function hasQueuedTelegramDelivery(body) {
@@ -183,6 +217,47 @@ function decodeBasicHtmlEntities(text) {
     .replaceAll('&amp;', '&');
 }
 
+function closeTelegramSupportedHtmlTag(tagName) {
+  return `</${String(tagName ?? '').trim().toLowerCase()}>`;
+}
+
+function balanceTelegramSupportedHtml(text) {
+  const source = String(text ?? '');
+  const tokenPattern = /<(\/)?(b|i|u|s|code|pre|blockquote|tg-spoiler|a)(?:\s+[^>]*)?>/gi;
+  const balancedParts = [];
+  const openTags = [];
+  let lastIndex = 0;
+  let match;
+  while ((match = tokenPattern.exec(source)) !== null) {
+    balancedParts.push(source.slice(lastIndex, match.index));
+    lastIndex = match.index + match[0].length;
+    const isClosingTag = Boolean(match[1]);
+    const tagName = String(match[2] ?? '').trim().toLowerCase();
+    if (!tagName) {
+      continue;
+    }
+    if (!isClosingTag) {
+      balancedParts.push(match[0]);
+      openTags.push(tagName);
+      continue;
+    }
+    const matchingIndex = openTags.lastIndexOf(tagName);
+    if (matchingIndex === -1) {
+      continue;
+    }
+    while (openTags.length - 1 > matchingIndex) {
+      balancedParts.push(closeTelegramSupportedHtmlTag(openTags.pop()));
+    }
+    balancedParts.push(match[0]);
+    openTags.pop();
+  }
+  balancedParts.push(source.slice(lastIndex));
+  while (openTags.length > 0) {
+    balancedParts.push(closeTelegramSupportedHtmlTag(openTags.pop()));
+  }
+  return balancedParts.join('');
+}
+
 function normalizeTelegramHtmlishToSupportedHtml(text) {
   const protectedTags = [];
   const protect = (value) => {
@@ -193,7 +268,8 @@ function normalizeTelegramHtmlishToSupportedHtml(text) {
 
   let html = decodeBasicHtmlEntities(text)
     .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
+    .replace(/\r/g, '\n');
+  html = rewriteHtmlTablesForTelegramHtml(html)
     .replace(/<\s*span\s+class=(["'])tg-spoiler\1\s*>([\s\S]*?)<\s*\/span\s*>/gi, '<tg-spoiler>$2</tg-spoiler>')
     .replace(/<\s*br\s*\/?\s*>/gi, '\n')
     .replace(/<\s*\/p\s*>/gi, '\n\n')
@@ -239,6 +315,7 @@ function normalizeTelegramHtmlishToSupportedHtml(text) {
   for (const [index, tag] of protectedTags.entries()) {
     html = html.replaceAll(`__VICUNA_TG_HTML_${index}__`, tag);
   }
+  html = balanceTelegramSupportedHtml(html);
   return html
     .replace(/\n{3,}/g, '\n\n')
     .replace(/[ \t]+\n/g, '\n')
@@ -355,19 +432,157 @@ function markdownTableCellToPlainText(cell) {
   return stripTelegramHtmlTags(convertMarkdownInlineToTelegramHtml(String(cell ?? '').trim()));
 }
 
-function renderMarkdownTableToTelegramHtml(headerCells, bodyRows) {
-  const plainRows = [headerCells, ...bodyRows].map((row) => row.map(markdownTableCellToPlainText));
-  const widths = plainRows[0].map((_, index) => (
-    plainRows.reduce((maxWidth, row) => Math.max(maxWidth, String(row[index] ?? '').length), 0)
-  ));
-  const border = `+${widths.map((width) => '-'.repeat(width + 2)).join('+')}+`;
-  const renderRow = (row) => `| ${row.map((cell, index) => String(cell ?? '').padEnd(widths[index], ' ')).join(' | ')} |`;
-  const lines = [border, renderRow(plainRows[0]), border];
-  for (const row of plainRows.slice(1)) {
-    lines.push(renderRow(row));
+function normalizeTelegramTablePlainText(text) {
+  return String(text ?? '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function renderMarkdownTableToTelegramNarrativeSource(headerCells, bodyRows) {
+  const labels = headerCells
+    .map(markdownTableCellToPlainText)
+    .map((value) => String(value ?? '').trim())
+    .map((value, index) => value || `Column ${index + 1}`);
+  if (!Array.isArray(bodyRows) || bodyRows.length <= 0) {
+    return `**Columns:** ${labels.join(', ')}`;
   }
-  lines.push(border);
-  return `<pre>${telegramHtmlEscape(lines.join('\n'))}</pre>`;
+
+  const blocks = bodyRows.map((row) => {
+    const values = Array.isArray(row)
+      ? row.map((value) => String(value ?? '').trim())
+      : [];
+    const lines = [];
+    const primaryLabel = labels[0] || 'Item';
+    const primaryValue = values[0] || '';
+    if (primaryValue) {
+      lines.push(`• **${primaryLabel}:** ${primaryValue}`);
+    } else {
+      lines.push(`• **${primaryLabel}**`);
+    }
+    for (let index = 1; index < labels.length; index += 1) {
+      const value = values[index] || '';
+      if (!value) {
+        continue;
+      }
+      lines.push(`  **${labels[index]}:** ${value}`);
+    }
+    return lines.join('\n');
+  });
+  return blocks.join('\n\n');
+}
+
+function renderMarkdownTableToTelegramHtml(headerCells, bodyRows) {
+  return convertMarkdownishToTelegramHtml(
+    renderMarkdownTableToTelegramNarrativeSource(headerCells, bodyRows),
+  );
+}
+
+function htmlTableCellToPlainText(cellHtml) {
+  return normalizeTelegramTablePlainText(
+    decodeBasicHtmlEntities(cellHtml)
+      .replace(/<\s*br\s*\/?\s*>/gi, '\n')
+      .replace(/<\s*\/p\s*>/gi, '\n\n')
+      .replace(/<\s*p(?:\s[^>]*)?>/gi, '')
+      .replace(/<\s*\/div\s*>/gi, '\n')
+      .replace(/<\s*div(?:\s[^>]*)?>/gi, '')
+      .replace(/<\s*li(?:\s[^>]*)?>/gi, '• ')
+      .replace(/<\s*\/li\s*>/gi, '\n')
+      .replace(/<\s*\/(?:ul|ol)\s*>/gi, '\n')
+      .replace(/<\s*(?:ul|ol)(?:\s[^>]*)?>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/[ \t]{2,}/g, ' '),
+  );
+}
+
+function renderHtmlTableToTelegramNarrativeHtml(tableHtml) {
+  const rowMatches = [...String(tableHtml ?? '').matchAll(/<\s*tr\b[^>]*>([\s\S]*?)<\s*\/tr\s*>/gi)];
+  if (rowMatches.length === 0) {
+    return convertMarkdownishToTelegramHtml(htmlTableCellToPlainText(tableHtml));
+  }
+
+  let headerCells = null;
+  const bodyRows = [];
+  let inferredColumnCount = 0;
+  for (const rowMatch of rowMatches) {
+    const rowInner = String(rowMatch[1] ?? '');
+    const cells = [...rowInner.matchAll(/<\s*(th|td)\b[^>]*>([\s\S]*?)<\s*\/(?:th|td)\s*>/gi)];
+    if (cells.length === 0) {
+      continue;
+    }
+    const values = cells.map((cell) => htmlTableCellToPlainText(cell[2] ?? ''));
+    inferredColumnCount = Math.max(inferredColumnCount, values.length);
+    const hasHeaderTag = cells.some((cell) => String(cell[1] ?? '').toLowerCase() === 'th');
+    if (!headerCells && hasHeaderTag) {
+      headerCells = values;
+      continue;
+    }
+    bodyRows.push(values);
+  }
+
+  if (!headerCells) {
+    const width = Math.max(
+      inferredColumnCount,
+      ...bodyRows.map((row) => (Array.isArray(row) ? row.length : 0)),
+      1,
+    );
+    headerCells = Array.from({ length: width }, (_value, index) => `Column ${index + 1}`);
+  }
+
+  return convertMarkdownishToTelegramHtml(
+    renderMarkdownTableToTelegramNarrativeSource(headerCells, bodyRows),
+  );
+}
+
+function rewriteHtmlTablesForTelegramHtml(text) {
+  return String(text ?? '').replace(/<\s*table\b[^>]*>[\s\S]*?<\s*\/table\s*>/gi, (match) => (
+    renderHtmlTableToTelegramNarrativeHtml(match)
+  ));
+}
+
+function rewriteMarkdownTablesForTelegramSource(markdown) {
+  const outputLines = [];
+  const lines = String(markdown ?? '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (trimmed.startsWith('```')) {
+      outputLines.push(line);
+      let closed = false;
+      for (index += 1; index < lines.length; index += 1) {
+        outputLines.push(lines[index]);
+        if (lines[index].trim().startsWith('```')) {
+          closed = true;
+          break;
+        }
+      }
+      if (!closed) {
+        break;
+      }
+      continue;
+    }
+
+    const tableHeaderCells = parseMarkdownTableCells(line);
+    if (tableHeaderCells.length >= 2 && index + 1 < lines.length && isMarkdownTableSeparatorRow(lines[index + 1])) {
+      const bodyRows = [];
+      index += 1;
+      while (index + 1 < lines.length) {
+        const nextCells = parseMarkdownTableCells(lines[index + 1]);
+        if (nextCells.length !== tableHeaderCells.length || isMarkdownTableSeparatorRow(lines[index + 1])) {
+          break;
+        }
+        bodyRows.push(nextCells);
+        index += 1;
+      }
+      outputLines.push(...renderMarkdownTableToTelegramNarrativeSource(tableHeaderCells, bodyRows).split('\n'));
+      continue;
+    }
+
+    outputLines.push(line);
+  }
+  return outputLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function convertMarkdownishToTelegramHtml(markdown) {
@@ -483,6 +698,126 @@ function getTelegramTextFieldForMethod(method) {
   return '';
 }
 
+function normalizeTelegramChunkCandidate({ telegramPayload, text = '' } = {}) {
+  const normalized = normalizeTelegramRichTextPayload({
+    telegramMethod: 'sendMessage',
+    telegramPayload,
+    text,
+  });
+  return {
+    sourceText: normalized.sourceText,
+    payload: normalized.payload,
+    textLength: normalized.textLength,
+    renderedLength: String(normalized.payload?.text ?? normalized.renderedText ?? '').length,
+    normalized: normalized.normalized,
+  };
+}
+
+function telegramChunkFitsLimits(candidate, options = {}) {
+  const visibleLimit = Math.max(1, Number(options.visibleLimit ?? TELEGRAM_MESSAGE_TEXT_LIMIT) || TELEGRAM_MESSAGE_TEXT_LIMIT);
+  const renderedLimit = Math.max(1, Number(options.renderedLimit ?? TELEGRAM_MESSAGE_SAFE_RENDERED_LIMIT) || TELEGRAM_MESSAGE_SAFE_RENDERED_LIMIT);
+  if (!candidate || typeof candidate !== 'object') {
+    return false;
+  }
+  return candidate.textLength > 0 &&
+    candidate.textLength <= visibleLimit &&
+    candidate.renderedLength > 0 &&
+    candidate.renderedLength <= renderedLimit;
+}
+
+function findPreferredTelegramChunkBreakIndex(sourceText, maxIndex) {
+  const searchText = String(sourceText ?? '').slice(0, Math.max(0, Number(maxIndex ?? 0) || 0));
+  if (!searchText) {
+    return 0;
+  }
+  const minimumPreferredIndex = Math.max(64, Math.floor(searchText.length * 0.5));
+  const patterns = [
+    /\n\s*\n/g,
+    /\n/g,
+    /[.!?](?:\s|$)/g,
+    /[;:](?:\s|$)/g,
+    /,(?:\s|$)/g,
+    /\s+/g,
+  ];
+  for (const pattern of patterns) {
+    let match;
+    let bestIndex = 0;
+    while ((match = pattern.exec(searchText)) !== null) {
+      const matchIndex = match.index + match[0].length;
+      if (matchIndex >= minimumPreferredIndex) {
+        bestIndex = matchIndex;
+      }
+    }
+    if (bestIndex > 0) {
+      return bestIndex;
+    }
+  }
+  return 0;
+}
+
+function findLargestTelegramChunkPrefix(sourceText, basePayload, options = {}) {
+  const visibleLimit = Math.max(1, Number(options.visibleLimit ?? TELEGRAM_MESSAGE_TEXT_LIMIT) || TELEGRAM_MESSAGE_TEXT_LIMIT);
+  const renderedLimit = Math.max(1, Number(options.renderedLimit ?? TELEGRAM_MESSAGE_SAFE_RENDERED_LIMIT) || TELEGRAM_MESSAGE_SAFE_RENDERED_LIMIT);
+  const source = String(sourceText ?? '').trim();
+  if (!source) {
+    return null;
+  }
+
+  let low = 1;
+  let high = source.length;
+  let bestCandidate = null;
+  let bestIndex = 0;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidateSource = source.slice(0, middle).trimEnd();
+    if (!candidateSource) {
+      low = middle + 1;
+      continue;
+    }
+    const candidate = normalizeTelegramChunkCandidate({
+      telegramPayload: {
+        ...cloneJsonValue(basePayload),
+        text: candidateSource,
+      },
+      text: candidateSource,
+    });
+    if (telegramChunkFitsLimits(candidate, { visibleLimit, renderedLimit })) {
+      bestCandidate = candidate;
+      bestIndex = candidateSource.length;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+
+  if (!bestCandidate || bestIndex <= 0) {
+    return null;
+  }
+
+  const preferredBreakIndex = findPreferredTelegramChunkBreakIndex(source, bestIndex);
+  if (preferredBreakIndex > 0 && preferredBreakIndex < bestIndex) {
+    const preferredSource = source.slice(0, preferredBreakIndex).trimEnd();
+    if (preferredSource) {
+      const preferredCandidate = normalizeTelegramChunkCandidate({
+        telegramPayload: {
+          ...cloneJsonValue(basePayload),
+          text: preferredSource,
+        },
+        text: preferredSource,
+      });
+      if (telegramChunkFitsLimits(preferredCandidate, { visibleLimit, renderedLimit })) {
+        bestCandidate = preferredCandidate;
+        bestIndex = preferredSource.length;
+      }
+    }
+  }
+
+  return {
+    chunk: bestCandidate,
+    remainder: source.slice(bestIndex).trimStart(),
+  };
+}
+
 export function normalizeTelegramRichTextPayload({
   telegramMethod,
   telegramPayload,
@@ -494,11 +829,13 @@ export function normalizeTelegramRichTextPayload({
   const payload = telegramPayload && typeof telegramPayload === 'object' && !Array.isArray(telegramPayload)
     ? cloneJsonValue(telegramPayload)
     : {};
-  const sourceText = sanitizeAssistantRelayText(String(
-    (typeof text === 'string' && text.trim())
-      ? text
-      : (typeof payload?.[targetField] === 'string' ? payload[targetField] : ''),
-  )).trim();
+  const sourceText = rewriteHtmlTablesForTelegramHtml(
+    rewriteMarkdownTablesForTelegramSource(sanitizeAssistantRelayText(String(
+      (typeof text === 'string' && text.trim())
+        ? text
+        : (typeof payload?.[targetField] === 'string' ? payload[targetField] : ''),
+    ))),
+  ).trim();
 
   if (!targetField || !sourceText) {
     return {
@@ -544,6 +881,102 @@ export function normalizeTelegramRichTextPayload({
     renderedText,
     textLength: stripTelegramHtmlTags(renderedText).length,
     normalized: renderedText !== sourceText || parseMode.toUpperCase() !== 'HTML',
+  };
+}
+
+export function buildTelegramPlainTextFallbackPayload({
+  telegramMethod,
+  telegramPayload,
+  text = '',
+  field = '',
+} = {}) {
+  const normalized = normalizeTelegramRichTextPayload({
+    telegramMethod,
+    telegramPayload,
+    text,
+    field,
+  });
+  const payload = normalized.payload && typeof normalized.payload === 'object' && !Array.isArray(normalized.payload)
+    ? cloneJsonValue(normalized.payload)
+    : {};
+  const targetField = normalized.field || getTelegramTextFieldForMethod(normalized.method);
+  if (!targetField) {
+    return {
+      payload,
+      method: normalized.method,
+      field: targetField,
+      text: '',
+    };
+  }
+  const plainText = stripTelegramHtmlTags(
+    String(payload?.[targetField] ?? normalized.renderedText ?? normalized.sourceText ?? ''),
+  ).trim();
+  payload[targetField] = plainText;
+  delete payload.parse_mode;
+  if (targetField === 'text') {
+    delete payload.entities;
+  } else {
+    delete payload.caption_entities;
+  }
+  return {
+    payload,
+    method: normalized.method,
+    field: targetField,
+    text: plainText,
+  };
+}
+
+export function buildTelegramMessageChunkPlan({
+  telegramPayload,
+  text = '',
+  visibleLimit = TELEGRAM_MESSAGE_TEXT_LIMIT,
+  renderedLimit = TELEGRAM_MESSAGE_SAFE_RENDERED_LIMIT,
+} = {}) {
+  const basePayload = telegramPayload && typeof telegramPayload === 'object' && !Array.isArray(telegramPayload)
+    ? cloneJsonValue(telegramPayload)
+    : {};
+  const initialCandidate = normalizeTelegramChunkCandidate({
+    telegramPayload: basePayload,
+    text,
+  });
+  const sourceText = initialCandidate.sourceText;
+  if (!sourceText) {
+    return {
+      sourceText: '',
+      chunks: [],
+      chunkCount: 0,
+    };
+  }
+
+  if (telegramChunkFitsLimits(initialCandidate, { visibleLimit, renderedLimit })) {
+    return {
+      sourceText,
+      chunks: [initialCandidate],
+      chunkCount: 1,
+    };
+  }
+
+  const chunks = [];
+  let remainder = sourceText;
+  while (remainder) {
+    const nextChunk = findLargestTelegramChunkPrefix(remainder, basePayload, {
+      visibleLimit,
+      renderedLimit,
+    });
+    if (!nextChunk?.chunk?.sourceText) {
+      throw new Error('Unable to split Telegram message into a safe chunk.');
+    }
+    chunks.push(nextChunk.chunk);
+    if (nextChunk.remainder === remainder) {
+      throw new Error('Telegram message chunk planner did not make forward progress.');
+    }
+    remainder = nextChunk.remainder;
+  }
+
+  return {
+    sourceText,
+    chunks,
+    chunkCount: chunks.length,
   };
 }
 
@@ -649,58 +1082,32 @@ export function buildTelegramAnimationDeliveryPlan({
     telegramPayload,
     text: sourceText,
   });
-  const spoilerVideoPayload = buildTelegramSpoilerVideoPayload({
-    telegramMethod: method,
-    telegramPayload,
-    text: sourceText,
-  });
-
-  if (spoilerVideoPayload.ok) {
-    return {
-      ok: true,
-      strategy: 'primary_spoiler_video',
-      messagePayload: normalizedMessagePayload.payload,
-      videoPayload: spoilerVideoPayload.payload,
-      captionLength: spoilerVideoPayload.captionLength,
-      captionLimit: TELEGRAM_VIDEO_CAPTION_LIMIT,
-    };
-  }
-
-  if (spoilerVideoPayload.reason === 'caption_too_long') {
-    const followupVideoPayload = {
-      has_spoiler: true,
-      supports_streaming: true,
-    };
-    const passthroughKeys = [
-      'business_connection_id',
-      'message_thread_id',
-      'direct_messages_topic_id',
-      'disable_notification',
-      'protect_content',
-      'allow_paid_broadcast',
-      'suggested_post_parameters',
-      'message_effect_id',
-    ];
-    for (const key of passthroughKeys) {
-      if (Object.prototype.hasOwnProperty.call(normalizedMessagePayload.payload, key)) {
-        followupVideoPayload[key] = cloneJsonValue(normalizedMessagePayload.payload[key]);
-      }
+  const followupVideoPayload = {
+    has_spoiler: true,
+    supports_streaming: true,
+  };
+  const passthroughKeys = [
+    'business_connection_id',
+    'message_thread_id',
+    'direct_messages_topic_id',
+    'disable_notification',
+    'protect_content',
+    'allow_paid_broadcast',
+    'suggested_post_parameters',
+    'message_effect_id',
+  ];
+  for (const key of passthroughKeys) {
+    if (Object.prototype.hasOwnProperty.call(normalizedMessagePayload.payload, key)) {
+      followupVideoPayload[key] = cloneJsonValue(normalizedMessagePayload.payload[key]);
     }
-    return {
-      ok: true,
-      strategy: 'split_text_and_video',
-      messagePayload: normalizedMessagePayload.payload,
-      videoPayload: followupVideoPayload,
-      captionLength: spoilerVideoPayload.captionLength,
-      captionLimit: spoilerVideoPayload.captionLimit,
-    };
   }
-
   return {
-    ok: false,
-    reason: spoilerVideoPayload.reason,
-    method,
+    ok: true,
+    strategy: 'split_text_and_video',
     messagePayload: normalizedMessagePayload.payload,
+    videoPayload: followupVideoPayload,
+    captionLength: 0,
+    captionLimit: TELEGRAM_VIDEO_CAPTION_LIMIT,
   };
 }
 
@@ -1399,23 +1806,39 @@ function normalizeTelegramOutboxDeliveryReceipt(raw) {
   const chatId = String(raw.chatId ?? '').trim();
   const replyToMessageId = Math.max(0, Number(raw.replyToMessageId ?? 0) || 0);
   const telegramMessageId = Math.max(0, Number(raw.telegramMessageId ?? 0) || 0);
+  const telegramMessageIds = Array.isArray(raw.telegramMessageIds)
+    ? raw.telegramMessageIds
+      .map((value) => Math.max(0, Number(value ?? 0) || 0))
+      .filter((value, index, list) => value > 0 && list.indexOf(value) === index)
+    : [];
   const deliveredAtMs = Math.max(0, Number(raw.deliveredAtMs ?? 0) || 0);
   const deliveryModeRaw = String(raw.deliveryMode ?? '').trim().toLowerCase();
-  const deliveryMode = deliveryModeRaw === 'fallback_no_reply'
-    ? 'fallback_no_reply'
-    : deliveryModeRaw === 'reply'
-      ? 'reply'
-      : '';
+  const deliveryMode = [
+    'reply',
+    'no_reply',
+    'fallback_no_reply',
+    'chunked_reply',
+    'chunked_no_reply',
+    'chunked_fallback_no_reply',
+  ].includes(deliveryModeRaw)
+    ? deliveryModeRaw
+    : '';
   const animation = normalizeTelegramOutboxDeliveryAnimation(raw.animation);
   if (sequenceNumber <= 0 || !chatId || telegramMessageId <= 0 || !deliveryMode) {
     return null;
   }
+  const normalizedMessageIds = telegramMessageIds.length > 0 ? telegramMessageIds : [telegramMessageId];
+  const chunkCount = Math.max(1, Number(raw.chunkCount ?? 0) || 0, normalizedMessageIds.length);
   return {
     sequenceNumber,
     chatId,
     replyToMessageId,
     deliveryMode,
     telegramMessageId,
+    ...(chunkCount > 1 ? {
+      telegramMessageIds: normalizedMessageIds,
+      chunkCount,
+    } : {}),
     deliveredAtMs,
     ...(animation ? { animation } : {}),
   };
@@ -1431,8 +1854,8 @@ function normalizeTelegramOutboxDeliveryAnimation(raw) {
   const requested = Boolean(raw.requested);
   const status = String(raw.status ?? '').trim().toLowerCase();
   const stage = String(raw.stage ?? '').trim().toLowerCase();
-  const normalizedStatus = ['sent', 'skipped', 'failed'].includes(status) ? status : '';
-  const normalizedStage = ['not_requested', 'render', 'encode', 'upload', 'complete'].includes(stage) ? stage : '';
+  const normalizedStatus = ['queued', 'sent', 'skipped', 'failed'].includes(status) ? status : '';
+  const normalizedStage = ['queued', 'not_requested', 'render', 'encode', 'upload', 'complete'].includes(stage) ? stage : '';
   if (!normalizedStatus || !normalizedStage) {
     return null;
   }
@@ -1452,6 +1875,75 @@ function normalizeTelegramOutboxDeliveryAnimation(raw) {
     animation.failureReason = failureReason;
   }
   return animation;
+}
+
+function normalizeTelegramPendingVideoDelivery(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+  const jobId = String(raw.jobId ?? '').trim();
+  const chatId = String(raw.chatId ?? '').trim();
+  const conversationId = String(raw.conversationId ?? '').trim();
+  const sequenceNumber = Math.max(0, Number(raw.sequenceNumber ?? 0) || 0);
+  const replyToMessageId = Math.max(0, Number(raw.replyToMessageId ?? 0) || 0);
+  const textTelegramMessageId = Math.max(0, Number(raw.textTelegramMessageId ?? 0) || 0);
+  const telegramMessageIds = Array.isArray(raw.telegramMessageIds)
+    ? raw.telegramMessageIds
+      .map((value) => Math.max(0, Number(value ?? 0) || 0))
+      .filter((value, index, list) => value > 0 && list.indexOf(value) === index)
+    : [];
+  const deliveryModeRaw = String(raw.deliveryMode ?? '').trim().toLowerCase();
+  const deliveryMode = [
+    'reply',
+    'no_reply',
+    'fallback_no_reply',
+    'chunked_reply',
+    'chunked_no_reply',
+    'chunked_fallback_no_reply',
+  ].includes(deliveryModeRaw)
+    ? deliveryModeRaw
+    : '';
+  const chunkCount = Math.max(1, Number(raw.chunkCount ?? 0) || 0, telegramMessageIds.length || 1);
+  const attemptCount = Math.max(0, Number(raw.attemptCount ?? 0) || 0);
+  const nextAttemptAtMs = Math.max(0, Number(raw.nextAttemptAtMs ?? 0) || 0);
+  const createdAtMs = Math.max(0, Number(raw.createdAtMs ?? 0) || 0);
+  const updatedAtMs = Math.max(0, Number(raw.updatedAtMs ?? 0) || 0);
+  const artifactReadyAtMs = Math.max(0, Number(raw.artifactReadyAtMs ?? 0) || 0);
+  const lastError = String(raw.lastError ?? '').trim();
+  const stageRaw = String(raw.stage ?? '').trim().toLowerCase();
+  const stage = ['queued', 'render', 'upload', 'complete', 'failed'].includes(stageRaw)
+    ? stageRaw
+    : 'queued';
+  const artifactPath = String(raw.artifactPath ?? '').trim();
+  const videoPayload = raw.videoPayload && typeof raw.videoPayload === 'object' && !Array.isArray(raw.videoPayload)
+    ? cloneJsonValue(raw.videoPayload)
+    : null;
+  const bundle = raw.bundle && typeof raw.bundle === 'object' && !Array.isArray(raw.bundle)
+    ? cloneJsonValue(raw.bundle)
+    : null;
+  if (!jobId || !chatId || !videoPayload || !bundle) {
+    return null;
+  }
+  return {
+    jobId,
+    chatId,
+    ...(conversationId ? { conversationId } : {}),
+    sequenceNumber,
+    replyToMessageId,
+    textTelegramMessageId,
+    ...(deliveryMode ? { deliveryMode } : {}),
+    ...(telegramMessageIds.length > 1 ? { telegramMessageIds, chunkCount } : {}),
+    videoPayload,
+    bundle,
+    attemptCount,
+    stage,
+    nextAttemptAtMs,
+    createdAtMs,
+    updatedAtMs,
+    ...(artifactPath ? { artifactPath } : {}),
+    ...(artifactReadyAtMs > 0 ? { artifactReadyAtMs } : {}),
+    ...(lastError ? { lastError } : {}),
+  };
 }
 
 function normalizeTelegramEmotiveMoment(raw) {
@@ -1501,14 +1993,39 @@ function normalizeTelegramEmotiveAnimationState(raw) {
   return normalized;
 }
 
+function normalizePendingVideoDeliveries(raw, maxPendingVideoDeliveries) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const normalizedEntries = [];
+  for (const value of Object.values(source)) {
+    const normalized = normalizeTelegramPendingVideoDelivery(value);
+    if (normalized) {
+      normalizedEntries.push([normalized.jobId, normalized]);
+    }
+  }
+  normalizedEntries.sort((lhs, rhs) => {
+    const left = lhs[1];
+    const right = rhs[1];
+    if (left.nextAttemptAtMs !== right.nextAttemptAtMs) {
+      return left.nextAttemptAtMs - right.nextAttemptAtMs;
+    }
+    if (left.createdAtMs !== right.createdAtMs) {
+      return left.createdAtMs - right.createdAtMs;
+    }
+    return left.jobId.localeCompare(right.jobId);
+  });
+  return Object.fromEntries(normalizedEntries.slice(-maxPendingVideoDeliveries));
+}
+
 export function normalizeState(raw, options = {}) {
   const state = raw && typeof raw === 'object' ? raw : {};
   const maxHistoryMessages = Math.max(1, parseInteger(options.maxHistoryMessages, DEFAULT_MAX_HISTORY_MESSAGES));
   const maxPendingPrompts = Math.max(1, parseInteger(options.maxPendingOptionPrompts, DEFAULT_MAX_PENDING_OPTION_PROMPTS));
+  const maxPendingVideoDeliveries = Math.max(1, parseInteger(options.maxPendingVideoDeliveries, DEFAULT_MAX_PENDING_VIDEO_DELIVERIES));
   const maxConversationMessageLinks = Math.max(1, parseInteger(options.maxConversationMessageLinks, DEFAULT_MAX_CONVERSATION_MESSAGE_LINKS));
   const chatSessions = normalizeChatSessions(state.chatSessions, maxHistoryMessages);
   const telegramOutboxDeliveryReceipt = normalizeTelegramOutboxDeliveryReceipt(state.telegramOutboxDeliveryReceipt);
   const telegramEmotiveAnimationState = normalizeTelegramEmotiveAnimationState(state.telegramEmotiveAnimationState);
+  const pendingVideoDeliveries = normalizePendingVideoDeliveries(state.pendingVideoDeliveries, maxPendingVideoDeliveries);
   const telegramOutboxOffset = Math.max(0, parseInteger(state.telegramOutboxOffset, 0));
   const checkpointInitialized = typeof state.telegramOutboxCheckpointInitialized === 'boolean'
     ? state.telegramOutboxCheckpointInitialized
@@ -1520,6 +2037,7 @@ export function normalizeState(raw, options = {}) {
     telegramOutboxCheckpointInitialized: checkpointInitialized,
     telegramOutboxDeliveryReceipt,
     telegramEmotiveAnimationState,
+    pendingVideoDeliveries,
     chatIds: uniqueStrings([...(state.chatIds ?? []), ...Object.keys(chatSessions)]),
     proactiveResponseIds: uniqueStrings(state.proactiveResponseIds).slice(-256),
     nextConversationOrdinal: Math.max(1, parseInteger(state.nextConversationOrdinal, 1)),
@@ -1558,6 +2076,81 @@ export function setTelegramEmotiveAnimationState(state, chatId, animationState, 
   return normalizeState({
     ...normalizedState,
     telegramEmotiveAnimationState: nextAnimationState,
+  }, options);
+}
+
+export function enqueueTelegramPendingVideoDelivery(state, delivery, options = {}) {
+  const normalizedState = normalizeState(state, options);
+  const normalizedDelivery = normalizeTelegramPendingVideoDelivery({
+    ...delivery,
+    attemptCount: Math.max(0, Number(delivery?.attemptCount ?? 0) || 0),
+    nextAttemptAtMs: Math.max(0, Number(delivery?.nextAttemptAtMs ?? Date.now()) || Date.now()),
+    createdAtMs: Math.max(0, Number(delivery?.createdAtMs ?? Date.now()) || Date.now()),
+    updatedAtMs: Math.max(0, Number(delivery?.updatedAtMs ?? Date.now()) || Date.now()),
+  });
+  if (!normalizedDelivery) {
+    return normalizedState;
+  }
+  return normalizeState({
+    ...normalizedState,
+    pendingVideoDeliveries: {
+      ...(normalizedState.pendingVideoDeliveries ?? {}),
+      [normalizedDelivery.jobId]: normalizedDelivery,
+    },
+  }, options);
+}
+
+export function getTelegramPendingVideoDelivery(state, jobId, options = {}) {
+  const normalizedState = normalizeState(state, options);
+  return normalizedState.pendingVideoDeliveries?.[String(jobId ?? '').trim()] ?? null;
+}
+
+export function listTelegramPendingVideoDeliveries(state, options = {}) {
+  const normalizedState = normalizeState(state, options);
+  return Object.values(normalizedState.pendingVideoDeliveries ?? {}).sort((lhs, rhs) => {
+    if (lhs.nextAttemptAtMs !== rhs.nextAttemptAtMs) {
+      return lhs.nextAttemptAtMs - rhs.nextAttemptAtMs;
+    }
+    if (lhs.createdAtMs !== rhs.createdAtMs) {
+      return lhs.createdAtMs - rhs.createdAtMs;
+    }
+    return lhs.jobId.localeCompare(rhs.jobId);
+  });
+}
+
+export function updateTelegramPendingVideoDelivery(state, jobId, patch, options = {}) {
+  const normalizedState = normalizeState(state, options);
+  const current = normalizedState.pendingVideoDeliveries?.[String(jobId ?? '').trim()];
+  if (!current) {
+    return normalizedState;
+  }
+  const next = normalizeTelegramPendingVideoDelivery({
+    ...current,
+    ...(patch && typeof patch === 'object' ? patch : {}),
+    jobId: current.jobId,
+    updatedAtMs: Math.max(0, Number(patch?.updatedAtMs ?? Date.now()) || Date.now()),
+  });
+  if (!next) {
+    return normalizedState;
+  }
+  return normalizeState({
+    ...normalizedState,
+    pendingVideoDeliveries: {
+      ...(normalizedState.pendingVideoDeliveries ?? {}),
+      [current.jobId]: next,
+    },
+  }, options);
+}
+
+export function deleteTelegramPendingVideoDelivery(state, jobId, options = {}) {
+  const normalizedState = normalizeState(state, options);
+  const nextDeliveries = {
+    ...(normalizedState.pendingVideoDeliveries ?? {}),
+  };
+  delete nextDeliveries[String(jobId ?? '').trim()];
+  return normalizeState({
+    ...normalizedState,
+    pendingVideoDeliveries: nextDeliveries,
   }, options);
 }
 

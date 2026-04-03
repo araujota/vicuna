@@ -64,6 +64,37 @@ export type ToolObservation = {
   observed_at_ms: number;
 };
 
+export type ToolCorrectnessStatus =
+  | "verified"
+  | "partially_verified"
+  | "unsupported"
+  | "failed"
+  | "unknown";
+
+export type ToolCorrectnessSource =
+  | "tool_native"
+  | "server_evaluator"
+  | "user_feedback"
+  | "unknown";
+
+export type ToolCorrectnessEvidence = {
+  kind: string;
+  label: string;
+  value_json: Record<string, unknown> | string | number | boolean | null;
+  weight?: number;
+};
+
+export type ToolCorrectnessSignal = {
+  schema_version: "tool_correctness_v1";
+  status: ToolCorrectnessStatus;
+  score: number;
+  confidence: number;
+  source: ToolCorrectnessSource;
+  evaluator_id: string;
+  summary: string;
+  evidence: ToolCorrectnessEvidence[];
+};
+
 function schemaNodeRequiresDescription(node: unknown, isRoot: boolean): boolean {
   if (isRoot || typeof node !== "object" || node === null || Array.isArray(node)) {
     return false;

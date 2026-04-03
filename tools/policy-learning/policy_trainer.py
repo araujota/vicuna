@@ -13,6 +13,7 @@ from policy_training_contract import (
     BOOLEAN_HEADS,
     PREFIX_PROFILE_VOCAB,
     REASONING_DEPTH_VOCAB,
+    REASONING_BUDGET_BUCKET_VOCAB,
     REPETITION_PROFILE_VOCAB,
     SAMPLING_PROFILE_VOCAB,
     SELECTED_MODE_VOCAB,
@@ -37,7 +38,6 @@ FEATURE_SCHEMA = [
     "available_tool_count_bucket",
     "parallel_tool_calls_requested",
     "input_message_count_bucket",
-    "ongoing_task_due_bucket",
     "vad_valence_bucket",
     "vad_arousal_bucket",
     "vad_dominance_bucket",
@@ -120,19 +120,6 @@ def _bucket_input_count(value: Any) -> str:
         return "two"
     return "many"
 
-
-def _bucket_due(value: Any) -> str:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return "unknown"
-    if number <= 0.0:
-        return "none"
-    if number < 0.5:
-        return "soon"
-    return "active"
-
-
 def extract_feature_values(observation: dict[str, Any]) -> dict[str, str]:
     vad = observation.get("vad") or {}
     heuristic_matched = bool(observation.get("heuristic_matched", False))
@@ -153,7 +140,6 @@ def extract_feature_values(observation: dict[str, Any]) -> dict[str, str]:
         "input_message_count_bucket": _bucket_input_count(
             observation.get("input_message_count", 0)
         ),
-        "ongoing_task_due_bucket": _bucket_due(observation.get("ongoing_task_due", 0.0)),
         "vad_valence_bucket": _bucket_signed(vad.get("valence")),
         "vad_arousal_bucket": _bucket_unit_interval(vad.get("arousal")),
         "vad_dominance_bucket": _bucket_unit_interval(vad.get("dominance")),
@@ -180,6 +166,8 @@ def _empty_head_counts() -> dict[str, dict[str, float]]:
         "sampling_profile": {},
         "repetition_profile": {},
         "tool_choice_profile": {},
+        "response_budget_bucket": {},
+        "reasoning_budget_bucket": {},
         "token_budget_bucket": {},
         "tool_parallelism_cap": {},
         **{head: {} for head in BOOLEAN_HEADS},
@@ -364,15 +352,26 @@ def predict_action_with_confidence(
         tool_choice_global_counts,
         preference_order=TOOL_CHOICE_PROFILE_VOCAB,
     )
-    token_bucket_counts, token_global_counts = _head_counts_for_signature(
-        artifact, feature_signature, "token_budget_bucket"
+    response_bucket_counts, response_global_counts = _head_counts_for_signature(
+        artifact, feature_signature, "response_budget_bucket"
     )
-    token_budget_bucket = int(
+    response_budget_bucket = int(
         _select_value(
-            list(TOKEN_BUDGET_BUCKET_VOCAB),
-            token_bucket_counts,
-            token_global_counts,
+            normalized_mask["allowed_response_budget_buckets"],
+            response_bucket_counts,
+            response_global_counts,
             preference_order=list(TOKEN_BUDGET_BUCKET_VOCAB),
+        )
+    )
+    reasoning_budget_counts, reasoning_budget_global_counts = _head_counts_for_signature(
+        artifact, feature_signature, "reasoning_budget_bucket"
+    )
+    reasoning_budget_bucket = int(
+        _select_value(
+            normalized_mask["allowed_reasoning_budget_buckets"],
+            reasoning_budget_counts,
+            reasoning_budget_global_counts,
+            preference_order=list(REASONING_BUDGET_BUCKET_VOCAB),
         )
     )
     parallelism_bucket_counts, parallelism_global_counts = _head_counts_for_signature(
@@ -451,12 +450,19 @@ def predict_action_with_confidence(
             tool_choice_global_counts,
             TOOL_CHOICE_PROFILE_VOCAB,
         ),
-        "token_budget_bucket": _confidence_for_value(
-            token_budget_bucket,
+        "response_budget_bucket": _confidence_for_value(
+            response_budget_bucket,
+            normalized_mask["allowed_response_budget_buckets"],
+            response_bucket_counts,
+            response_global_counts,
             list(TOKEN_BUDGET_BUCKET_VOCAB),
-            token_bucket_counts,
-            token_global_counts,
-            list(TOKEN_BUDGET_BUCKET_VOCAB),
+        ),
+        "reasoning_budget_bucket": _confidence_for_value(
+            reasoning_budget_bucket,
+            normalized_mask["allowed_reasoning_budget_buckets"],
+            reasoning_budget_counts,
+            reasoning_budget_global_counts,
+            list(REASONING_BUDGET_BUCKET_VOCAB),
         ),
         "tool_parallelism_cap": _confidence_for_value(
             tool_parallelism_cap,
@@ -498,7 +504,9 @@ def predict_action_with_confidence(
         "sampling_profile": sampling_profile,
         "repetition_profile": repetition_profile,
         "tool_choice_profile": tool_choice_profile,
-        "token_budget_bucket": token_budget_bucket,
+        "response_budget_bucket": response_budget_bucket,
+        "reasoning_budget_bucket": reasoning_budget_bucket,
+        "token_budget_bucket": response_budget_bucket,
         "tool_parallelism_cap": tool_parallelism_cap,
         **boolean_values,
         "proposal_source": "registry_artifact",
@@ -533,6 +541,8 @@ def _compare_action(candidate_action: dict[str, Any], targets: dict[str, Any]) -
         "sampling_profile",
         "repetition_profile",
         "tool_choice_profile",
+        "response_budget_bucket",
+        "reasoning_budget_bucket",
         "token_budget_bucket",
         "tool_parallelism_cap",
     ]
@@ -611,6 +621,8 @@ def train_policy(
             "sampling_profile",
             "repetition_profile",
             "tool_choice_profile",
+            "response_budget_bucket",
+            "reasoning_budget_bucket",
             "token_budget_bucket",
             "tool_parallelism_cap",
         ]:

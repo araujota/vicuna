@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/home/tyler-araujo/Projects/vicuna
-ExecStart=/home/tyler-araujo/Projects/vicuna/tools/ops/run-webgl-renderer.sh
+ExecStart=/home/tyler-araujo/Projects/vicuna/tools/ops/run-with-service-logs.sh webgl-renderer /home/tyler-araujo/Projects/vicuna/tools/ops/run-webgl-renderer.sh
 Restart=always
 RestartSec=2
 TimeoutStopSec=20

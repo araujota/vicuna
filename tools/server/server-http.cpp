@@ -12,10 +12,6 @@
 #include <thread>
 #include <unordered_set>
 
-// auto generated files (see README.md for details)
-#include "index.html.gz.hpp"
-#include "loading.html.hpp"
-
 //
 // HTTP implementation using cpp-httplib
 //
@@ -117,7 +113,7 @@ bool server_http_context::init(const server_runtime_params & params) {
     srv.reset(new httplib::Server());
 #endif
 
-    srv->set_default_headers({{"Server", "llama.cpp"}});
+    srv->set_default_headers({{"Server", "vicuna"}});
     srv->set_logger(log_server_request);
     srv->set_exception_handler([](const httplib::Request &, httplib::Response & res, const std::exception_ptr & ep) {
         // this is fail-safe; exceptions should already handled by `ex_wrapper`
@@ -254,26 +250,18 @@ bool server_http_context::init(const server_runtime_params & params) {
     auto middleware_server_state = [this, api_path_prefix = path_prefix](const httplib::Request & req, httplib::Response & res) {
         bool ready = is_ready.load();
         if (!ready) {
-            const std::string request_path = strip_path_prefix(req.path, api_path_prefix);
-            auto tmp = server_string_split(request_path, '.');
-            if (request_path == "/" || tmp.back() == "html") {
-                res.status = 503;
-                res.set_content(reinterpret_cast<const char*>(loading_html), loading_html_len, "text/html; charset=utf-8");
-            } else {
-                // no endpoints is allowed to be accessed when the server is not ready
-                // this is to prevent any data races or inconsistent states
-                res.status = 503;
-                res.set_content(
-                    safe_json_to_str(json {
-                        {"error", {
-                            {"message", "Loading model"},
-                            {"type", "unavailable_error"},
-                            {"code", 503}
-                        }}
-                    }),
-                    "application/json; charset=utf-8"
-                );
-            }
+            (void) strip_path_prefix(req.path, api_path_prefix);
+            res.status = 503;
+            res.set_content(
+                safe_json_to_str(json {
+                    {"error", {
+                        {"message", "Runtime not ready"},
+                        {"type", "unavailable_error"},
+                        {"code", 503}
+                    }}
+                }),
+                "application/json; charset=utf-8"
+            );
             return false;
         }
         return true;
@@ -313,37 +301,7 @@ bool server_http_context::init(const server_runtime_params & params) {
     LOG_INF("%s: using %d threads for HTTP server\n", __func__, n_threads_http);
     srv->new_task_queue = [n_threads_http] { return new httplib::ThreadPool(n_threads_http); };
 
-    //
-    // Web UI setup
-    //
-
-    if (!params.webui) {
-        LOG_INF("Web UI is disabled\n");
-    } else {
-        // register static assets routes
-        if (!params.public_path.empty()) {
-            // Set the base directory for serving static files
-            bool is_found = srv->set_mount_point(params.api_prefix + "/", params.public_path);
-            if (!is_found) {
-                LOG_ERR("%s: static assets path not found: %s\n", __func__, params.public_path.c_str());
-                return 1;
-            }
-        } else {
-            // using embedded static index.html
-            srv->Get(params.api_prefix + "/", [](const httplib::Request & req, httplib::Response & res) {
-                if (req.get_header_value("Accept-Encoding").find("gzip") == std::string::npos) {
-                    res.set_content("Error: gzip is not supported by this browser", "text/plain");
-                } else {
-                    res.set_header("Content-Encoding", "gzip");
-                    // COEP and COOP headers, required by pyodide (python interpreter)
-                    res.set_header("Cross-Origin-Embedder-Policy", "require-corp");
-                    res.set_header("Cross-Origin-Opener-Policy", "same-origin");
-                    res.set_content(reinterpret_cast<const char*>(index_html_gz), index_html_gz_len, "text/html; charset=utf-8");
-                }
-                return false;
-            });
-        }
-    }
+    LOG_INF("Web UI is disabled\n");
     return true;
 }
 

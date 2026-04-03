@@ -38,8 +38,15 @@ Optional variables:
 - `TELEGRAM_BRIDGE_MODEL` default: `deepseek-chat`
 - `TELEGRAM_BRIDGE_STATE_PATH` default: `/tmp/vicuna-telegram-bridge-state.json`
 - `TELEGRAM_BRIDGE_POLL_TIMEOUT_SECONDS` default: `30`
+- `TELEGRAM_BRIDGE_REQUEST_TIMEOUT_MS` default: `1800000`
 - `TELEGRAM_BRIDGE_MAX_HISTORY_MESSAGES` default: `12`
-- `TELEGRAM_BRIDGE_MAX_TOKENS` default: `256`
+- `TELEGRAM_BRIDGE_MAX_TOKENS` default: `1024`
+- `TELEGRAM_BRIDGE_WEBGL_RENDER_TIMEOUT_MS` default: `120000`
+- `TELEGRAM_BRIDGE_WEBGL_RENDER_MAX_ATTEMPTS` default: `3`
+- `TELEGRAM_BRIDGE_VIDEO_SPOOL_DIR` default: sibling `telegram-video-spool/` beside `TELEGRAM_BRIDGE_STATE_PATH`
+- `TELEGRAM_BRIDGE_VIDEO_RETRY_BASE_MS` default: `1000`
+- `TELEGRAM_BRIDGE_VIDEO_MAX_ATTEMPTS` default: `0` (`0` means retryable video jobs stay durable until success)
+- `TELEGRAM_BRIDGE_VIDEO_POLL_IDLE_MS` default: `500`
 - `TELEGRAM_BRIDGE_MAX_DOCUMENT_CHARS` default: `12000`
 - `TELEGRAM_BRIDGE_DOCLING_PYTHON_BIN` default: `python3`
 - `TELEGRAM_BRIDGE_DOCLING_PARSER_SCRIPT_PATH` default: repo-local `tools/telegram-bridge/docling-parse.py`
@@ -115,6 +122,41 @@ The key runtime variables are:
 - `VICUNA_DEEPSEEK_MODEL` default: `deepseek-reasoner`
 - `VICUNA_DEEPSEEK_TIMEOUT_MS` default: `60000`
 
+## Agentic Training Harness
+
+For repeated training-data collection runs that should still land in the live
+Telegram chat, use the host-side harness:
+
+- launcher:
+  [run-telegram-agentic-harness.sh](/Users/tyleraraujo/vicuna/tools/ops/run-telegram-agentic-harness.sh)
+- sample input:
+  [telegram-agentic-training-sample.json](/Users/tyleraraujo/vicuna/tools/ops/examples/telegram-agentic-training-sample.json)
+
+Behavior:
+
+- posts a visible prompt message into the configured Telegram chat
+- forwards the actual runtime request through the same Telegram-scoped host
+  `/v1/chat/completions` seam the bridge normally uses
+- waits on bridge state for text delivery and queued-or-terminal emotive-video
+  status so later async video retries do not block the batch
+- verifies that host-side `transitions.jsonl`, `decode_traces.jsonl`, and
+  `emotive_traces.jsonl` advanced before continuing to the next turn
+
+Usage:
+
+```bash
+tools/ops/run-telegram-agentic-harness.sh \
+  /absolute/path/to/requests.json \
+  /absolute/path/to/report.json
+```
+
+Important limitation:
+
+- the visible prompt message in Telegram is bot-authored because the Telegram
+  Bot API cannot spoof the user account
+- the runtime request is still simulated as a user turn through the
+  Telegram-scoped host headers and the harness-maintained transcript
+
 ## Behavior
 
 - `/start` registers the chat for proactive relay and returns a confirmation
@@ -167,7 +209,8 @@ The key runtime variables are:
   raw history clipping so the runtime keeps seeing a coherent conversation that
   still includes the latest user turn
 - each forwarded Telegram turn now logs transcript length and role sequence to
-  the bridge journal for continuity debugging
+  the structured bridge service log under `/var/log/vicuna/telegram-bridge/`
+  for continuity debugging
 - each deferred bridge-owned request now carries `X-Client-Request-Id` through
   to the runtime and emits structured JSON log events such as
   `vicuna_request_started`, `vicuna_request_finished`, and
@@ -196,6 +239,49 @@ The key runtime variables are:
   requested reply target, fallback mode, and returned Telegram `message_id`
 - if Telegram rejects a reply anchor, the bridge retries once without the reply
   anchor so the user still sees the final message
+- Telegram rich-text normalization now rebalances the supported HTML subset
+  before delivery, so malformed `<b>` or similar inline tags cannot strand a
+  completed outbox reply behind a `can't parse entities` retry loop
+- if Telegram still rejects a normalized rich-text payload, the bridge retries
+  once as plain text so the reply is delivered instead of remaining stranded in
+  the retained outbox
+- bridge-scoped provider requests now honor the configured
+  `TELEGRAM_BRIDGE_MAX_TOKENS` cap instead of forcing `256`, which prevents
+  long-form literature and research answers from being clipped prematurely
+- text delivery and emotive video delivery are now decoupled: bridge text is
+  delivered and checkpointed first, and any follow-up emotive video is queued
+  as a persisted background job instead of blocking the user-visible message
+- the bridge no longer uses caption-first video delivery for rich replies; text
+  always remains a `sendMessage`, and the emotive animation is always a
+  separate `sendVideo` follow-up
+- the async video worker now persists rendered MP4 artifacts under the bridge
+  state root, so a successful render can be reused across upload retries and
+  bridge restarts instead of forcing a rerender on every transient upload fault
+- emotive animation timing now follows the actual elapsed time between trace
+  moments, so rendered videos match the real turn duration instead of using a
+  fixed synthetic slot size
+- the WebGL renderer now streams frame buffers directly into `ffmpeg` while the
+  animation is being produced, instead of waiting for a full frame directory to
+  exist first
+- the renderer page caches compatible topology and scene scaffolding across
+  requests, and `/health` now exposes cache diagnostics alongside GPU health
+- the WebGL render client now sizes render timeout from animation duration and
+  keyframe count, which prevents larger clips from failing solely because they
+  exceed a static transport deadline
+- `renderer_not_ready`, render transport failures, and render timeouts now stay
+  queued by default; only terminal Telegram payload failures fail the follow-up
+  video job closed
+- malformed Telegram delivery handling is now explicitly layered:
+  - malformed outbox items are rejected or skipped before delivery
+  - oversized text is chunked into multiple `sendMessage` deliveries
+  - malformed or unbalanced Telegram HTML is normalized and balanced
+  - Telegram entity-parse failures fall back to plain text
+  - invalid reply targets fall back to no-reply delivery
+  - terminal chat failures are logged and skipped
+  - follow-up video jobs move explicitly through `queued`, `render`, `upload`,
+    `complete`, and terminal `failed`
+  - retryable renderer and upload transport failures remain durable in the
+    queue, while only terminal Telegram payload failures are removed
 - fresh or transcript-reset bridge state does not replay the retained runtime
   outbox backlog by default; explicit replay requires
   `TELEGRAM_BRIDGE_REPLAY_RETAINED_OUTBOX=1`

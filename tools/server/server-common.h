@@ -1,15 +1,29 @@
 #pragma once
 
-#include "log.h"
-
-#include "ggml.h"
-
-#define JSON_ASSERT GGML_ASSERT
+#include <cassert>
+#include <cstdarg>
+#include <cstdio>
+#include <mutex>
 #include <nlohmann/json.hpp>
-
 #include <string>
 
 using json = nlohmann::ordered_json;
+
+enum vicuna_log_level {
+    VICUNA_LOG_LEVEL_ERROR = 1,
+    VICUNA_LOG_LEVEL_WARN  = 2,
+    VICUNA_LOG_LEVEL_INFO  = 3,
+    VICUNA_LOG_LEVEL_DEBUG = 4,
+};
+
+void vicuna_log_set_verbosity(int level);
+void vicuna_log_printf(int level, const char * fmt, ...);
+
+#define LOG_INF(...) vicuna_log_printf(VICUNA_LOG_LEVEL_INFO, __VA_ARGS__)
+#define LOG_WRN(...) vicuna_log_printf(VICUNA_LOG_LEVEL_WARN, __VA_ARGS__)
+#define LOG_ERR(...) vicuna_log_printf(VICUNA_LOG_LEVEL_ERROR, __VA_ARGS__)
+#define LOG_DBG(...) vicuna_log_printf(VICUNA_LOG_LEVEL_DEBUG, __VA_ARGS__)
+#define LOG_CNT(...) vicuna_log_printf(VICUNA_LOG_LEVEL_INFO, __VA_ARGS__)
 
 #define SRV_INF(fmt, ...) LOG_INF("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SRV_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)

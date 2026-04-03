@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/home/tyler-araujo/Projects/vicuna
-ExecStart=/home/tyler-araujo/Projects/vicuna/tools/ops/run-policy-nightly.sh
+ExecStart=/home/tyler-araujo/Projects/vicuna/tools/ops/run-with-service-logs.sh policy-nightly /home/tyler-araujo/Projects/vicuna/tools/ops/run-policy-nightly.sh
 TimeoutStartSec=1800
 
 [Install]

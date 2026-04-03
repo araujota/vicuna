@@ -1,34 +1,50 @@
 # Build
 
-The supported build target is the provider-first `llama-server`.
-
-## Configure
+## Host Runtime
 
 ```bash
-cmake -S . -B build -G Ninja
+cmake -S /Users/tyleraraujo/vicuna -B /Users/tyleraraujo/vicuna/build
+cmake --build /Users/tyleraraujo/vicuna/build --target llama-server -j8
 ```
 
-## Build
+## Main Host Services
+
+- runtime: `tools/ops/run-vicuna-runtime.sh`
+- Telegram bridge: `tools/ops/run-telegram-bridge.sh`
+- WebGL renderer: `tools/ops/run-webgl-renderer.sh`
+
+## Runtime Modes
+
+- `VICUNA_HOST_INFERENCE_MODE=standard`
+  - use DeepSeek directly
+  - no RL/policy shaping in the request path
+- `VICUNA_HOST_INFERENCE_MODE=experimental`
+  - use the RunPod relay connector
+  - persist experimental capture on the host
+
+## RunPod Host Workflow
+
+The retained RunPod scripts are:
+
+- `tools/ops/runpod-ensure-pod.sh`
+- `tools/ops/runpod-runtime-common.sh`
+- `tools/ops/runpod-runtime-endpoint.sh`
+- `tools/ops/runpod-stop-pod.sh`
+- `tools/ops/runpod-sync-experimental-capture.sh`
+- `tools/ops/run-runpod-mistral-relay.sh`
+- `tools/ops/host-inference-mode.sh`
+
+The host-side post-processing workflow is:
+
+- sync JSONL capture from pod to host
+- render host videos from synced emotive traces
+
+## Service Installation
+
+Use:
 
 ```bash
-cmake --build build --target llama-server -j8
+sudo /Users/tyleraraujo/vicuna/tools/ops/install-vicuna-system-service.sh
 ```
 
-## Run
-
-```bash
-export VICUNA_DEEPSEEK_API_KEY="your-key"
-export VICUNA_DEEPSEEK_MODEL="deepseek-reasoner"
-export VICUNA_DEEPSEEK_BASE_URL="https://api.deepseek.com"
-
-./build/bin/llama-server --host 127.0.0.1 --port 8080 --api-surface openai --no-webui
-```
-
-Optional emotive embedding support:
-
-```bash
-export VICUNA_EMOTIVE_ENABLED="1"
-export VICUNA_EMOTIVE_EMBED_ENABLED="1"
-export VICUNA_EMOTIVE_EMBED_MODEL="/absolute/path/to/Qwen3-Embedding-0.6B-Q8_0.gguf"
-export VICUNA_EMOTIVE_EMBED_POOLING="last"
-```
+That installs the retained runtime, bridge, capture-sync, and render services.

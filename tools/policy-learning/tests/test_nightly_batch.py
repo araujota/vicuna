@@ -32,7 +32,6 @@ def make_transition(transition_id: str, tool_count: int) -> dict:
             "available_tool_count": tool_count,
             "parallel_tool_calls_requested": tool_count > 0,
             "input_message_count": 1,
-            "ongoing_task_due": 0.0,
             "vad": {"valence": 0.0, "arousal": 0.2, "dominance": 0.4},
         },
         "action_mask": {

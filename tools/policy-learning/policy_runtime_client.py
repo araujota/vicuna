@@ -38,6 +38,23 @@ class PolicyRuntimeClient:
         query = parse.urlencode(params)
         return self._request_json(f"/v1/policy/transitions?{query}")
 
+    def get_decode_traces(self, *, limit: int = 128, request_id: str | None = None) -> dict:
+        params = {"limit": str(limit)}
+        if request_id:
+            params["request_id"] = request_id
+        query = parse.urlencode(params)
+        return self._request_json(f"/v1/policy/decode-traces?{query}")
+
+    def get_runtime_artifacts(self) -> dict:
+        return self._request_json("/v1/policy/runtime-artifacts")
+
+    def apply_runtime_artifact(self, payload: dict) -> dict:
+        return self._request_json(
+            "/v1/policy/runtime-artifacts",
+            method="POST",
+            payload=payload,
+        )
+
     def propose_candidate(self, candidate_url: str, payload: dict) -> dict:
         base = candidate_url.rstrip("/")
         if not base.endswith("/v1/policy/propose"):

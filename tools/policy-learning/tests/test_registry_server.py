@@ -46,12 +46,13 @@ def bootstrap_registry(tmp_path: Path) -> Path:
                     "available_tool_count": 1,
                     "parallel_tool_calls_requested": True,
                     "input_message_count": 1,
-                    "ongoing_task_due": 0.0,
                     "vad": {"valence": 0.0, "arousal": 0.2, "dominance": 0.4},
                 },
                 "action_mask": {
                     "allowed_modes": ["direct", "tool_light"],
                     "allowed_reasoning_depths": ["short", "medium"],
+                    "allowed_response_budget_buckets": [256, 512],
+                    "allowed_reasoning_budget_buckets": [0, 64],
                     "max_tool_parallelism_cap": 1,
                     "allow_interrupt": True,
                     "allow_replan": True,
@@ -61,6 +62,8 @@ def bootstrap_registry(tmp_path: Path) -> Path:
                 "executed_action": {
                     "selected_mode": "tool_light",
                     "reasoning_depth": "short",
+                    "response_budget_bucket": 512,
+                    "reasoning_budget_bucket": 64,
                     "token_budget_bucket": 512,
                     "tool_parallelism_cap": 0,
                     "interrupt_allowed": False,
@@ -118,7 +121,7 @@ def _request_json(base_url: str, path: str, payload: dict | None = None) -> dict
         return json.loads(response.read().decode("utf-8"))
 
 
-def test_registry_server_health_and_propose(tmp_path: Path):
+def test_registry_server_health_and_propose(tmp_path: Path, capsys):
     registry_dir = bootstrap_registry(tmp_path)
     server = create_server(
         host="127.0.0.1",
@@ -149,12 +152,13 @@ def test_registry_server_health_and_propose(tmp_path: Path):
                     "available_tool_count": 1,
                     "parallel_tool_calls_requested": True,
                     "input_message_count": 1,
-                    "ongoing_task_due": 0.0,
                     "vad": {"valence": 0.0, "arousal": 0.2, "dominance": 0.4},
                 },
                 "action_mask": {
                     "allowed_modes": ["direct", "tool_light"],
                     "allowed_reasoning_depths": ["short", "medium"],
+                    "allowed_response_budget_buckets": [256, 512],
+                    "allowed_reasoning_budget_buckets": [0, 64],
                     "max_tool_parallelism_cap": 1,
                     "allow_interrupt": True,
                     "allow_replan": True,
@@ -168,6 +172,21 @@ def test_registry_server_health_and_propose(tmp_path: Path):
         assert response["action"]["selected_mode"] == "tool_light"
         assert response["confidence"]["overall"] > 0.0
         assert response["confidence"]["feature_signature_seen"] is True
+
+        resolved = _request_json(
+            base_url,
+            "/v1/artifacts/resolve",
+            payload={
+                "artifact_alias": "candidate",
+            },
+        )
+        assert resolved["artifact_kind"] == "policy"
+        assert resolved["artifact_alias"] == "candidate"
+        assert resolved["artifact"]["schema_version"] == "vicuna.policy_artifact.v1"
+        captured = capsys.readouterr()
+        assert '"event": "health_checked"' in captured.out
+        assert '"event": "proposal_served"' in captured.out
+        assert '"event": "artifact_resolved"' in captured.out
     finally:
         server.shutdown()
         thread.join(timeout=5.0)

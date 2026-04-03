@@ -644,6 +644,320 @@ static std::string sanitize_json_payload(const std::string & text) {
     return trimmed.substr(json_start, json_end - json_start + 1);
 }
 
+static bool parse_json_object_text(const std::string & text, json * out) {
+    if (!out) {
+        return false;
+    }
+    const std::string payload = sanitize_json_payload(text);
+    if (payload.empty() || payload.front() != '{') {
+        return false;
+    }
+    try {
+        const json parsed = json::parse(payload);
+        if (!parsed.is_object()) {
+            return false;
+        }
+        *out = parsed;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static float probe_signal_strength(const json & payload) {
+    const float mean_abs = clamp_unit(json_value(payload, "graph_value_mean_abs", 0.0f));
+    const float max_abs = clamp_unit(json_value(payload, "graph_value_max_abs", 0.0f));
+    const float sampled = json_value(payload, "graph_value_sample_count", 0) > 0 ?
+            clamp_unit(std::fabs(json_value(payload, "graph_value_mean", 0.0f))) :
+            0.0f;
+    return clamp_unit(0.45f * mean_abs + 0.35f * max_abs + 0.20f * sampled);
+}
+
+static std::string lowercase_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+static std::string runtime_event_type_name_from_id(int32_t type_id) {
+    switch (type_id) {
+        case 0: return "context_initialized";
+        case 1: return "batch_initialized";
+        case 2: return "memory_slot_prepared";
+        case 3: return "prefill_chunk_completed";
+        case 4: return "decode_step_completed";
+        case 5: return "sampler_applied";
+        case 6: return "token_accepted";
+        case 7: return "branch_checkpoint_saved";
+        case 8: return "branch_checkpoint_restored";
+        case 9: return "kv_memory_op";
+        case 10: return "graph_node_sampled";
+        case 11: return "runtime_fault";
+        case 12: return "branch_disagreement_reported";
+        case 13: return "moe_routing_emitted";
+        case 14: return "attention_diagnostic_emitted";
+        case 15: return "hidden_probe_emitted";
+        case 16: return "branch_consistency_reported";
+        case 17: return "memory_rail_planned";
+        case 18: return "memory_rail_span_evicted";
+        case 19: return "memory_rail_sink_refreshed";
+        case 20: return "memory_rail_lora_candidate";
+        case 21: return "memory_rail_lora_applied";
+        default: return "";
+    }
+}
+
+static std::string runtime_signal_string_field(const json & payload, const char * key) {
+    if (!payload.contains(key)) {
+        return "";
+    }
+    const json & value = payload.at(key);
+    if (value.is_string()) {
+        return value.get<std::string>();
+    }
+    if (value.is_number_integer()) {
+        return std::to_string(value.get<int32_t>());
+    }
+    if (value.is_boolean()) {
+        return value.get<bool>() ? "true" : "false";
+    }
+    return "";
+}
+
+static float normalize_distribution_entropy(float entropy, int32_t cardinality) {
+    if (entropy <= 0.0f || cardinality <= 1) {
+        return 0.0f;
+    }
+    const float denom = std::log(static_cast<float>(cardinality));
+    if (denom <= 0.0f) {
+        return 0.0f;
+    }
+    return clamp_unit(entropy / denom);
+}
+
+static float normalize_margin_signal(float margin) {
+    if (margin <= 0.0f) {
+        return 0.0f;
+    }
+    return clamp_unit(1.0f - std::exp(-0.85f * margin));
+}
+
+static void populate_runtime_signal_common_fields(const json & payload, server_runtime_signal_summary * summary) {
+    if (!summary) {
+        return;
+    }
+
+    summary->schema_version = json_value(payload, "schema_version", summary->schema_version);
+    summary->timestamp_ms = json_value(payload, "timestamp_ms", int64_t(0));
+    const int64_t timestamp_us = json_value(payload, "timestamp_us", int64_t(0));
+    if (summary->timestamp_ms <= 0 && timestamp_us > 0) {
+        summary->timestamp_ms = timestamp_us / 1000;
+    }
+    summary->event_type = runtime_signal_string_field(payload, "event_type");
+    if (summary->event_type.empty()) {
+        summary->event_type = runtime_signal_string_field(payload, "type_name");
+    }
+    if (summary->event_type.empty()) {
+        const json & type_value = payload.value("type", json());
+        if (type_value.is_string()) {
+            summary->event_type = type_value.get<std::string>();
+        } else if (type_value.is_number_integer()) {
+            summary->event_type = runtime_event_type_name_from_id(type_value.get<int32_t>());
+        }
+    }
+    summary->event_type = lowercase_copy(summary->event_type);
+
+    summary->attention_availability = lowercase_copy(runtime_signal_string_field(payload, "attention_availability"));
+    summary->consistency_source = lowercase_copy(runtime_signal_string_field(payload, "consistency_source"));
+    summary->probe_id = runtime_signal_string_field(payload, "probe_id");
+    summary->prompt_section_label = runtime_signal_string_field(payload, "prompt_section_label");
+    summary->sampler_chain = runtime_signal_string_field(payload, "sampler_chain");
+    summary->token_class = lowercase_copy(runtime_signal_string_field(payload, "token_class"));
+    summary->fault_type = lowercase_copy(runtime_signal_string_field(payload, "fault_type"));
+    summary->state_op = lowercase_copy(runtime_signal_string_field(payload, "state_op"));
+    summary->kv_op = lowercase_copy(runtime_signal_string_field(payload, "kv_op"));
+    summary->memory_status = lowercase_copy(runtime_signal_string_field(payload, "memory_status"));
+    summary->routing_mode = lowercase_copy(runtime_signal_string_field(payload, "routing_mode"));
+    summary->sink_role_label = lowercase_copy(runtime_signal_string_field(payload, "sink_role_label"));
+
+    summary->runtime_failure = json_value(payload, "runtime_failure", false);
+    summary->verifier_active = json_value(payload, "verifier_active", false);
+    summary->grammar_active = json_value(payload, "grammar_active", false);
+    summary->logit_bias_active = json_value(payload, "logit_bias_active", false);
+    summary->backend_sampler = json_value(payload, "backend_sampler", false);
+    summary->prompt_section_changed = json_value(payload, "prompt_section_changed", false);
+    summary->optimized = json_value(payload, "optimized", false);
+
+    summary->seq_id = json_value(payload, "seq_id", -1);
+    summary->layer_index = json_value(payload, "layer_index", -1);
+    summary->chunk_index = json_value(payload, "chunk_index", -1);
+    summary->step_index = json_value(payload, "step_index", -1);
+    summary->token_position = json_value(payload, "token_position", -1);
+    summary->token_count = json_value(payload, "token_count", 0);
+    summary->output_count = json_value(payload, "output_count", 0);
+    summary->unique_seq_count = json_value(payload, "unique_seq_count", 0);
+    summary->compared_token_count = json_value(payload, "compared_token_count", 0);
+    summary->candidate_count = json_value(payload, "candidate_count", 0);
+    if (summary->candidate_count <= 0 && payload.contains("distribution") && payload.at("distribution").is_object()) {
+        summary->candidate_count = json_value(payload.at("distribution"), "candidate_count", 0);
+    }
+    summary->expert_count = json_value(payload, "expert_count", 0);
+    summary->experts_selected = json_value(payload, "experts_selected", 0);
+    summary->dominant_expert_count = json_value(payload, "dominant_expert_count", 0);
+    summary->comparison_count = json_value(payload, "comparison_count", 0);
+    summary->semantic_group_count = json_value(payload, "semantic_group_count", 0);
+    summary->prompt_section_id = json_value(payload, "prompt_section_id", -1);
+    summary->prompt_section_transition_count = json_value(payload, "prompt_section_transition_count", 0);
+    summary->status_code = json_value(payload, "status_code", 0);
+
+    summary->graph_value_mean_abs = clamp_unit(json_value(payload, "graph_value_mean_abs", 0.0f));
+    summary->graph_value_rms = clamp_unit(json_value(payload, "graph_value_rms", 0.0f));
+    summary->graph_value_max_abs = clamp_unit(json_value(payload, "graph_value_max_abs", 0.0f));
+    summary->hidden_probe_strength = probe_signal_strength(payload);
+
+    summary->timing_wall_ms = clamp_unit(json_value(payload, "wall_time_us", uint64_t(0)) / 1000.0f / 250.0f);
+    summary->timing_decode_ms = clamp_unit(json_value(payload, "decode_us", uint64_t(0)) / 1000.0f / 250.0f);
+    summary->timing_sample_ms = clamp_unit(json_value(payload, "sample_us", uint64_t(0)) / 1000.0f / 50.0f);
+    summary->timing_delta_ms = clamp_unit(json_value(payload, "delta_us", uint64_t(0)) / 1000.0f / 250.0f);
+
+    const json sampler_profile = json_value(payload, "sampler_profile", json::object());
+    if (sampler_profile.is_object()) {
+        summary->sampler_temperature = clamp_unit(json_value(sampler_profile, "temperature", 0.0f) / 2.0f);
+        summary->sampler_top_p = clamp_unit(json_value(sampler_profile, "top_p", 0.0f));
+        summary->sampler_min_p = clamp_unit(json_value(sampler_profile, "min_p", 0.0f));
+        summary->sampler_typical_p = clamp_unit(json_value(sampler_profile, "typical_p", 0.0f));
+        summary->sampler_adaptive_target = clamp_unit(json_value(sampler_profile, "adaptive_target", 0.0f));
+    }
+
+    summary->memory_budget_ratio = clamp_unit(json_value(payload, "memory_budget_ratio", 0.0f));
+    summary->retention_score = clamp_unit(json_value(payload, "retention_score", 0.0f));
+    summary->retention_recency_score = clamp_unit(json_value(payload, "retention_recency_score", 0.0f));
+    summary->retention_attention_score = clamp_unit(json_value(payload, "retention_attention_score", 0.0f));
+    summary->retention_retrieval_score = clamp_unit(json_value(payload, "retention_retrieval_score", 0.0f));
+    summary->retention_persistence_score = clamp_unit(json_value(payload, "retention_persistence_score", 0.0f));
+    summary->retention_sink_score = clamp_unit(json_value(payload, "retention_sink_score", 0.0f));
+    summary->retention_distilled_score = clamp_unit(json_value(payload, "retention_distilled_score", 0.0f));
+    summary->lora_gate_score = clamp_unit(json_value(payload, "lora_gate_score", 0.0f));
+    summary->lora_delta_norm = clamp_unit(json_value(payload, "lora_delta_norm", 0.0f) / 0.05f);
+    summary->lora_global_norm = clamp_unit(json_value(payload, "lora_global_norm", 0.0f) / 0.75f);
+
+    const json distribution = json_value(payload, "distribution", json::object());
+    const float raw_mean_entropy = json_value(payload, "mean_entropy", 0.0f);
+    const float raw_max_entropy = json_value(payload, "max_entropy", 0.0f);
+    const float raw_mean_margin = json_value(payload, "mean_margin", 0.0f);
+    const float raw_sampled_prob = distribution.is_object()
+            ? json_value(distribution, "sampled_prob", 0.0f)
+            : json_value(payload, "sampled_prob", 0.0f);
+    const float raw_stop_prob = distribution.is_object()
+            ? json_value(distribution, "stop_prob", 0.0f)
+            : json_value(payload, "stop_prob", 0.0f);
+    const int32_t distribution_candidates = distribution.is_object()
+            ? json_value(distribution, "candidate_count", summary->candidate_count)
+            : summary->candidate_count;
+    summary->candidate_count = std::max(summary->candidate_count, distribution_candidates);
+    summary->mean_entropy = normalize_distribution_entropy(raw_mean_entropy, std::max(2, summary->candidate_count));
+    summary->max_entropy = normalize_distribution_entropy(raw_max_entropy, std::max(2, summary->candidate_count));
+    summary->mean_margin = normalize_margin_signal(raw_mean_margin);
+    summary->sampled_prob = clamp_unit(raw_sampled_prob);
+    summary->stop_prob = clamp_unit(raw_stop_prob);
+    summary->repeat_hit_rate = clamp_unit(json_value(payload, "repeat_hit_rate", 0.0f));
+
+    const float raw_route_entropy_mean = json_value(payload, "route_entropy_mean", 0.0f);
+    const float raw_route_entropy_max = json_value(payload, "route_entropy_max", 0.0f);
+    summary->route_entropy_mean = normalize_distribution_entropy(raw_route_entropy_mean, std::max(2, summary->expert_count));
+    summary->route_entropy_max = normalize_distribution_entropy(raw_route_entropy_max, std::max(2, summary->expert_count));
+    summary->route_top1_weight_mean = clamp_unit(json_value(payload, "route_top1_weight_mean", 0.0f));
+    summary->route_top1_weight_max = clamp_unit(json_value(payload, "route_top1_weight_max", 0.0f));
+
+    const int32_t attention_cardinality = std::max<int32_t>(
+            2,
+            json_value(payload, "attention_row_width", 0));
+    summary->attention_entropy_mean = normalize_distribution_entropy(
+            json_value(payload, "attention_entropy_mean", 0.0f),
+            attention_cardinality);
+    summary->attention_entropy_max = normalize_distribution_entropy(
+            json_value(payload, "attention_entropy_max", 0.0f),
+            attention_cardinality);
+    summary->attention_top1_mass_mean = clamp_unit(json_value(payload, "attention_top1_mass_mean", 0.0f));
+    summary->attention_top1_mass_max = clamp_unit(json_value(payload, "attention_top1_mass_max", 0.0f));
+
+    summary->agreement_score = clamp_unit(json_value(payload, "agreement_score", 0.0f));
+    summary->consistency_entropy = clamp_unit(json_value(payload, "consistency_entropy", 0.0f));
+    summary->branch_disagreement = clamp_unit(json_value(payload, "branch_disagreement", 0.0f));
+    summary->verifier_disagreement = clamp_unit(json_value(payload, "verifier_disagreement", 0.0f));
+
+    if (payload.contains("dominant_expert_fractions") && payload.at("dominant_expert_fractions").is_array()) {
+        float fraction_sum = 0.0f;
+        bool first = true;
+        for (const auto & item : payload.at("dominant_expert_fractions")) {
+            const float value = clamp_unit(item.is_number() ? item.get<float>() : 0.0f);
+            if (first) {
+                summary->dominant_expert_fraction_top1 = value;
+                first = false;
+            }
+            fraction_sum += value;
+        }
+        summary->dominant_expert_fraction_mass = clamp_unit(fraction_sum);
+    }
+
+    std::string probe_id = lowercase_copy(summary->probe_id);
+    if (!probe_id.empty()) {
+        if (probe_id.find("contradiction") != std::string::npos) {
+            summary->contradiction_probe = summary->hidden_probe_strength;
+        }
+        if (probe_id.find("uncertainty") != std::string::npos || probe_id.find("epistemic") != std::string::npos) {
+            summary->uncertainty_probe = summary->hidden_probe_strength;
+        }
+        if (probe_id.find("broadcast") != std::string::npos || probe_id.find("alignment") != std::string::npos) {
+            summary->broadcast_probe = summary->hidden_probe_strength;
+        }
+    }
+
+    const json correctness = json_value(payload, "correctness", json::object());
+    if (correctness.is_object() && !correctness.empty()) {
+        summary->tool_correctness_available = json_value(correctness, "available", false);
+        summary->tool_correctness_score = clamp_unit(json_value(correctness, "score", 0.0f));
+        summary->tool_correctness_confidence = clamp_unit(json_value(correctness, "confidence", 0.0f));
+    } else if (payload.contains("tool_correctness_score")) {
+        summary->tool_correctness_available = true;
+        summary->tool_correctness_score = clamp_unit(json_value(payload, "tool_correctness_score", 0.0f));
+        summary->tool_correctness_confidence = clamp_unit(json_value(payload, "tool_correctness_confidence", 0.0f));
+    }
+}
+
+static server_runtime_signal_summary runtime_signal_summary_from_text(const std::string & text) {
+    server_runtime_signal_summary summary = {};
+    json payload = nullptr;
+    if (!parse_json_object_text(text, &payload)) {
+        return summary;
+    }
+
+    summary.available = true;
+    populate_runtime_signal_common_fields(payload, &summary);
+
+    if (!summary.available) {
+        return summary;
+    }
+    if (!summary.event_type.empty() ||
+            !summary.probe_id.empty() ||
+            summary.runtime_failure ||
+            summary.mean_entropy > 0.0f ||
+            summary.route_entropy_mean > 0.0f ||
+            summary.attention_entropy_mean > 0.0f ||
+            summary.agreement_score > 0.0f ||
+            summary.branch_disagreement > 0.0f ||
+            summary.memory_budget_ratio > 0.0f ||
+            summary.retention_score > 0.0f ||
+            summary.lora_gate_score > 0.0f ||
+            summary.tool_correctness_available) {
+        return summary;
+    }
+
+    summary.available = false;
+    return summary;
+}
+
 static float lexical_text_similarity(const std::string & lhs_text, const std::string & rhs_text) {
     const auto lhs = split_words(lhs_text);
     const auto rhs = split_words(rhs_text);
@@ -773,7 +1087,6 @@ server_emotive_runtime_config server_emotive_runtime_config_from_env() {
     config.max_turn_history = env_to_int("VICUNA_EMOTIVE_MAX_TURN_HISTORY", config.max_turn_history);
     config.degraded_mode_allowed = env_to_bool("VICUNA_EMOTIVE_DEGRADED_MODE_ALLOWED", true);
     config.vad_ema_alpha = env_to_float("VICUNA_EMOTIVE_VAD_ALPHA", config.vad_ema_alpha, 0.05f, 1.0f);
-    config.embedding = server_embedding_backend_config_from_env();
     config.cognitive_replay.enabled = env_to_bool("VICUNA_COGNITIVE_REPLAY_ENABLED", config.cognitive_replay.enabled);
     config.cognitive_replay.max_entries = env_to_int("VICUNA_COGNITIVE_REPLAY_MAX_ENTRIES", config.cognitive_replay.max_entries);
     config.cognitive_replay.max_results = env_to_int("VICUNA_COGNITIVE_REPLAY_MAX_RESULTS", config.cognitive_replay.max_results);
@@ -883,6 +1196,10 @@ static json vector_to_json(const server_emotive_vector & vector) {
     };
 }
 
+json server_emotive_vector_to_json(const server_emotive_vector & vector) {
+    return vector_to_json(vector);
+}
+
 static json delta_to_json(const server_emotive_delta & delta) {
     return {
         {"d_epistemic_pressure", delta.d_epistemic_pressure},
@@ -943,9 +1260,107 @@ static json vad_to_json(const server_emotive_vad & vad) {
     };
 }
 
+json server_emotive_vad_to_json(const server_emotive_vad & vad) {
+    return vad_to_json(vad);
+}
+
+json server_runtime_signal_summary_to_json(const server_runtime_signal_summary & summary) {
+    return {
+        {"available", summary.available},
+        {"schema_version", summary.schema_version},
+        {"event_type", summary.event_type},
+        {"attention_availability", summary.attention_availability},
+        {"consistency_source", summary.consistency_source},
+        {"probe_id", summary.probe_id},
+        {"prompt_section_label", summary.prompt_section_label},
+        {"sampler_chain", summary.sampler_chain},
+        {"token_class", summary.token_class},
+        {"fault_type", summary.fault_type},
+        {"state_op", summary.state_op},
+        {"kv_op", summary.kv_op},
+        {"memory_status", summary.memory_status},
+        {"routing_mode", summary.routing_mode},
+        {"memory_strategy_label", summary.memory_strategy_label},
+        {"sink_materialization_label", summary.sink_materialization_label},
+        {"runtime_failure", summary.runtime_failure},
+        {"verifier_active", summary.verifier_active},
+        {"grammar_active", summary.grammar_active},
+        {"logit_bias_active", summary.logit_bias_active},
+        {"backend_sampler", summary.backend_sampler},
+        {"prompt_section_changed", summary.prompt_section_changed},
+        {"optimized", summary.optimized},
+        {"tool_correctness_available", summary.tool_correctness_available},
+        {"tool_correctness_score", summary.tool_correctness_score},
+        {"tool_correctness_confidence", summary.tool_correctness_confidence},
+        {"mean_entropy", summary.mean_entropy},
+        {"max_entropy", summary.max_entropy},
+        {"mean_margin", summary.mean_margin},
+        {"sampled_prob", summary.sampled_prob},
+        {"stop_prob", summary.stop_prob},
+        {"repeat_hit_rate", summary.repeat_hit_rate},
+        {"route_entropy_mean", summary.route_entropy_mean},
+        {"route_entropy_max", summary.route_entropy_max},
+        {"route_top1_weight_mean", summary.route_top1_weight_mean},
+        {"route_top1_weight_max", summary.route_top1_weight_max},
+        {"attention_entropy_mean", summary.attention_entropy_mean},
+        {"attention_entropy_max", summary.attention_entropy_max},
+        {"attention_top1_mass_mean", summary.attention_top1_mass_mean},
+        {"attention_top1_mass_max", summary.attention_top1_mass_max},
+        {"agreement_score", summary.agreement_score},
+        {"consistency_entropy", summary.consistency_entropy},
+        {"branch_disagreement", summary.branch_disagreement},
+        {"verifier_disagreement", summary.verifier_disagreement},
+        {"contradiction_probe", summary.contradiction_probe},
+        {"uncertainty_probe", summary.uncertainty_probe},
+        {"broadcast_probe", summary.broadcast_probe},
+        {"hidden_probe_strength", summary.hidden_probe_strength},
+        {"graph_value_mean_abs", summary.graph_value_mean_abs},
+        {"graph_value_rms", summary.graph_value_rms},
+        {"graph_value_max_abs", summary.graph_value_max_abs},
+        {"dominant_expert_fraction_top1", summary.dominant_expert_fraction_top1},
+        {"dominant_expert_fraction_mass", summary.dominant_expert_fraction_mass},
+        {"timing_wall_ms", summary.timing_wall_ms},
+        {"timing_decode_ms", summary.timing_decode_ms},
+        {"timing_sample_ms", summary.timing_sample_ms},
+        {"timing_delta_ms", summary.timing_delta_ms},
+        {"sampler_temperature", summary.sampler_temperature},
+        {"sampler_top_p", summary.sampler_top_p},
+        {"sampler_min_p", summary.sampler_min_p},
+        {"sampler_typical_p", summary.sampler_typical_p},
+        {"sampler_adaptive_target", summary.sampler_adaptive_target},
+        {"memory_budget_ratio", summary.memory_budget_ratio},
+        {"attention_budget_ratio", summary.attention_budget_ratio},
+        {"recurrent_budget_ratio", summary.recurrent_budget_ratio},
+        {"timestamp_ms", summary.timestamp_ms},
+        {"seq_id", summary.seq_id},
+        {"layer_index", summary.layer_index},
+        {"chunk_index", summary.chunk_index},
+        {"step_index", summary.step_index},
+        {"token_position", summary.token_position},
+        {"token_count", summary.token_count},
+        {"output_count", summary.output_count},
+        {"unique_seq_count", summary.unique_seq_count},
+        {"compared_token_count", summary.compared_token_count},
+        {"candidate_count", summary.candidate_count},
+        {"expert_count", summary.expert_count},
+        {"experts_selected", summary.experts_selected},
+        {"dominant_expert_count", summary.dominant_expert_count},
+        {"comparison_count", summary.comparison_count},
+        {"semantic_group_count", summary.semantic_group_count},
+        {"prompt_section_id", summary.prompt_section_id},
+        {"prompt_section_transition_count", summary.prompt_section_transition_count},
+        {"attention_pos_min", summary.attention_pos_min},
+        {"attention_pos_max", summary.attention_pos_max},
+        {"recurrent_pos_min", summary.recurrent_pos_min},
+        {"recurrent_pos_max", summary.recurrent_pos_max},
+        {"status_code", summary.status_code},
+    };
+}
+
 static json block_record_to_json(const server_emotive_block_record & block) {
     return {
         {"block_index", block.block_index},
+        {"timestamp_ms", block.timestamp_ms},
         {"source", {
             {"kind", kind_name(block.kind)},
             {"label", kind_label(block.kind)},
@@ -958,6 +1373,7 @@ static json block_record_to_json(const server_emotive_block_record & block) {
         {"embedding_mode", block.embedding_mode},
         {"semantic_similarity_to_user", block.semantic_similarity_to_user},
         {"semantic_similarity_to_previous", block.semantic_similarity_to_previous},
+        {"runtime_signals", server_runtime_signal_summary_to_json(block.runtime_signals)},
     };
 }
 
@@ -1127,6 +1543,8 @@ static json metacognitive_policy_to_json(const server_metacognitive_policy_decis
         {"policy_version", decision.policy_version},
         {"selected_mode", decision.selected_mode},
         {"reasoning_depth", decision.reasoning_depth},
+        {"response_budget_bucket", decision.response_budget_bucket},
+        {"reasoning_budget_bucket", decision.reasoning_budget_bucket},
         {"thinking_mode", decision.thinking_mode},
         {"prefix_profile", decision.prefix_profile},
         {"stop_profile", decision.stop_profile},
@@ -1160,9 +1578,9 @@ json server_policy_observation_to_json(const server_policy_observation & observa
         {"trace_id", observation.trace_id.empty() ? json(nullptr) : json(observation.trace_id)},
         {"decision_id", observation.decision_id},
         {"mode_label", observation.mode_label},
+        {"inference_substrate", observation.inference_substrate},
         {"bridge_scoped", observation.bridge_scoped},
         {"cognitive_replay", observation.cognitive_replay},
-        {"ongoing_task_due", observation.ongoing_task_due},
         {"moment", vector_to_json(observation.moment)},
         {"vad", vad_to_json(observation.vad)},
         {"heuristic", {
@@ -1172,6 +1590,7 @@ json server_policy_observation_to_json(const server_policy_observation & observa
         {"tool_context", {
             {"available_tool_count", observation.available_tool_count},
             {"parallel_tool_calls_requested", observation.parallel_tool_calls_requested},
+            {"correctness", server_tool_correctness_signal_to_json(observation.tool_correctness)},
         }},
         {"recent_runtime", {
             {"input_message_count", observation.input_message_count},
@@ -1185,6 +1604,8 @@ json server_policy_action_to_json(const server_policy_action & action) {
         {"policy_version", action.policy_version},
         {"selected_mode", action.selected_mode},
         {"reasoning_depth", action.reasoning_depth},
+        {"response_budget_bucket", action.response_budget_bucket},
+        {"reasoning_budget_bucket", action.reasoning_budget_bucket},
         {"token_budget_bucket", action.token_budget_bucket},
         {"tool_parallelism_cap", action.tool_parallelism_cap},
         {"interrupt_allowed", action.interrupt_allowed},
@@ -1211,12 +1632,99 @@ json server_policy_action_mask_to_json(const server_policy_action_mask & mask) {
         {"allowed_sampling_profiles", mask.allowed_sampling_profiles},
         {"allowed_repetition_profiles", mask.allowed_repetition_profiles},
         {"allowed_tool_choice_profiles", mask.allowed_tool_choice_profiles},
+        {"allowed_response_budget_buckets", mask.allowed_response_budget_buckets},
+        {"allowed_reasoning_budget_buckets", mask.allowed_reasoning_budget_buckets},
         {"max_tool_parallelism_cap", mask.max_tool_parallelism_cap},
         {"allow_interrupt", mask.allow_interrupt},
         {"allow_replan", mask.allow_replan},
         {"allow_early_stop", mask.allow_early_stop},
         {"allow_force_synthesis", mask.allow_force_synthesis},
     };
+}
+
+json server_request_policy_config_to_json(const server_request_policy_config & config) {
+    return {
+        {"schema_version", config.schema_version},
+        {"response_budget_bucket", config.response_budget_bucket},
+        {"reasoning_budget_bucket", config.reasoning_budget_bucket},
+        {"token_budget_bucket", config.token_budget_bucket},
+        {"thinking_enabled", config.thinking_enabled},
+        {"thinking_mode", config.thinking_mode},
+        {"prefix_profile", config.prefix_profile},
+        {"stop_profile", config.stop_profile},
+        {"sampling_profile", config.sampling_profile},
+        {"repetition_profile", config.repetition_profile},
+        {"tool_choice_profile", config.tool_choice_profile},
+        {"tool_parallelism_cap", config.tool_parallelism_cap},
+        {"parallel_tool_calls", config.parallel_tool_calls},
+        {"temperature", config.temperature_present ? json(config.temperature) : json(nullptr)},
+        {"top_k", config.top_k_present ? json(config.top_k) : json(nullptr)},
+        {"top_p", config.top_p_present ? json(config.top_p) : json(nullptr)},
+        {"min_p", config.min_p_present ? json(config.min_p) : json(nullptr)},
+        {"frequency_penalty", config.frequency_penalty_present ? json(config.frequency_penalty) : json(nullptr)},
+        {"presence_penalty", config.presence_penalty_present ? json(config.presence_penalty) : json(nullptr)},
+    };
+}
+
+bool server_request_policy_config_from_json(
+        const json & payload,
+        server_request_policy_config * out_config,
+        std::string * out_error) {
+    if (!out_config) {
+        if (out_error) {
+            *out_error = "request policy config output must not be null";
+        }
+        return false;
+    }
+    if (!payload.is_object()) {
+        if (out_error) {
+            *out_error = "request policy config payload must be an object";
+        }
+        return false;
+    }
+
+    server_request_policy_config config = {};
+    config.schema_version = json_value(payload, "schema_version", config.schema_version);
+    config.response_budget_bucket = json_value(payload, "response_budget_bucket", config.response_budget_bucket);
+    config.reasoning_budget_bucket = json_value(payload, "reasoning_budget_bucket", config.reasoning_budget_bucket);
+    config.token_budget_bucket = json_value(payload, "token_budget_bucket", config.token_budget_bucket);
+    config.thinking_enabled = json_value(payload, "thinking_enabled", config.thinking_enabled);
+    config.thinking_mode = json_value(payload, "thinking_mode", config.thinking_mode);
+    config.prefix_profile = json_value(payload, "prefix_profile", config.prefix_profile);
+    config.stop_profile = json_value(payload, "stop_profile", config.stop_profile);
+    config.sampling_profile = json_value(payload, "sampling_profile", config.sampling_profile);
+    config.repetition_profile = json_value(payload, "repetition_profile", config.repetition_profile);
+    config.tool_choice_profile = json_value(payload, "tool_choice_profile", config.tool_choice_profile);
+    config.tool_parallelism_cap = json_value(payload, "tool_parallelism_cap", config.tool_parallelism_cap);
+    config.parallel_tool_calls = json_value(payload, "parallel_tool_calls", config.parallel_tool_calls);
+    config.temperature_present = payload.contains("temperature") && !payload.at("temperature").is_null();
+    if (config.temperature_present) {
+        config.temperature = payload.at("temperature").get<double>();
+    }
+    config.top_k_present = payload.contains("top_k") && !payload.at("top_k").is_null();
+    if (config.top_k_present) {
+        config.top_k = payload.at("top_k").get<int32_t>();
+    }
+    config.top_p_present = payload.contains("top_p") && !payload.at("top_p").is_null();
+    if (config.top_p_present) {
+        config.top_p = payload.at("top_p").get<double>();
+    }
+    config.min_p_present = payload.contains("min_p") && !payload.at("min_p").is_null();
+    if (config.min_p_present) {
+        config.min_p = payload.at("min_p").get<double>();
+    }
+    config.frequency_penalty_present =
+            payload.contains("frequency_penalty") && !payload.at("frequency_penalty").is_null();
+    if (config.frequency_penalty_present) {
+        config.frequency_penalty = payload.at("frequency_penalty").get<double>();
+    }
+    config.presence_penalty_present =
+            payload.contains("presence_penalty") && !payload.at("presence_penalty").is_null();
+    if (config.presence_penalty_present) {
+        config.presence_penalty = payload.at("presence_penalty").get<double>();
+    }
+    *out_config = std::move(config);
+    return true;
 }
 
 json server_policy_applied_provider_controls_to_json(const server_policy_applied_provider_controls & controls) {
@@ -1229,7 +1737,9 @@ json server_policy_applied_provider_controls_to_json(const server_policy_applied
         {"tool_choice_profile", controls.tool_choice_profile},
         {"prefix_used", controls.prefix_used},
         {"temperature", controls.temperature_present ? json(controls.temperature) : json(nullptr)},
+        {"top_k", controls.top_k_present ? json(controls.top_k) : json(nullptr)},
         {"top_p", controls.top_p_present ? json(controls.top_p) : json(nullptr)},
+        {"min_p", controls.min_p_present ? json(controls.min_p) : json(nullptr)},
         {"frequency_penalty", controls.frequency_penalty_present ? json(controls.frequency_penalty) : json(nullptr)},
         {"presence_penalty", controls.presence_penalty_present ? json(controls.presence_penalty) : json(nullptr)},
         {"tool_choice", controls.tool_choice.empty() ? json(nullptr) : json(controls.tool_choice)},
@@ -1238,6 +1748,33 @@ json server_policy_applied_provider_controls_to_json(const server_policy_applied
         {"defaulted_fields", controls.defaulted_fields},
         {"field_sources", controls.field_sources},
         {"beta_routing_reason", controls.beta_routing_reason.empty() ? json(nullptr) : json(controls.beta_routing_reason)},
+    };
+}
+
+json server_tool_correctness_evidence_to_json(const server_tool_correctness_evidence & evidence) {
+    return {
+        {"kind", evidence.kind},
+        {"label", evidence.label},
+        {"value_json", evidence.value},
+        {"weight", evidence.weight},
+    };
+}
+
+json server_tool_correctness_signal_to_json(const server_tool_correctness_signal & signal) {
+    json evidence = json::array();
+    for (const auto & item : signal.evidence) {
+        evidence.push_back(server_tool_correctness_evidence_to_json(item));
+    }
+    return {
+        {"schema_version", signal.schema_version},
+        {"available", signal.available},
+        {"status", signal.status},
+        {"score", signal.score},
+        {"confidence", signal.confidence},
+        {"source", signal.source},
+        {"evaluator_id", signal.evaluator_id.empty() ? json(nullptr) : json(signal.evaluator_id)},
+        {"summary", signal.summary.empty() ? json(nullptr) : json(signal.summary)},
+        {"evidence", std::move(evidence)},
     };
 }
 
@@ -1275,7 +1812,7 @@ json server_policy_reward_model_to_json(const server_policy_reward_model & model
         {"latency_ms_scale", model.latency_ms_scale},
         {"token_cost_cap", model.token_cost_cap},
         {"token_scale", model.token_scale},
-        {"tool_success_bonus", model.tool_success_bonus},
+        {"tool_correctness_scale", model.tool_correctness_scale},
         {"candidate_failure_penalty", model.candidate_failure_penalty},
     };
 }
@@ -1291,7 +1828,7 @@ json server_policy_reward_breakdown_to_json(const server_policy_reward_breakdown
         {"completion_quality_reward", breakdown.completion_quality_reward},
         {"latency_cost", breakdown.latency_cost},
         {"token_cost", breakdown.token_cost},
-        {"tool_success_reward", breakdown.tool_success_reward},
+        {"tool_correctness_reward", breakdown.tool_correctness_reward},
         {"candidate_failure_penalty", breakdown.candidate_failure_penalty},
         {"total", breakdown.total},
     };
@@ -1305,6 +1842,23 @@ json server_policy_safety_guard_result_to_json(const server_policy_safety_guard_
         {"clipped_fields", result.clipped_fields},
         {"fallback_to_native", result.fallback_to_native},
         {"reason", result.reason},
+    };
+}
+
+json server_policy_rollout_metadata_to_json(const server_policy_rollout_metadata & rollout) {
+    if (!rollout.available) {
+        return {
+            {"available", false},
+        };
+    }
+
+    return {
+        {"available", true},
+        {"artifact_kind", rollout.artifact_kind.empty() ? json(nullptr) : json(rollout.artifact_kind)},
+        {"policy_version", rollout.policy_version.empty() ? json(nullptr) : json(rollout.policy_version)},
+        {"selected_log_prob", rollout.selected_log_prob},
+        {"value_estimate", rollout.value_estimate},
+        {"entropy", rollout.entropy},
     };
 }
 
@@ -1331,6 +1885,7 @@ json server_policy_transition_to_json(const server_policy_transition & transitio
         {"candidate_executed_live", transition.candidate_executed_live},
         {"candidate_confidence", transition.candidate_confidence_present ? json(transition.candidate_confidence) : json(nullptr)},
         {"candidate_confidence_passed", transition.candidate_confidence_passed},
+        {"policy_rollout", server_policy_rollout_metadata_to_json(transition.policy_rollout)},
         {"rollout_decision_reason", transition.rollout_decision_reason.empty() ? json(nullptr) : json(transition.rollout_decision_reason)},
         {"canary_share_percent", transition.canary_share_percent},
         {"rollout_step_index", transition.rollout_step_index},
@@ -1418,6 +1973,7 @@ json server_emotive_trace_to_json(const server_emotive_trace & trace) {
         {"trace_id", trace.trace_id},
         {"model", trace.model},
         {"blocks", blocks},
+        {"turn_start_block_index", trace.turn_start_block_index},
         {"live_generation_start_block_index", trace.live_generation_start_block_index},
         {"final_moment", vector_to_json(trace.final_moment)},
         {"final_vad", vad_to_json(trace.final_vad)},
@@ -1434,10 +1990,222 @@ json server_emotive_trace_to_json(const server_emotive_trace & trace) {
     };
 }
 
+static server_emotive_block_kind emotive_block_kind_from_name(const std::string & name) {
+    if (name == "user_message") {
+        return SERVER_EMOTIVE_BLOCK_USER_MESSAGE;
+    }
+    if (name == "assistant_reasoning") {
+        return SERVER_EMOTIVE_BLOCK_ASSISTANT_REASONING;
+    }
+    if (name == "assistant_content") {
+        return SERVER_EMOTIVE_BLOCK_ASSISTANT_CONTENT;
+    }
+    return SERVER_EMOTIVE_BLOCK_RUNTIME_EVENT;
+}
+
+static server_emotive_vector vector_from_json(const json & payload) {
+    server_emotive_vector vector = {};
+    if (!payload.is_object()) {
+        return vector;
+    }
+    vector.epistemic_pressure = json_value(payload, "epistemic_pressure", 0.0f);
+    vector.confidence = json_value(payload, "confidence", 0.0f);
+    vector.contradiction_pressure = json_value(payload, "contradiction_pressure", 0.0f);
+    vector.planning_clarity = json_value(payload, "planning_clarity", 0.0f);
+    vector.curiosity = json_value(payload, "curiosity", 0.0f);
+    vector.caution = json_value(payload, "caution", 0.0f);
+    vector.frustration = json_value(payload, "frustration", 0.0f);
+    vector.satisfaction = json_value(payload, "satisfaction", 0.0f);
+    vector.momentum = json_value(payload, "momentum", 0.0f);
+    vector.stall = json_value(payload, "stall", 0.0f);
+    vector.semantic_novelty = json_value(payload, "semantic_novelty", 0.0f);
+    vector.user_alignment = json_value(payload, "user_alignment", 0.0f);
+    vector.runtime_trust = json_value(payload, "runtime_trust", 0.0f);
+    vector.runtime_failure_pressure = json_value(payload, "runtime_failure_pressure", 0.0f);
+    return vector;
+}
+
+bool server_emotive_vector_from_json(
+        const json & payload,
+        server_emotive_vector * out_vector,
+        std::string * out_error) {
+    if (!out_vector) {
+        if (out_error) {
+            *out_error = "emotive vector output must not be null";
+        }
+        return false;
+    }
+    if (!payload.is_object()) {
+        if (out_error) {
+            *out_error = "emotive vector payload must be an object";
+        }
+        return false;
+    }
+    *out_vector = vector_from_json(payload);
+    return true;
+}
+
+static server_emotive_delta delta_from_json(const json & payload) {
+    server_emotive_delta delta = {};
+    if (!payload.is_object()) {
+        return delta;
+    }
+    delta.d_epistemic_pressure = json_value(payload, "d_epistemic_pressure", 0.0f);
+    delta.d_confidence = json_value(payload, "d_confidence", 0.0f);
+    delta.d_contradiction_pressure = json_value(payload, "d_contradiction_pressure", 0.0f);
+    delta.d_planning_clarity = json_value(payload, "d_planning_clarity", 0.0f);
+    delta.d_curiosity = json_value(payload, "d_curiosity", 0.0f);
+    delta.d_caution = json_value(payload, "d_caution", 0.0f);
+    delta.d_frustration = json_value(payload, "d_frustration", 0.0f);
+    delta.d_satisfaction = json_value(payload, "d_satisfaction", 0.0f);
+    delta.d_momentum = json_value(payload, "d_momentum", 0.0f);
+    delta.d_stall = json_value(payload, "d_stall", 0.0f);
+    delta.d_semantic_novelty = json_value(payload, "d_semantic_novelty", 0.0f);
+    delta.d_user_alignment = json_value(payload, "d_user_alignment", 0.0f);
+    delta.d_runtime_trust = json_value(payload, "d_runtime_trust", 0.0f);
+    delta.d_runtime_failure_pressure = json_value(payload, "d_runtime_failure_pressure", 0.0f);
+    delta.negative_mass = json_value(payload, "negative_mass", 0.0f);
+    return delta;
+}
+
+static server_emotive_vad vad_from_json(const json & payload) {
+    server_emotive_vad vad = {};
+    if (!payload.is_object()) {
+        return vad;
+    }
+    vad.valence = json_value(payload, "valence", 0.0f);
+    vad.arousal = json_value(payload, "arousal", 0.0f);
+    vad.dominance = json_value(payload, "dominance", 0.0f);
+    if (payload.contains("trend") && payload.at("trend").is_object()) {
+        const json & trend = payload.at("trend");
+        vad.trend.d_valence = json_value(trend, "d_valence", 0.0f);
+        vad.trend.d_arousal = json_value(trend, "d_arousal", 0.0f);
+        vad.trend.d_dominance = json_value(trend, "d_dominance", 0.0f);
+    }
+    if (payload.contains("labels") && payload.at("labels").is_array()) {
+        for (const auto & label : payload.at("labels")) {
+            if (label.is_string()) {
+                vad.labels.push_back(label.get<std::string>());
+            }
+        }
+    }
+    if (payload.contains("dominant_dimensions") && payload.at("dominant_dimensions").is_array()) {
+        for (const auto & dimension : payload.at("dominant_dimensions")) {
+            if (dimension.is_string()) {
+                vad.dominant_dimensions.push_back(dimension.get<std::string>());
+            }
+        }
+    }
+    if (payload.contains("style_guide") && payload.at("style_guide").is_object()) {
+        const json & style = payload.at("style_guide");
+        vad.style_guide.tone_label = json_value(style, "tone_label", std::string());
+        vad.style_guide.warmth = json_value(style, "warmth", 0.0f);
+        vad.style_guide.energy = json_value(style, "energy", 0.0f);
+        vad.style_guide.assertiveness = json_value(style, "assertiveness", 0.0f);
+        vad.style_guide.empathy = json_value(style, "empathy", 0.0f);
+        vad.style_guide.hedging = json_value(style, "hedging", 0.0f);
+        vad.style_guide.directness = json_value(style, "directness", 0.0f);
+        if (style.contains("prompt_hints") && style.at("prompt_hints").is_array()) {
+            for (const auto & hint : style.at("prompt_hints")) {
+                if (hint.is_string()) {
+                    vad.style_guide.prompt_hints.push_back(hint.get<std::string>());
+                }
+            }
+        }
+    }
+    return vad;
+}
+
+bool server_emotive_vad_from_json(
+        const json & payload,
+        server_emotive_vad * out_vad,
+        std::string * out_error) {
+    if (!out_vad) {
+        if (out_error) {
+            *out_error = "emotive vad output must not be null";
+        }
+        return false;
+    }
+    if (!payload.is_object()) {
+        if (out_error) {
+            *out_error = "emotive vad payload must be an object";
+        }
+        return false;
+    }
+    *out_vad = vad_from_json(payload);
+    return true;
+}
+
+server_runtime_signal_summary server_runtime_signal_summary_from_json(const json & payload) {
+    server_runtime_signal_summary summary = {};
+    if (!payload.is_object()) {
+        return summary;
+    }
+    summary.available = json_value(payload, "available", false);
+    populate_runtime_signal_common_fields(payload, &summary);
+    summary.contradiction_probe = clamp_unit(json_value(payload, "contradiction_probe", summary.contradiction_probe));
+    summary.uncertainty_probe = clamp_unit(json_value(payload, "uncertainty_probe", summary.uncertainty_probe));
+    summary.broadcast_probe = clamp_unit(json_value(payload, "broadcast_probe", summary.broadcast_probe));
+    return summary;
+}
+
+bool server_emotive_trace_from_json(const json & payload, server_emotive_trace * out_trace) {
+    if (!out_trace) {
+        return false;
+    }
+    *out_trace = server_emotive_trace();
+    if (!payload.is_object()) {
+        return false;
+    }
+
+    server_emotive_trace trace = {};
+    trace.valid = true;
+    trace.trace_id = json_value(payload, "trace_id", std::string());
+    trace.model = json_value(payload, "model", std::string());
+    trace.turn_start_block_index = json_value(payload, "turn_start_block_index", int32_t(0));
+    trace.live_generation_start_block_index = json_value(payload, "live_generation_start_block_index", int32_t(0));
+    trace.final_moment = vector_from_json(json_value(payload, "final_moment", json::object()));
+    trace.final_vad = vad_from_json(json_value(payload, "final_vad", json::object()));
+    trace.embedding_mode = json_value(payload, "embedding_mode", std::string());
+    trace.estimator_version = json_value(payload, "estimator_version", std::string());
+    trace.provider_streamed = json_value(payload, "provider_streamed", false);
+    trace.retained_block_count = json_value(payload, "retained_block_count", int32_t(0));
+    trace.cognitive_replay = json_value(payload, "cognitive_replay", false);
+    trace.cognitive_replay_entry_id = json_value(payload, "cognitive_replay_entry_id", std::string());
+    trace.suppress_replay_admission = json_value(payload, "suppress_replay_admission", false);
+    trace.mode_label = json_value(payload, "mode", std::string());
+    trace.final_policy = payload.contains("final_policy") ? payload.at("final_policy") : json(nullptr);
+    trace.heuristic_retrieval = payload.contains("heuristic_retrieval") ? payload.at("heuristic_retrieval") : json(nullptr);
+
+    if (payload.contains("blocks") && payload.at("blocks").is_array()) {
+        for (const auto & item : payload.at("blocks")) {
+            if (!item.is_object()) {
+                continue;
+            }
+            server_emotive_block_record block = {};
+            block.block_index = json_value(item, "block_index", int32_t(0));
+            block.timestamp_ms = json_value(item, "timestamp_ms", int64_t(0));
+            const json source = item.value("source", json::object());
+            block.kind = emotive_block_kind_from_name(json_value(source, "kind", std::string()));
+            block.text = json_value(item, "text", std::string());
+            block.char_count = json_value(item, "char_count", int32_t(0));
+            block.moment = vector_from_json(item.value("moment", json::object()));
+            block.delta = delta_from_json(item.value("delta", json::object()));
+            block.vad = vad_from_json(item.value("vad", json::object()));
+            block.embedding_mode = json_value(item, "embedding_mode", std::string());
+            block.semantic_similarity_to_user = json_value(item, "semantic_similarity_to_user", 0.0f);
+            block.semantic_similarity_to_previous = json_value(item, "semantic_similarity_to_previous", 0.0f);
+            block.runtime_signals = server_runtime_signal_summary_from_json(item.value("runtime_signals", json::object()));
+            trace.blocks.push_back(std::move(block));
+        }
+    }
+
+    *out_trace = std::move(trace);
+    return true;
+}
+
 server_emotive_runtime::server_emotive_runtime(const server_emotive_runtime_config & config) :
         config_(config) {
-    std::string error;
-    embedding_backend_.configure(config.embedding, &error);
     load_heuristic_memory();
 }
 
@@ -1446,20 +2214,12 @@ const server_emotive_runtime_config & server_emotive_runtime::config() const {
 }
 
 bool server_emotive_runtime::build_embedding(const std::string & text, std::vector<float> & out_embedding, std::string * out_mode) const {
+    (void) text;
     if (!config_.enabled) {
         if (out_mode) {
             *out_mode = "disabled";
         }
         return false;
-    }
-
-    if (embedding_backend_.ready()) {
-        if (embedding_backend_.embed_text(text, out_embedding)) {
-            if (out_mode) {
-                *out_mode = embedding_backend_.mode_label();
-            }
-            return true;
-        }
     }
 
     if (out_mode) {
@@ -1468,6 +2228,414 @@ bool server_emotive_runtime::build_embedding(const std::string & text, std::vect
     out_embedding.clear();
     return false;
 }
+
+namespace {
+
+enum runtime_event_family {
+    RUNTIME_EVENT_FAMILY_NEUTRAL,
+    RUNTIME_EVENT_FAMILY_TOKEN,
+    RUNTIME_EVENT_FAMILY_CONSISTENCY,
+    RUNTIME_EVENT_FAMILY_ROUTING,
+    RUNTIME_EVENT_FAMILY_ATTENTION,
+    RUNTIME_EVENT_FAMILY_PROBE,
+    RUNTIME_EVENT_FAMILY_CHECKPOINT,
+    RUNTIME_EVENT_FAMILY_MEMORY,
+    RUNTIME_EVENT_FAMILY_FAILURE,
+};
+
+struct server_runtime_tick_features {
+    float predictive_uncertainty = 0.0f;
+    float certainty = 0.0f;
+    float conflict = 0.0f;
+    float focus = 0.0f;
+    float routing_commitment = 0.0f;
+    float progress = 0.0f;
+    float runtime_reliability = 0.0f;
+    float failure_load = 0.0f;
+    float novelty_drive = 0.0f;
+    float repetition_drag = 0.0f;
+    float control = 0.0f;
+    float verification_pressure = 0.0f;
+    float tool_success = 0.0f;
+    float attention_diffusion = 0.0f;
+    float routing_diffusion = 0.0f;
+    float timing_load = 0.0f;
+    float salience = 0.0f;
+};
+
+static runtime_event_family classify_runtime_event_family(const std::string & event_type) {
+    if (event_type == "decode_step_completed" ||
+            event_type == "prefill_chunk_completed" ||
+            event_type == "sampler_applied" ||
+            event_type == "token_accepted") {
+        return RUNTIME_EVENT_FAMILY_TOKEN;
+    }
+    if (event_type == "branch_disagreement_reported" ||
+            event_type == "branch_consistency_reported") {
+        return RUNTIME_EVENT_FAMILY_CONSISTENCY;
+    }
+    if (event_type == "moe_routing_emitted") {
+        return RUNTIME_EVENT_FAMILY_ROUTING;
+    }
+    if (event_type == "attention_diagnostic_emitted") {
+        return RUNTIME_EVENT_FAMILY_ATTENTION;
+    }
+    if (event_type == "hidden_probe_emitted") {
+        return RUNTIME_EVENT_FAMILY_PROBE;
+    }
+    if (event_type == "branch_checkpoint_saved" ||
+            event_type == "branch_checkpoint_restored") {
+        return RUNTIME_EVENT_FAMILY_CHECKPOINT;
+    }
+    if (event_type == "memory_slot_prepared" ||
+            event_type == "kv_memory_op" ||
+            event_type == "memory_rail_planned" ||
+            event_type == "memory_rail_span_evicted" ||
+            event_type == "memory_rail_sink_refreshed" ||
+            event_type == "memory_rail_lora_candidate" ||
+            event_type == "memory_rail_lora_applied") {
+        return RUNTIME_EVENT_FAMILY_MEMORY;
+    }
+    if (event_type == "runtime_fault") {
+        return RUNTIME_EVENT_FAMILY_FAILURE;
+    }
+    return RUNTIME_EVENT_FAMILY_NEUTRAL;
+}
+
+static float runtime_event_family_alpha(
+        runtime_event_family family,
+        float salience) {
+    float base = 0.16f;
+    switch (family) {
+        case RUNTIME_EVENT_FAMILY_TOKEN:       base = 0.18f; break;
+        case RUNTIME_EVENT_FAMILY_CONSISTENCY: base = 0.24f; break;
+        case RUNTIME_EVENT_FAMILY_ROUTING:     base = 0.20f; break;
+        case RUNTIME_EVENT_FAMILY_ATTENTION:   base = 0.18f; break;
+        case RUNTIME_EVENT_FAMILY_PROBE:       base = 0.22f; break;
+        case RUNTIME_EVENT_FAMILY_CHECKPOINT:  base = 0.22f; break;
+        case RUNTIME_EVENT_FAMILY_MEMORY:      base = 0.20f; break;
+        case RUNTIME_EVENT_FAMILY_FAILURE:     base = 0.34f; break;
+        case RUNTIME_EVENT_FAMILY_NEUTRAL:     base = 0.12f; break;
+    }
+    return clamp_unit(base + 0.18f * salience);
+}
+
+static float blend_runtime_axis(float previous, float target, float alpha) {
+    return clamp_unit((1.0f - alpha) * previous + alpha * target);
+}
+
+static server_runtime_tick_features runtime_tick_features_from_summary(
+        const server_runtime_signal_summary & summary) {
+    server_runtime_tick_features features = {};
+    const bool attention_full = summary.attention_availability == "full";
+    const float prompt_shift = clamp_unit(
+            (summary.prompt_section_changed ? 0.65f : 0.0f) +
+            0.35f * clamp_unit(summary.prompt_section_transition_count / 3.0f));
+    const float timing_load = clamp_unit(
+            0.45f * summary.timing_sample_ms +
+            0.35f * summary.timing_decode_ms +
+            0.20f * summary.timing_wall_ms);
+    const float tool_success = summary.tool_correctness_available
+            ? clamp_unit(summary.tool_correctness_score * std::max(0.30f, summary.tool_correctness_confidence))
+            : 0.0f;
+    const float routing_diffusion = clamp_unit(
+            0.60f * summary.route_entropy_mean +
+            0.40f * summary.route_entropy_max);
+    const float routing_commitment = clamp_unit(
+            0.38f * summary.route_top1_weight_mean +
+            0.22f * summary.route_top1_weight_max +
+            0.20f * summary.dominant_expert_fraction_top1 +
+            0.20f * (1.0f - routing_diffusion));
+    const float attention_diffusion = attention_full
+            ? clamp_unit(
+                    0.55f * summary.attention_entropy_mean +
+                    0.25f * summary.attention_entropy_max +
+                    0.20f * (1.0f - summary.attention_top1_mass_mean))
+            : clamp_unit(
+                    0.45f * prompt_shift +
+                    0.25f * summary.sampler_temperature +
+                    0.30f * timing_load);
+    const float focus = attention_full
+            ? clamp_unit(
+                    0.38f * summary.attention_top1_mass_mean +
+                    0.22f * summary.attention_top1_mass_max +
+                    0.22f * (1.0f - attention_diffusion) +
+                    0.18f * (1.0f - summary.repeat_hit_rate))
+            : clamp_unit(
+                    0.35f * summary.mean_margin +
+                    0.25f * (1.0f - summary.repeat_hit_rate) +
+                    0.20f * (1.0f - prompt_shift) +
+                    0.20f * (1.0f - summary.sampler_temperature));
+    const float consistency_risk = clamp_unit(
+            0.42f * (1.0f - summary.agreement_score) +
+            0.28f * summary.consistency_entropy +
+            0.20f * summary.branch_disagreement +
+            0.10f * summary.verifier_disagreement);
+    const float predictive_uncertainty = clamp_unit(
+            0.34f * summary.max_entropy +
+            0.20f * summary.mean_entropy +
+            0.16f * (1.0f - summary.mean_margin) +
+            0.10f * (1.0f - summary.sampled_prob) +
+            0.12f * consistency_risk +
+            0.08f * timing_load);
+    const float contradiction_signal = clamp_unit(
+            0.40f * summary.contradiction_probe +
+            0.24f * summary.branch_disagreement +
+            0.18f * summary.verifier_disagreement +
+            0.18f * summary.consistency_entropy);
+    const float verification_pressure = clamp_unit(
+            (summary.verifier_active ? 0.40f : 0.0f) +
+            0.34f * summary.verifier_disagreement +
+            0.18f * summary.branch_disagreement +
+            0.08f * (summary.consistency_source == "verifier" ? 1.0f : 0.0f));
+    const bool checkpoint_restore_failure =
+            summary.event_type == "branch_checkpoint_restored" &&
+            (summary.status_code != 0 || summary.state_op == "sequence_restore_purge");
+    const bool state_failure =
+            (summary.event_type == "branch_checkpoint_restored" ||
+             summary.event_type == "branch_checkpoint_saved") &&
+            summary.status_code != 0;
+    const bool kv_failure = summary.event_type == "kv_memory_op" && summary.status_code != 0;
+    const bool memory_rail_planned = summary.event_type == "memory_rail_planned";
+    const bool memory_rail_evicted = summary.event_type == "memory_rail_span_evicted";
+    const bool memory_rail_sink = summary.event_type == "memory_rail_sink_refreshed";
+    const bool memory_rail_lora_candidate = summary.event_type == "memory_rail_lora_candidate";
+    const bool memory_rail_lora_applied = summary.event_type == "memory_rail_lora_applied";
+    const bool memory_rail_event = memory_rail_planned ||
+            memory_rail_evicted ||
+            memory_rail_sink ||
+            memory_rail_lora_candidate ||
+            memory_rail_lora_applied;
+    const bool memory_failure =
+            summary.memory_status == "exhausted" ||
+            summary.memory_status == "failed" ||
+            summary.memory_status == "rejected";
+    const float memory_budget_pressure = clamp_unit(summary.memory_budget_ratio);
+    const float sink_continuity = clamp_unit(
+            (memory_rail_sink ? 0.28f : 0.0f) +
+            0.32f * summary.retention_attention_score +
+            0.24f * summary.retention_retrieval_score +
+            0.16f * summary.retention_sink_score);
+    const float durable_memory_write = clamp_unit(
+            (memory_rail_lora_applied ? 0.34f : 0.0f) +
+            (memory_rail_lora_candidate ? 0.08f : 0.0f) +
+            0.30f * summary.lora_gate_score +
+            0.18f * summary.retention_distilled_score +
+            0.10f * summary.retention_persistence_score);
+    const float eviction_disruption = clamp_unit(
+            (memory_rail_evicted ? 0.22f : 0.0f) +
+            0.34f * (1.0f - summary.retention_score) +
+            0.18f * memory_budget_pressure +
+            0.14f * (1.0f - sink_continuity) +
+            0.12f * (memory_rail_event && !memory_rail_sink && !memory_rail_lora_applied ? 1.0f : 0.0f));
+    const float failure_load = clamp_unit(
+            (summary.runtime_failure ? 0.48f : 0.0f) +
+            (checkpoint_restore_failure ? 0.18f : 0.0f) +
+            (state_failure ? 0.12f : 0.0f) +
+            (kv_failure ? 0.10f : 0.0f) +
+            (memory_failure ? 0.08f : 0.0f) +
+            0.10f * eviction_disruption +
+            (summary.tool_correctness_available ? 0.18f * (1.0f - tool_success) : 0.0f) +
+            0.06f * timing_load);
+    const float certainty = clamp_unit(
+            0.34f * (1.0f - predictive_uncertainty) +
+            0.22f * summary.mean_margin +
+            0.14f * summary.sampled_prob +
+            0.16f * summary.agreement_score +
+            0.14f * routing_commitment);
+    const float control = clamp_unit(
+            0.30f * focus +
+            0.26f * routing_commitment +
+            0.20f * certainty +
+            0.14f * (1.0f - failure_load) +
+            0.10f * sink_continuity +
+            0.10f * (summary.optimized ? 1.0f : 0.0f));
+    const float accepted_token = summary.event_type == "token_accepted" ? 1.0f : 0.0f;
+    const float checkpoint_progress = summary.event_type == "branch_checkpoint_saved" && summary.status_code == 0 ? 1.0f : 0.0f;
+    const float progress = clamp_unit(
+            0.24f * summary.agreement_score +
+            0.18f * tool_success +
+            0.16f * accepted_token +
+            0.14f * checkpoint_progress +
+            0.14f * summary.mean_margin +
+            0.08f * focus +
+            0.06f * sink_continuity);
+    const float runtime_reliability = clamp_unit(
+            0.30f * summary.agreement_score +
+            0.26f * tool_success +
+            0.22f * control +
+            0.14f * durable_memory_write +
+            0.08f * (1.0f - failure_load));
+    const float novelty_drive = clamp_unit(
+            0.32f * prompt_shift +
+            0.18f * attention_diffusion +
+            0.18f * summary.broadcast_probe +
+            0.12f * (summary.consistency_source == "sample_set" ? 1.0f : 0.0f) +
+            0.10f * summary.sampler_temperature +
+            0.10f * summary.uncertainty_probe);
+    const float repetition_drag = clamp_unit(summary.repeat_hit_rate);
+    const float conflict = clamp_unit(
+            0.34f * contradiction_signal +
+            0.26f * consistency_risk +
+            0.20f * verification_pressure +
+            0.10f * routing_diffusion +
+            0.06f * summary.uncertainty_probe +
+            0.04f * eviction_disruption);
+
+    features.predictive_uncertainty = predictive_uncertainty;
+    features.certainty = certainty;
+    features.conflict = conflict;
+    features.focus = focus;
+    features.routing_commitment = routing_commitment;
+    features.progress = progress;
+    features.runtime_reliability = runtime_reliability;
+    features.failure_load = failure_load;
+    features.novelty_drive = novelty_drive;
+    features.repetition_drag = repetition_drag;
+    features.control = control;
+    features.verification_pressure = verification_pressure;
+    features.tool_success = tool_success;
+    features.attention_diffusion = attention_diffusion;
+    features.routing_diffusion = routing_diffusion;
+    features.timing_load = clamp_unit(timing_load + 0.20f * memory_budget_pressure);
+    features.salience = clamp_unit(std::max({
+            predictive_uncertainty,
+            conflict,
+            failure_load,
+            verification_pressure,
+            0.50f * attention_diffusion + 0.50f * repetition_drag
+    }));
+    return features;
+}
+
+static server_emotive_vector runtime_tick_target_moment(
+        const server_runtime_signal_summary & summary,
+        const server_runtime_tick_features & features,
+        const server_emotive_vector * previous_moment) {
+    server_emotive_vector target = previous_moment ? *previous_moment : server_emotive_vector();
+    const runtime_event_family family = classify_runtime_event_family(summary.event_type);
+    const float confidence_softener = family == RUNTIME_EVENT_FAMILY_FAILURE ? 0.10f : 0.0f;
+
+    target.epistemic_pressure = clamp_unit(
+            0.48f * features.predictive_uncertainty +
+            0.22f * features.conflict +
+            0.18f * summary.uncertainty_probe +
+            0.12f * (1.0f - features.control));
+    target.confidence = clamp_unit(
+            0.40f * features.certainty +
+            0.18f * features.progress +
+            0.16f * features.routing_commitment +
+            0.14f * features.focus +
+            0.12f * features.tool_success -
+            0.28f * features.conflict -
+            (0.18f + confidence_softener) * features.failure_load);
+    target.contradiction_pressure = clamp_unit(
+            0.46f * features.conflict +
+            0.20f * features.verification_pressure +
+            0.18f * (1.0f - summary.agreement_score) +
+            0.16f * summary.contradiction_probe);
+    target.planning_clarity = clamp_unit(
+            0.34f * features.control +
+            0.24f * features.focus +
+            0.20f * features.certainty +
+            0.12f * features.progress -
+            0.18f * features.conflict -
+            0.16f * features.repetition_drag);
+    target.curiosity = clamp_unit(
+            0.42f * features.novelty_drive +
+            0.22f * features.attention_diffusion +
+            0.18f * summary.sampler_temperature +
+            0.18f * (summary.consistency_source == "sample_set" ? 1.0f : 0.0f));
+    target.caution = clamp_unit(
+            0.36f * features.predictive_uncertainty +
+            0.24f * features.verification_pressure +
+            0.22f * features.conflict +
+            0.18f * features.failure_load);
+    target.frustration = clamp_unit(
+            0.30f * features.failure_load +
+            0.22f * features.repetition_drag +
+            0.18f * features.conflict +
+            0.16f * (1.0f - features.control) +
+            0.14f * features.attention_diffusion);
+    target.satisfaction = clamp_unit(
+            0.34f * features.progress +
+            0.24f * features.certainty +
+            0.22f * features.tool_success +
+            0.12f * features.control -
+            0.22f * features.failure_load -
+            0.14f * features.conflict);
+    target.momentum = clamp_unit(
+            0.28f * features.progress +
+            0.22f * features.control +
+            0.18f * features.focus +
+            0.12f * features.certainty +
+            0.10f * features.novelty_drive -
+            0.18f * features.failure_load -
+            0.14f * features.repetition_drag);
+    target.stall = clamp_unit(
+            0.32f * features.repetition_drag +
+            0.22f * features.attention_diffusion +
+            0.18f * features.failure_load +
+            0.16f * (1.0f - features.control) +
+            0.12f * (1.0f - features.progress));
+    target.semantic_novelty = clamp_unit(
+            0.56f * features.novelty_drive +
+            0.24f * features.attention_diffusion +
+            0.20f * (summary.prompt_section_changed ? 1.0f : 0.0f));
+    target.user_alignment = clamp_unit(
+            0.42f * summary.broadcast_probe +
+            0.24f * features.tool_success +
+            0.18f * summary.agreement_score +
+            0.16f * (summary.prompt_section_label == "user" ? 1.0f : 0.0f));
+    target.runtime_trust = clamp_unit(
+            0.44f * features.runtime_reliability +
+            0.22f * features.tool_success +
+            0.18f * summary.agreement_score +
+            0.16f * features.control -
+            0.34f * features.failure_load);
+    target.runtime_failure_pressure = clamp_unit(
+            0.58f * features.failure_load +
+            0.22f * features.verification_pressure +
+            0.20f * (1.0f - features.control));
+
+    return target;
+}
+
+static void apply_runtime_signal_summary_to_moment(
+        const server_runtime_signal_summary & summary,
+        server_emotive_block_record * record,
+        const server_emotive_vector * previous_moment) {
+    if (!record || !summary.available) {
+        return;
+    }
+
+    const runtime_event_family family = classify_runtime_event_family(summary.event_type);
+    const server_runtime_tick_features features = runtime_tick_features_from_summary(summary);
+    const server_emotive_vector target = runtime_tick_target_moment(summary, features, previous_moment);
+    const float alpha = runtime_event_family_alpha(family, features.salience);
+
+    if (!previous_moment) {
+        record->moment = target;
+        return;
+    }
+
+    record->moment.epistemic_pressure = blend_runtime_axis(previous_moment->epistemic_pressure, target.epistemic_pressure, alpha);
+    record->moment.confidence = blend_runtime_axis(previous_moment->confidence, target.confidence, alpha);
+    record->moment.contradiction_pressure = blend_runtime_axis(previous_moment->contradiction_pressure, target.contradiction_pressure, alpha);
+    record->moment.planning_clarity = blend_runtime_axis(previous_moment->planning_clarity, target.planning_clarity, alpha);
+    record->moment.curiosity = blend_runtime_axis(previous_moment->curiosity, target.curiosity, alpha);
+    record->moment.caution = blend_runtime_axis(previous_moment->caution, target.caution, alpha);
+    record->moment.frustration = blend_runtime_axis(previous_moment->frustration, target.frustration, alpha);
+    record->moment.satisfaction = blend_runtime_axis(previous_moment->satisfaction, target.satisfaction, alpha);
+    record->moment.momentum = blend_runtime_axis(previous_moment->momentum, target.momentum, alpha);
+    record->moment.stall = blend_runtime_axis(previous_moment->stall, target.stall, alpha);
+    record->moment.semantic_novelty = blend_runtime_axis(previous_moment->semantic_novelty, target.semantic_novelty, alpha);
+    record->moment.user_alignment = blend_runtime_axis(previous_moment->user_alignment, target.user_alignment, alpha);
+    record->moment.runtime_trust = blend_runtime_axis(previous_moment->runtime_trust, target.runtime_trust, alpha);
+    record->moment.runtime_failure_pressure = blend_runtime_axis(previous_moment->runtime_failure_pressure, target.runtime_failure_pressure, alpha);
+}
+
+} // namespace
 
 server_emotive_block_record server_emotive_runtime::evaluate_block(
         server_emotive_block_kind kind,
@@ -1520,8 +2688,18 @@ server_emotive_block_record server_emotive_runtime::evaluate_block(
 
     const float semantic_novelty = clamp_unit(previous_embedding.empty() ? 0.0f : 1.0f - sim_previous);
     const float lexical_repetition = clamp_unit(previous_embedding.empty() ? 0.0f : sim_previous);
-    const float runtime_failure = clamp_unit(kind == SERVER_EMOTIVE_BLOCK_RUNTIME_EVENT &&
-            (record.text.find("error") != std::string::npos || record.text.find("fail") != std::string::npos || record.text.find("timeout") != std::string::npos) ? 1.0f : 0.0f);
+    record.runtime_signals = kind == SERVER_EMOTIVE_BLOCK_RUNTIME_EVENT ?
+            runtime_signal_summary_from_text(record.text) :
+            server_runtime_signal_summary();
+    record.timestamp_ms = record.runtime_signals.available && record.runtime_signals.timestamp_ms > 0
+            ? record.runtime_signals.timestamp_ms
+            : now_ms();
+    const float runtime_failure = clamp_unit(
+            kind == SERVER_EMOTIVE_BLOCK_RUNTIME_EVENT &&
+            (record.runtime_signals.runtime_failure ||
+             record.text.find("error") != std::string::npos ||
+             record.text.find("fail") != std::string::npos ||
+             record.text.find("timeout") != std::string::npos) ? 1.0f : 0.0f);
     const float user_alignment = clamp_unit(sim_user);
     const float runtime_trust = clamp_unit(0.70f - 0.60f * runtime_failure + 0.10f * (kind == SERVER_EMOTIVE_BLOCK_RUNTIME_EVENT ? 0.0f : 1.0f));
     const float runtime_failure_pressure = clamp_unit(runtime_failure);
@@ -1585,6 +2763,10 @@ server_emotive_block_record server_emotive_runtime::evaluate_block(
     record.moment.user_alignment = user_alignment;
     record.moment.runtime_trust = runtime_trust;
     record.moment.runtime_failure_pressure = runtime_failure_pressure;
+
+    if (record.runtime_signals.available) {
+        apply_runtime_signal_summary_to_moment(record.runtime_signals, &record, previous_moment);
+    }
 
     record.delta = compute_delta(record.moment, previous_moment);
     record.vad = project_vad(record.moment, previous_vad, config_.vad_ema_alpha);
@@ -1863,7 +3045,6 @@ json server_emotive_runtime::health_json() const {
             {"last_error", heuristic_memory_error_},
             {"last_retrieval", heuristic_retrieval_decision_to_json(last_heuristic_retrieval_)},
         }},
-        {"embedding_backend", embedding_backend_.health_json()},
     };
 }
 
@@ -2481,8 +3662,7 @@ server_metacognitive_policy_decision server_emotive_runtime::compute_control_pol
                     0.15f * valence_n);
     decision.background_defer_score = with_bias(
             "background_defer",
-            0.50f * state.ongoing_task_due +
-                    0.35f * m.satisfaction +
+            0.35f * m.satisfaction +
                     0.30f * m.planning_clarity +
                     0.25f * m.momentum -
                     0.55f * m.user_alignment -
@@ -2511,9 +3691,6 @@ server_metacognitive_policy_decision server_emotive_runtime::compute_control_pol
     if (m.stall >= 0.75f && m.contradiction_pressure >= 0.55f) {
         decision.selected_mode = "reflective";
     }
-    if (state.ongoing_task_due >= 0.80f && m.user_alignment <= 0.25f) {
-        decision.selected_mode = "background_defer";
-    }
     if (state.cognitive_replay) {
         decision.selected_mode = "reflective";
     }
@@ -2538,6 +3715,8 @@ server_metacognitive_policy_decision server_emotive_runtime::compute_control_pol
     } else {
         decision.reasoning_depth = "deep";
     }
+    decision.response_budget_bucket = server_default_response_budget_bucket();
+    decision.reasoning_budget_bucket = server_default_reasoning_budget_bucket();
 
     decision.tool_aggression = clamp_unit(with_bias(
             "tool_aggression",
@@ -2668,6 +3847,8 @@ server_emotive_turn_builder::server_emotive_turn_builder(
         user_anchor_count_(0),
         have_previous_moment_(false),
         have_previous_vad_(false),
+        turn_start_block_index_(0),
+        turn_start_marked_(false),
         live_generation_start_block_index_(0),
         live_generation_start_marked_(false),
         cognitive_replay_(cognitive_replay),
@@ -2700,6 +3881,12 @@ void server_emotive_turn_builder::observe_content_delta(const std::string & text
 void server_emotive_turn_builder::observe_runtime_event(const std::string & text) {
     append_text(SERVER_EMOTIVE_BLOCK_RUNTIME_EVENT, text);
     flush_pending();
+}
+
+void server_emotive_turn_builder::mark_turn_start() {
+    flush_pending();
+    turn_start_block_index_ = (int32_t) blocks_.size();
+    turn_start_marked_ = true;
 }
 
 void server_emotive_turn_builder::mark_live_generation_start() {
@@ -2801,11 +3988,14 @@ server_emotive_trace server_emotive_turn_builder::finalize() {
     trace.trace_id = make_trace_id();
     trace.model = model_name_;
     trace.blocks = blocks_;
+    trace.turn_start_block_index = turn_start_marked_ ?
+            turn_start_block_index_ :
+            0;
     trace.live_generation_start_block_index = live_generation_start_marked_ ?
             live_generation_start_block_index_ :
             0;
     trace.embedding_mode = blocks_.empty() ? "lexical_only" : blocks_.back().embedding_mode;
-    trace.estimator_version = "v2_vad_projection";
+    trace.estimator_version = "v4_runtime_tick";
     trace.provider_streamed = true;
     trace.retained_block_count = (int32_t) blocks_.size();
     trace.cognitive_replay = cognitive_replay_;

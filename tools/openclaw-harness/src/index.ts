@@ -1,25 +1,21 @@
 import { buildCatalog } from "./catalog.js";
-import {
-  defaultPaths,
-  loadToolSecrets,
-  saveToolSecrets,
-  upsertApiToolConfig,
-  upsertServarrConfig,
-  upsertTavilyApiKey
-} from "./config.js";
+import { defaultPaths, loadToolSecrets } from "./config.js";
+import { isCliEntrypoint } from "./cli-entrypoint.js";
 import {
   buildProviderToolsFromRuntimeCatalog,
   invokeRuntimeCapability,
   resolveCapabilityByToolName,
-  resolveInvocation,
 } from "./invoke.js";
-import { loadRuntimeCatalogState, writeRuntimeCatalog } from "./runtime-catalog.js";
+import {
+  loadRuntimeCatalogState,
+  writeRuntimeCatalog,
+  writeTelegramRuntimeToolsSnapshot,
+} from "./runtime-catalog.js";
 
 export * from "./contracts.js";
 export * from "./catalog.js";
 export * from "./config.js";
 export * from "./invoke.js";
-export * from "./ongoing-tasks.js";
 export * from "./runtime-catalog.js";
 export {
   HardMemoryToolError,
@@ -55,18 +51,6 @@ export {
   type HostShellResponseEnvelope,
 } from "./host-shell.js";
 export {
-  ParsedDocumentsToolError,
-  errorEnvelope as parsedDocumentsErrorEnvelope,
-  handleParsedDocuments,
-  parseCliInvocation as parseParsedDocumentsCliInvocation,
-  resolveParsedDocumentsConfig,
-  runParsedDocumentsCli,
-  type ParsedDocumentsConfig,
-  type ParsedDocumentsInvocation,
-  type ParsedDocumentsResponseEnvelope,
-  type ParsedDocumentSearchResult,
-} from "./parsed-documents.js";
-export {
   TelegramRelayToolError,
   errorEnvelope as telegramRelayErrorEnvelope,
   handleTelegramRelay,
@@ -76,10 +60,6 @@ export {
   type TelegramRelayInvocation,
   type TelegramRelayResponseEnvelope,
 } from "./telegram-relay.js";
-
-function defaultCliPaths() {
-  return defaultPaths();
-}
 
 function parseCliFlags(argv: string[]): Map<string, string> {
   const flags = new Map<string, string>();
@@ -110,13 +90,14 @@ function parseJsonObjectArgument(encoded: string | undefined, flagName: string):
   return parsed as Record<string, unknown>;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isCliEntrypoint(import.meta.url, process.argv[1])) {
   const command = process.argv[2] ?? "catalog";
   const flags = parseCliFlags(process.argv.slice(3));
+  const paths = defaultPaths();
+
   if (command === "catalog") {
     process.stdout.write(`${JSON.stringify(buildCatalog(), null, 2)}\n`);
   } else if (command === "runtime-catalog") {
-    const paths = defaultCliPaths();
     process.stdout.write(
       `${JSON.stringify(
         {
@@ -124,14 +105,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
           catalog: loadRuntimeCatalogState({
             secretsPath: paths.secretsPath,
             runtimeCatalogPath: paths.runtimeCatalogPath,
-          })
+          }),
         },
         null,
         2
       )}\n`
     );
   } else if (command === "runtime-tools") {
-    const paths = defaultCliPaths();
     const excludeToolNames = (flags.get("exclude-tool-name") ?? "")
       .split(",")
       .map((value) => value.trim())
@@ -158,7 +138,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       throw new Error("invoke-runtime requires --tool-name=<name>");
     }
     const providerArguments = parseJsonObjectArgument(flags.get("arguments-base64"), "--arguments-base64");
-    const paths = defaultCliPaths();
     const catalog = loadRuntimeCatalogState({
       secretsPath: paths.secretsPath,
       runtimeCatalogPath: paths.runtimeCatalogPath,
@@ -174,6 +153,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
               tool_surface_id: capability.tool_surface_id,
               merged_arguments: result.mergedArguments,
               observation: result.observation,
+              ...(result.correctness ? { correctness: result.correctness } : {}),
             },
             null,
             2
@@ -185,77 +165,38 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         process.exitCode = 1;
       });
   } else if (command === "sync-runtime-catalog") {
-    const paths = defaultCliPaths();
     writeRuntimeCatalog(paths.runtimeCatalogPath, paths.secretsPath);
     process.stdout.write(
       `${JSON.stringify(
         {
-          runtime_catalog_path: paths.runtimeCatalogPath
-        },
-        null,
-        2
-      )}\n`
-    );
-  } else if (command === "install-tavily") {
-    const apiKey = process.argv[3];
-    if (!apiKey) {
-      throw new Error("install-tavily requires an api key argument");
-    }
-    const paths = defaultCliPaths();
-    const secrets = upsertTavilyApiKey(loadToolSecrets(paths.secretsPath), apiKey);
-    saveToolSecrets(paths.secretsPath, secrets);
-    writeRuntimeCatalog(paths.runtimeCatalogPath, paths.secretsPath);
-    process.stdout.write(
-      `${JSON.stringify(
-        {
-          secrets_path: paths.secretsPath,
           runtime_catalog_path: paths.runtimeCatalogPath,
-          tavily_enabled: true
         },
         null,
         2
       )}\n`
     );
-  } else if (command === "install-radarr" || command === "install-sonarr" || command === "install-chaptarr") {
-    const apiKey = process.argv[3];
-    if (!apiKey) {
-      throw new Error(`${command} requires an api key argument`);
-    }
-    const optionalBaseUrl = process.argv[4];
-    const paths = defaultCliPaths();
-    const toolId =
-      command === "install-radarr"
-        ? "radarr"
-        : command === "install-sonarr"
-          ? "sonarr"
-          : "chaptarr";
-    const secrets =
-      toolId === "chaptarr"
-        ? upsertApiToolConfig(loadToolSecrets(paths.secretsPath), toolId, apiKey, optionalBaseUrl)
-        : upsertServarrConfig(loadToolSecrets(paths.secretsPath), toolId, apiKey, optionalBaseUrl);
-    saveToolSecrets(paths.secretsPath, secrets);
-    writeRuntimeCatalog(paths.runtimeCatalogPath, paths.secretsPath);
+  } else if (command === "publish-telegram-runtime-tools") {
+    const snapshotPath = flags.get("snapshot-path")?.trim() || paths.telegramRuntimeToolsSnapshotPath;
+    const snapshot = writeTelegramRuntimeToolsSnapshot({
+      snapshotPath,
+      secretsPath: paths.secretsPath,
+      runtimeCatalogPath: paths.runtimeCatalogPath,
+      entryPath: process.argv[1] ?? "",
+      nodeBin: process.execPath,
+    });
     process.stdout.write(
       `${JSON.stringify(
         {
-          secrets_path: paths.secretsPath,
-          runtime_catalog_path: paths.runtimeCatalogPath,
-          tool: toolId,
-          installed: true
+          snapshot_path: snapshotPath,
+          tool_count: snapshot.tool_count,
         },
         null,
         2
       )}\n`
     );
-  } else if (command === "validate") {
-    const payload = process.argv[3];
-    if (!payload) {
-      throw new Error("validate requires a JSON payload");
-    }
-    const invocation = JSON.parse(payload);
-    const capability = resolveInvocation(buildCatalog(), invocation);
-    process.stdout.write(`${JSON.stringify(capability, null, 2)}\n`);
+  } else if (command === "show-secrets") {
+    process.stdout.write(`${JSON.stringify(loadToolSecrets(paths.secretsPath), null, 2)}\n`);
   } else {
-    throw new Error(`unknown command: ${command}`);
+    throw new Error(`unsupported command: ${command}`);
   }
 }

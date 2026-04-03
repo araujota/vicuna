@@ -35,7 +35,11 @@ def _registry_path(registry_dir: Path, model_name: str) -> Path:
 def ensure_registry(registry_dir: Path, model_name: str) -> dict[str, Any]:
     registry_path = _registry_path(registry_dir, model_name)
     if registry_path.exists():
-        return _read_json(registry_path)
+        payload = _read_json(registry_path)
+        payload.setdefault("aliases", {})
+        payload.setdefault("aliases_by_kind", {})
+        payload.setdefault("promotion_history", [])
+        return payload
     now_ms = int(time.time() * 1000)
     manifest = {
         "schema_version": REGISTRY_SCHEMA_VERSION,
@@ -44,6 +48,7 @@ def ensure_registry(registry_dir: Path, model_name: str) -> dict[str, Any]:
         "updated_at_ms": now_ms,
         "versions": [],
         "aliases": {},
+        "aliases_by_kind": {},
         "promotion_history": [],
     }
     _write_json(registry_path, manifest)
@@ -68,6 +73,50 @@ def _copy_into_version_dir(source_path: Path, destination_path: Path) -> str:
     destination_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source_path, destination_path)
     return str(destination_path)
+
+
+def _artifact_metadata(artifact: dict[str, Any]) -> dict[str, Any]:
+    schema_version = str(artifact.get("schema_version", ""))
+    if schema_version == "vicuna.policy_artifact.v1":
+        return {
+            "artifact_kind": "policy",
+            "artifact_version": artifact["policy_version"],
+            "metrics_summary": {
+                "exact_match_rate": artifact.get("training_metrics", {}).get("exact_match_rate"),
+                "record_count": artifact.get("training_metrics", {}).get("record_count"),
+            },
+        }
+    if schema_version == "vicuna.ppo_policy_artifact.v1":
+        return {
+            "artifact_kind": "ppo_policy",
+            "artifact_version": artifact["policy_version"],
+            "metrics_summary": {
+                "record_count": artifact.get("training_metrics", {}).get("record_count"),
+                "warmstart_loss": artifact.get("training_metrics", {}).get("warmstart_loss"),
+                "ppo_loss": artifact.get("training_metrics", {}).get("ppo_loss"),
+                "live_rollout_count": artifact.get("training_metrics", {}).get("live_rollout_count"),
+            },
+        }
+    if schema_version == "vicuna.cvec_generator_artifact.v1":
+        return {
+            "artifact_kind": "cvec_generator",
+            "artifact_version": artifact["generator_version"],
+            "metrics_summary": {
+                "weighted_mse": artifact.get("training_metrics", {}).get("weighted_mse"),
+                "weighted_cosine": artifact.get("training_metrics", {}).get("weighted_cosine"),
+                "record_count": artifact.get("training_metrics", {}).get("record_count"),
+            },
+        }
+    if schema_version == "vicuna.decode_controller_artifact.v1":
+        return {
+            "artifact_kind": "decode_controller",
+            "artifact_version": artifact["controller_version"],
+            "metrics_summary": {
+                "record_count": artifact.get("training_metrics", {}).get("record_count"),
+                "loss_total": artifact.get("training_metrics", {}).get("total"),
+            },
+        }
+    raise ValueError(f"unsupported artifact schema_version {schema_version}")
 
 
 def register_artifact(
@@ -102,10 +151,12 @@ def register_artifact(
     evaluation_report = _read_json(copied_evaluation_report_path)
     now_ms = int(time.time() * 1000)
 
+    artifact_meta = _artifact_metadata(artifact)
     registry["versions"].append(
         {
             "version": version,
-            "policy_version": artifact["policy_version"],
+            "artifact_kind": artifact_meta["artifact_kind"],
+            "artifact_version": artifact_meta["artifact_version"],
             "registered_at_ms": now_ms,
             "artifact_path": str(copied_artifact_path.relative_to(_model_dir(registry_dir, model_name))),
             "training_run_manifest_path": str(
@@ -116,6 +167,7 @@ def register_artifact(
             ),
             "dataset_id": training_manifest["dataset_id"],
             "metrics_summary": {
+                **artifact_meta["metrics_summary"],
                 "exact_match_rate": evaluation_report.get("exact_match_rate"),
                 "invalid_action_rate": evaluation_report.get("invalid_action_rate"),
                 "reward_total_mean_on_match": evaluation_report.get("reward_total_mean_on_match"),
@@ -125,24 +177,38 @@ def register_artifact(
     )
     registry["updated_at_ms"] = now_ms
     _write_json(_registry_path(registry_dir, model_name), registry)
-    return {
+    result = {
         "model_name": model_name,
         "version": version,
         "registry_manifest_path": str(_registry_path(registry_dir, model_name)),
         "artifact_path": str(copied_artifact_path),
         "training_run_manifest_path": str(copied_training_manifest_path),
         "evaluation_report_path": str(copied_evaluation_report_path),
-        "policy_version": artifact["policy_version"],
+        "artifact_kind": artifact_meta["artifact_kind"],
+        "artifact_version": artifact_meta["artifact_version"],
     }
+    if artifact_meta["artifact_kind"] == "policy":
+        result["policy_version"] = artifact_meta["artifact_version"]
+    if artifact_meta["artifact_kind"] == "ppo_policy":
+        result["policy_version"] = artifact_meta["artifact_version"]
+    if artifact_meta["artifact_kind"] == "cvec_generator":
+        result["generator_version"] = artifact_meta["artifact_version"]
+    if artifact_meta["artifact_kind"] == "decode_controller":
+        result["controller_version"] = artifact_meta["artifact_version"]
+    return result
 
 
 def get_alias_version(
     registry_dir: Path,
     model_name: str,
     alias: str,
+    artifact_kind: str | None = None,
 ) -> int | None:
     registry = ensure_registry(registry_dir, model_name)
-    value = registry.get("aliases", {}).get(alias)
+    if artifact_kind:
+        value = (registry.get("aliases_by_kind", {}).get(artifact_kind) or {}).get(alias)
+    else:
+        value = registry.get("aliases", {}).get(alias)
     if value is None:
         return None
     return int(value)
@@ -162,17 +228,26 @@ def promote_alias(
     alias: str,
     version: int,
     reason: str,
+    artifact_kind: str | None = None,
     thresholds: dict[str, Any] | None = None,
     decision: str = "promoted",
 ) -> dict[str, Any]:
     registry = ensure_registry(registry_dir, model_name)
-    _version_entry(registry, version)
-    previous_version = registry.get("aliases", {}).get(alias)
+    entry = _version_entry(registry, version)
+    if artifact_kind is None:
+        inferred_kind = entry.get("artifact_kind")
+        artifact_kind = inferred_kind if inferred_kind in {"decode_controller", "cvec_generator"} else None
+    if artifact_kind:
+        aliases = registry.setdefault("aliases_by_kind", {}).setdefault(artifact_kind, {})
+    else:
+        aliases = registry.setdefault("aliases", {})
+    previous_version = aliases.get(alias)
     if decision == "promoted":
-        registry.setdefault("aliases", {})[alias] = int(version)
+        aliases[alias] = int(version)
     event = {
         "created_at_ms": int(time.time() * 1000),
         "alias": alias,
+        "artifact_kind": artifact_kind,
         "from_version": previous_version,
         "to_version": int(version),
         "reason": reason,
@@ -202,6 +277,7 @@ def registry_status(registry_dir: Path, model_name: str) -> dict[str, Any]:
         "version_count": len(registry["versions"]),
         "latest_version": latest_version,
         "aliases": registry.get("aliases", {}),
+        "aliases_by_kind": registry.get("aliases_by_kind", {}),
         "promotion_history": registry.get("promotion_history", []),
         "registry_manifest_path": str(_registry_path(registry_dir, model_name)),
     }
@@ -213,13 +289,17 @@ def resolve_artifact_path(
     *,
     alias: str | None = None,
     version: int | None = None,
+    artifact_kind: str | None = None,
 ) -> Path:
     registry = ensure_registry(registry_dir, model_name)
     resolved_version = version
     if resolved_version is None:
         if alias is None:
             raise ValueError("alias or version is required")
-        alias_version = registry.get("aliases", {}).get(alias)
+        if artifact_kind:
+            alias_version = (registry.get("aliases_by_kind", {}).get(artifact_kind) or {}).get(alias)
+        else:
+            alias_version = registry.get("aliases", {}).get(alias)
         if alias_version is None:
             raise ValueError(f"alias {alias} is not assigned")
         resolved_version = int(alias_version)
@@ -233,13 +313,17 @@ def resolve_version_entry(
     *,
     alias: str | None = None,
     version: int | None = None,
+    artifact_kind: str | None = None,
 ) -> dict[str, Any]:
     registry = ensure_registry(registry_dir, model_name)
     resolved_version = version
     if resolved_version is None:
         if alias is None:
             raise ValueError("alias or version is required")
-        alias_version = registry.get("aliases", {}).get(alias)
+        if artifact_kind:
+            alias_version = (registry.get("aliases_by_kind", {}).get(artifact_kind) or {}).get(alias)
+        else:
+            alias_version = registry.get("aliases", {}).get(alias)
         if alias_version is None:
             raise ValueError(f"alias {alias} is not assigned")
         resolved_version = int(alias_version)

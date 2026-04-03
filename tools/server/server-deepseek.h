@@ -44,6 +44,17 @@ struct deepseek_chat_result {
     json rich_response = nullptr;
 };
 
+json deepseek_tool_call_to_json(const deepseek_tool_call & tool_call);
+bool deepseek_tool_call_from_json(
+        const json & body,
+        deepseek_tool_call * out_tool_call,
+        std::string * out_error = nullptr);
+json deepseek_chat_result_to_json(const deepseek_chat_result & result);
+bool deepseek_chat_result_from_json(
+        const json & body,
+        deepseek_chat_result * out_result,
+        std::string * out_error = nullptr);
+
 deepseek_runtime_config deepseek_runtime_config_from_env();
 bool deepseek_validate_runtime_config(const deepseek_runtime_config & config, json * out_error = nullptr);
 bool deepseek_complete_chat(

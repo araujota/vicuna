@@ -9,7 +9,7 @@ User=@VICUNA_SERVICE_USER@
 Group=@VICUNA_SERVICE_GROUP@
 WorkingDirectory=@VICUNA_REPO_ROOT@
 EnvironmentFile=-@VICUNA_ENV_FILE@
-ExecStart=@VICUNA_REPO_ROOT@/tools/ops/run-policy-nightly.sh
+ExecStart=@VICUNA_REPO_ROOT@/tools/ops/run-with-service-logs.sh policy-nightly @VICUNA_REPO_ROOT@/tools/ops/run-policy-nightly.sh
 TimeoutStartSec=1800
 
 [Install]

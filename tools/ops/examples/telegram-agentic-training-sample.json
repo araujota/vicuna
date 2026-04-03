@@ -1,0 +1,22 @@
+{
+  "chatId": "7502424413",
+  "conversationId": "training-harness-sample",
+  "hostBaseUrl": "http://127.0.0.1:8080",
+  "model": "vicuna-experimental",
+  "deferredDelivery": true,
+  "verifyCapture": true,
+  "requests": [
+    {
+      "id": "web_search_runtime",
+      "text": "Use whichever runtime tools are appropriate to inspect the retained Vicuna runtime surfaces and summarize the two most important operational differences between standard and experimental mode."
+    },
+    {
+      "id": "docs_bridge_render",
+      "text": "Inspect the local Vicuna docs or runtime knowledge and explain how Telegram text delivery and follow-up emotive video delivery are sequenced for one turn."
+    },
+    {
+      "id": "memory_skill_probe",
+      "text": "Use the host-owned skills or hard-memory surfaces if needed and explain how a future decode controller training pass would consume data from transitions, decode traces, and emotive traces."
+    }
+  ]
+}

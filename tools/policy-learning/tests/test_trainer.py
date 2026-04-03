@@ -33,12 +33,13 @@ def make_transition(transition_id: str, available_tool_count: int) -> dict:
             "available_tool_count": available_tool_count,
             "parallel_tool_calls_requested": available_tool_count > 0,
             "input_message_count": 1,
-            "ongoing_task_due": 0.0,
             "vad": {"valence": 0.1, "arousal": 0.2, "dominance": 0.3},
         },
         "action_mask": {
             "allowed_modes": ["direct", "tool_light"],
             "allowed_reasoning_depths": ["short", "medium"],
+            "allowed_response_budget_buckets": [256, 512],
+            "allowed_reasoning_budget_buckets": [0, 64],
             "max_tool_parallelism_cap": 1,
             "allow_interrupt": True,
             "allow_replan": True,
@@ -48,6 +49,8 @@ def make_transition(transition_id: str, available_tool_count: int) -> dict:
         "executed_action": {
             "selected_mode": selected_mode,
             "reasoning_depth": "short",
+            "response_budget_bucket": 512,
+            "reasoning_budget_bucket": 64,
             "token_budget_bucket": 512,
             "tool_parallelism_cap": 0,
             "interrupt_allowed": False,

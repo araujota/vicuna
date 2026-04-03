@@ -31,6 +31,8 @@ def make_transition(transition_id: str, request_id: str, available_tool_count: i
         "action_mask": {
             "allowed_modes": ["direct", "tool_light"],
             "allowed_reasoning_depths": ["short", "medium"],
+            "allowed_response_budget_buckets": [256, 512, 1024],
+            "allowed_reasoning_budget_buckets": [0, 64, 128],
             "max_tool_parallelism_cap": 1,
             "allow_interrupt": True,
             "allow_replan": True,
@@ -40,6 +42,8 @@ def make_transition(transition_id: str, request_id: str, available_tool_count: i
         "executed_action": {
             "selected_mode": "direct" if available_tool_count == 0 else "tool_light",
             "reasoning_depth": "short",
+            "response_budget_bucket": 512,
+            "reasoning_budget_bucket": 64,
             "token_budget_bucket": 512,
             "tool_parallelism_cap": 0,
             "interrupt_allowed": False,
@@ -93,5 +97,7 @@ def test_evaluate_dataset_with_command_adapter(tmp_path: Path):
     assert "exact_match_rate" in report
     assert "thinking_mode_match_rate" in report
     assert "prefix_profile_match_rate" in report
+    assert "response_budget_bucket_match_rate" in report
+    assert "reasoning_budget_bucket_match_rate" in report
     assert "per_head_disagreement" in report
     assert report["reward_model_version"] == "desired_state_reward_v1"

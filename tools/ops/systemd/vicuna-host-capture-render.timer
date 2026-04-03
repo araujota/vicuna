@@ -1,0 +1,10 @@
+[Unit]
+Description=Vicuña Host Experimental Capture Render Timer
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=20s
+Unit=vicuna-host-capture-render.service
+
+[Install]
+WantedBy=timers.target

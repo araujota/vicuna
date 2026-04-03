@@ -65,6 +65,10 @@ def _compare_targets(candidate_targets: dict[str, Any], executed_targets: dict[s
         == executed_targets["repetition_profile"],
         "tool_choice_profile": candidate_targets["tool_choice_profile"]
         == executed_targets["tool_choice_profile"],
+        "response_budget_bucket": candidate_targets["response_budget_bucket"]
+        == executed_targets["response_budget_bucket"],
+        "reasoning_budget_bucket": candidate_targets["reasoning_budget_bucket"]
+        == executed_targets["reasoning_budget_bucket"],
         "token_budget_bucket": candidate_targets["token_budget_bucket"]
         == executed_targets["token_budget_bucket"],
         "tool_parallelism_cap": candidate_targets["tool_parallelism_cap"]
@@ -110,6 +114,8 @@ def evaluate_dataset(
         "sampling_profile": 0,
         "repetition_profile": 0,
         "tool_choice_profile": 0,
+        "response_budget_bucket": 0,
+        "reasoning_budget_bucket": 0,
         "token_budget_bucket": 0,
         "tool_parallelism_cap": 0,
         **{head: 0 for head in BOOLEAN_HEADS},
@@ -129,6 +135,8 @@ def evaluate_dataset(
         "sampling_profile": 0,
         "repetition_profile": 0,
         "tool_choice_profile": 0,
+        "response_budget_bucket": 0,
+        "reasoning_budget_bucket": 0,
         "token_budget_bucket": 0,
         "tool_parallelism_cap": 0,
         **{head: 0 for head in BOOLEAN_HEADS},
@@ -221,6 +229,8 @@ def evaluate_dataset(
         "sampling_profile_match_rate": safe_rate(head_match_counts["sampling_profile"]),
         "repetition_profile_match_rate": safe_rate(head_match_counts["repetition_profile"]),
         "tool_choice_profile_match_rate": safe_rate(head_match_counts["tool_choice_profile"]),
+        "response_budget_bucket_match_rate": safe_rate(head_match_counts["response_budget_bucket"]),
+        "reasoning_budget_bucket_match_rate": safe_rate(head_match_counts["reasoning_budget_bucket"]),
         "reward_total_mean": safe_mean(reward_total_sum, evaluated_records),
         "reward_total_mean_on_match": safe_mean(
             reward_total_match_sum, reward_total_match_count

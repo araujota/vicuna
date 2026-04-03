@@ -1,0 +1,16 @@
+[Unit]
+Description=Vicuña Host Experimental Capture Render
+After=network-online.target vicuna-webgl-renderer.service
+Wants=network-online.target vicuna-webgl-renderer.service
+
+[Service]
+Type=oneshot
+User=@VICUNA_SERVICE_USER@
+Group=@VICUNA_SERVICE_GROUP@
+WorkingDirectory=@VICUNA_REPO_ROOT@
+EnvironmentFile=-@VICUNA_ENV_FILE@
+ExecStart=@VICUNA_REPO_ROOT@/tools/ops/run-with-service-logs.sh host-capture-render @VICUNA_REPO_ROOT@/tools/ops/run-host-capture-render.sh
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

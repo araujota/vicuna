@@ -1191,6 +1191,106 @@ bool deepseek_complete_chat(
     }
 }
 
+json deepseek_tool_call_to_json(const deepseek_tool_call & tool_call) {
+    return {
+        {"id", tool_call.id},
+        {"name", tool_call.name},
+        {"arguments_json", tool_call.arguments_json},
+    };
+}
+
+bool deepseek_tool_call_from_json(
+        const json & body,
+        deepseek_tool_call * out_tool_call,
+        std::string * out_error) {
+    if (!out_tool_call) {
+        if (out_error) {
+            *out_error = "tool call output must not be null";
+        }
+        return false;
+    }
+    if (!body.is_object()) {
+        if (out_error) {
+            *out_error = "tool call payload must be an object";
+        }
+        return false;
+    }
+
+    out_tool_call->id = json_value(body, "id", std::string());
+    out_tool_call->name = json_value(body, "name", std::string());
+    out_tool_call->arguments_json = json_value(body, "arguments_json", std::string());
+    if (trim_ascii_copy_local(out_tool_call->name).empty()) {
+        if (out_error) {
+            *out_error = "tool call payload did not include a name";
+        }
+        return false;
+    }
+    return true;
+}
+
+json deepseek_chat_result_to_json(const deepseek_chat_result & result) {
+    json tool_calls = json::array();
+    for (const auto & tool_call : result.tool_calls) {
+        tool_calls.push_back(deepseek_tool_call_to_json(tool_call));
+    }
+
+    json body = {
+        {"content", result.content},
+        {"reasoning_content", result.reasoning_content},
+        {"finish_reason", result.finish_reason},
+        {"prompt_tokens", result.prompt_tokens},
+        {"completion_tokens", result.completion_tokens},
+        {"tool_calls", std::move(tool_calls)},
+        {"emotive_trace", result.emotive_trace},
+        {"rich_response", result.rich_response},
+    };
+    return body;
+}
+
+bool deepseek_chat_result_from_json(
+        const json & body,
+        deepseek_chat_result * out_result,
+        std::string * out_error) {
+    if (!out_result) {
+        if (out_error) {
+            *out_error = "chat result output must not be null";
+        }
+        return false;
+    }
+    if (!body.is_object()) {
+        if (out_error) {
+            *out_error = "chat result payload must be an object";
+        }
+        return false;
+    }
+
+    deepseek_chat_result parsed;
+    parsed.content = json_value(body, "content", std::string());
+    parsed.reasoning_content = json_value(body, "reasoning_content", std::string());
+    parsed.finish_reason = json_value(body, "finish_reason", std::string("stop"));
+    parsed.prompt_tokens = json_value(body, "prompt_tokens", int32_t(0));
+    parsed.completion_tokens = json_value(body, "completion_tokens", int32_t(0));
+    if (body.contains("tool_calls") && !body.at("tool_calls").is_null()) {
+        if (!body.at("tool_calls").is_array()) {
+            if (out_error) {
+                *out_error = "chat result tool_calls payload must be an array";
+            }
+            return false;
+        }
+        for (const auto & item : body.at("tool_calls")) {
+            deepseek_tool_call tool_call;
+            if (!deepseek_tool_call_from_json(item, &tool_call, out_error)) {
+                return false;
+            }
+            parsed.tool_calls.push_back(std::move(tool_call));
+        }
+    }
+    parsed.emotive_trace = body.contains("emotive_trace") ? body.at("emotive_trace") : json(nullptr);
+    parsed.rich_response = body.contains("rich_response") ? body.at("rich_response") : json(nullptr);
+    *out_result = std::move(parsed);
+    return true;
+}
+
 json deepseek_build_health_json(const deepseek_runtime_config & config) {
     return {
         {"status", "ok"},

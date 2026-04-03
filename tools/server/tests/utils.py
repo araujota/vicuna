@@ -142,114 +142,19 @@ class ServerProcess:
             self.server_host,
             "--port",
             self.server_port,
-            "--temp",
-            self.temperature,
-            "--seed",
-            self.seed,
         ]
-        if self.offline:
-            server_args.append("--offline")
-        if self.model_file:
-            server_args.extend(["--model", self.model_file])
-        if self.model_url:
-            server_args.extend(["--model-url", self.model_url])
-        if self.model_draft:
-            server_args.extend(["--model-draft", self.model_draft])
-        if self.model_hf_repo:
-            server_args.extend(["--hf-repo", self.model_hf_repo])
-        if self.model_hf_file:
-            server_args.extend(["--hf-file", self.model_hf_file])
-        if self.models_dir:
-            server_args.extend(["--models-dir", self.models_dir])
-        if self.models_max is not None:
-            server_args.extend(["--models-max", self.models_max])
-        if self.n_batch:
-            server_args.extend(["--batch-size", self.n_batch])
-        if self.n_ubatch:
-            server_args.extend(["--ubatch-size", self.n_ubatch])
         if self.n_threads:
             server_args.extend(["--threads", self.n_threads])
-        if self.n_gpu_layer:
-            server_args.extend(["--n-gpu-layers", self.n_gpu_layer])
-        if self.draft is not None:
-            server_args.extend(["--draft", self.draft])
-        if self.server_continuous_batching:
-            server_args.append("--cont-batching")
-        if self.server_embeddings:
-            server_args.append("--embedding")
-        if self.server_reranking:
-            server_args.append("--reranking")
-        if self.server_metrics:
-            server_args.append("--metrics")
-        if self.kv_unified:
-            server_args.append("--kv-unified")
-        if self.server_slots:
-            server_args.append("--slots")
-        else:
-            server_args.append("--no-slots")
-        if self.pooling:
-            server_args.extend(["--pooling", self.pooling])
-        if self.model_alias:
-            server_args.extend(["--alias", self.model_alias])
-        if self.model_tags:
-            server_args.extend(["--tags", self.model_tags])
-        if self.n_ctx:
-            server_args.extend(["--ctx-size", self.n_ctx])
         if self.n_slots:
             server_args.extend(["--parallel", self.n_slots])
-        if self.ctk:
-            server_args.extend(["-ctk", self.ctk])
-        if self.ctv:
-            server_args.extend(["-ctv", self.ctv])
-        if self.fa is not None:
-            server_args.extend(["-fa", self.fa])
-        if self.n_predict:
-            server_args.extend(["--n-predict", self.n_predict])
-        if self.slot_save_path:
-            server_args.extend(["--slot-save-path", self.slot_save_path])
-        if self.n_ga:
-            server_args.extend(["--grp-attn-n", self.n_ga])
-        if self.n_ga_w:
-            server_args.extend(["--grp-attn-w", self.n_ga_w])
-        if self.debug:
-            server_args.append("--verbose")
-        if self.lora_files:
-            for lora_file in self.lora_files:
-                server_args.extend(["--lora", lora_file])
-        if self.enable_ctx_shift:
-            server_args.append("--context-shift")
         if self.api_key:
             server_args.extend(["--api-key", self.api_key])
-        if self.draft_max:
-            server_args.extend(["--draft-max", self.draft_max])
-        if self.draft_min:
-            server_args.extend(["--draft-min", self.draft_min])
         if self.no_webui:
             server_args.append("--no-webui")
-        if self.no_models_autoload:
-            server_args.append("--no-models-autoload")
-        if self.jinja:
-            server_args.append("--jinja")
-        else:
-            server_args.append("--no-jinja")
-        if self.reasoning_format is not None:
-            server_args.extend(("--reasoning-format", self.reasoning_format))
-        if self.reasoning_budget is not None:
-            server_args.extend(("--reasoning-budget", self.reasoning_budget))
-        if self.chat_template:
-            server_args.extend(["--chat-template", self.chat_template])
-        if self.chat_template_file:
-            server_args.extend(["--chat-template-file", self.chat_template_file])
-        if self.mmproj_url:
-            server_args.extend(["--mmproj-url", self.mmproj_url])
-        if self.media_path:
-            server_args.extend(["--media-path", self.media_path])
-        if self.sleep_idle_seconds is not None:
-            server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
-        if self.webui_mcp_proxy:
-            server_args.append("--webui-mcp-proxy")
         if self.api_surface is not None:
             server_args.extend(["--api-surface", self.api_surface])
+        if self.debug:
+            server_args.append("--verbose")
 
         args = [str(arg) for arg in [server_path, *server_args]]
         print(f"tests: starting server with: {' '.join(args)}")

@@ -6,7 +6,7 @@ Wants=network-online.target vicuna-runtime.service vicuna-webgl-renderer.service
 [Service]
 Type=simple
 WorkingDirectory=/home/tyler-araujo/Projects/vicuna
-ExecStart=/home/tyler-araujo/Projects/vicuna/tools/ops/run-telegram-bridge.sh
+ExecStart=/home/tyler-araujo/Projects/vicuna/tools/ops/run-with-service-logs.sh telegram-bridge /home/tyler-araujo/Projects/vicuna/tools/ops/run-telegram-bridge.sh
 Restart=always
 RestartSec=2
 TimeoutStopSec=20

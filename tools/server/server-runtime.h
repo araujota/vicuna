@@ -2,8 +2,6 @@
 
 #include "server-common.h"
 
-#include "llama.h"
-
 #include <cpp-httplib/httplib.h>
 
 #include <string>
@@ -21,7 +19,7 @@ struct server_runtime_params {
     int32_t port = 8080;
     std::string api_prefix;
     server_api_surface api_surface = SERVER_API_SURFACE_DEFAULT;
-    bool webui = true;
+    bool webui = false;
     std::string public_path;
     std::string ssl_file_key;
     std::string ssl_file_cert;
@@ -62,17 +60,4 @@ std::string server_http_show_masked_url(const server_http_url & parts);
 std::string server_string_format(const char * fmt, ...);
 std::vector<std::string> server_string_split(const std::string & str, char delim);
 bool server_string_ends_with(std::string_view str, std::string_view suffix);
-
-void server_batch_add(
-        llama_batch & batch,
-        llama_token id,
-        llama_pos pos,
-        const std::vector<llama_seq_id> & seq_ids,
-        bool logits);
-std::vector<llama_token> server_tokenize(
-        const llama_context * ctx,
-        const std::string & text,
-        bool add_special,
-        bool parse_special);
-void server_embd_normalize(const float * inp, float * out, int n, int embd_norm);
-float server_embd_similarity_cos(const float * embd1, const float * embd2, int n);
+float server_embd_similarity_cos(const float * a, const float * b, int n);
